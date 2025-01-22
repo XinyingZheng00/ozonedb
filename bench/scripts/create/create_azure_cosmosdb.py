@@ -1,0 +1,1 @@
+#az cosmosdb create --name $account --resource-group $resourceGroup --default-consistency-level Eventual --locations regionName="$location" failoverPriority=0 isZoneRedundant=False --capabilities EnableServerless

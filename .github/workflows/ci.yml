@@ -1,0 +1,31 @@
+name: C++ CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install Dependencies
+      run: sudo apt-get install libgtest-dev cmake libprotobuf-dev protobuf-compiler libsnappy-dev libsqlite3-dev zlib1g-dev libbz2-dev libgflags-dev liblz4-dev libzstd-dev libboost-all-dev
+    - name: Compile gtest
+      run: cd /usr/src/gtest && sudo cmake CMakeLists.txt && sudo make && sudo cp lib/*.a /usr/lib
+    - name: Create Build Directory
+      run: mkdir build && cd build
+    # - name: install pebblesdb
+    #   run: cd /usr/src/ &&sudo git clone https://github.com/utsaslab/pebblesdb.git && cd pebblesdb/src && sudo autoreconf -i &&sudo ./configure &&sudo make -j$(nproc)&& sudo make install &&sudo ldconfig
+    # - name: install RocksDB
+    #   run: |
+    #     cd /usr/src/
+    #     sudo git clone https://github.com/facebook/rocksdb.git
+    #     cd rocksdb
+    #     sudo make static_lib -j$(nproc)
+    #     sudo make install
+    #     sudo ldconfig
+    - name: Build
+      run: cd build && cmake .. && make -j $(nproc)
+    - name: create test database
+      run: sudo mkdir -p /tank/db/ozonedb/
+    - name: Run tests
+      run: cd build && sudo ./runUnitTests

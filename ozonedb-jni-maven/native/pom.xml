@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns="http://maven.apache.org/POM/4.0.0"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>ozonedbjnimaven</groupId>
+        <artifactId>jni-demo</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>demoproc-native</artifactId>
+    <packaging>so</packaging>
+
+    <name>demoproc-native</name>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.1</version>
+                <configuration>
+                    <source>1.8</source>
+                    <target>1.8</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>native-maven-plugin</artifactId>
+                <version>1.0-alpha-8</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <compilerProvider>generic-classic</compilerProvider>
+                    <compilerExecutable>g++</compilerExecutable>
+                    <linkerExecutable>g++</linkerExecutable>
+                    <sources>
+                        <source>
+                            <directory>${basedir}/src/main/cpp/</directory>
+                            <fileNames>
+                                <fileName>jni_OzoneDBJNI.cpp</fileName>
+                            </fileNames>
+                        </source>
+                    </sources>
+                    <compilerStartOptions>
+                        <compilerStartOption>-std=c++17</compilerStartOption> 
+                        <compilerStartOption>-I ${JAVA_HOME}/include/</compilerStartOption>
+                        <compilerStartOption>-I ${JAVA_HOME}/include/linux/</compilerStartOption>
+                        <compilerStartOption>-I../../src/include/ozonedb/</compilerStartOption>
+                        <compilerStartOption>-I../../src/util/</compilerStartOption>
+                        <compilerStartOption>-I${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/include/</compilerStartOption>
+                    </compilerStartOptions>
+                    <compilerEndOptions>
+                        <compilerEndOption>-fPIC</compilerEndOption>
+                        <compilerEndOption>-shared</compilerEndOption>
+                    </compilerEndOptions>
+                    <linkerStartOptions>
+                    </linkerStartOptions>
+                    <linkerEndOptions>
+                        <linkerEndOption>-shared</linkerEndOption>
+                        <linkerEndOption>-L${OZONEDB_HOME}/ozonedb-jni-maven/native/src/main/cpp/lib -lOzoneDB</linkerEndOption>
+                        <linkerEndOption>-L${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/lib -llog4cxx -lapr-1</linkerEndOption>
+                        <linkerEndOption>-Wl,-rpath=${OZONEDB_HOME}/ozonedb-jni-maven/native/src/main/cpp/lib</linkerEndOption>
+                    </linkerEndOptions>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

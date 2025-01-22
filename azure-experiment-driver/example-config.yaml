@@ -1,0 +1,79 @@
+github_username: "XinyingZheng00"
+github_token: "~/access_token.github"
+airdb_branch: "latency"
+id: "testrun"
+
+azure:
+  location: "eastus2"
+  username: "Xinying"
+  password: "Zxy102246!"
+
+
+ycsb_t:
+  # - workload: "workloada"
+  #   operationcount: 10000
+  #   threadcount: 1
+  # - workload: "workloadb"
+  #   operationcount: 10000
+  #   threadcount: 1
+  - workload: "workloadc"
+    recordcount: 10000000
+    operationcount: 1000
+    threadcount: 1
+  - workload: "workloadf"
+    recordcount: 10000000
+    operationcount: 1000
+    threadcount: 1
+  - workload: "workloadd"
+    recordcount: 10000000
+    operationcount: 1000
+    threadcount: 1
+
+storage:
+  account_name: "ozonedbstorage"
+
+postgres:
+  server_name: "airdb-postgresql-server"
+  port: 5432
+  sku_name: "Standard_B2ms"
+  sku_tier: "Burstable"
+  storage_size: 64
+  subnet_name: "airdb-postgresql-subnet"
+  subnet_address_prefix: "10.0.1.0/24"
+
+mysql:
+  server_name: "airdb-mysql-server1234"
+  port: 3306
+  sku_name: "Standard_B2ms"
+  sku_tier: "Burstable"
+  storage_size: 64
+  subnet_name: "airdb-mysql-subnet"
+  subnet_address_prefix: "10.0.2.0/24"
+
+azure_sql:
+  server_name: "airdb-azuresql-server"
+  sku_name: "GP_S_Gen5_4"
+  sku_tier: "GeneralPurpose"
+
+resource_group:
+  name: "ozonedb_test"
+
+network:
+  vnet_name: "ozonedb-test-vnet"
+  vnet_address_prefix: "10.0.0.0/16"
+  subnet_name: "default"
+  subnet_address_prefix: "10.0.0.0/24"
+  ip_name: "ozonedb-test-ip"
+  ip_config_name: "ozonedb-test-ip-config"
+  nic_name: "ozonedb-test-nic"
+
+vm:
+  num: 1
+  name: "test-vm"
+  ssh_key: "~/.ssh/id_rsa.pub"
+  vm_size: "Standard_D4s_v3"
+  image_reference:
+    publisher: "Canonical"
+    offer: "0001-com-ubuntu-server-focal"
+    sku: "20_04-lts-gen2"
+    version: "latest"

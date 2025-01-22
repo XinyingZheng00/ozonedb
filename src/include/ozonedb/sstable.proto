@@ -1,0 +1,88 @@
+syntax = "proto2";
+
+// one SSTable will only be written by at most one client, so we don't need to consider synchronization
+// between multiple clients.
+/* SSTable format
+<beginning_of_file>
+[data block 1]
+[data block 2]
+...
+[data block N]
+data blocks:
+The sequence of key/value pairs in the file are stored in sorted order and partitioned into a sequence of data blocks.
+These blocks come one after another at the beginning of the file. Each data block is formatted according to the code in block_builder.cc,
+and then optionally compressed.
+
+[meta block 1]
+...
+[meta block K]
+The supported meta block types are "filter" Meta Block and "stats" Meta Block. More meta block types may be added in the future.
+
+[metaindex block]
+A "metaindex" block. It contains one entry for every other meta block where the key is the name of the meta block
+and the value is a BlockHandle pointing to that meta block.
+
+[index block]
+An "index" block. This block contains one entry per data block, where the key is a string >= last key in that data block and before
+the first key in the successive data block. The value is the BlockHandle for the data block.
+
+[Footer]        (fixed size; starts at file_size - sizeof(Footer))
+At the very end of the file is a fixed length footer that contains the BlockHandle of the metaindex and index blocks as well as a magic number.
+
+ metaindex_handle: char[p];     // Block handle for metaindex
+ index_handle:     char[q];     // Block handle for index
+ padding:          char[40-p-q];// zeroed bytes to make fixed length
+                                // (40==2*BlockHandle::kMaxEncodedLength)
+ magic:            fixed64;     // == 0xdb4775248b80fb57 (little-endian)
+<end_of_file>
+
+First stage: we build a simple SSTable that only contain data blocks and index block and Footer.
+*/
+
+message BlockIdentifier {
+  required fixed64 offset = 1;
+  required fixed64 length = 2;
+}
+
+message BlockEntry {
+  // Length of shared bytes (0 for restart points).
+  required uint32 shared_bytes = 1;
+  // Length of unshared bytes.
+  required uint32 unshared_bytes = 2;
+  // Key delta (unshared bytes).
+  required bytes key_delta = 3;
+  // Value. for data block, it is the value. for index block, it is the block identifier of the data block.
+  required bytes value = 4;
+}
+
+message BlockData {
+  // represent for a data block or a index block
+  // block data
+  repeated BlockEntry entries = 1;
+  // Offsets within the block of restart points.
+  repeated fixed32 restarts = 2;
+  required fixed32 num_restarts = 3;
+}
+
+message FilterBlock {
+  // Repeated field for filters. Each filter is stored as a byte array.
+  repeated bytes filters = 1;
+  // lg(base), where base is the range size.
+  required uint32 lg_base = 2;
+}
+
+message MetaIndexBlock {
+  message MetaIndexBlockEntry {
+    // The key is the name of the meta block and the value is a BlockHandle pointing to that meta block.
+    required bytes key = 1;
+    required BlockIdentifier value = 2;
+  }
+  repeated MetaIndexBlockEntry entries = 1;
+}
+
+message FooterBlock {
+  // this is need to be fixed size, so that we can always read the footer from the end of the file.
+  required BlockIdentifier index_identifier = 1;
+  required BlockIdentifier metaindex_identifier = 2;
+  required fixed64 magic = 3;
+}

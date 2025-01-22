@@ -1,0 +1,175 @@
+import argparse
+import logging
+import os
+import subprocess
+import sys
+import threading
+import yaml
+from azure.identity import AzureCliCredential
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.network import NetworkManagementClient
+from azure.mgmt.resource import ResourceManagementClient
+from azure.mgmt.storage import StorageManagementClient
+from azure.mgmt.sql import SqlManagementClient
+
+sys.path.append('/home/xinying/Desktop/ozonedb/bench/scripts/cache')
+from azuresql_data_cache import *
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+def server_exec(server, command, tmux_session=None, wait=True):
+    """Executes a command on a remote server with optional tmux session support."""
+    ssh_base_cmd = ["ssh", "-i", "~/.ssh/id_rsa", "-oStrictHostKeyChecking=no", "-p", "22", server]
+    if tmux_session:
+        if wait:
+            command = f"tmux send -t {tmux_session} '{command}; tmux wait-for -S 0' ENTER"
+            subprocess.run(ssh_base_cmd + [command])
+            subprocess.run(ssh_base_cmd + ["tmux wait-for 0"])
+        else:
+            command = f"tmux send -t {tmux_session} '{command}' ENTER"
+            subprocess.run(ssh_base_cmd + [command])
+    else:
+        subprocess.run(ssh_base_cmd + [command])
+
+
+def load_ycsb(node, i, ycsb_t_start, config):
+    workload_config = config["cloud"]["load"]
+    workloads, record_cnt, operation_cnts, key_sizes, threads = (
+        workload_config["workload_name"], str(workload_config["record_cnt"]), 
+        workload_config["operation_cnt"], workload_config["key_size"],
+        workload_config["threads"]
+    )
+    
+    ycsb_path = os.path.join("$OZONEDB_HOME", "ycsb")
+    result_path = os.path.join("$OZONEDB_HOME", "bench", "results", "azure")
+    script_path = os.path.join("$OZONEDB_HOME", "bench", "scripts")
+
+    server_exec(node, "tmux kill-server")
+    server_exec(node, "tmux new -s azuresql_load -d")
+    server_exec(node, f"mkdir -p {result_path}", tmux_session="azuresql_load")
+    server_exec(node, f"cd {ycsb_path}", tmux_session="azuresql_load")
+
+    for op_cnt in map(str, operation_cnts):
+        for key_size in key_sizes:
+            for workload in workloads:
+                print(f"Generating workload for {workload} with key size {key_size} and operation count {op_cnt}")
+                gen_command = f"python3 {script_path}/generate_workload.py --workload_name {workload} --key_size {key_size} --operation_cnt {op_cnt} --record_cnt {record_cnt}"
+                server_exec(node, gen_command, tmux_session="azuresql_load")
+                workload_path = os.path.join(ycsb_path, "workloads/generated_workloads", f"workload{workload}_{key_size}_{op_cnt}_{record_cnt}")
+                
+                db = "azuresql"
+                insert_result = os.path.join(result_path, f"{db}-{key_size}-workload{workload}-{op_cnt}-insert.result")
+                server_exec(node, "rm -rf " + insert_result, tmux_session="azuresql_load")
+                
+                cached_data_path = f"cached_data_{db}_{key_size}_workload{workload}_{record_cnt}".lower()
+                table_name = "usertable"
+                clear_table(conn_str, table_name)
+                
+                command = ["python3", "bin/ycsb", "load", 'jdbc', '-threads', f'{threads}', "-s", "-P", workload_path, "-P", "$OZONEDB_HOME/bench/scripts/config/azuresql.properties", f"-p statusinterval=1 2>&1 | tee -a {insert_result}"]
+                ycsb_t_start.wait()
+                server_exec(node, " ".join(command), tmux_session="azuresql_load")
+                copy_table(conn_str, table_name, cached_data_path)
+                clear_table(conn_str, table_name)
+
+
+def download_file_from_server(server, remote_file_path, local_destination_path):
+    """Downloads a file from a remote server using SCP."""
+    scp_command = ["scp", "-i", "~/.ssh/id_rsa", "-oStrictHostKeyChecking=no", 
+                   f"{server}:{remote_file_path}", local_destination_path]
+    print(" ".join(scp_command))
+    subprocess.run(scp_command)
+
+
+def download_results(node, config):
+    """Downloads experiment results from the server."""
+    remote_result_path = "~/ozonedb/bench/results/azure"
+    local_result_path = os.path.join('../', "results", "azure")
+    import pathlib
+    pathlib.Path(local_result_path).mkdir(parents=True, exist_ok=True)
+    workload_config = config["cloud"]["load"]
+    for op_cnt in map(str, workload_config["operation_cnt"]):
+        for key_size in workload_config["key_size"]:
+            for workload in workload_config["workload_name"]:
+                db = "azuresql"
+                remote_insert_result = os.path.join(remote_result_path, f"{db}-{key_size}-workload{workload}-{op_cnt}-insert.result")
+                local_insert_result = os.path.join(local_result_path, f"{db}-{key_size}-workload{workload}-{op_cnt}-insert.result")
+                subprocess.run(["rm", "-rf", local_insert_result])
+                download_file_from_server(node, remote_insert_result, local_insert_result)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Load ycsb-t data on Azure VMs and Azuresql")
+    parser.add_argument("--config", type=str, default="config/ycsb.yaml")
+    args = parser.parse_args()
+
+    with open(args.config, "r") as file:
+        config = yaml.safe_load(file)
+
+    credential = AzureCliCredential()
+    subscription_id = os.environ["AZURE_SUBSCRIPTION_ID"]
+    if subscription_id is None:
+        raise ValueError("AZURE_SUBSCRIPTION_ID environment variable is not set")
+
+    resource_client = ResourceManagementClient(credential, subscription_id)
+    network_client = NetworkManagementClient(credential, subscription_id)
+    compute_client = ComputeManagementClient(credential, subscription_id)
+    storage_client = StorageManagementClient(credential, subscription_id)
+    azuresql_client = SqlManagementClient(credential, subscription_id)
+
+    resource_group = config["resource_group"]["name"]
+    storage_account_name = config["storage"]["account_name"]
+    username = config["azure"]["username"]
+    password = config["azure"]["password"]
+
+
+    DEFAULT_DB = 'ycsb'
+    DEFAULT_TABLE = 'usertable'
+    DEFAULT_SERVER = azuresql_client.servers.get(resource_group, config["azure_sql"]["server_name"]).fully_qualified_domain_name
+    DEFAULT_PORT = 1433
+    conn_str = f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={DEFAULT_SERVER},{DEFAULT_PORT};DATABASE={DEFAULT_DB};UID={username};PWD={password}'
+
+    vm_setup = []
+    ycsb_t_run = []
+    result_downloader = []
+    
+    ycsb_t_start = threading.Event()
+    vm_list = list(compute_client.virtual_machines.list(resource_group))
+    if len(vm_list) < config["vm"]["num"]:
+        print(f"Only {len(vm_list)} VMs found, expected {config['vm']['num']}")
+        sys.exit(1)
+    vm_list = vm_list[: config["vm"]["num"]]
+
+    for i, vm in enumerate(vm_list):
+        ip_name = str(vm.name).replace(config["vm"]["name"], config["network"]["ip_name"])
+        public_ip_address = network_client.public_ip_addresses.get(resource_group, ip_name)
+        server = f"{config['azure']['username']}@{public_ip_address.ip_address}"
+        print(f"Starting setup for {public_ip_address.ip_address}")
+        ycsb_t_run.append(threading.Thread(target=load_ycsb, args=(server, i, ycsb_t_start, config)))
+        result_downloader.append(threading.Thread(target=download_results, args=(server, config)))
+       
+    for t in vm_setup:
+        t.start()
+
+    for t in vm_setup:
+        t.join()
+
+    print("Setup complete")
+
+    for t in ycsb_t_run:
+        t.start()
+
+    print("Starting ycsb-t experiment")
+    ycsb_t_start.set()
+
+    for t in ycsb_t_run:
+        t.join()
+    print("Experiment complete")
+    print("Downloading results")
+    for t in result_downloader:
+        t.start()
+
+    for t in result_downloader:
+        t.join()
+        
+    print("Cleanup complete")

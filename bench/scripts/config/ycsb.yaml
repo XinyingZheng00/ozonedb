@@ -1,0 +1,123 @@
+local:
+  load:
+    workload_name:
+      - "c"
+    operation_cnt:
+      - 100000
+    record_cnt: 100000
+    key_size:
+      - "1KB"
+    db_name:
+      - "rocksdb"
+    repeated: 1
+    ycsb_data_path: "/tank/ycsb_data"
+  run:
+    workload_name:
+      - "a"
+    operation_cnt:
+      - 10000
+      - 20000
+      - 30000
+      - 40000
+      - 50000
+      - 60000
+      - 70000
+      - 80000
+      - 90000
+      - 100000
+    record_cnt: 100000
+    key_size:
+      - "1KB"
+      - "10KB"
+    db_name:
+      - "rocksdb"
+    repeated: 5
+    ycsb_data_path: "/tank/ycsb_data"
+
+cloud:
+  load:
+    workload_name:
+      - "a"
+    operation_cnt:
+      - 1000000
+    record_cnt: 1000000
+    key_size:
+      - "1KB"
+    db_name:
+      - "ozonedb"
+    threads: 4
+    ycsb_data_path: "ycsb-data"
+  run:
+    workload_name:
+      - "a"
+    operation_cnt:
+      - 1000000
+    record_cnt: 1000000
+    key_size:
+      - "1KB"
+    db_name:
+      - "ozonedb"
+    threads: 32
+    ycsb_data_path: "ycsb-data"
+
+github_username: "XinyingZheng00"
+github_token: "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"
+ozonedb_branch: "main"
+id: "testrun"
+
+azure:
+  location: "eastus2"
+  username: "Xinying"
+  password: "Zxy102246!"
+
+storage:
+  account_name: "ozonedbstorage"
+
+postgres:
+  server_name: "ozonedb-postgresql-server"
+  port: 5432
+  sku_name: "Standard_B2ms"
+  sku_tier: "Burstable"
+  storage_size: 64
+  subnet_name: "ozonedb-postgresql-subnet"
+  subnet_address_prefix: "10.0.1.0/24"
+
+cosmosdb:
+  account_name: "ozonedb-cosmosdb-account"
+  
+mysql:
+  server_name: "ozonedb-mysql-server1234"
+  port: 3306
+  sku_name: "Standard_B2ms"
+  sku_tier: "Burstable"
+  storage_size: 64
+  subnet_name: "ozonedb-mysql-subnet"
+  subnet_address_prefix: "10.0.2.0/24"
+
+azure_sql:
+  server_name: "ozonedb-azuresql-server"
+  sku_name: "GP_S_Gen5_4"
+  sku_tier: "GeneralPurpose"
+
+resource_group:
+  name: "ozonedb_test"
+
+network:
+  vnet_name: "ozonedb-test-vnet"
+  vnet_address_prefix: "10.0.0.0/16"
+  subnet_name: "default"
+  subnet_address_prefix: "10.0.0.0/24"
+  ip_name: "ozonedb-test-ip"
+  ip_config_name: "ozonedb-test-ip-config"
+  nic_name: "ozonedb-test-nic"
+
+vm:
+  num: 1
+  name: "test-vm"
+  ssh_key: "~/.ssh/id_rsa.pub"
+  vm_size: "Standard_D4s_v3"
+  image_reference:
+    publisher: "Canonical"
+    offer: "0001-com-ubuntu-server-focal"
+    sku: "20_04-lts-gen2"
+    version: "latest"

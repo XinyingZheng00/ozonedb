@@ -1,0 +1,44 @@
+syntax = "proto2";
+
+enum ValueType {
+  kTypeDeletion = 0;
+  kTypeValue = 1;
+}
+
+message Record {
+  // maybe add timestamp here
+  required bytes key = 1;  // change to bytesz
+  optional bytes value = 2;
+  required ValueType type = 3;
+}
+
+message OperationRecord {
+  enum OperationType {
+    LOGCREATE = 0;
+    COMPACT = 1;
+  }
+  required OperationType op_type = 1;
+  optional bool compact_in_last_level = 2;
+  repeated string output_file = 3;
+  repeated string key_start = 4;
+  repeated string key_end = 5;
+  repeated string input_files = 6;  // for COMPACT operations, it's the input files, for CREATE operations, it's the identified current tail.
+}
+
+message TaskRecord {
+  message TaskIdentifier {
+    repeated string input_files = 1;
+    required bool compactIntoNextLevel = 2;
+    required uint32 destinationLevel = 3;
+  }
+  required TaskIdentifier task_id = 1;
+  required string owner = 2;
+  enum TaskStatus {
+    TASK_BEGIN = 0;
+    TASK_IN_PROGRESS = 1;
+    TASK_COMPLETE = 2;
+    TASK_DEAD = 3;
+  }
+  required TaskStatus status = 3;  // 0 - compete for the task, 1 - task heartbeat, 3 - task complete
+  required uint32 owner_generation = 4;
+}
