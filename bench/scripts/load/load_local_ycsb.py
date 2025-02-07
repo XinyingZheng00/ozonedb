@@ -26,6 +26,7 @@ def load_ycsb(workload_names, record_cnt, operation_cnt, key_size, db_names, ycs
     record_cnt = str(record_cnt)
     ycsb_path = os.path.join(ozonedb_home, "ycsb")
     result_path = os.path.join(ozonedb_home, "bench", "results/ycsb")
+    subprocess.run(['mkdir', '-p', result_path])
     log_path = os.path.join(ozonedb_home, "bench", "results/")
     script_path = os.path.join(ozonedb_home, "bench", "scripts")
 
@@ -53,7 +54,8 @@ def load_ycsb(workload_names, record_cnt, operation_cnt, key_size, db_names, ycs
                         command.append(f"shared_config={config}")
                     # command.append(f"-p statusinterval=1")
                     # command.append(f" >> {result_file_insert}")
-                    subprocess.run(command)
+                    with open(result_file_insert, "w") as f:
+                        subprocess.run(command, stdout=f, stderr=f)
                     subprocess.run(['mv', os.path.join(log_path, "client.log"), result_client_log]) 
     
 if __name__ == "__main__":
@@ -62,7 +64,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--config',
         type=str,
-        default='ycsb.yaml',
+        default='config/ycsb.yaml',
         help='workload configuration.'
     )
     args = parser.parse_args()

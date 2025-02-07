@@ -5,14 +5,10 @@ namespace ozonedb {
 Status CompactionWatcher::startCompactionWatcher(std::atomic<bool> const* active) {
   std::cout << "Starting compaction watcher" << std::endl;
   this->compaction_thread = new std::thread(&CompactionWatcher::watchForCompaction, this, active);
-  this->compaction_thread->detach();
   return Status::kSuccess;
 }
 Status CompactionWatcher::stopCompactionWatcher() {
-  std::thread::id id = this->compaction_thread->get_id();
-  std::cout << id <<" Stopping compaction watcher" << std::endl;
-  // this->compaction_thread->join();
-  std::cout << id <<" Compaction watcher stopped" <<std::endl;
+  this->compaction_thread->join();
   return Status::kSuccess;
 }
 

@@ -68,11 +68,9 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
 
 Status DB::closeDB(DB*& db) {
   db->active = false;
-  std::cout << std::this_thread::get_id()<< " DB is closing0" << std::endl;
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     db->watcher->stopCompactionWatcher();
   }
-  std::cout <<std::this_thread::get_id()<< " DB is closing1" << std::endl;
   db->thread_pool->waitForCompletion();
   db->metadata_log->stopViewUpdate();
   // delete db;

@@ -45,7 +45,7 @@ void FileStorage::createDirectory(std::string name) {
 Status FileStorage::append(std::string const& fileName, unsigned char* const& data, int length) {
   std::ofstream* output_file = getWriteStream(fileName);
   if (isSealed(fileName)) {
-    std::cerr << getpid() << ":The file is sealed: " << fileName << std::endl;
+    // std::cerr << getpid() << ":The file is sealed: " << fileName << std::endl;
     return Status::kSealed;
   } else if (!output_file->is_open()) {
     std::cerr << "Failed to open output file: " << fileName << std::endl;
@@ -63,7 +63,7 @@ Status FileStorage::append(std::string const& fileName, unsigned char* const& da
 Status FileStorage::appendNoFlush(std::string const& fileName, unsigned char* const& data, int length) {
   std::ofstream* output_file = getWriteStream(fileName);
   if (isSealed(fileName)) {
-    std::cerr << getpid() << ":The file is sealed: " << fileName << std::endl;
+    // std::cerr << getpid() << ":The file is sealed: " << fileName << std::endl;
     return Status::kSealed;
   } else if (!output_file->is_open()) {
     std::cerr << "Failed to open output file: " << fileName << std::endl;
