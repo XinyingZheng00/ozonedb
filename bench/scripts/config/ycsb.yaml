@@ -1,37 +1,29 @@
 local:
   load:
-    workload_name:
-      - "c"
-    operation_cnt:
-      - 30000000
-    record_cnt: 30000000
+    record_cnt: 
+      - 1000000
     key_size:
       - "1KB"
     db_name:
       - "ozonedb"
     repeated: 1
     ycsb_data_path: "/tank/ycsb_data"
+    threads: 64
   run:
     workload_name:
-      - "a"
+      - "b"
+      - "c"
+      - "d"
+      - "f"
     operation_cnt:
-      - 10000
-      - 20000
-      - 30000
-      - 40000
-      - 50000
-      - 60000
-      - 70000
-      - 80000
-      - 90000
-      - 100000
-    record_cnt: 100000
+      - 1000000
+    record_cnt: 1000000
     key_size:
       - "1KB"
-      - "10KB"
     db_name:
-      - "rocksdb"
-    repeated: 5
+      - "ozonedb"
+    threads: 8
+    repeated: 1
     ycsb_data_path: "/tank/ycsb_data"
 
 cloud:

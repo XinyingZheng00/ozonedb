@@ -24,13 +24,9 @@ def generate_workload(workload_name, key_size_str, operations_cnt, record_cnt):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
 
-    # Define paths based on OZONEDB_HOME
     ycsb_path = os.path.join(ozonedb_home, "ycsb")
-
-    # Convert key size string to bytes
     key_size = convert_to_bytes(key_size_str)
     workload_name = "workload"+workload_name
-    # Define the input file name and the output file name
     input_file = ycsb_path + f"/workloads/{workload_name}"  # Assuming workload files are in .txt format
     output_dir = ycsb_path + "/workloads/generated_workloads"
     output_file = os.path.join(output_dir, f"{workload_name}_{key_size_str}_{operations_cnt}_{record_cnt}")
@@ -40,17 +36,14 @@ def generate_workload(workload_name, key_size_str, operations_cnt, record_cnt):
         print(f"Error: The file '{input_file}' does not exist.")
         return
 
-    # Create output directory if it does not exist
     os.makedirs(output_dir, exist_ok=True)
     if os.path.isfile(output_file):
         print(f"Workload File exist!")
         return
 
-    # Read the workload data
     with open(input_file, 'r') as file:
         lines = file.readlines()
 
-    # Modify the recordcount and operationcount, and calculate fieldlength
     field_length = math.ceil(key_size / 10)
     modified_lines = []
     
@@ -61,15 +54,9 @@ def generate_workload(workload_name, key_size_str, operations_cnt, record_cnt):
             modified_lines.append(f"operationcount={operations_cnt}\n")
         else:
             modified_lines.append(line)
-
-    # Add the new fieldlength line
-    # change this if you want to change the field length
-    # modified_lines.append(f"fieldlength={field_length}\n")
-
-    # Write the modified workload to the output file
+            
     with open(output_file, 'w') as file:
         file.writelines(modified_lines)
-
     print(f"Workload generated: {output_file}")
 
 if __name__ == "__main__":

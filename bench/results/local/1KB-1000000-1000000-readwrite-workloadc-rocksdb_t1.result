@@ -1,0 +1,45 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:rocksdb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb-tmp/ycsb/rocksdb/conf:/users/Xinying/ozonedb-tmp/ycsb/rocksdb/target/rocksdb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/net/jcip/jcip-annotations/1.0/jcip-annotations-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb-tmp/ycsb/core/target/core-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/rocksdb/rocksdbjni/9.6.1/rocksdbjni-9.6.1.jar site.ycsb.Client -db site.ycsb.db.rocksdb.RocksDBClient -threads 1 -s -P /users/Xinying/ozonedb-tmp/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p rocksdb.dir=/tank/ycsb_data/rocksdb-1KB-workloadc-1000000/ -t
+Command line: -db site.ycsb.db.rocksdb.RocksDBClient -threads 1 -s -P /users/Xinying/ozonedb-tmp/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p rocksdb.dir=/tank/ycsb_data/rocksdb-1KB-workloadc-1000000/ -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+2025-04-02 20:37:45:191 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2025-04-02 20:37:55:191 10 sec: 169502 operations; 16948.51 current ops/sec; est completion in 50 seconds [READ: Count=169517, Max=5515, Min=3, Avg=54.05, 90=103, 99=137, 99.9=168, 99.99=205] 
+2025-04-02 20:38:05:191 20 sec: 357396 operations; 18791.28 current ops/sec; est completion in 36 seconds [READ: Count=187890, Max=4199, Min=3, Avg=52.11, 90=101, 99=135, 99.9=162, 99.99=188] 
+2025-04-02 20:38:15:191 30 sec: 546294 operations; 18889.8 current ops/sec; est completion in 25 seconds [READ: Count=188899, Max=210, Min=3, Avg=51.84, 90=101, 99=134, 99.9=160, 99.99=182] 
+2025-04-02 20:38:25:191 40 sec: 735023 operations; 18872.9 current ops/sec; est completion in 15 seconds [READ: Count=188730, Max=3973, Min=3, Avg=51.92, 90=101, 99=135, 99.9=161, 99.99=181] 
+2025-04-02 20:38:35:191 50 sec: 922823 operations; 18780 current ops/sec; est completion in 5 second [READ: Count=187802, Max=5363, Min=3, Avg=52.18, 90=101, 99=135, 99.9=162, 99.99=186] 
+2025-04-02 20:38:39:298 54 sec: 1000000 operations; 18787 current ops/sec; [READ: Count=77162, Max=235, Min=3, Avg=52.1, 90=101, 99=135, 99.9=163, 99.99=191] [CLEANUP: Count=1, Max=3963, Min=3962, Avg=3963, 90=3963, 99=3963, 99.9=3963, 99.99=3963] 
+[OVERALL], RunTime(ms), 54108
+[OVERALL], Throughput(ops/sec), 18481.555407703112
+[TOTAL_GCS_PS_Scavenge], Count, 5
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 21
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.03881126635617654
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 5
+[TOTAL_GC_TIME], Time(ms), 21
+[TOTAL_GC_TIME_%], Time(%), 0.03881126635617654
+[READ], Operations, 1000000
+[READ], AverageLatency(us), 52.363892
+[READ], MinLatency(us), 3
+[READ], MaxLatency(us), 5515
+[READ], 95thPercentileLatency(us), 113
+[READ], 99thPercentileLatency(us), 135
+[READ], Return=OK, 1000000
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 3963.0
+[CLEANUP], MinLatency(us), 3962
+[CLEANUP], MaxLatency(us), 3963
+[CLEANUP], 95thPercentileLatency(us), 3963
+[CLEANUP], 99thPercentileLatency(us), 3963

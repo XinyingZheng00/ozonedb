@@ -51,7 +51,7 @@ public class RocksDBClient extends DB {
 
   @GuardedBy("RocksDBClient.class") private static Path rocksDbDir = null;
   @GuardedBy("RocksDBClient.class") private static Path optionsFile = 
-      Paths.get(OZONEDB_HOME + "/bench/scripts/rocksdb.option");
+      Paths.get(OZONEDB_HOME + "/bench/scripts/config/rocksdb.option");
   @GuardedBy("RocksDBClient.class") private static RocksObject dbOptions = null;
   @GuardedBy("RocksDBClient.class") private static RocksDB rocksDb = null;
   @GuardedBy("RocksDBClient.class") private static int references = 0;

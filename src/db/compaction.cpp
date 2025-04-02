@@ -68,7 +68,6 @@ Status CompactionWatcher::watchForCompaction(std::atomic<bool> const* active) {
       }
     }
   }
-  std::cout << std::this_thread::get_id() <<":exiting" << std::endl;
   return Status::kSuccess;
 }
 
