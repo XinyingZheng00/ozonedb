@@ -24,7 +24,7 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                 workload_path = ycsb_path + "/workloads/generated_workloads/workload" + workload_name + "_" + each_key_size + "_" + each_operation_cnt + "_" + record_cnt
                 
                 for db_name in db_names:
-                    result_file_readwrite = os.path.join(result_path, f'{each_key_size}-{each_operation_cnt}-{record_cnt}-readwrite-workload{workload_name}-{db_name}_t{threads}.result')
+                    result_file_readwrite = os.path.join(result_path, f'{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_t{threads}.result')
                     cached_data_path = ycsb_data_path + "/" + "cached_data-"+f'{db_name}-{each_key_size}-{record_cnt}/'
                     if not os.path.exists(cached_data_path):
                         print(f"cached_data_path {cached_data_path} does not exist, skipping...")

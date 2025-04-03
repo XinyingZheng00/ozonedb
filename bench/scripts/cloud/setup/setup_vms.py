@@ -32,32 +32,25 @@ def server_exec(server, command, tmux_session=None, wait=True):
 
 def common_init(node, cfg):
     # git clone ozonedb
-    server_exec(node, "tmux new -s ozonedb_setup -d")
-    # server_exec(node, f"git clone --branch={cfg['ozonedb_branch']} git@github.com:XinyingZheng00/ozonedb.git",  tmux_session="ozonedb_setup")
-    # server_exec(node, f'cd ozonedb && git submodule update --init --recursive',  tmux_session="ozonedb_setup")
-    # server_exec(node, "echo \"export OZONEDB_HOME=$(pwd)/ozonedb\" >> ~/.profile",  tmux_session="ozonedb_setup")
-    server_exec(node, "source ~/.profile",  tmux_session="ozonedb_setup")
-    # server_exec(node, "sudo apt update", tmux_session="ozonedb_setup")
-    # server_exec(node, "sudo apt install -y cmake maven python3-pip zip pkg-config",  tmux_session="ozonedb_setup")
-    
-    server_exec(node, "cd $OZONEDB_HOME/src/include/ozonedb/protobuf && rm -rf *",  tmux_session="ozonedb_setup")
-    server_exec(node, "mkdir -p $OZONEDB_HOME/build && cd $OZONEDB_HOME/build && cmake .. && make -j$(nproc)",  tmux_session="ozonedb_setup")
-
-    # server_exec(node, "sudo apt install openjdk-8-jdk -y",  tmux_session="ozonedb_setup")
-    # server_exec(node, 'echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> ~/.profile &&source ~/.profile&& echo "export PATH=$JAVA_HOME/bin:$PATH" >> ~/.profile',  tmux_session="ozonedb_setup")
-    server_exec(node, "bash $OZONEDB_HOME/bench/scripts/update_jni.sh",  tmux_session="ozonedb_setup")
+    server_exec(node, "tmux new -s setup -d")
+    server_exec(node, 'ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts',  tmux_session="setup")
+    access_token = config["github_token"]
+    server_exec(node, f'curl -H "Authorization: token {access_token}" --data "{{\\"title\\":\\"key:$(hostname)\\",\\"key\\":\\"$(cat ~/.ssh/id_rsa.pub)\\"}}" https://api.github.com/user/keys', tmux_session="setup")
+    server_exec(node, f'[ -d "ozonedb-tmp" ] || git clone git@github.com:XinyingZheng00/ozonedb-tmp.git',  tmux_session="setup") # to be changed 
+    server_exec(node, "cd ozonedb-tmp", tmux_session="setup") # to be changed 
+    server_exec(node, ". bench/scripts/setup_node.sh", tmux_session="setup")
     server_exec(node, "tmux kill-server")
+
     
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Setup VMs with Ozonedb for ycsb benchmarking")
-    parser.add_argument("--config", type=str, default="config/ycsb.yaml", help="Path to the config YAML file")
+    parser.add_argument("--config", type=str, default="../../config/ycsb.yaml", help="Path to the config YAML file")
     args = parser.parse_args()
 
     with open(args.config, "r") as file:
         config = yaml.safe_load(file)
         
-
     credential = AzureCliCredential()
     subscription_id = os.environ["AZURE_SUBSCRIPTION_ID"]
     if subscription_id is None:

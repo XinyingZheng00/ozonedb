@@ -27,7 +27,7 @@ def delete_blobs_in_directory(container_client: ContainerClient, directory_name:
         # Attempt to get properties of the container
         container_client.get_container_properties()
     except Exception as e:
-        print(f"Container does not exist or could not be accessed: {e}")
+        print(f"Container does not exist or could not be accessed")
         return
         
     blobs = list_blobs_in_directory(container_client, directory_name)
@@ -45,9 +45,9 @@ def copy_blobs_between_directories(container_client: ContainerClient, source_dir
         target_blob_client = container_client.get_blob_client(target_blob_name)
         target_blob_client.start_copy_from_url(source_blob_url)
 
-def load_cached_data(storage_client: BlobServiceClient, cached_data_dir: str, runtime_data_dir: str):
+def load_cached_data(storage_client: BlobServiceClient, cached_data_dir: str, runtime_data_dir: str, ycsb_data_path: str):
     """Copy data from data_cache to ycsbt_bench_dir after clearing ycsbt_bench_dir."""
-    container_client = get_container_client(storage_client, "ycsb-data")
+    container_client = get_container_client(storage_client, ycsb_data_path)
 
     delete_blobs_in_directory(container_client, runtime_data_dir)
     copy_blobs_between_directories(container_client, cached_data_dir, runtime_data_dir)
