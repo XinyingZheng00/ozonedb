@@ -189,7 +189,7 @@ public:
   std::unordered_map<std::string, std::vector<unsigned char>> cached_file;  // In-memory cache for sstable data
   std::chrono::_V2::system_clock::time_point last_commited_time_;
   int commit_count_ = 0;  // Commit count
-  int commit_interval_ = 500;  // Commit interval in milliseconds
+  int commit_interval_ = 10;  // Commit interval in milliseconds
 
   // vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==
   AzureBlobStorage(std::string const& connectionString, std::string const& containerName, std::string const& db_path)
