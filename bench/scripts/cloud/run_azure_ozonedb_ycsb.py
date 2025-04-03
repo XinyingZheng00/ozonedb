@@ -63,7 +63,7 @@ def run_ycsb(node, i, ycsb_t_start, config, blob_client):
                 # server_exec(node, "rm -rf" + run_result, tmux_session="ozonedb_run")
                 
                 run_data_path = f"usertable".lower()
-                gen_config_command = f"python3 {script_path}/generate_config_for_ozonedb.py --new_dir {run_data_path}"
+                gen_config_command = f"python3 {script_path}/generate_config_for_ozonedb.py --new_dir {run_data_path}/"
                 server_exec(node, gen_config_command, tmux_session="ozonedb_run")                    
                 cached_data_path = f"cached-data-{db_name}-{each_key_size}-workload{workload}-{record_cnt}".lower()                   
                 load_cached_data(blob_client, cached_data_path, run_data_path, ycsb_data_path)

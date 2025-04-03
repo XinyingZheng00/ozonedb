@@ -69,7 +69,7 @@ def load_ycsb(node, i, ycsb_t_start, config, blob_client):
             cached_data_path = f"cached-data-{db_name}-{each_key_size}-{each_record_cnt}".lower()
             delete_blobs_in_directory(get_container_client(blob_client, ycsb_data_path), cached_data_path)
             
-            gen_command = f"python3 {script_path}/cloud/generate_config_for_ozonedb_cloud.py --new_dir {cached_data_path}"
+            gen_command = f"python3 {script_path}/cloud/generate_config_for_ozonedb_cloud.py --new_dir {cached_data_path}/"
             server_exec(node, gen_command, tmux_session="ozonedb_load")
             command = ["python3", "bin/ycsb", "load", db_name, '-threads', str(threads), "-s", "-P", workload_path, "-p", f"shared_config=$OZONEDB_HOME/src/config/cloud/shared_config_rocksdb.json", f"2>&1 | tee -a {result_file_insert}"]
             ycsb_t_start.wait()
@@ -111,7 +111,7 @@ def download_results(node, config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load YCSB on Azure VMs and Ozonedb")
-    parser.add_argument("--config", type=str, default="../../config/ycsb.yaml")
+    parser.add_argument("--config", type=str, default=os.environ.get("OZONEDB_HOME") + "/bench/scripts/config/ycsb.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r") as file:
