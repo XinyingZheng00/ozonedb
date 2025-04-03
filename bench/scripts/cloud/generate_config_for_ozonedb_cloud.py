@@ -23,4 +23,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--new_dir", type=str)
     args = parser.parse_args()
-    generate_config_for_ozonedb_cloud(args.new_dir, args.is_local)
+    generate_config_for_ozonedb_cloud(args.new_dir)
