@@ -99,15 +99,15 @@ def download_results(node, config):
         for key_size in workload_config["key_size"]:
             for workload in workload_config["workload_name"]:
                 db_name = "ozonedb"
-                remote_insert_result = os.path.join(remote_result_path, f"{db_name}-{key_size}-workload{workload}-{op_cnt}-run.result")
-                local_insert_result = os.path.join(local_result_path, f"{db_name}-{key_size}-workload{workload}-{op_cnt}-run.result")
+                remote_insert_result = os.path.join(remote_result_path, f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
+                local_insert_result = os.path.join(local_result_path, f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
                 subprocess.run(["rm", "-rf", local_insert_result])
                 download_file_from_server(node, remote_insert_result, local_insert_result)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run YCSB on Azure VMs and Ozonedb")
-    parser.add_argument("--config", type=str, default="config/ycsb.yaml")
+    parser.add_argument("--config", type=str, default=os.environ.get("OZONEDB_HOME") + "/bench/scripts/config/ycsb.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r") as file:
