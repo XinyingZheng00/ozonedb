@@ -9,11 +9,20 @@ source ~/.bashrc
 source ~/.profile
 echo $OZONEDB_HOME
 sudo apt update
-sudo apt install -y cmake maven python3-pip zip pkg-config sqlite3
+sudo apt install -y cmake maven python3-pip zip pkg-config sqlite3 build-essential
 sudo apt install openjdk-8-jdk -y
-echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> ~/.bashrc
+ARCH=$(dpkg --print-architecture)
+if [ "$ARCH" = "amd64" ]; then
+    echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> ~/.bashrc
+    echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> ~/.profile
+elif [ "$ARCH" = "arm64" ]; then
+    echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-arm64" >> ~/.bashrc
+    echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-arm64" >> ~/.profile
+else
+    echo "Unsupported architecture: $ARCH"
+    echo $ARCH
+fi
 echo "export PATH=$JAVA_HOME/bin:$PATH" >> ~/.bashrc
-echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> ~/.profile # for cloud use
 echo "export PATH=$JAVA_HOME/bin:$PATH" >> ~/.profile # for cloud use
 source ~/.bashrc
 source ~/.profile
