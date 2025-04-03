@@ -45,7 +45,7 @@ def common_init(node, cfg):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Setup VMs with Ozonedb for ycsb benchmarking")
-    parser.add_argument("--config", type=str, default="../../config/ycsb.yaml", help="Path to the config YAML file")
+    parser.add_argument("--config", type=str, default=os.environ.get("OZONEDB_HOME") + "/bench/scripts/config/ycsb.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r") as file:

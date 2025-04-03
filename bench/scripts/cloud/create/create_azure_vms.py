@@ -22,7 +22,7 @@ def get_public_ip():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Provision VMs")
-    parser.add_argument("--config", type=str, default="../../config/ycsb.yaml")
+    parser.add_argument("--config", type=str, default=os.environ.get("OZONEDB_HOME") + "/bench/scripts/config/ycsb.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r") as file:
@@ -158,7 +158,21 @@ if __name__ == "__main__":
     except:
         vm_list = []
 
-
+    # add ssh_key_data to vm's authorized_keys
+    for vm in vm_list:
+        print(f"Adding SSH key to {vm.name}...")
+        command = f'echo "{ssh_key_data.strip()}" >> /home/{username}/.ssh/authorized_keys'
+        poller = compute_client.virtual_machines.begin_run_command(
+            resource_group_name,
+            vm.name,
+            {
+                "command_id": "RunShellScript",
+                "script": [command]
+            }
+        )
+        result = poller.result()  # Wait until the command completes
+        print(f"Added SSH key to {vm.name}")
+    
     for vm_index in range(len(vm_list), num_vms):
         vm_name = f"{base_vm_name}-{vm_index}"
         nic_name = f"{base_nic_name}-{vm_index}"

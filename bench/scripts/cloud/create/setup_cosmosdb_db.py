@@ -37,7 +37,7 @@ def setup_cosmosdb(cosmos_client, db, collection, partition_key):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Setup PostgreSQL for benchmarking.')
-    parser.add_argument('--config', type=str, default='config/ycsb.yaml', help='Configuration file')
+    parser.add_argument("--config", type=str, default=os.environ.get("OZONEDB_HOME") + "/bench/scripts/config/ycsb.yaml")
     parser.add_argument('--db', default=DEFAULT_DB, help='Database name')
     parser.add_argument('--collection', default=DEFAULT_COLLECTION, help='Collection name')
     parser.add_argument('--partition_key', default=DEFAULT_PARTITION_KEY, help='Partition key')

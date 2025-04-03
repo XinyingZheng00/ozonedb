@@ -61,12 +61,8 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run YCSB tests with specified parameters.")
 
-    parser.add_argument(
-        '--config',
-        type=str,
-        default='../config/ycsb.yaml',
-        help='workload configuration.'
-    )
+    parser.add_argument("--config", type=str, default=os.environ.get("OZONEDB_HOME") + "/bench/scripts/config/ycsb.yaml")
+    
     args = parser.parse_args()
     json_path = args.config
     

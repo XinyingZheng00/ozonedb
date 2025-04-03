@@ -29,7 +29,7 @@ local:
 cloud:
   load:
     record_cnt: 
-      - 100000
+      - 1000
     key_size:
       - "1KB"
     repeated: 1
@@ -37,13 +37,13 @@ cloud:
     threads: 8
   run:
     workload_name:
-      - "a"
+      - "c"
     operation_cnt:
-      - 100000
-    record_cnt: 100000
+      - 1000
+    record_cnt: 1000
     key_size:
       - "1KB"
-    threads: 8
+    threads: 1
     repeated: 1
     ycsb_data_path: "ycsb-data"
 
@@ -71,6 +71,8 @@ postgres:
 
 cosmosdb:
   account_name: "ozonedb-cosmosdb-account"
+  consistency_level: "Eventual"
+  mode: "serverless"
   
 mysql:
   server_name: "ozonedb-mysql-server1234"
