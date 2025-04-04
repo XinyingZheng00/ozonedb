@@ -1,0 +1,44 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:ozonedb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb-tmp/ycsb/ozonedb/conf:/users/Xinying/ozonedb-tmp/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb-tmp/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb-tmp/ycsb/workloads/generated_workloads/workloada_1KB_100000_100000 -p shared_config=/users/Xinying/ozonedb-tmp/src/config/local/shared_config_rocksdb.json -load
+Command line: -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb-tmp/ycsb/workloads/generated_workloads/workloada_1KB_100000_100000 -p shared_config=/users/Xinying/ozonedb-tmp/src/config/local/shared_config_rocksdb.json -load
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+2025-04-03 22:18:58:959 0 sec: 0 operations; est completion in 0 second 
+Starting compaction watcher
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2025-04-03 22:19:08:960 10 sec: 46780 operations; 4678 current ops/sec; est completion in 12 seconds [INSERT: Count=46792, Max=39199, Min=134, Avg=206.57, 90=224, 99=263, 99.9=552, 99.99=2475] 
+140705980593728:Compacting datalog/1 datalog/2 into:sstable1/4d102821-bed7-4cf5-8e9a-8c5dc73a0bfe202504031618581743718752081416282.sst
+2025-04-03 22:19:18:960 20 sec: 89407 operations; 4262.7 current ops/sec; est completion in 3 second [INSERT: Count=42621, Max=24543, Min=145, Avg=228.65, 90=250, 99=274, 99.9=577, 99.99=2825] 
+2025-04-03 22:19:21:317 22 sec: 100000 operations; 4492.37 current ops/sec; [CLEANUP: Count=1, Max=61055, Min=61024, Avg=61040, 90=61055, 99=61055, 99.9=61055, 99.99=61055] [INSERT: Count=10587, Max=675, Min=196, Avg=212.45, 90=220, 99=248, 99.9=537, 99.99=557] 
+[OVERALL], RunTime(ms), 22360
+[OVERALL], Throughput(ops/sec), 4472.27191413238
+[TOTAL_GCS_PS_Scavenge], Count, 1
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 7
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.03130590339892666
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 1
+[TOTAL_GC_TIME], Time(ms), 7
+[TOTAL_GC_TIME_%], Time(%), 0.03130590339892666
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 61040.0
+[CLEANUP], MinLatency(us), 61024
+[CLEANUP], MaxLatency(us), 61055
+[CLEANUP], 95thPercentileLatency(us), 61055
+[CLEANUP], 99thPercentileLatency(us), 61055
+[INSERT], Operations, 100000
+[INSERT], AverageLatency(us), 216.60377
+[INSERT], MinLatency(us), 134
+[INSERT], MaxLatency(us), 39199
+[INSERT], 95thPercentileLatency(us), 252
+[INSERT], 99thPercentileLatency(us), 266
+[INSERT], Return=OK, 100000

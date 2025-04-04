@@ -1,0 +1,41 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:rocksdb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb-tmp/ycsb/rocksdb/conf:/users/Xinying/ozonedb-tmp/ycsb/rocksdb/target/rocksdb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/net/jcip/jcip-annotations/1.0/jcip-annotations-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb-tmp/ycsb/core/target/core-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/rocksdb/rocksdbjni/9.6.1/rocksdbjni-9.6.1.jar site.ycsb.Client -db site.ycsb.db.rocksdb.RocksDBClient -threads 1 -s -P /users/Xinying/ozonedb-tmp/ycsb/workloads/generated_workloads/workloada_1KB_100000_100000 -p rocksdb.dir=/tank/ycsb_data/cached_data-rocksdb-1KB-100000/ -load
+Command line: -db site.ycsb.db.rocksdb.RocksDBClient -threads 1 -s -P /users/Xinying/ozonedb-tmp/ycsb/workloads/generated_workloads/workloada_1KB_100000_100000 -p rocksdb.dir=/tank/ycsb_data/cached_data-rocksdb-1KB-100000/ -load
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+2025-04-03 22:19:41:338 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2025-04-03 22:19:51:338 10 sec: 58770 operations; 5877 current ops/sec; est completion in 8 second [INSERT: Count=58775, Max=48447, Min=115, Avg=161.19, 90=199, 99=224, 99.9=514, 99.99=2623] 
+2025-04-03 22:20:00:206 18 sec: 100000 operations; 4648.78 current ops/sec; [CLEANUP: Count=1, Max=4695, Min=4692, Avg=4694, 90=4695, 99=4695, 99.9=4695, 99.99=4695] [INSERT: Count=41225, Max=27775, Min=142, Avg=210.81, 90=222, 99=266, 99.9=307, 99.99=731] 
+[OVERALL], RunTime(ms), 18870
+[OVERALL], Throughput(ops/sec), 5299.417064122947
+[TOTAL_GCS_PS_Scavenge], Count, 1
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 13
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.0688924218335983
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 1
+[TOTAL_GC_TIME], Time(ms), 13
+[TOTAL_GC_TIME_%], Time(%), 0.0688924218335983
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 4694.0
+[CLEANUP], MinLatency(us), 4692
+[CLEANUP], MaxLatency(us), 4695
+[CLEANUP], 95thPercentileLatency(us), 4695
+[CLEANUP], 99thPercentileLatency(us), 4695
+[INSERT], Operations, 100000
+[INSERT], AverageLatency(us), 181.64492
+[INSERT], MinLatency(us), 115
+[INSERT], MaxLatency(us), 48447
+[INSERT], 95thPercentileLatency(us), 221
+[INSERT], 99thPercentileLatency(us), 237
+[INSERT], Return=OK, 100000

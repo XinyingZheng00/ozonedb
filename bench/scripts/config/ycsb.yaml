@@ -1,14 +1,17 @@
 local:
   load:
     record_cnt: 
-      - 1000000
+      - 100000
     key_size:
       - "1KB"
     db_name:
-      - "ozonedb"
+      # - "ozonedb"
+      - "sqlite"
+      # - "rocksdb"
+      # - "raw_sync_io"
     repeated: 1
     ycsb_data_path: "/tank/ycsb_data"
-    threads: 64
+    threads: 1
   run:
     workload_name:
       - "b"
@@ -16,13 +19,15 @@ local:
       - "d"
       - "f"
     operation_cnt:
-      - 1000000
-    record_cnt: 1000000
+      - 100000
+    record_cnt: 100000
     key_size:
       - "1KB"
     db_name:
       - "ozonedb"
-    threads: 8
+      - "sqlite"
+      - "rocksdb"
+    threads: 1
     repeated: 1
     ycsb_data_path: "/tank/ycsb_data"
 
