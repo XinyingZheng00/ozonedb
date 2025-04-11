@@ -101,14 +101,13 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
   Iterator* iter = table->blockReader(table, index_value);
   file_lock.unlock();
   iter->seekToFirst();
-
-  std::unordered_map<std::string, Record*> records_tmp;
+  std::unordered_map<std::string, Record*>* records_tmp = new std::unordered_map<std::string, Record*>();
   size_t size = 0;
   while (iter->valid()) {
     std::string const& value = iter->value();
     auto* record = new Record();
     (*record).ParseFromArray(value.data(), value.size());
-    records_tmp[iter->key()] = record;
+    (*records_tmp)[iter->key()] = record;
     size += record->ByteSizeLong();
     iter->next();
   }
@@ -135,8 +134,8 @@ void LRUCache::get(std::string const& file_name, std::string const& key, Record*
     auto& records = file_to_entry_map[file_name].block_records[index_value];
     updateLRU(file_name, index_value);
     // Find the record corresponding to the key
-    auto record_it = records.find(key);
-    if (record_it != records.end()) {
+    auto record_it = records->find(key);
+    if (record_it != records->end()) {
       // Key found, assign the record
       record = record_it->second;
     } else {
@@ -179,7 +178,7 @@ void LRUCache::putSSTableMeta(std::string const& key, Table* table) {
   file_to_entry_map[key] = entry;
 }
 
-void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*> const& records, std::string const& index_value, size_t size) {
+void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*>* records, std::string const& index_value, size_t size) {
   std::unique_lock lock(mutex);
   file_to_entry_map[key].block_records[index_value] = records;
   file_to_entry_map[key].block_size[index_value] = size;

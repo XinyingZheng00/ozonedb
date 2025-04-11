@@ -24,14 +24,14 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                 workload_path = ycsb_path + "/workloads/generated_workloads/workload" + workload_name + "_" + each_key_size + "_" + each_operation_cnt + "_" + record_cnt
                 
                 for db_name in db_names:
-                    result_file_readwrite = os.path.join(result_path, f'{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_t{threads}.result')
+                    result_file_readwrite = os.path.join(result_path, f'{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_t1.result')
                     cached_data_path = ycsb_data_path + "/" + "cached_data-"+f'{db_name}-{each_key_size}-{record_cnt}/'
                     if not os.path.exists(cached_data_path):
                         print(f"cached_data_path {cached_data_path} does not exist, skipping...")
                         continue
                     run_data_path = ycsb_data_path + "/" + f'{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}/'
                     subprocess.run(['rm', '-rf', result_file_readwrite])
-                    command = ['python3', f'bin/ycsb', 'run', db_name, '-threads', str(threads), '-s','-P', workload_path]
+                    command = ['python3', f'bin/ycsb', 'run', db_name, '-threads', str(1), '-s','-P', workload_path, '-p', 'status.interval=1']
                     if db_name == "rocksdb":
                         command.append("-p")
                         command.append("rocksdb.dir="+run_data_path)
@@ -52,6 +52,20 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                         command.append(ycsb_path + "/jdbc/target/dependency/sqlite-jdbc-3.49.1.0.jar")
                     
                     for _ in range(repeated):
+                        if db_name == "ozonedb":
+                            for thread in threads:
+                                thread = str(thread)
+                                subprocess.run(['rm', '-rf', run_data_path]) # clean cached data 
+                                subprocess.run(['cp', '-r', cached_data_path, run_data_path]) 
+                                result_file_readwrite = os.path.join(result_path, f'{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_t{thread}.result')
+                                subprocess.run(['rm', '-rf', result_file_readwrite]) # remove the result data if is exist
+                                with open(result_file_readwrite, "a") as f:
+                                    command[5] = thread
+                                    print(" ".join(command))
+                                    subprocess.run(command, stdout=f, stderr=f)
+                                subprocess.run(['rm', '-rf', run_data_path])
+                            continue
+                    
                         subprocess.run(['rm', '-rf', run_data_path]) # clean db data
                         subprocess.run(['cp', '-r', cached_data_path, run_data_path]) 
                         with open(result_file_readwrite, "a") as f:

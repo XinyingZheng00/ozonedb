@@ -32,8 +32,38 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.text.SimpleDateFormat;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+
+class MyEventListener extends AbstractEventListener {
+  private final SimpleDateFormat timestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss:SSS");
+  
+  private String getCurrentTimestamp() {
+    return timestampFormat.format(new Date());
+  }
+
+  @Override
+  public void onFlushBegin(RocksDB db, FlushJobInfo flushJobInfo) {
+    System.out.println(getCurrentTimestamp() + " - Flush started: " + flushJobInfo.toString());
+  }
+
+  @Override
+  public void onFlushCompleted(RocksDB db, FlushJobInfo flushJobInfo) {
+    System.out.println(getCurrentTimestamp() + " - Flush completed: " + flushJobInfo.toString());
+  }
+
+  @Override
+  public void onCompactionBegin(RocksDB db, CompactionJobInfo compactionJobInfo) {
+    System.out.println(getCurrentTimestamp() + " - Compaction started: " + compactionJobInfo.toString());
+  }
+
+  @Override
+  public void onCompactionCompleted(RocksDB db, CompactionJobInfo compactionJobInfo) {
+    System.out.println(getCurrentTimestamp() + " - Compaction completed: " + compactionJobInfo.toString());
+  }
+}
+
 
 /**
  * RocksDB binding for <a href="http://rocksdb.org/">RocksDB</a>.
@@ -108,6 +138,9 @@ public class RocksDBClient extends DB {
       RocksDB.loadLibrary();
       OptionsUtil.loadOptionsFromFile(
           configOptions, optionsFile.toAbsolutePath().toString(), options, cfDescriptors);
+      List<AbstractEventListener> eventListeners = new ArrayList<>();
+      eventListeners.add(new MyEventListener());
+      options.setListeners(eventListeners);
       dbOptions = options;
     }
 

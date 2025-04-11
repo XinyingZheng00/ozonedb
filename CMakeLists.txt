@@ -12,7 +12,7 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_BUILD_TYPE DEBUG) # enable debug symbols
+# set(CMAKE_BUILD_TYPE DEBUG) # enable debug symbols
 # Find Packages
 link_directories("$ENV{OZONEDB_HOME}/build/vcpkg_installed/x64-linux/lib")
 find_package(azure-identity-cpp CONFIG REQUIRED)

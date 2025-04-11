@@ -71,7 +71,7 @@ Status DB::closeDB(DB*& db) {
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     db->watcher->stopCompactionWatcher();
   }
-  db->thread_pool->waitForCompletion();
+  // db->thread_pool->waitForCompletion();
   db->metadata_log->stopViewUpdate();
   // delete db;
   return Status::kSuccess;
@@ -168,9 +168,12 @@ Status DB::get(std::string const& key, std::string const*& value) {
     }
   }
 
-  if (updated) {
-    tail_cache->updateCache(key, latest_record, latest_offset, offset);
-  }
+  // if (updated) {
+  //   // Perform cache update asynchronously to avoid blocking the critical path
+  //   this->thread_pool->enqueue([this, key, latest_record, latest_offset, offset]() {
+  //       tail_cache->updateCache(key, latest_record, latest_offset, offset);
+  //   });
+  // }
 
   if (latest_record) {
     if (latest_record->type() == kTypeDeletion) {

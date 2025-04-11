@@ -83,9 +83,7 @@ Status CompactionWatcher::taskHeartbeat(Compaction* compaction, TaskRecord* task
 }
 
 Status CompactionWatcher::pickCompaction(Compaction*& compaction, TaskRecord*& task_record, bool& has_worked_on_compaction) {
-  std::shared_lock<std::shared_mutex> lock(this->metadata_handler->getViewMutex());
   this->metadata_handler->getLatestView(this->latest_view);
-  lock.unlock();
 
   // First step: check if there is any log level compaction
   // log level compaction

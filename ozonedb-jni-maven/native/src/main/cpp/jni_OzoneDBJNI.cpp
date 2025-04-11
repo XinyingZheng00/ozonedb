@@ -14,51 +14,45 @@ LoggerPtr logger;
 
 thread_local ozonedb::DB* db_instance = nullptr;
 class EventListenerOzonedb : public ozonedb::EventListener {
+  private:
+  std::string getCurrentTimestamp() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto now_time_t = system_clock::to_time_t(now);
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::ostringstream oss;
+    oss << std::put_time(std::gmtime(&now_time_t), "%Y-%m-%d %H:%M:%S")
+        << ':' << std::setw(3) << std::setfill('0') << ms.count();
+    return oss.str();
+  }
+
  public:
-  
+//keep the interface in case we need to differentiate between log and sstable compaction
   void onLogCompactionStart() {
-    long long now = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);;
-    LOG4CXX_INFO(logger, getpid() << ":"
-                                  << "Log Compaction Started at "
-                                  << std::to_string(now));
-  };
-  void onLogCompactionCompletion(int time) {
-    long long now = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);;
-    LOG4CXX_INFO(logger,getpid() << ":"
-                                  << "Log Compaction Completed"
-                                  << " time: " << time
-                                  << " at "
-                                  << std::to_string(now));
-  };
+    std::cout << getCurrentTimestamp() << " - Compaction started: " << std::endl;
+  }
+
+  void onLogCompactionCompletion(int time_ms) {
+    std::cout << getCurrentTimestamp() << " - Compaction completed: " << std::endl;
+  }
+
   void onSSTableCompactionStart() {
-    long long now = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);;
-    LOG4CXX_INFO(logger, getpid() << ":"
-                                  <<"SST Compaction Started at "
-                                  << std::to_string(now) );
-  };
-  void onSSTableCompactionCompletion(int time, int source_level) {
-    long long now = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);
-    LOG4CXX_INFO(logger, getpid() << ":"
-                                  << "Level "
-                                  << source_level 
-                                  << " SST Compaction Completed"
-                                  << " time: " << time
-                                  << " at "
-                                  << std::to_string(now));
+    std::cout << getCurrentTimestamp() << " - Compaction started: " << std::endl;
+  }
+
+  void onSSTableCompactionCompletion(int time_ms, int source_level) {
+    std::cout << getCurrentTimestamp() << " - Compaction completed: " << std::endl;
+  }
+
+  // void onViewUpdate() {
+  //   std::cout << getCurrentTimestamp() << " - Viewupdate completed" << std::endl;
+  // };
+
+  void onNewTail() {
+    std::cout << getCurrentTimestamp() << " - NewTail completed: " << std::endl;
   };
 
-  void onViewUpdate() {
-    long long now = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);;
-    LOG4CXX_INFO(logger, getpid() << ":"
-                                  << "View update Completed at "
-                                  <<std::to_string(now) );
-  };
-  void onNewTail() {
-    long long now = std::chrono::system_clock::now().time_since_epoch() / std::chrono::milliseconds(1);;
-    LOG4CXX_INFO(logger, getpid() << ":"
-                                  << "New Tail Completed at "
-                                  << std::to_string(now));
-  };
 };
 
 
@@ -67,7 +61,7 @@ JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_openDB(JNIEnv* env, jobject obj, jstr
   logger = Logger::getLogger("event");
   char const* nativeConfigPath = env->GetStringUTFChars(configPath, 0);
   ozonedb::Status status = ozonedb::DB::openDB(db_instance, std::string(nativeConfigPath));
-  // db_instance->setEventListener(new EventListenerOzonedb());
+  db_instance->setEventListener(new EventListenerOzonedb());
   env->ReleaseStringUTFChars(configPath, nativeConfigPath);
 
   if (status != ozonedb::Status::kSuccess) {

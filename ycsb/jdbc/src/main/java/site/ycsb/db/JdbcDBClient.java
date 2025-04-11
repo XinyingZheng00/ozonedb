@@ -228,7 +228,6 @@ public class JdbcDBClient extends DB {
         System.out.println("user: " + user);
         System.out.println("passwd: " + passwd);
         Connection conn = DriverManager.getConnection(url, user, passwd);
-      
         // Since there is no explicit commit method in the DB interface, all
         // operations should auto commit, except when explicitly told not to
         // (this is necessary in cases such as for PostgreSQL when running a

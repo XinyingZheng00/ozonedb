@@ -22,6 +22,9 @@ class TailCache {
   // Update the cache with a key, record, and offset
   void updateCache(std::string key, Record* record, std::string new_tail, std::string old_tail) {
     std::unique_lock<std::shared_mutex> lock(mutex);
+    if (old_tail.empty()) {
+      old_tail = cache_[key].second;
+    }
     if (record != nullptr) {
       cache_[key] = std::make_pair(record, new_tail);
     } else {
@@ -37,6 +40,32 @@ class TailCache {
     }
     tail_to_key_map[new_tail].push_back(key);
   }
+  
+  void updateCacheBatch(const std::vector<std::tuple<std::string, Record*, std::string, std::string>>& updates) {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    {
+        for (const auto& [key, record, new_tail, old_tail] : updates) {
+            if (record != nullptr) {
+                cache_[key] = std::make_pair(record, new_tail);
+            } else {
+                cache_[key].second = new_tail;
+            }
+        }
+    }
+
+    {
+        for (const auto& [key, record, new_tail, old_tail] : updates) {
+            if (!old_tail.empty() && tail_to_key_map.find(old_tail) != tail_to_key_map.end()) {
+                auto& old_vec = tail_to_key_map[old_tail];
+                old_vec.erase(std::remove(old_vec.begin(), old_vec.end(), key), old_vec.end());
+                if (old_vec.empty()) {
+                    tail_to_key_map.erase(old_tail);
+                }
+            }
+            tail_to_key_map[new_tail].push_back(key);
+        }
+    }
+}
   // get cache_
   std::unordered_map<std::string, std::pair<Record*, std::string>>& getKeyToTailMap() {
     std::shared_lock<std::shared_mutex> lock(mutex);
@@ -67,7 +96,7 @@ class LRUCache {
  private:
   struct CacheEntry {
     std::unordered_map<std::string, Record*> records;
-    std::unordered_map<std::string, std::unordered_map<std::string, Record*>> block_records;  // index_value_for_block -> records
+    std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records;  // index_value_for_block -> records
     std::unordered_map<std::string, size_t> block_size;                                       // index_value_for_block -> tail
     std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> lru_itr;
 
@@ -108,10 +137,12 @@ class LRUCache {
       for (auto& record : entry.second.records) {
         delete record.second;
       }
-      for (auto& block : entry.second.block_records) {
-        for (auto& record : block.second) {
+      //std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records; 
+      for (auto block : entry.second.block_records) {
+        for (auto record : *block.second) {
           delete record.second;
         }
+        delete block.second;
       }
       if (entry.second.table != nullptr) {
         delete entry.second.table;
@@ -138,7 +169,7 @@ class LRUCache {
   // Function to update the cache with a file_name, records, offset, and sealed status
   void putLogRecords(std::string const& key, std::unordered_map<std::string, Record*> const& records, size_t offset, bool sealed);
   void putSSTableMeta(std::string const& key, Table* table);
-  void putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*> const& records, std::string const& index_value, size_t size);
+  void putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*>* records, std::string const& index_value, size_t size);
 
   // set latest view
   void setLatestView(View* view) {

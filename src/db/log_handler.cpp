@@ -106,7 +106,7 @@ Status LogHandler::readRecord(std::string const& key, Record*& record, std::stri
           finished_threads++;
         }
         cv.notify_one();
-      });
+      }, ThreadPool::Priority::High);
     } else {
       Record* record_tmp = nullptr;
       cache->get(file_name, key, record_tmp);

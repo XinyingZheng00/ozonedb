@@ -68,7 +68,7 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
             workload_path = ycsb_path + "/workloads/generated_workloads/" + "workloada" + "_" + each_key_size + "_" + each_record_cnt +"_" + each_record_cnt
             
             for db_name in db_names:
-                result_file_insert = os.path.join(result_path, f'{each_key_size}-{each_record_cnt}-insert-{db_name}_t{threads}.result')
+                result_file_insert = os.path.join(result_path, f'{each_key_size}-{each_record_cnt}-insert-{db_name}_t1.result')
                 cached_data_path = os.path.join(ycsb_data_path, f'cached_data-{db_name}-{each_key_size}-{each_record_cnt}/')
                 subprocess.run(['rm', '-rf', result_file_insert]) # remove the result data if is exist
                 
@@ -110,7 +110,7 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
 
                     continue
                 
-                command = ["python3", f'bin/ycsb', 'load', db_name, '-threads', str(threads), '-s', '-P', workload_path]
+                command = ["python3", f'bin/ycsb', 'load', db_name, '-threads', str(1), '-s', '-P', workload_path]
                 if db_name == "rocksdb":
                     command.append("-p")
                     command.append("rocksdb.dir="+cached_data_path)
@@ -125,14 +125,16 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
                     db_file = os.path.join(cached_data_path, "mydb.db")
                     with open(config_path, 'w') as f:
                         f.write("db.driver=org.sqlite.JDBC\n")
-                        f.write(f"db.url=jdbc:sqlite:{db_file}\n")
+                        f.write(f"db.url=jdbc:sqlite:{db_file}?journal_mode=WAL&cache_size=-163840&synchronous=FULL\n")
                     command.append("-P")
                     command.append(config_path)
                     command.append("-cp")
                     command.append(ycsb_path + "/jdbc/target/dependency/sqlite-jdbc-3.49.1.0.jar")
-                # command.append(f"-p statusinterval=1")
+                command.append("-p")
+                command.append("status.interval=1")
                 for _ in range(repeated):
                     print("Start round ", _)
+                    subprocess.run(['rm', '-rf', cached_data_path]) # clean cached data  
                     if db_name == "sqlite":
                         os.makedirs(cached_data_path, exist_ok=True)
                         with open(db_file, "w") as f:
@@ -143,18 +145,39 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
                         # Page size. Default 4 KB. 
                         # (128+32)MB/4KB
                         cursor.execute("PRAGMA cache_size = -163840;")
-                        cursor.execute("PRAGMA synchronous = FULL;") # vs OFF
+                        cursor.execute("PRAGMA synchronous = FULL;")
+                        cursor.execute("PRAGMA journal_mode = WAL;")
                         cursor.execute("CREATE TABLE usertable ( \
-                        YCSB_KEY VARCHAR(255) PRIMARY KEY,  \
+                        YCSB_KEY VARCHAR(255),  \
                         FIELD0 TEXT, FIELD1 TEXT, FIELD2 TEXT, FIELD3 TEXT, FIELD4 TEXT, \
                         FIELD5 TEXT, FIELD6 TEXT, FIELD7 TEXT, FIELD8 TEXT, FIELD9 TEXT);")
                         conn.commit()
-                        conn.close() 
-                    else:
-                        subprocess.run(['rm', '-rf', cached_data_path]) # clean cached data  
+                        conn.close()
+                        
+                    if db_name == "ozonedb":
+                        for thread in threads:
+                            thread = str(thread)
+                            subprocess.run(['rm', '-rf', cached_data_path]) # clean cached data 
+                            result_file_insert = os.path.join(result_path, f'{each_key_size}-{each_record_cnt}-insert-{db_name}_t{thread}.result')
+                            subprocess.run(['rm', '-rf', result_file_insert]) # remove the result data if is exist
+                            with open(result_file_insert, "a") as f:
+                                command[5] = thread
+                                print(" ".join(command))
+                                subprocess.run(command, stdout=f, stderr=f)
+                        continue
+                    
                     with open(result_file_insert, "a") as f:
+                        print(" ".join(command))
                         subprocess.run(command, stdout=f, stderr=f)
 
+                    if db_name == "sqlite":
+                        # create index on the database
+                        conn = sqlite3.connect(db_file)
+                        cursor = conn.cursor()
+                        cursor.execute("CREATE INDEX idx_ycsb_key ON usertable (YCSB_KEY);")
+                        conn.commit()
+                        conn.close() 
+                                            
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load YCSB tests with specified parameters.")
 

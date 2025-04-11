@@ -171,7 +171,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       latest_view.file_size[output_file] = this->storage->size(output_file);
     }
     for (auto const& key : keys) {
-      this->tai_cache->updateCache(key, nullptr, record->output_file(0), this->tai_cache->getKeyToTailMap()[key].second);
+      this->tai_cache->updateCache(key, nullptr, record->output_file(0), "");
     }
     delete record;
     return input_prefix;
@@ -208,7 +208,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       latest_view.file_size[output_file] = this->storage->size(output_file);
     }
     for (auto const& key : keys) {
-      this->tai_cache->updateCache(key, nullptr, record->output_file(0), this->tai_cache->getKeyToTailMap()[key].second);
+      this->tai_cache->updateCache(key, nullptr, record->output_file(0), "");
     }
     delete record;
     return "";

@@ -13,21 +13,25 @@
 // Thread Pool class with task completion tracking
 class ThreadPool {
  public:
+  enum class Priority { High, Low };
+
   ThreadPool(size_t numThreads);
   ~ThreadPool();
-  void enqueue(std::function<void()> task);
+  void enqueue(std::function<void()> task, Priority priority = Priority::Low);
   void waitForCompletion();  // Wait for all tasks to complete
   void stop();               // Graceful stop function
 
  private:
   std::vector<std::thread> workers;
-  std::queue<std::function<void()>> tasks;
+  std::queue<std::function<void()>> highPriorityTasks;
+  std::queue<std::function<void()>> lowPriorityTasks;
+
   std::mutex queueMutex;
   std::condition_variable condition;
   std::atomic<bool> stopFlag;
   std::mutex taskMutex;
   std::condition_variable taskCondition;
-  std::atomic<size_t> activeTasks;  // Counter for active tasks
+  std::atomic<size_t> activeTasks;
 };
 
 // Constructor: Create a pool of worker threads
@@ -38,11 +42,23 @@ inline ThreadPool::ThreadPool(size_t numThreads) : stopFlag(false), activeTasks(
         std::function<void()> task;
         {
           std::unique_lock<std::mutex> lock(this->queueMutex);
-          this->condition.wait(lock, [this]() { return this->stopFlag || !this->tasks.empty(); });
-          if (this->stopFlag && this->tasks.empty()) return;
-          task = std::move(this->tasks.front());
-          this->tasks.pop();
+          this->condition.wait(lock, [this]() {
+            return this->stopFlag || !this->highPriorityTasks.empty() || !this->lowPriorityTasks.empty();
+          });
+
+          if (this->stopFlag && this->highPriorityTasks.empty() && this->lowPriorityTasks.empty()) {
+            return;
+          }
+
+          if (!this->highPriorityTasks.empty()) {
+            task = std::move(this->highPriorityTasks.front());
+            this->highPriorityTasks.pop();
+          } else if (!this->lowPriorityTasks.empty()) {
+            task = std::move(this->lowPriorityTasks.front());
+            this->lowPriorityTasks.pop();
+          }
         }
+
         {
           std::unique_lock<std::mutex> lock(this->taskMutex);
           ++this->activeTasks;
@@ -59,17 +75,22 @@ inline ThreadPool::ThreadPool(size_t numThreads) : stopFlag(false), activeTasks(
   }
 }
 
-// Destructor: Stop all threads and clean up
+// Destructor
 inline ThreadPool::~ThreadPool() {
   stop();
 }
 
-// Add a new task to the queue
-inline void ThreadPool::enqueue(std::function<void()> task) {
+// Enqueue a task with optional priority
+inline void ThreadPool::enqueue(std::function<void()> task, Priority priority) {
   {
     std::unique_lock<std::mutex> lock(queueMutex);
     if (stopFlag) throw std::runtime_error("enqueue on stopped ThreadPool");
-    tasks.emplace(std::move(task));
+
+    if (priority == Priority::High) {
+      highPriorityTasks.emplace(std::move(task));
+    } else {
+      lowPriorityTasks.emplace(std::move(task));
+    }
   }
   condition.notify_one();
 }
