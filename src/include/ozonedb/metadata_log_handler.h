@@ -44,7 +44,7 @@ class MetadataLogHandler {
   size_t offset;
   std::string active_unit;
   Storage* storage = nullptr;
-  TailCache* tai_cache = nullptr;
+  TailCache* tail_cache = nullptr;
   LRUCache* lru_cache = nullptr;
   std::thread* update_view_thread = nullptr;
   View latest_view;
@@ -63,7 +63,7 @@ class MetadataLogHandler {
     this->offset = 0;
     this->storage = storage;
     this->active_unit = metadata_log;
-    this->tai_cache = tail_cache;
+    this->tail_cache = tail_cache;
   };
   // set event listener
   void setEventListener(EventListener* event_listener) { this->event_listener = event_listener; }

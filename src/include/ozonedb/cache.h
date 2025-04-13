@@ -30,56 +30,24 @@ class TailCache {
     } else {
       cache_[key].second = new_tail;
     }
-
-    if (!old_tail.empty() && tail_to_key_map.find(old_tail) != tail_to_key_map.end()) {  // maybe the old tail is already expired
-      auto& old_vec = tail_to_key_map[old_tail];
-      old_vec.erase(std::remove(old_vec.begin(), old_vec.end(), key), old_vec.end());
-      if (old_vec.empty()) {
-        tail_to_key_map.erase(old_tail);
-      }
-    }
-    tail_to_key_map[new_tail].push_back(key);
   }
-  
-  void updateCacheBatch(const std::vector<std::tuple<std::string, Record*, std::string, std::string>>& updates) {
-    std::unique_lock<std::shared_mutex> lock(mutex);
-    {
-        for (const auto& [key, record, new_tail, old_tail] : updates) {
-            if (record != nullptr) {
-                cache_[key] = std::make_pair(record, new_tail);
-            } else {
-                cache_[key].second = new_tail;
-            }
-        }
-    }
-
-    {
-        for (const auto& [key, record, new_tail, old_tail] : updates) {
-            if (!old_tail.empty() && tail_to_key_map.find(old_tail) != tail_to_key_map.end()) {
-                auto& old_vec = tail_to_key_map[old_tail];
-                old_vec.erase(std::remove(old_vec.begin(), old_vec.end(), key), old_vec.end());
-                if (old_vec.empty()) {
-                    tail_to_key_map.erase(old_tail);
-                }
-            }
-            tail_to_key_map[new_tail].push_back(key);
-        }
-    }
-}
-  // get cache_
-  std::unordered_map<std::string, std::pair<Record*, std::string>>& getKeyToTailMap() {
-    std::shared_lock<std::shared_mutex> lock(mutex);
-    return cache_;
-  }
-  // get file_to_key_map
-  std::unordered_map<std::string, std::vector<std::string>>& getTailToKeyMap() {
-    std::shared_lock<std::shared_mutex> lock(mutex);
-    return tail_to_key_map;
+ 
+  // add tail change
+  void addTailChange(std::string old_tail, std::string new_tail) {
+    tail_to_tail_map[old_tail] = new_tail;
   }
 
   // Retrieve the latest record for a given key up to a specified offset
+  // also check if the tail has changed
   bool getLatestRecord(std::string key, std::pair<Record*, std::string>& entry) {
     if (cache_.find(key) != cache_.end()) {
+      std::string old_tail = cache_[key].second;
+      while (tail_to_tail_map.find(old_tail) != tail_to_tail_map.end()) {
+        old_tail = tail_to_tail_map[old_tail];
+      }
+      if (old_tail != entry.second) {
+        entry.second = old_tail;
+      }
       entry = cache_[key];
       return true;
     } else {
@@ -89,7 +57,7 @@ class TailCache {
 
  private:
   std::unordered_map<std::string, std::pair<Record*, std::string>> cache_;
-  std::unordered_map<std::string, std::vector<std::string>> tail_to_key_map;
+  std::unordered_map<std::string, std::string> tail_to_tail_map;  // old tail -> new tail
 };
 
 class LRUCache {

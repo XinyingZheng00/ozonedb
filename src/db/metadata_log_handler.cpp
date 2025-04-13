@@ -150,10 +150,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       this->buffer[input_prefix].push({index, record});
       return "buffered";
     }
-    std::vector<std::string> keys;
     for (auto const& input_file : record->input_files()) {
-      auto& vec = this->tai_cache->getTailToKeyMap()[input_file];
-      keys.insert(keys.end(), vec.begin(), vec.end());
       // remove input file from latest_view
       latest_view.storage_layout[input_prefix].pop_front();
       if (latest_view.key_range.find(input_file) != latest_view.key_range.end()) {
@@ -162,6 +159,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       if (latest_view.file_size.find(input_file) != latest_view.file_size.end()) {
         latest_view.file_size.erase(input_file);
       }
+      this->tail_cache->addTailChange(input_file, record->output_file(0));
     }
     for (int i = 0; i < record->output_file_size(); i++) {
       std::string const& output_file = record->output_file(i);
@@ -169,9 +167,6 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       latest_view.storage_layout[output_prefix].push_back(output_file);
       latest_view.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
       latest_view.file_size[output_file] = this->storage->size(output_file);
-    }
-    for (auto const& key : keys) {
-      this->tai_cache->updateCache(key, nullptr, record->output_file(0), "");
     }
     delete record;
     return input_prefix;
@@ -182,10 +177,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
     std::vector<std::string> keys;
     auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
     int index = std::distance(level_layout.begin(), it);
-
     for (auto const& input_file : record->input_files()) {
-      auto& vec = this->tai_cache->getTailToKeyMap()[input_file];
-      keys.insert(keys.end(), vec.begin(), vec.end());
       // remove input file from latest_view
       //find the index of the input file
       auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
@@ -197,8 +189,8 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       if (latest_view.file_size.find(input_file) != latest_view.file_size.end()) {
         latest_view.file_size.erase(input_file);
       }
+      this->tail_cache->addTailChange(input_file, record->output_file(0));
     }
-
     for (int i = 0; i < record->output_file_size(); i++) {
       std::string const& output_file = record->output_file(i);
       std::string output_prefix = getPrefix(output_file);
@@ -206,9 +198,6 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       level_layout.insert(level_layout.begin() + index + i, output_file);
       latest_view.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
       latest_view.file_size[output_file] = this->storage->size(output_file);
-    }
-    for (auto const& key : keys) {
-      this->tai_cache->updateCache(key, nullptr, record->output_file(0), "");
     }
     delete record;
     return "";
