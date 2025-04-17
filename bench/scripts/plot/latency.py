@@ -13,7 +13,7 @@ workload_description = {
     "workloada": "50% read, 50% write",
     "workloadb": "95% read, 5% write",
     "workloadc": "100% read",
-    "workloadd": "95% read, 5% insert",
+    # "workloadd": "95% read, 5% insert",
     "workloadf": "50% read, 50% read-modify-write"
 }
 if not ozonedb_home:
@@ -48,11 +48,14 @@ def plot_individual_graphs():
     """
     for metric, workloads in data.items():
         fig, ax = plt.subplots(figsize=(12, 6))
-        workload_labels = list(workloads.keys())
+        workload_labels = sorted(workloads.keys())
+        print(f"workload_labels: {workload_labels}")
+        
         db_names = sorted(
-            {db for workload in workloads.values() for db in workload},
-            key=extract_numeric_suffix  # Sort using extracted numeric suffix
+            workloads[workload_labels[0]].keys(),
+            key=lambda db: (db != "sqlite_t1", db != "rocksdb_t1", not db.startswith("ozonedb"), extract_numeric_suffix(db))
         )
+        print(f"db_names: {db_names}")
         
         num_dbs = len(db_names)
         max_width = 0.8  # Fraction of available space for bars
@@ -150,6 +153,4 @@ if __name__ == "__main__":
     key_size = os.path.basename(result_files[0]).split('-')[0]
     op_cnt = os.path.basename(result_files[0]).split('-')[1]
     
-    for file in result_files:
-        print(file)
     main(result_files)

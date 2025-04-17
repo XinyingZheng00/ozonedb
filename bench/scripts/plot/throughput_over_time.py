@@ -162,7 +162,7 @@ def main():
             db_name = os.path.basename(file).split('-')[-1].split('.')[0]
             extract_data(file, db_name)
     result_graph_name = os.path.join(result_path, f"{key_size}-{op_cnt}-{workload}-throughput_over_time.pdf")
-    plot_throughput(result_graph_name, 1)
+    plot_throughput(result_graph_name, add_event)
 
 
 if __name__ == "__main__":

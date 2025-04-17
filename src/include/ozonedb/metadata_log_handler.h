@@ -20,22 +20,16 @@ class View {
   std::string current_log_tail;
   size_t tail_size;
 
-  // get file number in the view
   int getFileNumber(std::string const& prefix);
 
-  // get files with prefix
   std::deque<std::string> getWithPrefix(std::string const& prefix);
 
-  // get key range of a file
   std::pair<std::string, std::string> getKeyRange(std::string const& file_name);
 
-  // get file size of a file
   size_t getFileSize(std::string const& file_name);
 
-  // get tail size
   size_t getTailSize() { return tail_size; }
 
-  // get current log tail
   std::string getCurrentLogTail() { return current_log_tail; }
 };
 
@@ -47,9 +41,12 @@ class MetadataLogHandler {
   TailCache* tail_cache = nullptr;
   LRUCache* lru_cache = nullptr;
   std::thread* update_view_thread = nullptr;
-  View latest_view;
+  View latest_view_w;
+  View latest_view_r;
+
   Metadata* metadata = nullptr;
-  std::shared_mutex view_mutex;
+  std::shared_mutex view_mutex_w;
+  std::shared_mutex view_mutex_r;
   std::shared_mutex read_mutex;
   std::unordered_map<std::string, std::priority_queue<std::pair<int, OperationRecord*>, std::vector<std::pair<int, OperationRecord*>>, std::greater<>>> buffer;
 
@@ -65,28 +62,23 @@ class MetadataLogHandler {
     this->active_unit = metadata_log;
     this->tail_cache = tail_cache;
   };
-  // set event listener
   void setEventListener(EventListener* event_listener) { this->event_listener = event_listener; }
   
-  // set lru cache
   void setLRUCache(LRUCache* lru_cache) { this->lru_cache = lru_cache; }
 
-  // set metadata
   void setMetadata(Metadata* metadata) { this->metadata = metadata; }
 
   ~MetadataLogHandler(){};
-  // get view mutex
-  std::shared_mutex& getViewMutex() { return view_mutex; }
 
-  // used by get module
   void rollForwardMetadataLogPeriodically(std::atomic<bool> const* active);
 
-  // used by compaction module and put module
   View rollForwardMetadataLog();
 
   void initSSTMetadata();
 
   void getLatestView(View& view);
+
+  void flushLatestView();
 
   void getLatestScore(double& score);
 

@@ -1,10 +1,10 @@
-// #include "db.h"
-// #include "gtest/gtest.h"
-// #include "log_handler.h"
-// #include "test_tool.h"
-// #include "thread_pool.h"
-// #include <thread>
-// using namespace ozonedb;
+#include "db.h"
+#include "gtest/gtest.h"
+#include "log_handler.h"
+#include "test_tool.h"
+#include "thread_pool.h"
+#include <thread>
+using namespace ozonedb;
 // TEST(LogTest, log_write_read_single_record) {
 //   Storage* storage = new FileStorage("/tank/test/log/");
 //   std::string prefix = "write_read_single_record_log" + std::to_string(time(0));
@@ -398,169 +398,168 @@
 //   delete storage;
 // }
 
-// TEST(LogCacheTest, PutAndGetSealedFile) {
-//   Storage* storage = new FileStorage("/tank/test/log/");
-//   LRUCache* cache = new LRUCache(33554432, storage);
-//   std::string fileName = "log1";
-//   std::unordered_map<std::string, Record*> records;
-//   for (size_t i = 0; i < 2; i++) {
-//     Record* record = new Record();
-//     record->set_key("key" + std::to_string(i));
-//     record->set_value("value" + std::to_string(i));
-//     record->set_type(kTypeValue);
-//     records[record->key()] = record;
-//   }
-//   size_t offset = 2;
-//   bool sealed = true;
+TEST(LogCacheTest, PutAndGetSealedFile) {
+    Storage* storage = new FileStorage("/tank/test/log/");
+    LRUCache* cache = new LRUCache(33554432, storage);
+    std::string fileName = "log1";
+    std::unordered_map<std::string, Record*> records;
+    for (size_t i = 0; i < 2; i++) {
+        Record* record = new Record();
+        record->set_key("key" + std::to_string(i));
+        record->set_value("value" + std::to_string(i));
+        record->set_type(kTypeValue);
+        records[record->key()] = record;
+    }
+    size_t offset = 2;
+    bool sealed = true;
 
-//   // Add to cache
-//   cache->putLogRecords(fileName, records, offset, sealed);
+    // Add to cache
+    cache->putLogRecords(fileName, records, offset, sealed);
+    // Retrieve from cache
+    Record* dummyRecord;
+    cache->get(fileName, "key0", dummyRecord);
 
-//   // Retrieve from cache
-//   Record* dummyRecord;
-//   cache->get(fileName, "key0", dummyRecord);
+    // Check if the records and offset match
+    EXPECT_EQ("key0", dummyRecord->key());
+    EXPECT_EQ("value0", dummyRecord->value());
+    EXPECT_EQ(kTypeValue, dummyRecord->type());
+    EXPECT_EQ(sealed, cache->getCacheMap()[fileName].sealed);
 
-//   // Check if the records and offset match
-//   EXPECT_EQ("key0", dummyRecord->key());
-//   EXPECT_EQ("value0", dummyRecord->value());
-//   EXPECT_EQ(kTypeValue, dummyRecord->type());
-//   EXPECT_EQ(sealed, cache->getCacheMap()[fileName].sealed);
+    // Clean up dynamically allocated Records
+    for (auto record : records) {
+        delete record.second;
+    }
+}
 
-//   // Clean up dynamically allocated Records
-//   for (auto record : records) {
-//     delete record.second;
-//   }
-// }
+TEST(LogCacheTest, ComplexCase) {
+    Storage* storage = new FileStorage("/tank/test/log/");
+    LRUCache* lru_cache = new LRUCache(33554432, storage);
+    MetadataLogHandler* metadata_log = new MetadataLogHandler("cache1meta", storage, new TailCache());
+    LogHandler* log_handler = new LogHandler(1024, "logcache1", storage, lru_cache, metadata_log);
+    lru_cache->setFileMutexManager(new FileMutexManager());
+    ThreadPool* thread_pool = new ThreadPool(10);
+    log_handler->setThreadPool(thread_pool);
+    LRUCache* cache = new LRUCache(33554432, storage);
+    cache->setFileMutexManager(new FileMutexManager());
 
-// TEST(LogCacheTest, ComplexCase) {
-//   Storage* storage = new FileStorage("/tank/test/log/");
-//   LRUCache* lru_cache = new LRUCache(33554432, storage);
-//   MetadataLogHandler* metadata_log = new MetadataLogHandler("cache1meta", storage, new TailCache());
-//   LogHandler* log_handler = new LogHandler(1024, "logcache1", storage, lru_cache, metadata_log);
-//   lru_cache->setFileMutexManager(new FileMutexManager());
-//   ThreadPool* thread_pool = new ThreadPool(10);
-//   log_handler->setThreadPool(thread_pool);
-//   LRUCache* cache = new LRUCache(33554432, storage);
-//   cache->setFileMutexManager(new FileMutexManager());
+    std::vector<Record*> records;
+    for (size_t i = 0; i < 2; i++) {
+        Record* record = new Record();
+        record->set_key("key" + std::to_string(i));
+        record->set_value("value" + std::to_string(i));
+        record->set_type(kTypeValue);
+        records.push_back(record);
+    }
+    // case 1: in the cache, but it is not sealed, new records are added
+    log_handler->addRecord(*records[0]);
+    std::string fileName = "logcache1/1";
+    size_t offset = storage->size(fileName);
+    bool sealed = storage->isSealed(fileName);
+    cache->putLogRecords(fileName, {{records[0]->key(), records[0]}}, offset, sealed);
 
-//   std::vector<Record*> records;
-//   for (size_t i = 0; i < 2; i++) {
-//     Record* record = new Record();
-//     record->set_key("key" + std::to_string(i));
-//     record->set_value("value" + std::to_string(i));
-//     record->set_type(kTypeValue);
-//     records.push_back(record);
-//   }
-//   // case 1: in the cache, but it is not sealed, new records are added
-//   log_handler->addRecord(*records[0]);
-//   std::string fileName = "logcache1/1";
-//   size_t offset = storage->size(fileName);
-//   bool sealed = storage->isSealed(fileName);
-//   cache->putLogRecords(fileName, {{records[0]->key(), records[0]}}, offset, sealed);
+    Record* dummyRecord;
+    cache->get(fileName, "key0", dummyRecord);
+    EXPECT_EQ("key0", dummyRecord->key());
+    EXPECT_EQ("value0", dummyRecord->value());
+    EXPECT_EQ(kTypeValue, dummyRecord->type());
 
-//   Record* dummyRecord;
-//   cache->get(fileName, "key0", dummyRecord);
-//   EXPECT_EQ("key0", dummyRecord->key());
-//   EXPECT_EQ("value0", dummyRecord->value());
-//   EXPECT_EQ(kTypeValue, dummyRecord->type());
+    log_handler->addRecord(*records[1]);
+    
+    View view = metadata_log->rollForwardMetadataLog();
+    cache->setLatestView(&view);
 
-//   log_handler->addRecord(*records[1]);
-  
-//   View view = metadata_log->rollForwardMetadataLog();
-//   cache->setLatestView(&view);
+    // Retrieve from cache
+    Record* dummyRecord1;
+    bool read_more = true;  // not found or the file is tail(not sealed)
+    size_t cached_offset = 0;
+    size_t size = 0;
+    cache->checkReadMoreLog(fileName, read_more, cached_offset, size);
+    if (read_more) {
+        cache->readDataLog(fileName, cached_offset, size);
+    }
+    cache->get(fileName, "key1", dummyRecord1);
+    EXPECT_EQ("key1", dummyRecord1->key());
+    EXPECT_EQ("value1", dummyRecord1->value());
+    EXPECT_EQ(kTypeValue, dummyRecord1->type());
+    delete log_handler;
+    delete cache;
+    delete metadata_log;
 
-//   // Retrieve from cache
-//   Record* dummyRecord1;
-//   bool read_more = true;  // not found or the file is tail(not sealed)
-//   size_t cached_offset = 0;
-//   size_t size = 0;
-//   cache->checkReadMoreLog(fileName, read_more, cached_offset, size);
-//   if (read_more) {
-//     cache->readDataLog(fileName, cached_offset, size);
-//   }
-//   cache->get(fileName, "key1", dummyRecord1);
-//   EXPECT_EQ("key1", dummyRecord1->key());
-//   EXPECT_EQ("value1", dummyRecord1->value());
-//   EXPECT_EQ(kTypeValue, dummyRecord1->type());
-//   delete log_handler;
-//   delete cache;
-//   delete metadata_log;
-
-//   // records have been deleted when delete cache
-//   records.clear();
-//   for (size_t i = 0; i < 2; i++) {
-//     Record* record = new Record();
-//     record->set_key("key" + std::to_string(i));
-//     record->set_value("value" + std::to_string(i));
-//     record->set_type(kTypeValue);
-//     records.push_back(record);
-//   }
-//   // case 2: not in the cache
-//   //  Retrieve from cache
-//   delete lru_cache;
-//   lru_cache = new LRUCache(33554432, storage);
-//   metadata_log = new MetadataLogHandler("cache2meta", storage, new TailCache());
-//   log_handler = new LogHandler(1024, "logcache2", storage, lru_cache, metadata_log);
-//   lru_cache->setFileMutexManager(new FileMutexManager());
-//   cache = new LRUCache(33554432, storage);
-//   cache->setFileMutexManager(new FileMutexManager());
-//   log_handler->addRecord(*records[0]);
-//   log_handler->addRecord(*records[1]);
-//   fileName = "logcache2/1";
-  
-//   view = metadata_log->rollForwardMetadataLog();
-//   cache->setLatestView(&view);
-  
-//   Record* dummyRecord2;
-//   read_more = true;  // not found or the file is tail(not sealed)
-//   cached_offset = 0;
-//   size = 0;
-//   cache->checkReadMoreLog(fileName, read_more, cached_offset, size);
-//   if (read_more) {
-//     cache->readDataLog(fileName, cached_offset, size);
-//   }
-//   Record* record_tmp;
-//   cache->get(fileName, "key0", dummyRecord2);
-//   EXPECT_EQ("key0", dummyRecord2->key());
-//   EXPECT_EQ("value0", dummyRecord2->value());
-//   EXPECT_EQ(kTypeValue, dummyRecord2->type());
-//   Record* dummyRecord3;
-//   cache->get(fileName, "key1", dummyRecord3);
-//   EXPECT_EQ("key1", dummyRecord3->key());
-//   EXPECT_EQ("value1", dummyRecord3->value());
-//   EXPECT_EQ(kTypeValue, dummyRecord3->type());
-//   delete log_handler;
-//   delete cache;
-// }
+    // records have been deleted when delete cache
+    records.clear();
+    for (size_t i = 0; i < 2; i++) {
+        Record* record = new Record();
+        record->set_key("key" + std::to_string(i));
+        record->set_value("value" + std::to_string(i));
+        record->set_type(kTypeValue);
+        records.push_back(record);
+    }
+    // case 2: not in the cache
+    //  Retrieve from cache
+    delete lru_cache;
+    lru_cache = new LRUCache(33554432, storage);
+    metadata_log = new MetadataLogHandler("cache2meta", storage, new TailCache());
+    log_handler = new LogHandler(1024, "logcache2", storage, lru_cache, metadata_log);
+    lru_cache->setFileMutexManager(new FileMutexManager());
+    cache = new LRUCache(33554432, storage);
+    cache->setFileMutexManager(new FileMutexManager());
+    log_handler->addRecord(*records[0]);
+    log_handler->addRecord(*records[1]);
+    fileName = "logcache2/1";
+    
+    view = metadata_log->rollForwardMetadataLog();
+    cache->setLatestView(&view);
+    
+    Record* dummyRecord2;
+    read_more = true;  // not found or the file is tail(not sealed)
+    cached_offset = 0;
+    size = 0;
+    cache->checkReadMoreLog(fileName, read_more, cached_offset, size);
+    if (read_more) {
+        cache->readDataLog(fileName, cached_offset, size);
+    }
+    Record* record_tmp;
+    cache->get(fileName, "key0", dummyRecord2);
+    EXPECT_EQ("key0", dummyRecord2->key());
+    EXPECT_EQ("value0", dummyRecord2->value());
+    EXPECT_EQ(kTypeValue, dummyRecord2->type());
+    Record* dummyRecord3;
+    cache->get(fileName, "key1", dummyRecord3);
+    EXPECT_EQ("key1", dummyRecord3->key());
+    EXPECT_EQ("value1", dummyRecord3->value());
+    EXPECT_EQ(kTypeValue, dummyRecord3->type());
+    delete log_handler;
+    delete cache;
+}
 
 // TEST(LogCacheTest, EvictLeastRecentlyUsed) {
-//   std::string file1 = "sst1";
-//   std::string file2 = "sst2";
-//   std::string file3 = "sst3";
-//   std::string file4 = "sst4";  // This will cause the eviction of the least recently used file
+//     std::string file1 = "sst1";
+//     std::string file2 = "sst2";
+//     std::string file3 = "sst3";
+//     std::string file4 = "sst4";  // This will cause the eviction of the least recently used file
 
-//   Storage* storage = new FileStorage("/tank/test/log/");
-//   LRUCache* cache = new LRUCache(3, storage);
-//   Record* record1 = new Record();
-//   record1->set_key("key1");
-//   record1->set_value("value1");
-//   record1->set_type(kTypeValue);
+//     Storage* storage = new FileStorage("/tank/test/log/");
+//     LRUCache* cache = new LRUCache(3, storage);
+//     Record* record1 = new Record();
+//     record1->set_key("key1");
+//     record1->set_value("value1");
+//     record1->set_type(kTypeValue);
 
-//   cache->putSSTableRecords(file1, {{"1", record1}}, "index1", 1);
-//   cache->putSSTableRecords(file2, {{"1", record1}}, "index2", 1);
-//   cache->putSSTableRecords(file3, {{"1", record1}}, "index3", 1);
+//     cache->putSSTableRecords(file1, {{"1", record1}}, "index1", 1);
+//     cache->putSSTableRecords(file2, {{"1", record1}}, "index2", 1);
+//     cache->putSSTableRecords(file3, {{"1", record1}}, "index3", 1);
 
-//   // Access file1 to make it most recently used
-//   Record* dummyRecord;
-//   cache->get(file1, "key1", dummyRecord, "index1");  // checkReadMore and get must be invoken together
+//     // Access file1 to make it most recently used
+//     Record* dummyRecord;
+//     cache->get(file1, "key1", dummyRecord, "index1");  // checkReadMore and get must be invoken together
 
-//   // Adding file4 should evict file2 (least recently used)
-//   cache->putSSTableRecords(file4, {{"1", record1}}, "index4", 1);
+//     // Adding file4 should evict file2 (least recently used)
+//     cache->putSSTableRecords(file4, {{"1", record1}}, "index4", 1);
 
-//   // Check if file2 has been evicted
-//   EXPECT_EQ(cache->getCacheMap()[file2].block_records.find("index2"), cache->getCacheMap()[file2].block_records.end());
+//     // Check if file2 has been evicted
+//     EXPECT_EQ(cache->getCacheMap()[file2].block_records.find("index2"), cache->getCacheMap()[file2].block_records.end());
 
-//   delete record1;
+//     delete record1;
 // }
 
 // TEST(MetadataLogTest, UnorderedRecord){

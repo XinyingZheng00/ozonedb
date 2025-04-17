@@ -64,11 +64,13 @@ class LRUCache {
  private:
   struct CacheEntry {
     std::unordered_map<std::string, Record*> records;
+    std::list<std::string>::iterator lru_itr_log;
+
     std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records;  // index_value_for_block -> records
     std::unordered_map<std::string, size_t> block_size;                                       // index_value_for_block -> tail
     std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> lru_itr;
-
     Table* table = nullptr;
+
     size_t offset = 0;    // Offset indicating the cached records until this offset
     bool sealed = false;  // Indicates whether the file is sealed (fully cached)
     // Default constructor
@@ -82,10 +84,13 @@ class LRUCache {
   };
   Storage* storage = nullptr;
   size_t capacity = 33554432;
+  int log_num_limit = 2;
   size_t current_size = 0;
+  int log_num = 0;
   std::shared_mutex mutex;  // this is to protect file_to_records_map and lru_list
   std::unordered_map<std::string, CacheEntry> file_to_entry_map;
   std::list<std::pair<std::string, std::string>> lru_list;
+  std::list<std::string> lru_list_log;
   // std::unordered_map<std::string, std::shared_mutex> file_to_mutex_map;
   // std::shared_mutex map_mutex;
   FileMutexManager* file_mutex_manager = nullptr;
@@ -93,9 +98,10 @@ class LRUCache {
 
   // Function to move a key to the front of the LRU list
   void updateLRU(std::string const& file_name, std::string const& index_value);
-
+  void updateLRULog(std::string const& file_name);
   // Function to evict the least recently used item
   void evict();
+  void evictLog();
 
  public:
   LRUCache(int capacity, Storage* storage) : capacity(capacity), storage(storage) {}

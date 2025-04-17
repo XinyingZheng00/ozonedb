@@ -405,7 +405,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     // this->storage->remove(input);
   }
   compaction->finished = true;
-  std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
+  // std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
   // delete the records
   for (auto const& record : records) {
     delete record;

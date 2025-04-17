@@ -45,20 +45,27 @@ Status MetadataLogHandler::stopViewUpdate() {
 
 // get latest view
 void MetadataLogHandler::getLatestView(View& view) {
-  std::shared_lock<std::shared_mutex> lock(view_mutex);
-  view = latest_view;
+  std::shared_lock<std::shared_mutex> lock(view_mutex_r);
+  view = latest_view_r;
+}
+
+void MetadataLogHandler::flushLatestView() {
+  //flush latest_view_w to the latest_view_r
+  std::unique_lock<std::shared_mutex> lock_r(view_mutex_r);
+  latest_view_r = latest_view_w;
+  lock_r.unlock();
 }
 
 void MetadataLogHandler::getLatestScore(double& score) {
   // For sst levels, the score is total size of the level divided by the target
   // size. for log level, the score is the total number of files, divided by the
   // target number of files.
-  std::shared_lock<std::shared_mutex> lock(view_mutex);
-  for (auto const& entry : this->latest_view.storage_layout) {
+  std::shared_lock<std::shared_mutex> lock(view_mutex_r);
+  for (auto const& entry : this->latest_view_r.storage_layout) {
     if (entry.first.find("sstable") != std::string::npos) {
       size_t total_size = 0;
       for (auto const& file : entry.second) {
-        total_size += this->latest_view.file_size[file];
+        total_size += this->latest_view_r.file_size[file];
       }
       double level_score =
           total_size * 1.0 /
@@ -124,17 +131,17 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
     std::string const& input_file = record->input_files()[0];
     std::string const& output_file = record->output_file()[0];
     std::string prefix = getPrefix(output_file);
-    std::deque<std::string>& level_layout = this->latest_view.storage_layout[prefix];
-    if (this->latest_view.current_log_tail.empty() || this->latest_view.current_log_tail == input_file) {
+    std::deque<std::string>& level_layout = this->latest_view_w.storage_layout[prefix];
+    if (this->latest_view_w.current_log_tail.empty() || this->latest_view_w.current_log_tail == input_file) {
       level_layout.push_back(output_file);
-      this->latest_view.file_size[input_file] = this->storage->size(input_file);
-      this->latest_view.current_log_tail = output_file;
-      // this->latest_view.tail_size = this->storage->size(output_file);
-      // this->latest_view.file_size[output_file] = this->latest_view.tail_size; => update at outside
+      this->latest_view_w.file_size[input_file] = this->storage->size(input_file);
+      this->latest_view_w.current_log_tail = output_file;
+      // this->latest_view_w.tail_size = this->storage->size(output_file);
+      // this->latest_view_w.file_size[output_file] = this->latest_view_w.tail_size; => update at outside
       delete record;
       return "tail" + prefix;
     }
-    if (getNumberInTheEnd(this->latest_view.current_log_tail) < getNumberInTheEnd(input_file)) {
+    if (getNumberInTheEnd(this->latest_view_w.current_log_tail) < getNumberInTheEnd(input_file)) {
       this->buffer["tail" + prefix].push({getNumberInTheEnd(input_file), record});
       return "buffered";
     }
@@ -143,7 +150,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
   } else if (record->op_type() == OperationRecord::COMPACT && !record->compact_in_last_level()) {
     std::string const& input_file = record->input_files()[0];
     std::string input_prefix = getPrefix(input_file);
-    std::deque<std::string>& level_layout = this->latest_view.storage_layout[input_prefix];
+    std::deque<std::string>& level_layout = this->latest_view_w.storage_layout[input_prefix];
     if (level_layout.front() != input_file) {
       auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
       int index = std::distance(level_layout.begin(), it);
@@ -151,43 +158,43 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       return "buffered";
     }
     for (auto const& input_file : record->input_files()) {
-      // remove input file from latest_view
-      latest_view.storage_layout[input_prefix].pop_front();
-      if (latest_view.key_range.find(input_file) != latest_view.key_range.end()) {
-        latest_view.key_range.erase(input_file);
+      // remove input file from latest_view_w
+      latest_view_w.storage_layout[input_prefix].pop_front();
+      if (latest_view_w.key_range.find(input_file) != latest_view_w.key_range.end()) {
+        latest_view_w.key_range.erase(input_file);
       }
-      if (latest_view.file_size.find(input_file) != latest_view.file_size.end()) {
-        latest_view.file_size.erase(input_file);
+      if (latest_view_w.file_size.find(input_file) != latest_view_w.file_size.end()) {
+        latest_view_w.file_size.erase(input_file);
       }
       this->tail_cache->addTailChange(input_file, record->output_file(0));
     }
     for (int i = 0; i < record->output_file_size(); i++) {
       std::string const& output_file = record->output_file(i);
       std::string output_prefix = getPrefix(output_file);
-      latest_view.storage_layout[output_prefix].push_back(output_file);
-      latest_view.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
-      latest_view.file_size[output_file] = this->storage->size(output_file);
+      latest_view_w.storage_layout[output_prefix].push_back(output_file);
+      latest_view_w.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
+      latest_view_w.file_size[output_file] = this->storage->size(output_file);
     }
     delete record;
     return input_prefix;
   } else if (record->op_type() == OperationRecord::COMPACT && record->compact_in_last_level()) {
     std::string const& input_file = record->input_files()[0];
     std::string input_prefix = getPrefix(input_file);
-    std::deque<std::string>& level_layout = this->latest_view.storage_layout[input_prefix];
+    std::deque<std::string>& level_layout = this->latest_view_w.storage_layout[input_prefix];
     std::vector<std::string> keys;
     auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
     int index = std::distance(level_layout.begin(), it);
     for (auto const& input_file : record->input_files()) {
-      // remove input file from latest_view
+      // remove input file from latest_view_w
       //find the index of the input file
       auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
       level_layout.erase(it);
 
-      if (latest_view.key_range.find(input_file) != latest_view.key_range.end()) {
-        latest_view.key_range.erase(input_file);
+      if (latest_view_w.key_range.find(input_file) != latest_view_w.key_range.end()) {
+        latest_view_w.key_range.erase(input_file);
       }
-      if (latest_view.file_size.find(input_file) != latest_view.file_size.end()) {
-        latest_view.file_size.erase(input_file);
+      if (latest_view_w.file_size.find(input_file) != latest_view_w.file_size.end()) {
+        latest_view_w.file_size.erase(input_file);
       }
       this->tail_cache->addTailChange(input_file, record->output_file(0));
     }
@@ -196,8 +203,8 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       std::string output_prefix = getPrefix(output_file);
       //place the output file in the last level in the index position
       level_layout.insert(level_layout.begin() + index + i, output_file);
-      latest_view.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
-      latest_view.file_size[output_file] = this->storage->size(output_file);
+      latest_view_w.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
+      latest_view_w.file_size[output_file] = this->storage->size(output_file);
     }
     delete record;
     return "";
@@ -210,18 +217,19 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
   while (*active) {
     std::vector<OperationRecord*> records = readMetadataLog();
     if (records.empty()) {
-      std::unique_lock<std::shared_mutex> lock(view_mutex);
-      if (!this->latest_view.current_log_tail.empty()) {
-        this->latest_view.tail_size = this->storage->size(this->latest_view.current_log_tail);
-        this->latest_view.file_size[this->latest_view.current_log_tail] = this->latest_view.tail_size;
+      std::unique_lock<std::shared_mutex> lock(view_mutex_w);
+      if (!this->latest_view_w.current_log_tail.empty()) {
+        this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
+        this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
         if (this->event_listener != nullptr)
           this->event_listener->onViewUpdate();
       }
+      flushLatestView();
       lock.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
     }
-    std::unique_lock<std::shared_mutex> lock(view_mutex);
+    std::unique_lock<std::shared_mutex> lock(view_mutex_w);
     for (auto const& record : records) {
       std::string modified_layer = rollforwardSingleOperationRecord(record);
       while (modified_layer != "buffered" && !this->buffer[modified_layer].empty()) {
@@ -230,10 +238,11 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
         modified_layer = rollforwardSingleOperationRecord(op_record);
       }
     }
-    if (!this->latest_view.current_log_tail.empty()) {
-      this->latest_view.tail_size = this->storage->size(this->latest_view.current_log_tail);
-      this->latest_view.file_size[this->latest_view.current_log_tail] = this->latest_view.tail_size;
+    if (!this->latest_view_w.current_log_tail.empty()) {
+      this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
+      this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
     }
+    flushLatestView();
     lock.unlock();
     if (this->event_listener != nullptr)
       this->event_listener->onViewUpdate();
@@ -245,14 +254,15 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
 View MetadataLogHandler::rollForwardMetadataLog() {
   std::vector<OperationRecord*> records = readMetadataLog();
   if (records.empty()) {
-    std::unique_lock<std::shared_mutex> lock(view_mutex);
-    if (!this->latest_view.current_log_tail.empty()) {
-      this->latest_view.tail_size = this->storage->size(this->latest_view.current_log_tail);
-      this->latest_view.file_size[this->latest_view.current_log_tail] = this->latest_view.tail_size;
+    std::unique_lock<std::shared_mutex> lock(view_mutex_w);
+    if (!this->latest_view_w.current_log_tail.empty()) {
+      this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
+      this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
     }
-    return latest_view;
+    flushLatestView();
+    return latest_view_w;
   }
-  std::unique_lock<std::shared_mutex> lock(view_mutex);
+  std::unique_lock<std::shared_mutex> lock(view_mutex_w);
   for (auto const& record : records) {
     std::string modified_layer = rollforwardSingleOperationRecord(record);
     while (modified_layer != "buffered" && !this->buffer[modified_layer].empty()) {
@@ -261,15 +271,16 @@ View MetadataLogHandler::rollForwardMetadataLog() {
       modified_layer = rollforwardSingleOperationRecord(op_record);
     }
   }
-  if (!this->latest_view.current_log_tail.empty()) {
-    this->latest_view.tail_size = this->storage->size(this->latest_view.current_log_tail);
-    this->latest_view.file_size[this->latest_view.current_log_tail] = this->latest_view.tail_size;
+  if (!this->latest_view_w.current_log_tail.empty()) {
+    this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
+    this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
   }
-  return latest_view;
+  flushLatestView();
+  return latest_view_w;
 }
 void MetadataLogHandler::initSSTMetadata() {
   // this is invoked only when the database starts so no need to lock
-  for (auto const& entry : this->latest_view.storage_layout) {
+  for (auto const& entry : this->latest_view_r.storage_layout) {
     if (entry.first.find("sstable") == std::string::npos) {
       continue;
     } else {

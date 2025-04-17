@@ -1,6 +1,7 @@
 # cd $OZONEDB_HOME/src/include/ozonedb/protobuf && rm -rf *
 mkdir -p $OZONEDB_HOME/src/include/ozonedb/protobuf
 mkdir -p $OZONEDB_HOME/build
+rm $OZONEDB_HOME/build/CMakeCache.txt
 cd $OZONEDB_HOME/build
 cmake .. && make -j20
 mkdir -p ../ozonedb-jni-maven/native/src/main/cpp/lib

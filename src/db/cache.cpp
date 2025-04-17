@@ -6,7 +6,10 @@
 namespace ozonedb {
 // Function to move a key to the front of the LRU list
 void LRUCache::updateLRU(std::string const& file_name, std::string const& index_value) {
-  lru_list.erase(file_to_entry_map[file_name].lru_itr[index_value]);
+  if (file_to_entry_map[file_name].lru_itr.find(index_value) != file_to_entry_map[file_name].lru_itr.end()) {
+    auto index_value_itr = file_to_entry_map[file_name].lru_itr[index_value];
+    lru_list.erase(index_value_itr); 
+  }
   lru_list.push_front({file_name, index_value});
   file_to_entry_map[file_name].lru_itr[index_value] = lru_list.begin();
 }
@@ -16,18 +19,49 @@ void LRUCache::evict() {
   while (current_size > capacity) {
     auto it = lru_list.rbegin();
     current_size -= file_to_entry_map[it->first].block_size[it->second];
+    auto block_records = file_to_entry_map[it->first].block_records[it->second];
+    for (auto& record : *block_records) {
+      delete record.second;
+    }
+    delete block_records;
     file_to_entry_map[it->first].block_records.erase(it->second);
     file_to_entry_map[it->first].block_size.erase(it->second);
     file_to_entry_map[it->first].lru_itr.erase(it->second);
+    if (file_to_entry_map[it->first].block_records.empty()) {
+      file_to_entry_map.erase(it->first);
+    }
     lru_list.pop_back();
+  }
+}
+void LRUCache::updateLRULog(std::string const& file_name) {
+  if (file_to_entry_map.find(file_name) != file_to_entry_map.end()) {
+    auto& lru_itr_log = file_to_entry_map[file_name].lru_itr_log;
+    lru_list_log.erase(lru_itr_log);
+    lru_list_log.push_front(file_name);
+    file_to_entry_map[file_name].lru_itr_log = lru_list_log.begin();
+  } else {
+    lru_list_log.push_front(file_name);
+  }
+
+}
+
+// Function to evict the least recently used item
+void LRUCache::evictLog() {
+  while (log_num > log_num_limit) {
+    auto it = lru_list_log.back();
+    log_num -= 1;
+    auto records = file_to_entry_map[it].records;
+    for (auto& record : records) {
+      delete record.second;
+    }
+    file_to_entry_map.erase(it);
+    lru_list_log.pop_back();
   }
 }
 void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size) {
   std::unique_lock lock(mutex);
   auto it = file_to_entry_map.find(file_name);
   if (it != file_to_entry_map.end()) {
-    // Key found in the cache
-    // updateLRU(file_name);
     if (it->second.sealed) {
       read_more = false;
       return;
@@ -79,13 +113,11 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
     putSSTableMeta(file_name, table);
   } else {
     table = it->second.table;
-    // updateLRU(file_name);
   }
 }
 
 void LRUCache::needReadBlock(std::string const& file_name, bool& read_more, std::string const& index_value) {
   std::unique_lock lock(mutex);
-  // updateLRU(file_name);
   auto it = file_to_entry_map.find(file_name);
   if (it->second.block_records.find(index_value) != it->second.block_records.end()) {
     read_more = false;
@@ -95,9 +127,7 @@ void LRUCache::needReadBlock(std::string const& file_name, bool& read_more, std:
 void LRUCache::readDataBlocks(std::string const& file_name, std::string const& index_value) {
   std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
   std::unique_lock file_lock(file_mutex);
-  // if sstable not in cache, read from storage and put it in cache
   Table* table = file_to_entry_map[file_name].table;
-  // read block from storage
   Iterator* iter = table->blockReader(table, index_value);
   file_lock.unlock();
   iter->seekToFirst();
@@ -117,29 +147,29 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
 
 // Function to get the latest records for a given filename, return records and offset
 void LRUCache::get(std::string const& file_name, std::string const& key, Record*& record, std::string const& index_value) {
-  // Get the records from the cache
-  // if it is log file:
   std::shared_lock lock(mutex);
   if (file_name.find("log") != std::string::npos) {
+    if (file_to_entry_map.find(file_name) == file_to_entry_map.end()) {
+      // the latest tail may not be created yet
+      record = nullptr;
+      return;
+    }
     auto& records = file_to_entry_map[file_name].records;
-    // Find the record corresponding to the key
+    updateLRULog(file_name);
     auto record_it = records.find(key);
     if (record_it != records.end()) {
-      // Key found, assign the record
       record = record_it->second;
     } else {
-      record = nullptr;  // empty record
+      record = nullptr;
     }
   } else {
     auto& records = file_to_entry_map[file_name].block_records[index_value];
     updateLRU(file_name, index_value);
-    // Find the record corresponding to the key
     auto record_it = records->find(key);
     if (record_it != records->end()) {
-      // Key found, assign the record
       record = record_it->second;
     } else {
-      record = nullptr;  // empty record
+      record = nullptr;
     }
   }
 }
@@ -156,24 +186,22 @@ void LRUCache::putLogRecords(std::string const& key, std::unordered_map<std::str
       it->second.offset = offset;
       it->second.sealed = sealed;
     }
-    // updateLRU(key);
+    updateLRULog(key);
   } else {
     // Key does not exist, insert new entry
-    // if (lru_list.size() >= capacity) {
-    //   evict();
-    // }
-    // lru_list.push_front(key);
+    log_num += 1;
+    if (log_num > log_num_limit) {
+      evictLog();
+    }
+    updateLRULog(key);
     CacheEntry entry(records, offset, sealed);
     file_to_entry_map[key] = entry;
+    file_to_entry_map[key].lru_itr_log = lru_list_log.begin();
   }
 }
 
 void LRUCache::putSSTableMeta(std::string const& key, Table* table) {
   std::unique_lock lock(mutex);
-  // if (lru_list.size() >= capacity) {
-  //   evict();
-  // }
-  // lru_list.push_front(key);
   CacheEntry entry(table);
   file_to_entry_map[key] = entry;
 }
@@ -186,8 +214,7 @@ void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std:
   if (current_size > capacity) {
     evict();
   }
-  lru_list.push_front({key, index_value});
-  file_to_entry_map[key].lru_itr[index_value] = lru_list.begin();
+  updateLRU(key, index_value);
 }
 
 }  // namespace ozonedb

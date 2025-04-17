@@ -72,43 +72,45 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
                 cached_data_path = os.path.join(ycsb_data_path, f'cached_data-{db_name}-{each_key_size}-{each_record_cnt}/')
                 subprocess.run(['rm', '-rf', result_file_insert]) # remove the result data if is exist
                 
-                if db_name == "raw_sync_io":
-                    data = b'a' * parse_size(each_key_size)
-                    total_bytes = int(each_record_cnt) * parse_size(each_key_size)
+                # if db_name == "raw_sync_io":
+                #     data = b'a' * parse_size(each_key_size)
+                #     total_bytes = int(each_record_cnt) * parse_size(each_key_size)
 
-                    for repeat_round in range(repeated):
-                        file_path = os.path.join(result_path, f"sync_test_{each_key_size}_{each_record_cnt}_{repeat_round}.dat")
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
+                #     for repeat_round in range(repeated):
+                #         file_path = os.path.join(result_path, f"sync_test_{each_key_size}_{each_record_cnt}_{repeat_round}.dat")
+                #         if os.path.exists(file_path):
+                #             os.remove(file_path)
 
-                        print(f"Starting raw sync IO round {repeat_round + 1}/{repeated}")
-                        start_time = time.time()
+                #         print(f"Starting raw sync IO round {repeat_round + 1}/{repeated}")
+                #         start_time = time.time()
+                #         timestamp = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S:%f')[:-3]
+                #         with open(result_file_insert, "a") as res_f:
+                #             res_f.write(timestamp +  " 0 sec: 0 operations; est completion in 0 second\n")
+                #         ops_done = 0
+                #         status_interval = 10000
 
-                        ops_done = 0
-                        status_interval = 10000
+                #         with open(file_path, "wb") as f:
+                #             for i in range(int(each_record_cnt)):
+                #                 f.write(data)
+                #                 f.flush()
+                #                 os.fsync(f.fileno())
+                #                 ops_done += 1
+                #                 if ops_done % status_interval == 0 or ops_done == int(each_record_cnt):
+                #                     print_status(start_time, ops_done, int(each_record_cnt), result_file_insert)
 
-                        with open(file_path, "wb") as f:
-                            for i in range(int(each_record_cnt)):
-                                f.write(data)
-                                f.flush()
-                                os.fsync(f.fileno())
-                                ops_done += 1
-                                if ops_done % status_interval == 0 or ops_done == int(each_record_cnt):
-                                    print_status(start_time, ops_done, int(each_record_cnt), result_file_insert)
+                #         elapsed = time.time() - start_time
+                #         throughput = total_bytes / elapsed / (1024 * 1024)
 
-                        elapsed = time.time() - start_time
-                        throughput = total_bytes / elapsed / (1024 * 1024)
+                #         with open(result_file_insert, "a") as res_f:
+                #             res_f.write(f"[OVERALL], RunTime(ms), {int(elapsed * 1000)}\n")
+                #             res_f.write(f"[OVERALL], Throughput(ops/sec), {ops_done / elapsed:.2f}\n")
+                #             res_f.write(f"[INSERT], Operations, {ops_done}\n")
+                #             res_f.write(f"[INSERT], AverageLatency(us), {int(elapsed * 1e6 / ops_done)}\n")
+                #             res_f.write(f"[INSERT], Return=OK, {ops_done}\n")
 
-                        with open(result_file_insert, "a") as res_f:
-                            res_f.write(f"[OVERALL], RunTime(ms), {int(elapsed * 1000)}\n")
-                            res_f.write(f"[OVERALL], Throughput(ops/sec), {ops_done / elapsed:.2f}\n")
-                            res_f.write(f"[INSERT], Operations, {ops_done}\n")
-                            res_f.write(f"[INSERT], AverageLatency(us), {int(elapsed * 1e6 / ops_done)}\n")
-                            res_f.write(f"[INSERT], Return=OK, {ops_done}\n")
+                #         os.remove(file_path)
 
-                        os.remove(file_path)
-
-                    continue
+                #     continue
                 
                 command = ["python3", f'bin/ycsb', 'load', db_name, '-threads', str(1), '-s', '-P', workload_path]
                 if db_name == "rocksdb":

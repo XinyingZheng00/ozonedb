@@ -62,7 +62,7 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
     // only use in the case of HoAl and HeAl
     db->watcher->startCompactionWatcher(&(db->active));
   }
-  db->metadata_log->startViewUpdate(&(db->active));
+  // db->metadata_log->startViewUpdate(&(db->active));
   return Status::kSuccess;
 }
 
@@ -72,7 +72,7 @@ Status DB::closeDB(DB*& db) {
     db->watcher->stopCompactionWatcher();
   }
   // db->thread_pool->waitForCompletion();
-  db->metadata_log->stopViewUpdate();
+  // db->metadata_log->stopViewUpdate();
   // delete db;
   return Status::kSuccess;
 }
@@ -127,6 +127,7 @@ Status DB::remove(std::string const& key) {
 
 Status DB::get(std::string const& key, std::string const*& value) {
   // Step1: get the latest view and cache state from metadata log
+  metadata_log->rollForwardMetadataLog(); 
   metadata_log->getLatestView(this->latest_view);
   this->log_handler->setLatestView(&this->latest_view);
   this->sstable_handler->setLatestView(&this->latest_view);
