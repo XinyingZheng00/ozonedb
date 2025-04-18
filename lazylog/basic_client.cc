@@ -13,14 +13,14 @@ int main(int argc, const char *argv[]) {
 
     if (prop.GetProperty("mode", "w") == "w") {
         for (int i = 0; i < 10; i++){
-            cli.AppendEntryQuorum("this is a log entry");
+            cli.AppendEntryAll("this is a log entry1");
             std::cout << "Wrote entry " << i << std::endl;
         }
     } else {
         int yea = 0, nay = 0;
         std::string data;
-        for (int i = 15000; i < 45000; i++) {
-            if (cli.SpecReadEntry(i, data) > 0)
+        for (int i = 0; i < 11; i++) {
+            if (cli.ReadEntry(i, data) > 0)
                 yea++;
             else
                 nay++;
