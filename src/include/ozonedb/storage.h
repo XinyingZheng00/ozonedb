@@ -13,12 +13,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "status.h"
 namespace ozonedb {
 
-enum class Status { kSuccess,
-                    kFailure,
-                    kSealed,
-                    kNotFound };
 
 /**
  * @brief Base class for all the storage classes
@@ -227,35 +224,6 @@ public:
   void seek(std::ifstream& file, int position);  // Move the pointer to the position in the file
   void logBatch(std::string const& fileName, unsigned char* const& data, int length);
 };
-
-// #include "lazylog_cli.h"
-// #include "utils/properties.h"
-// class SharedLogStorage : public Storage {
-//  private:
-//   LazyLogClient shared_data_log;
-//   LazyLogClient shared_metadata_log;
-//   LazyLogClient shared_task_log; 
-
-//  public:
-//   explicit SharedLogStorage(const std::string& storage_path);
-//   ~SharedLogStorage();
-
-//   void createDirectory(std::string name) override;
-//   Status append(std::string const& fileName, unsigned char* const& data, int length) override;
-//   Status appendNoFlush(std::string const& fileName, unsigned char* const& data, int length) override;
-//   Status appendInBatch(std::string const& fileName, unsigned char* const& data, int length) override;
-//   Status flush(std::string const& fileName) override;
-//   Status read(std::string const& fileName, unsigned char*& data, size_t& size) override;
-//   Status read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) override;
-//   size_t size(std::string fileName) override;
-//   void seal(std::string fileName) override;
-//   bool isSealed(std::string fileName) override;
-//   void remove(std::string fileName) override;
-//   bool exist(std::string fileName) override;
-// };
-
-// #endif // SHARED_LOG_STORAGE_H
-
 
 }  // namespace ozonedb
 #endif  // STORAGE_H

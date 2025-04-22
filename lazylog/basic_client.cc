@@ -1,6 +1,8 @@
 #include "lazylog_cli.h"
 #include "utils/properties.h"
 
+//sudo GLOG_minloglevel=1 ./basic_client -P /sharedfs/LazyLog-Artifact/cfg/be.prop -P /sharedfs/LazyLog-Artifact/cfg/dl_client.prop -P /sharedfs/LazyLog-Artifact/cfg/rdma.prop -p mode=w
+
 int main(int argc, const char *argv[]) {
     using namespace lazylog;
 

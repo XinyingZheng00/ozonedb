@@ -1,97 +1,60 @@
-#include "storage.h"
-#include <stdexcept>
-#include <string>
-#include <vector>
+#include "shared_log_storage.h"
+#include "utils/properties.h"
 
-SharedLogStorage::SharedLogStorage(const std::string& storage_path)
-    : Storage(storage_path) {}
+namespace ozonedb {
+/*
+sudo GLOG_minloglevel=1 -P /sharedfs/LazyLog-Artifact/cfg/be.prop -P /sharedfs/LazyLog-Artifact/cfg/dl_client.prop -P /sharedfs/LazyLog-Artifact/cfg/rdma.prop 
+*/
+
+SharedLogStorage::SharedLogStorage(int client_id){
+    lazylog::Properties prop;
+    std::ifstream be("/sharedfs/LazyLog-Artifact/cfg/be.prop");
+    prop.Load(be);
+    std::ifstream dl_client("/sharedfs/LazyLog-Artifact/cfg/dl_client.prop");
+    prop.Load(dl_client);
+    std::ifstream rdma("/sharedfs/LazyLog-Artifact/cfg/rdma.prop");
+    prop.Load(rdma);
+    if (client_id != -1) {
+        prop.SetProperty("dur_log.client_id", std::to_string(client_id));
+    }
+    shared_log = std::make_unique<lazylog::LazyLogClient>();
+    shared_log->Initialize(prop);
+}
 
 SharedLogStorage::~SharedLogStorage() = default;
 
-void SharedLogStorage::createDirectory(std::string name) {
-  throw std::runtime_error("createDirectory() is not supported for SharedLogStorage");
+Status SharedLogStorage::append(std::string const& data) {
+  shared_log->AppendEntryAll(data);
+  return Status::kSuccess;
 }
 
-Status SharedLogStorage::append(std::string const& fileName, unsigned char* const& data, int length) {
-  if (fileName.contains("metadatalog")) {
-    std::string data_str(reinterpret_cast<const char*>(data), length);
-    shared_log.AppendEntryAll(data_str);
-  } else if (fileName.contains("tasklog")) {
-    std::string data_str(reinterpret_cast<const char*>(data), length);
-    shared_log.AppendEntryAll(data_str);
-  } else if (fileName.contains("log")) {
-    std::string data_str(reinterpret_cast<const char*>(data), length);
-    shared_log.AppendEntryAll(data_str);
-  } else if(fileName.contains("sstable")) {
-    //write to nfs at storage_path
-    std::string data_str(reinterpret_cast<const char*>(data), length);
-
-  } else {
-    throw std::runtime_error("Unknown file type");
+Status SharedLogStorage::read(std::vector<std::string>& entries, size_t from, size_t to) {
+  for (size_t i = from; i < to; ++i) {
+    std::string entry;
+    if (!shared_log->ReadEntry(i, entry)) {
+      std::cerr << "ReadEntry failed" << std::endl;
+      return Status::kFailure;
+    }
+    entries.push_back(entry);
   }
   return Status::kSuccess;
 }
 
-Status SharedLogStorage::appendNoFlush(std::string const& fileName, unsigned char* const& data, int length) {
-  return append(fileName, data, length);
-}
-
-Status SharedLogStorage::appendInBatch(std::string const& fileName, unsigned char* const& data, int length) {
-  return append(fileName, data, length);
-}
-
-Status SharedLogStorage::flush(std::string const& fileName) {
-  throw std::runtime_error("flush() is not supported for SharedLogStorage");
-}
-
-Status SharedLogStorage::read(std::string const& fileName, unsigned char*& data, size_t& size) {
-  std::string entry_data;
-  uint64_t index = std::stoull(fileName);
-  if (!shared_log.ReadEntry(index, entry_data)) {
-    return Status::Failure("ReadEntry failed");
-  }
-  size = entry_data.size();
-  data = new unsigned char[size];
-  std::memcpy(data, entry_data.data(), size);
-  return Status::Success();
-}
-
-Status SharedLogStorage::read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) {
-  uint64_t from = a;
-  uint64_t to = a + length - 1;
-  std::vector<LogEntry> entries;
-  if (!shared_log.ReadEntries(from, to, entries)) {
-    return Status::Failure("ReadEntries failed");
-  }
-  std::string combined_data;
-  for (const auto& entry : entries) {
-    combined_data.append(entry.data);
-  }
-  size_t combined_size = combined_data.size();
-  data = new unsigned char[combined_size];
-  std::memcpy(data, combined_data.data(), combined_size);
-  return Status::Success();
-}
-
-size_t SharedLogStorage::size(std::string fileName) {
-  auto [last_index, _, __] = shared_log.GetTail();
+size_t SharedLogStorage::size() {
+  /*
+     * @return 0. durable tail: index of the newest unordered entry + 1,
+     *  1. ordered tail: index of the oldest unordered entry (i.e. index of the newest ordered entry + 1)
+     *  2. curent view number
+     * What you should fetch is within [ tail[1], tail[0] )
+    std::tuple<uint64_t, uint64_t, uint16_t> GetTail();
+  */
+  std::tuple<uint64_t, uint64_t, uint16_t> tail = shared_log->GetTail();
+  uint64_t last_index = std::get<0>(tail);
   return last_index;
 }
 
-void SharedLogStorage::seal(std::string fileName) {
-  throw std::runtime_error("seal() is not supported for SharedLogStorage");
+bool SharedLogStorage::exist() {
+  return true;
 }
 
-bool SharedLogStorage::isSealed(std::string fileName) {
-  return false;
-}
-
-void SharedLogStorage::remove(std::string fileName) {
-  throw std::runtime_error("remove() is not supported for SharedLogStorage");
-}
-
-bool SharedLogStorage::exist(std::string fileName) {
-  uint64_t index = std::stoull(fileName);
-  std::string entry_data;
-  return shared_log.ReadEntry(index, entry_data);
 }

@@ -3,6 +3,7 @@
 #include "storage.h"
 #include "test_tool.h"
 #include <thread>
+#include "shared_log_storage.h"
 using namespace ozonedb;
 TEST(StorageTest, read_write_to_binary_file_test) {
   // append timestamp to avoid file name conflict
