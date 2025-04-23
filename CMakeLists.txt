@@ -68,6 +68,7 @@ add_library(OzoneDB STATIC
     src/db/compaction.cpp
     src/db/db.cpp
     src/db/log_handler.cpp
+    src/db/log_handler_shared_log.cpp
     src/db/cache.cpp
     src/db/metadata_log_handler.cpp
     src/db/task_log_handler.cpp
@@ -103,7 +104,7 @@ add_executable(runUnitTests
     tests/test_db.cpp 
     tests/test_log.cpp
     tests/test_storage.cpp
-    tests/test_shared_log_storage.cpp
+    tests/test_shared_log.cpp
     tests/test_all.cpp
     tests/test_protobuf.cpp
     tests/test_sstable.cpp

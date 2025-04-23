@@ -2,6 +2,7 @@
 #define LOG_HANDLER_H
 
 #include "cache.h"
+#include "log_handler_base.h"
 #include "metadata.h"
 #include "metadata_log_handler.h"
 #include "protobuf/record.pb.h"
@@ -13,7 +14,7 @@
 #include <vector>
 
 namespace ozonedb {
-class LogHandler {
+class LogHandler : public LogHandlerBase {
  private:
   /**
    * @brief prefix for each file
@@ -65,7 +66,7 @@ class LogHandler {
    * @param record
    * @return Status
    */
-  Status addRecord(Record const& record);
+  Status addRecord(Record const& record) override;
 
   /**
    * @brief read record from this level, end to the offset
@@ -74,7 +75,7 @@ class LogHandler {
    * @param value
    * @return Status
    */
-  Status readRecord(std::string const& key, Record*& record, std::string const& offset, std::string& latest_offset);
+  Status readRecord(std::string const& key, Record*& record, std::string const& offset, std::string& latest_offset) override;
 
   // set thread pool
   void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }

@@ -1,24 +1,26 @@
 #include "gtest/gtest.h"
+#include "log_handler_base.h"
+#include "log_handler_shared_log.h"
 #include "shared_log_storage.h"
+#include <hdr/hdr_histogram.h>
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <thread>
-#include <hdr/hdr_histogram.h>
 #include <unordered_map>
-#include <chrono>
-#include <atomic>
-//need to be run in the root mode
+// need to be run in the root mode
 
 using namespace ozonedb;
 TEST(SharedLogStorageTest, AppendAndSizeIncreases) {
   SharedLogStorage* storage = new SharedLogStorage();
   std::string test_data = "test_entry";
   size_t size_before = storage->size();
-  
+
   EXPECT_EQ(storage->append(test_data), Status::kSuccess);
 
   size_t size_after = storage->size();
-  std::cout << "Size before: " << size_before << ", Size after: " << size_after << std::endl; 
+  std::cout << "Size before: " << size_before << ", Size after: " << size_after << std::endl;
   EXPECT_GT(size_after, size_before);  // size should increase after append
 }
 
@@ -51,7 +53,7 @@ std::unordered_map<int, std::pair<uint64_t, uint64_t>> num_requests_and_duration
 
 void reader_thread(int thd_id, hdr_histogram* histogram, int runtime_secs) {
   uint64_t idx = 0;
-  SharedLogStorage* storage = new SharedLogStorage(2*thd_id);
+  SharedLogStorage* storage = new SharedLogStorage(2 * thd_id);
   auto begin = high_resolution_clock::now();
 
   while (duration_cast<seconds>(high_resolution_clock::now() - begin).count() < runtime_secs) {
@@ -69,7 +71,7 @@ void reader_thread(int thd_id, hdr_histogram* histogram, int runtime_secs) {
 void writer_thread(int thd_id, hdr_histogram* histogram, int runtime_secs) {
   uint64_t idx = 0;
   std::string data(1024, 'W');
-  SharedLogStorage* storage = new SharedLogStorage(2*thd_id + 1);
+  SharedLogStorage* storage = new SharedLogStorage(2 * thd_id + 1);
   auto begin = high_resolution_clock::now();
 
   while (duration_cast<seconds>(high_resolution_clock::now() - begin).count() < runtime_secs) {
@@ -83,9 +85,9 @@ void writer_thread(int thd_id, hdr_histogram* histogram, int runtime_secs) {
       idx, duration_cast<nanoseconds>(high_resolution_clock::now() - begin).count()};
 }
 
-double compute_throughput(const std::unordered_map<int, std::pair<uint64_t, uint64_t>>& stats) {
+double compute_throughput(std::unordered_map<int, std::pair<uint64_t, uint64_t>> const& stats) {
   double tput = 0;
-  for (const auto& [_, p] : stats) {
+  for (auto const& [_, p] : stats) {
     tput += static_cast<double>(p.first) * 1.0e9 / p.second;
   }
   return tput;
@@ -130,4 +132,43 @@ TEST(SharedLogStorageTest, MixedReadWriteThroughput) {
 
   hdr_close(read_hist);
   hdr_close(write_hist);
+}
+
+TEST(SharedLogLogHanderTest, AddAndReadRecordSuccess) {
+  LogHandlerBase* handler = new log_handler_shared_log(0);
+  Record r1;
+  r1.set_key("k1");
+  r1.set_value("v1");
+  r1.set_type(kTypeValue);
+  handler->addRecord(r1);
+
+  Record* out = nullptr;
+  std::string latest_offset;
+  ASSERT_EQ(handler->readRecord("k1", out, "0", latest_offset), Status::kSuccess);
+  ASSERT_NE(out, nullptr);
+  EXPECT_EQ(out->key(), "k1");
+  EXPECT_EQ(out->value(), "v1");
+  std::cout << "latest offset: " << latest_offset << std::endl;
+  delete out;
+  delete handler;
+}
+
+TEST(SharedLogLogHanderTest, RecordNotFound) {
+  LogHandlerBase* handler = new log_handler_shared_log(0);
+  Record* out = nullptr;
+  std::string latest_offset;
+  ASSERT_EQ(handler->readRecord("missing_key", out, "0", latest_offset), Status::kNotFound);
+  ASSERT_EQ(out, nullptr);
+}
+
+TEST(SharedLogLogHanderTest, OffsetEqualToAndBeyondSize) {
+  LogHandlerBase* handler = new log_handler_shared_log(0);
+  Record* out = nullptr;
+  std::string latest_offset;
+  handler->readRecord("k1", out, "1", latest_offset);
+
+  ASSERT_EQ(handler->readRecord("k1", out, latest_offset, latest_offset), Status::kNotFound);
+
+  std::string offset = std::to_string(std::stoul(latest_offset) + 1);
+  ASSERT_EQ(handler->readRecord("k1", out, offset, latest_offset), Status::kFailure);
 }
