@@ -31,7 +31,7 @@ Status Table::open(Storage* storage,
                    std::string const& fileName,
                    Table*& table) {
   // read the footer
-  size_t size = storage->size(fileName);//tobe changed.
+  size_t size = storage->size(fileName);  // tobe changed.
   unsigned char* footer_vector = nullptr;
   Status s = storage->read(fileName, footer_vector, size - FOOTER_BLOCK_SIZE, FOOTER_BLOCK_SIZE);
   if (s != Status::kSuccess) return s;

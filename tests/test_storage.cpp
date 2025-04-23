@@ -1,9 +1,9 @@
 #include "gtest/gtest.h"
 #include "protobuf/record.pb.h"
+#include "shared_log_storage.h"
 #include "storage.h"
 #include "test_tool.h"
 #include <thread>
-#include "shared_log_storage.h"
 using namespace ozonedb;
 TEST(StorageTest, read_write_to_binary_file_test) {
   // append timestamp to avoid file name conflict
@@ -214,11 +214,10 @@ TEST(CloudStorageTest, read_write_to_block_blob_test) {
 }
 
 TEST(CloudStorageTest, read_partial_file_back) {
-  //run with previous test
+  // run with previous test
   Storage* storage = new AzureBlobStorage(connection_string, "tank", "test/storage/");
   std::string fileNameBlob = "read-write-to-blob-file";
   std::string fileNameAppend = "read-write-to-append-file";
-
 
   int num = 5;
   int start = 5;
@@ -251,7 +250,7 @@ TEST(CloudStorageTest, size_test) {
 
 TEST(CloudStorageTest, seal_test) {
   Storage* storage = new AzureBlobStorage(connection_string, "tank", "test/storage/");
-  std::string fileName = "seal-test" ;
+  std::string fileName = "seal-test";
   storage->remove(fileName);
   std::vector<uint8_t> data = {1, 2, 3, 4, 5};
   Status status = storage->append(fileName, data.data(), data.size());
@@ -261,22 +260,21 @@ TEST(CloudStorageTest, seal_test) {
   delete storage;
 }
 
-
 TEST(CloudStorageTest, write_file_to_append_blob_test) {
   Storage* storage = new AzureBlobStorage(connection_string, "tank", "test/storage/");
   std::string fileName = "read-write-to-append-file";
   storage->remove(fileName);
-// Service version 2022-11-02 and later: The maximum block size is 100 MB
-// Service versions earlier than 2022-11-02: The maximum block size is 4 MB
+  // Service version 2022-11-02 and later: The maximum block size is 100 MB
+  // Service versions earlier than 2022-11-02: The maximum block size is 4 MB
 
   int length = 100 * 1024 * 1024;  // 100MB file
   unsigned char* const& data = new unsigned char[length];
-  //fill the data with random generated data
+  // fill the data with random generated data
   for (int i = 0; i < length; i++) {
     data[i] = rand() % 256;
   }
 
-  std::cout<<"Start uploading file to Azure Blob Storage..."<<std::endl;
+  std::cout << "Start uploading file to Azure Blob Storage..." << std::endl;
   int sum = 0;
   for (int i = 0; i < 20; i++) {
     auto start = std::chrono::high_resolution_clock::now();
@@ -290,7 +288,7 @@ TEST(CloudStorageTest, write_file_to_append_blob_test) {
   int duration = sum / 20;
   std::cout << "Average Time taken: " << duration << " millseconds." << std::endl;
 
-  //calculate the upload speed in kBps
+  // calculate the upload speed in kBps
   double upload_speed_mbps = (length / 1024 / 1024) / (duration * 1.0 / 1000);
 
   std::cout << "File uploaded successfully!" << std::endl;

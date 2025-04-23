@@ -20,7 +20,7 @@ class Metadata {
    * @brief Path info for all files
    *
    */
-  std::string container_name; // only for cloud storage
+  std::string container_name;  // only for cloud storage
   std::string DBpath;
   int is_cloud = false;
   std::string metadata_log = "metadata.log";

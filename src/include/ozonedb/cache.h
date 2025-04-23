@@ -4,11 +4,11 @@
 #include "sstable/table_reader.h"
 #include "storage.h"
 #include <list>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <mutex>
 namespace ozonedb {
 
 class View;
@@ -31,7 +31,7 @@ class TailCache {
       cache_[key].second = new_tail;
     }
   }
- 
+
   // add tail change
   void addTailChange(std::string old_tail, std::string new_tail) {
     tail_to_tail_map[old_tail] = new_tail;
@@ -67,7 +67,7 @@ class LRUCache {
     std::list<std::string>::iterator lru_itr_log;
 
     std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records;  // index_value_for_block -> records
-    std::unordered_map<std::string, size_t> block_size;                                       // index_value_for_block -> tail
+    std::unordered_map<std::string, size_t> block_size;                                        // index_value_for_block -> tail
     std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> lru_itr;
     Table* table = nullptr;
 
@@ -111,7 +111,7 @@ class LRUCache {
       for (auto& record : entry.second.records) {
         delete record.second;
       }
-      //std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records; 
+      // std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records;
       for (auto block : entry.second.block_records) {
         for (auto record : *block.second) {
           delete record.second;

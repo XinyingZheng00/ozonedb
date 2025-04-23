@@ -13,7 +13,8 @@
 // Thread Pool class with task completion tracking
 class ThreadPool {
  public:
-  enum class Priority { High, Low };
+  enum class Priority { High,
+                        Low };
 
   ThreadPool(size_t numThreads);
   ~ThreadPool();

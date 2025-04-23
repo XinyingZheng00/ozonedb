@@ -50,7 +50,7 @@ void MetadataLogHandler::getLatestView(View& view) {
 }
 
 void MetadataLogHandler::flushLatestView() {
-  //flush latest_view_w to the latest_view_r
+  // flush latest_view_w to the latest_view_r
   std::unique_lock<std::shared_mutex> lock_r(view_mutex_r);
   latest_view_r = latest_view_w;
   lock_r.unlock();
@@ -186,7 +186,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
     int index = std::distance(level_layout.begin(), it);
     for (auto const& input_file : record->input_files()) {
       // remove input file from latest_view_w
-      //find the index of the input file
+      // find the index of the input file
       auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
       level_layout.erase(it);
 
@@ -201,7 +201,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
     for (int i = 0; i < record->output_file_size(); i++) {
       std::string const& output_file = record->output_file(i);
       std::string output_prefix = getPrefix(output_file);
-      //place the output file in the last level in the index position
+      // place the output file in the last level in the index position
       level_layout.insert(level_layout.begin() + index + i, output_file);
       latest_view_w.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
       latest_view_w.file_size[output_file] = this->storage->size(output_file);

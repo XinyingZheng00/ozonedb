@@ -13,7 +13,7 @@ BlockBlobClient AzureBlobStorage::getBlockBlobClient(std::string const& fileName
 }
 
 AppendBlobClient AzureBlobStorage::getAppendBlobClient(std::string const& fileName) {
-  auto appendClient = containerClient->GetAppendBlobClient(this->storage_path +fileName);
+  auto appendClient = containerClient->GetAppendBlobClient(this->storage_path + fileName);
   appendClient.CreateIfNotExists();
   return appendClient;
 }
@@ -62,7 +62,7 @@ void AzureBlobStorage::logBatch(std::string const& fileName, unsigned char* cons
   }
   logFile->write(reinterpret_cast<char const*>(data), length);  // Write buffer contents
   logFile->flush();
-  fsync(GetFileDescriptor(*logFile->rdbuf())); // todo: test without fsync, test fsyc performance
+  fsync(GetFileDescriptor(*logFile->rdbuf()));  // todo: test without fsync, test fsyc performance
 }
 
 Status AzureBlobStorage::appendInBatch(std::string const& fileName, unsigned char* const& data, int length) {
@@ -71,8 +71,8 @@ Status AzureBlobStorage::appendInBatch(std::string const& fileName, unsigned cha
   auto now = std::chrono::high_resolution_clock::now();
   commit_count_++;
   if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_commited_time_).count() > commit_interval_) {
-    std::cout<<std::this_thread::get_id()<<":committing batch for "<<commit_count_<<std::endl;
-    commit_count_=0;
+    std::cout << std::this_thread::get_id() << ":committing batch for " << commit_count_ << std::endl;
+    commit_count_ = 0;
     std::unique_lock lock(mtx);
     auto it = cached_file.find(fileName);
     if (it == cached_file.end()) {
@@ -96,26 +96,26 @@ Status AzureBlobStorage::appendInBatch(std::string const& fileName, unsigned cha
     } catch (std::exception const& e) {
       return Status::kFailure;
     }
-  /*
-  std::thread([this, fileName, buffer = std::move(buffer)]() {
-          try {
-              // Perform blob upload asynchronously
-              std::cout<<"uploading blob : "<< std::to_string(buffer.size())<<std::endl;
-              Azure::Core::IO::MemoryBodyStream content(buffer.data(), buffer.size());
-              auto blobClient = getAppendBlobClient(fileName);
-              blobClient.AppendBlock(content);
-              cached_file.erase(fileName);
-              // std::filesystem::remove(fileName);
-          } catch (Azure::Core::RequestFailedException const& e) {
-              if (e.ErrorCode == "BlobIsSealed") {
-                  // Handle sealed blob error
-              }
-              // Handle other errors
-          } catch (std::exception const& e) {
-              // Handle general exceptions
-          }
-      }).detach();  // Detach the thread to run asynchronously  
-  */
+    /*
+    std::thread([this, fileName, buffer = std::move(buffer)]() {
+            try {
+                // Perform blob upload asynchronously
+                std::cout<<"uploading blob : "<< std::to_string(buffer.size())<<std::endl;
+                Azure::Core::IO::MemoryBodyStream content(buffer.data(), buffer.size());
+                auto blobClient = getAppendBlobClient(fileName);
+                blobClient.AppendBlock(content);
+                cached_file.erase(fileName);
+                // std::filesystem::remove(fileName);
+            } catch (Azure::Core::RequestFailedException const& e) {
+                if (e.ErrorCode == "BlobIsSealed") {
+                    // Handle sealed blob error
+                }
+                // Handle other errors
+            } catch (std::exception const& e) {
+                // Handle general exceptions
+            }
+        }).detach();  // Detach the thread to run asynchronously
+    */
   }
   return Status::kSuccess;
 }
@@ -141,9 +141,9 @@ Status AzureBlobStorage::flush(std::string const& fileName) {
   Azure::Storage::Blobs::UploadBlockBlobOptions options;
   Azure::Core::Context context;
   try {
-    blobClient.Upload(content, options, context); 
+    blobClient.Upload(content, options, context);
     cached_file.erase(it);
-  } catch (const std::exception& e) {
+  } catch (std::exception const& e) {
     return Status::kFailure;
   }
   return Status::kSuccess;
@@ -160,12 +160,11 @@ Status AzureBlobStorage::read(std::string const& fileName, unsigned char*& data,
     Azure::Core::Context context;
     auto response = blobClient.Download(options, context);
     size_t totalBytesRead = 0;
-    while (totalBytesRead < size)
-    { 
-        size_t bytesRead = response.Value.BodyStream->Read(
-            data + totalBytesRead, size - totalBytesRead, context);
-        if (bytesRead == 0) break; // End of stream
-        totalBytesRead += bytesRead;
+    while (totalBytesRead < size) {
+      size_t bytesRead = response.Value.BodyStream->Read(
+          data + totalBytesRead, size - totalBytesRead, context);
+      if (bytesRead == 0) break;  // End of stream
+      totalBytesRead += bytesRead;
     }
     return Status::kSuccess;
   } catch (std::exception const&) {
@@ -185,12 +184,11 @@ Status AzureBlobStorage::read(std::string const& fileName, unsigned char*& data,
     auto response = blobClient.Download(options, context);
     data = new unsigned char[length];
     size_t totalBytesRead = 0;
-    while (totalBytesRead < length)
-    { 
-        size_t bytesRead = response.Value.BodyStream->Read(
-            data + totalBytesRead, length - totalBytesRead, context);
-        if (bytesRead == 0) break; // End of stream
-        totalBytesRead += bytesRead;
+    while (totalBytesRead < length) {
+      size_t bytesRead = response.Value.BodyStream->Read(
+          data + totalBytesRead, length - totalBytesRead, context);
+      if (bytesRead == 0) break;  // End of stream
+      totalBytesRead += bytesRead;
     }
     return Status::kSuccess;
   } catch (std::exception const&) {
@@ -219,19 +217,19 @@ void AzureBlobStorage::seal(std::string fileName) {
 }
 
 bool AzureBlobStorage::isSealed(std::string fileName) {
-    try {
-        auto blobClient = getBlobClient(fileName);
-        auto properties = blobClient.GetProperties().Value;
-        return properties.IsSealed.HasValue() ? properties.IsSealed.Value() : false;
-    } catch (const Azure::Storage::StorageException& e) {
-        // Check for "404 Not Found" error, indicating the blob does not exist
-        if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound) {
-            return false;  // Blob does not exist, return false
-        } else {
-            // Rethrow if it's a different error
-            throw;
-        }
+  try {
+    auto blobClient = getBlobClient(fileName);
+    auto properties = blobClient.GetProperties().Value;
+    return properties.IsSealed.HasValue() ? properties.IsSealed.Value() : false;
+  } catch (Azure::Storage::StorageException const& e) {
+    // Check for "404 Not Found" error, indicating the blob does not exist
+    if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound) {
+      return false;  // Blob does not exist, return false
+    } else {
+      // Rethrow if it's a different error
+      throw;
     }
+  }
 }
 
 void AzureBlobStorage::remove(std::string fileName) {

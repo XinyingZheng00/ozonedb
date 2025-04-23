@@ -8,7 +8,7 @@ namespace ozonedb {
 void LRUCache::updateLRU(std::string const& file_name, std::string const& index_value) {
   if (file_to_entry_map[file_name].lru_itr.find(index_value) != file_to_entry_map[file_name].lru_itr.end()) {
     auto index_value_itr = file_to_entry_map[file_name].lru_itr[index_value];
-    lru_list.erase(index_value_itr); 
+    lru_list.erase(index_value_itr);
   }
   lru_list.push_front({file_name, index_value});
   file_to_entry_map[file_name].lru_itr[index_value] = lru_list.begin();
@@ -42,7 +42,6 @@ void LRUCache::updateLRULog(std::string const& file_name) {
   } else {
     lru_list_log.push_front(file_name);
   }
-
 }
 
 // Function to evict the least recently used item
@@ -92,7 +91,7 @@ void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, s
     auto* rec = static_cast<Record*>(msg);
     records_tmp[rec->key()] = rec;
   }
-  bool sealed = file_name!=latest_view->current_log_tail;
+  bool sealed = file_name != latest_view->current_log_tail;
   putLogRecords(file_name, records_tmp, size, sealed);
 }
 

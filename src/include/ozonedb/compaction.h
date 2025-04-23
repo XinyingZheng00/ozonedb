@@ -23,7 +23,7 @@ class Compaction {
   TaskRecord::TaskIdentifier* task_id = nullptr;
   TableBuilder* outputBuilder = nullptr;
   bool finished = false;
-  int compaction_version = -1; // this is only used for the last layer compaction
+  int compaction_version = -1;  // this is only used for the last layer compaction
 };
 
 class CompactionWatcher {

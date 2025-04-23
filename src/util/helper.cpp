@@ -40,7 +40,7 @@ int getNumberInTheEnd(std::string const& filename) {
   return -1;
 }
 
-//sstable1/e71c7eb6-b20b-4ebe-8a23-965b1269b673202410081038101728405491035205186.sst
+// sstable1/e71c7eb6-b20b-4ebe-8a23-965b1269b673202410081038101728405491035205186.sst
 int getSSTLayerNumber(std::string const& filename) {
   std::regex re(R"(sstable(\d+)/.*)");
   std::smatch match;

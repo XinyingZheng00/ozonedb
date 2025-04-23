@@ -47,23 +47,20 @@ Status CompactionWatcher::watchForCompaction(std::atomic<bool> const* active) {
     bool has_worked_on_compaction;
     Compaction* compaction = nullptr;
     TaskRecord* task_record = nullptr;
-    
+
     Status status = pickCompaction(compaction, task_record, has_worked_on_compaction);
-    
+
     if (!has_worked_on_compaction) {
-      
-      std::this_thread::sleep_for(std::chrono::milliseconds(100)); // only sleep when there's nothing to do
-      
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));  // only sleep when there's nothing to do
+
     } else {
-      
       Status status = startCompaction(compaction, task_record);
       delete compaction;
       delete task_record;
       compaction = nullptr;
       task_record = nullptr;
-      
+
       if (status != Status::kSuccess) {
-        
         return Status::kFailure;  // crash
       }
     }
@@ -266,21 +263,20 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       this->event_listener->onSSTableCompactionStart();
     }
   }
-  
+
   for (auto const& input : compaction->task_id->input_files()) {
     // read from log level
-    
+
     log_string += input + " ";
     if (input.find(this->metadata->log_prefix) != std::string::npos) {
-      
       std::unordered_map<std::string, Record*> records_tmp;
       unsigned char* buffer = nullptr;
       size_t file_size;
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
       std::unique_lock file_lock(file_mutex);
-      
+
       this->storage->read(input, buffer, file_size);
-      
+
       file_lock.unlock();
       std::vector<google::protobuf::Message*> messages;
       protobuf::deserializeMessages(buffer, file_size, messages, []() -> google::protobuf::Message* {
@@ -296,16 +292,14 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
         key_record[rec->key()] = rec;
       }
     } else {
-      
-
       std::unordered_map<std::string, Record*> records_tmp;
       Table* table = nullptr;
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
       std::unique_lock file_lock(file_mutex);
-      
+
       Table::open(this->storage, input, table);
       records_tmp = table->getAll();
-      
+
       file_lock.unlock();
       // print the range of records_tmp
       std::string key_start = records_tmp.begin()->first;
@@ -325,7 +319,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       delete table;
     }
   }
-  
+
   std::vector<Record*> records;
   records.reserve(key_record.size());
   for (auto const& [key, record] : key_record) {
@@ -334,7 +328,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
 
   // Step3: write to the destination file, cut the file by the max file size
   // sort based on the key
-  
+
   log_string += "into";
   std::sort(records.begin(), records.end(), [](Record* a, Record* b) {
     return a->key() < b->key();
@@ -372,7 +366,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     }
     compaction->outputBuilder->add(records[i]->key(), *records[i]);
   }
-  
+
   if (compaction->outputBuilder != nullptr) {
     compaction->outputBuilder->finish();
     key_range.second = records[records.size() - 1]->key();
@@ -381,7 +375,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     delete compaction->outputBuilder;
     compaction->outputBuilder = nullptr;
   }
-  
+
   OperationRecord operation_record;
   operation_record.set_op_type(OperationRecord::COMPACT);
   for (auto const& input : compaction->task_id->input_files()) {
@@ -398,7 +392,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     operation_record.set_compact_in_last_level(true);
   }
   this->metadata_handler->appendToMetadataLog(operation_record);
-  
+
   // Step4: delete the input files: append to metadata log first, then delete
   for (auto const& input : compaction->task_id->input_files()) {
     // std::cout << "Deleting " << input << std::endl;

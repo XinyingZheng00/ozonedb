@@ -13,8 +13,7 @@ DB::DB(std::string const& shared_config_path) {
   }
   if (this->metadata->is_cloud) {
     this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
-  }
-  else{
+  } else {
     this->storage = new FileStorage(this->metadata->DBpath);
   }
   this->tail_cache = new TailCache();
@@ -127,7 +126,7 @@ Status DB::remove(std::string const& key) {
 
 Status DB::get(std::string const& key, std::string const*& value) {
   // Step1: get the latest view and cache state from metadata log
-  metadata_log->rollForwardMetadataLog(); 
+  metadata_log->rollForwardMetadataLog();
   metadata_log->getLatestView(this->latest_view);
   this->log_handler->setLatestView(&this->latest_view);
   this->sstable_handler->setLatestView(&this->latest_view);

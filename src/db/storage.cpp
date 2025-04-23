@@ -171,7 +171,7 @@ void FileStorage::remove(std::string fileName) {
   try {
     // Attempt to remove the file
     std::filesystem::remove(this->storage_path + fileName);
-  } catch (const std::filesystem::filesystem_error &e) {
+  } catch (std::filesystem::filesystem_error const& e) {
     // Output the error message and error code
     std::cerr << "Error deleting file: " << e.what() << '\n';
     std::cerr << "Error code: " << e.code().message() << '\n';

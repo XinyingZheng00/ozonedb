@@ -207,7 +207,7 @@ Status TableBuilder::finish() {
       r->offset += footer_encoding_size;
     }
   }
-  r->storage->flush(r->fileName); //flush at last
+  r->storage->flush(r->fileName);  // flush at last
   // r->storage->seal(r->fileName);
   delete filter_block_identifier;
   delete filter_block_for_file_identifier;

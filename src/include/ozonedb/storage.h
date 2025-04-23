@@ -1,6 +1,7 @@
 #ifndef STORAGE_H
 #define STORAGE_H
 #include "protobuf/record.pb.h"
+#include "status.h"
 #include <azure/identity/client_secret_credential.hpp>
 #include <azure/storage/blobs.hpp>
 #include <filesystem>
@@ -13,9 +14,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "status.h"
 namespace ozonedb {
-
 
 /**
  * @brief Base class for all the storage classes
@@ -178,14 +177,14 @@ class FileStorage : public Storage {
 using namespace Azure::Storage::Blobs;
 using namespace Azure::Identity;
 class AzureBlobStorage : public Storage {
-public:
+ public:
   std::shared_ptr<BlobServiceClient> blobServiceClient;
   std::shared_ptr<BlobContainerClient> containerClient;
   std::string containerName;
-  std::mutex mtx;  // Mutex for the cached_file
+  std::mutex mtx;                                                           // Mutex for the cached_file
   std::unordered_map<std::string, std::vector<unsigned char>> cached_file;  // In-memory cache for sstable data
   std::chrono::_V2::system_clock::time_point last_commited_time_;
-  int commit_count_ = 0;  // Commit count
+  int commit_count_ = 0;      // Commit count
   int commit_interval_ = 10;  // Commit interval in milliseconds
 
   // vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==

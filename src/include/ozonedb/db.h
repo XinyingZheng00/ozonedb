@@ -89,7 +89,7 @@ class DB {
     return tail_cache;
   }
 
-  //set event listener
+  // set event listener
   void setEventListener(EventListener* event_listener) {
     this->event_listener = event_listener;
     this->watcher->setEventListener(event_listener);

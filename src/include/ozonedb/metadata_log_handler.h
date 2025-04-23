@@ -63,7 +63,7 @@ class MetadataLogHandler {
     this->tail_cache = tail_cache;
   };
   void setEventListener(EventListener* event_listener) { this->event_listener = event_listener; }
-  
+
   void setLRUCache(LRUCache* lru_cache) { this->lru_cache = lru_cache; }
 
   void setMetadata(Metadata* metadata) { this->metadata = metadata; }

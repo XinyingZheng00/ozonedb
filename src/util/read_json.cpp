@@ -50,7 +50,7 @@ std::map<std::string, std::string> parseJSON(std::string const& path) {
   return result;
 }
 
-std::vector<std::string> jsonArrayToVector(std::string & json) {
+std::vector<std::string> jsonArrayToVector(std::string& json) {
   std::vector<std::string> vec;
   std::string delimiter = ",";
   size_t pos = 0;
