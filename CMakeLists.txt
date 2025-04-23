@@ -1,4 +1,3 @@
-# set(CMAKE_POSITION_INDEPENDENT_CODE ON) only for shared libraries
 # set(CMAKE_BUILD_TYPE DEBUG) # enable debug symbols
 # link_directories($ENV{OZONEDB_HOME}/build/vcpkg_installed/x64-linux/lib)
 # include_directories(/usr/local/include)
@@ -15,6 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 
 if(NOT ERPC_DIR)

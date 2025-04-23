@@ -1,16 +1,16 @@
 #include "jni_OzoneDBJNI.h"
 #include "db.h"
-#include <log4cxx/basicconfigurator.h>
-#include <log4cxx/helpers/exception.h>
-#include <log4cxx/logger.h>
-#include <log4cxx/logmanager.h>
-#include <log4cxx/propertyconfigurator.h>
-#include <log4cxx/xml/domconfigurator.h>
+// #include <log4cxx/basicconfigurator.h>
+// #include <log4cxx/helpers/exception.h>
+// #include <log4cxx/logger.h>
+// #include <log4cxx/logmanager.h>
+// #include <log4cxx/propertyconfigurator.h>
+// #include <log4cxx/xml/domconfigurator.h>
 #include <iostream>
 
-using namespace log4cxx;
-using namespace log4cxx::helpers;
-LoggerPtr logger;
+// using namespace log4cxx;
+// using namespace log4cxx::helpers;
+// LoggerPtr logger;
 
 thread_local ozonedb::DB* db_instance = nullptr;
 class EventListenerOzonedb : public ozonedb::EventListener {
@@ -57,8 +57,8 @@ class EventListenerOzonedb : public ozonedb::EventListener {
 
 
 JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_openDB(JNIEnv* env, jobject obj, jstring configPath) {
-  BasicConfigurator::configure();  // Configure the logger
-  logger = Logger::getLogger("event");
+  // BasicConfigurator::configure();  // Configure the logger
+  // logger = Logger::getLogger("event");
   char const* nativeConfigPath = env->GetStringUTFChars(configPath, 0);
   ozonedb::Status status = ozonedb::DB::openDB(db_instance, std::string(nativeConfigPath));
   db_instance->setEventListener(new EventListenerOzonedb());

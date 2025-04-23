@@ -16,15 +16,6 @@
     <build>
         <plugins>
             <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.1</version>
-                <configuration>
-                    <source>1.8</source>
-                    <target>1.8</target>
-                </configuration>
-            </plugin>
-            <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>native-maven-plugin</artifactId>
                 <version>1.0-alpha-8</version>
@@ -43,11 +34,11 @@
                     </sources>
                     <compilerStartOptions>
                         <compilerStartOption>-std=c++17</compilerStartOption> 
-                        <compilerStartOption>-I ${JAVA_HOME}/include/</compilerStartOption>
+                        <compilerStartOption>-I ${JAVA_HOME}/include/</compilerStartOption> <!-- for jni.h -->
                         <compilerStartOption>-I ${JAVA_HOME}/include/linux/</compilerStartOption>
-                        <compilerStartOption>-I../../src/include/ozonedb/</compilerStartOption>
-                        <compilerStartOption>-I../../src/util/</compilerStartOption>
-                        <compilerStartOption>-I${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/include/</compilerStartOption>
+                        <compilerStartOption>-I ${OZONEDB_HOME}/src/include/ozonedb/</compilerStartOption>
+                        <compilerStartOption>-I ${OZONEDB_HOME}/src/util/</compilerStartOption>
+                        <compilerStartOption>-I ${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/include/</compilerStartOption>
                     </compilerStartOptions>
                     <compilerEndOptions>
                         <compilerEndOption>-fPIC</compilerEndOption>
@@ -58,8 +49,18 @@
                     <linkerEndOptions>
                         <linkerEndOption>-shared</linkerEndOption>
                         <linkerEndOption>-L${OZONEDB_HOME}/ozonedb-jni-maven/native/src/main/cpp/lib -lOzoneDB</linkerEndOption>
-                        <linkerEndOption>-L${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/lib -llog4cxx -lapr-1</linkerEndOption>
-                        <linkerEndOption>-Wl,-rpath=${OZONEDB_HOME}/ozonedb-jni-maven/native/src/main/cpp/lib</linkerEndOption>
+                        <linkerEndOption>-L${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/lib</linkerEndOption>
+                        <linkerEndOption>-Wl,--start-group</linkerEndOption>
+                        <linkerEndOption>-lprotobuf</linkerEndOption>
+                        <linkerEndOption>-labsl</linkerEndOption>
+                        <linkerEndOption>-lazure-core</linkerEndOption>
+                        <linkerEndOption>-lazure-storage-blobs</linkerEndOption>
+                        <linkerEndOption>-lazure-storage-common</linkerEndOption>
+                        <linkerEndOption>-lxml2</linkerEndOption>
+                        <linkerEndOption>-lssl</linkerEndOption>
+                        <linkerEndOption>-lcrypto</linkerEndOption>
+                        <linkerEndOption>-lcurl</linkerEndOption>
+                        <linkerEndOption>-Wl,--end-group</linkerEndOption>
                     </linkerEndOptions>
                 </configuration>
             </plugin>

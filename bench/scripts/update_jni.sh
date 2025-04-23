@@ -5,7 +5,7 @@ rm -rf $OZONEDB_HOME/build/CMakeCache.txt
 cd $OZONEDB_HOME/build
 cmake .. && make -j20
 mkdir -p ../ozonedb-jni-maven/native/src/main/cpp/lib
-cp libOzoneDB.so ../ozonedb-jni-maven/native/src/main/cpp/lib/.
+cp libOzoneDB.a ../ozonedb-jni-maven/native/src/main/cpp/lib/.
 cd ../ozonedb-jni-maven
 sudo mkdir -p /tank && sudo chmod 777 /tank && mvn clean package
 sudo cp ${OZONEDB_HOME}/ozonedb-jni-maven/jni/target/classes/libozonedb.so /usr/lib/
