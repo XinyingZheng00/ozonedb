@@ -52,7 +52,7 @@ Status LogHandler::addRecord(Record const& record) {
     newTail();
   }
   View view;
-  metadata_log->rollForwardMetadataLog();
+  // metadata_log->rollForwardMetadataLog();
   metadata_log->getLatestView(view);
   while (view.getFileSize(this->active_unit) >= this->file_size_limit || view.current_log_tail != this->active_unit) {
     newTail();

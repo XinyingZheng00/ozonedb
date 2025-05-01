@@ -8,11 +8,11 @@ sudo GLOG_minloglevel=1 -P /sharedfs/LazyLog-Artifact/cfg/be.prop -P /sharedfs/L
 
 SharedLogStorage::SharedLogStorage(int client_id) {
   lazylog::Properties prop;
-  std::ifstream be("/sharedfs/LazyLog-Artifact/cfg/be.prop");
+  std::ifstream be("/sharedfs/LazyLog-Artifact/cfg_datalog/be.prop");
   prop.Load(be);
-  std::ifstream dl_client("/sharedfs/LazyLog-Artifact/cfg/dl_client.prop");
+  std::ifstream dl_client("/sharedfs/LazyLog-Artifact/cfg_datalog/dl_client.prop");
   prop.Load(dl_client);
-  std::ifstream rdma("/sharedfs/LazyLog-Artifact/cfg/rdma.prop");
+  std::ifstream rdma("/sharedfs/LazyLog-Artifact/cfg_datalog/rdma.prop");
   prop.Load(rdma);
   if (client_id != -1) {
     prop.SetProperty("dur_log.client_id", std::to_string(client_id));

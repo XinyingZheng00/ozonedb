@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns="http://maven.apache.org/POM/4.0.0"
+    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>lazykvjnimaven</groupId>
+        <artifactId>jni-demo</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>demoproc-native</artifactId>
+    <packaging>so</packaging>
+
+    <name>demoproc-native</name>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>native-maven-plugin</artifactId>
+                <version>1.0-alpha-8</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <compilerProvider>generic-classic</compilerProvider>
+                    <compilerExecutable>g++</compilerExecutable>
+                    <linkerExecutable>g++</linkerExecutable>
+                    <sources>
+                        <source>
+                            <directory>${basedir}/src/main/cpp/</directory>
+                            <fileNames>
+                                <fileName>jni_LazyKVJNI.cpp</fileName>
+                                <fileName>lazy_kv_client.cpp</fileName>
+                            </fileNames>
+                        </source>
+                    </sources>
+                    <compilerStartOptions>
+                        <compilerStartOption>-std=c++17</compilerStartOption> 
+                        <compilerStartOption>-I ${JAVA_HOME}/include/</compilerStartOption> <!-- for jni.h -->
+                        <compilerStartOption>-I ${JAVA_HOME}/include/linux/</compilerStartOption>
+                        <compilerStartOption>-I /sharedfs/eRPC/src/</compilerStartOption>
+                        <compilerStartOption>-I /sharedfs/eRPC/third_party/asio/include</compilerStartOption>
+                        <compilerStartOption>-DERPC_INFINIBAND=true</compilerStartOption>
+                    </compilerStartOptions>
+                    <compilerEndOptions>
+                        <compilerEndOption>-fPIC</compilerEndOption>
+                        <compilerEndOption>-shared</compilerEndOption>
+                    </compilerEndOptions>
+                    <linkerStartOptions>
+                    </linkerStartOptions>
+                    <linkerEndOptions>
+                        <linkerEndOption>-shared</linkerEndOption>
+                        <linkerEndOption>-L${OZONEDB_HOME}/lazykv-jni-maven/native/src/main/cpp/lib -lerpc</linkerEndOption>
+                        <linkerEndOption>-libverbs</linkerEndOption>
+                        <linkerEndOption>-lnuma</linkerEndOption>
+                    </linkerEndOptions>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

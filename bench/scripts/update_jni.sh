@@ -1,4 +1,4 @@
-# cd $OZONEDB_HOME/src/include/ozonedb/protobuf && rm -rf *
+cd $OZONEDB_HOME/src/include/ozonedb/protobuf && rm -rf *
 mkdir -p $OZONEDB_HOME/src/include/ozonedb/protobuf
 mkdir -p $OZONEDB_HOME/build
 rm -rf $OZONEDB_HOME/build/CMakeCache.txt
