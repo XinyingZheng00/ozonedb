@@ -39,6 +39,8 @@
                         <compilerStartOption>-I ${JAVA_HOME}/include/linux/</compilerStartOption>
                         <compilerStartOption>-I /sharedfs/eRPC/src/</compilerStartOption>
                         <compilerStartOption>-I /sharedfs/eRPC/third_party/asio/include</compilerStartOption>
+                        <compilerStartOption>-I /sharedfs/LazyLog-Artifact/src</compilerStartOption>
+                        <compilerStartOption>-I ${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/include/</compilerStartOption>
                         <compilerStartOption>-DERPC_INFINIBAND=true</compilerStartOption>
                     </compilerStartOptions>
                     <compilerEndOptions>
@@ -49,9 +51,11 @@
                     </linkerStartOptions>
                     <linkerEndOptions>
                         <linkerEndOption>-shared</linkerEndOption>
-                        <linkerEndOption>-L${OZONEDB_HOME}/lazykv-jni-maven/native/src/main/cpp/lib -lerpc</linkerEndOption>
+                        <linkerEndOption>-L${OZONEDB_HOME}/build/vcpkg_installed/x64-linux/lib -labsl</linkerEndOption>
+                        <linkerEndOption>-L${OZONEDB_HOME}/lazykv-jni-maven/native/src/main/cpp/lib -llazylogcli -lbackendcli -lerpc</linkerEndOption>
                         <linkerEndOption>-libverbs</linkerEndOption>
                         <linkerEndOption>-lnuma</linkerEndOption>
+                        <linkerEndOption>-lglog</linkerEndOption>
                     </linkerEndOptions>
                 </configuration>
             </plugin>

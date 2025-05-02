@@ -1,64 +1,40 @@
-#ifndef YCSB_C_LAZY_KV_H_
-#define YCSB_C_LAZY_KV_H_
+#ifndef LAZY_KV_H_
+#define LAZY_KV_H_
 
-#include "rpc.h"
-#
+#include "client/lazylog_cli.h"
+#include <absl/container/flat_hash_map.h>
+#include <atomic>
 
-const uint8_t KV_INSERT = 41;
-const uint8_t KV_READ = 42;
+namespace lazylog {
 
 class LazyKV {
-  friend void rpc_cont_func(void* context, void* tag);
-
  public:
-  LazyKV() : complete_(false) {}
+  LazyKV() {}
   ~LazyKV() {}
-  void Init(std::string client_uri, std::string wr_server_uri, std::string rd_server_uri, uint8_t phy_port, int msg_size);
+
+  void Init(std::string be_path, std::string dl_client_path, std::string rdma_path, int client_id);
   void Cleanup();
-
-  // void Read(std::string const& key, std::vector<Field>& result);
-
-  // void Scan(std::string const& key, int len, std::vector<std::string> const* fields,
-  //             std::vector<std::vector<Field>>& result) {
-  //   throw "Scan: function not implemented!";
-  // }
-
-  // void Update(std::string const& key, std::vector<Field>& values) {
-  //   return Insert(key, values);
-  // }
-
-  // void Insert(std::string const& key, std::vector<Field>& values);
-
+  void Read(std::string const& key, std::string const*& value);
+  void Insert(std::string const& key, std::string value);
+  void Update(std::string const& key, std::string value) { Insert(key, value); };
   void Delete(std::string const& key) { throw "Delete: function not implemented!"; }
 
-  void ReadIdx(const uint64_t idx, std::string& data) { throw "ReadIdx: function not implemented!"; }
-
  private:
-  /**
-   * key format:
-   * | len | key |
-   */
-  static size_t SerializeKey(std::string const& key, char* data);
+  Properties prop;
+  LazyLogClient* ll_cli_w = nullptr;
+  LazyLogClient* ll_cli_r = nullptr;
 
-  /**
-   * value format:
-   * | field0_len | field0 | value0_len | value0 |...
-   */
-  // static size_t SerializeRow(std::vector<Field> const& values, char* data);
-  // static void DeserializeRow(std::vector<Field>& values, char const* p, char const* lim);
-  void pollForRpcComplete();
-  void notifyRpcComplete();
+  bool is_reader = false;
+  std::thread* playlog_thread_ = nullptr;
+  uint64_t next_idx_ = 0;
 
- protected:
-  static erpc::Nexus* nexus_;
-  erpc::Rpc<erpc::CTransport>* rpc_;
-  int wr_session_num_;
-  int rd_session_num_;
-  erpc::MsgBuffer req_;
-  erpc::MsgBuffer resp_;
-  static std::atomic<uint8_t> global_rpc_id_;
+  bool running;
+  static absl::flat_hash_map<std::string, std::string> kv_store_;
 
-  bool complete_;
-};
-
-#endif
+  void playlog_func();
+  std::string Serialize(std::string const& key, std::string const& value, uint8_t op);
+  std::string DeserializeKey(const char* data);
+  bool Deserialize(std::string const& buffer, std::string& key, std::string& value, uint8_t& op);
+  };
+}  // namespace lazylog
+#endif  // LAZY_KV_H_

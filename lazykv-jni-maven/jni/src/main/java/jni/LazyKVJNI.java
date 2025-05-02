@@ -1,14 +1,13 @@
 package jni;
 
-import java.util.*;
-
 public class LazyKVJNI {
   static {
     System.loadLibrary("lazykv");
   }
 
-  public native void init(String clientUri, String writeServerUri, String readServerUri, int phyPort, int msgSize);
-  public native int insert(String table, String key, Map<String, String> values);
-  public native int read(String table, String key, Map<String, String> result);
+  public native void init(String be_prop_path, String cl_client_path, String rdma_path, int client_id);
+  public native void insert(String key, byte[] value);
+  public native void update(String key, byte[] value);
+  public native byte[] read(String key);
   public native void cleanup();
 }

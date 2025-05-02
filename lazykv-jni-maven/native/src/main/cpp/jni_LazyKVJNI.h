@@ -10,30 +10,42 @@ extern "C" {
 /*
  * Class:     jni_LazyKVJNI
  * Method:    init
- * Signature: (Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;II)V
+ * Signature: (Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V
  */
-JNIEXPORT void JNICALL Java_jni_LazyKVJNI_init(JNIEnv*, jobject, jstring, jstring, jstring, jint, jint);
+JNIEXPORT void JNICALL Java_jni_LazyKVJNI_init
+  (JNIEnv *, jobject, jstring, jstring, jstring, jint);
 
 /*
  * Class:     jni_LazyKVJNI
  * Method:    insert
- * Signature: (Ljava/lang/String;Ljava/lang/String;Ljava/util/Map;)I
+ * Signature: (Ljava/lang/String;[B)V
  */
-JNIEXPORT jint JNICALL Java_jni_LazyKVJNI_insert(JNIEnv*, jobject, jstring, jstring, jobject);
+JNIEXPORT void JNICALL Java_jni_LazyKVJNI_insert
+  (JNIEnv *, jobject, jstring, jbyteArray);
+
+/*
+ * Class:     jni_LazyKVJNI
+ * Method:    update
+ * Signature: (Ljava/lang/String;[B)V
+ */
+JNIEXPORT void JNICALL Java_jni_LazyKVJNI_update
+  (JNIEnv *, jobject, jstring, jbyteArray);
 
 /*
  * Class:     jni_LazyKVJNI
  * Method:    read
- * Signature: (Ljava/lang/String;Ljava/lang/String;Ljava/util/Map;)I
+ * Signature: (Ljava/lang/String;)[B
  */
-JNIEXPORT jint JNICALL Java_jni_LazyKVJNI_read(JNIEnv*, jobject, jstring, jstring, jobject);
+JNIEXPORT jbyteArray JNICALL Java_jni_LazyKVJNI_read
+  (JNIEnv *, jobject, jstring);
 
 /*
  * Class:     jni_LazyKVJNI
  * Method:    cleanup
  * Signature: ()V
  */
-JNIEXPORT void JNICALL Java_jni_LazyKVJNI_cleanup(JNIEnv*, jobject);
+JNIEXPORT void JNICALL Java_jni_LazyKVJNI_cleanup
+  (JNIEnv *, jobject);
 
 #ifdef __cplusplus
 }

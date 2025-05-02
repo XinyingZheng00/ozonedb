@@ -20,6 +20,8 @@ int main(int argc, const char *argv[]) {
             std::cout << "Wrote entry " << i << std::endl;
         }
     } else {
+        int tail = std::get<0>(cli.GetTail());
+        std::cout << "Tail: " << tail << std::endl;
         int yea = 0, nay = 0;
         std::string data;
         for (int i = 0; i < 10; i++) {
