@@ -4,12 +4,15 @@
 #include <map>
 #include <string>
 using namespace lazylog;
-thread_local LazyKV* kv = nullptr;  // todo: multiple thread problem
+
+static LazyKV* kv = nullptr;  // multiple threads should access the same kv instance
+static std::once_flag kv_init_once;
+static std::once_flag kv_cleanup_once;
 
 extern "C" {
 
-JNIEXPORT void JNICALL Java_jni_LazyKVJNI_init(JNIEnv* env, jobject, jstring be_path, jstring dl_client_path, jstring rdma_path, jint client_id) {
-  if (kv == nullptr) {
+JNIEXPORT void JNICALL Java_jni_LazyKVJNI_init(JNIEnv* env, jobject, jstring be_path, jstring dl_client_path, jstring rdma_path) {
+  std::call_once(kv_init_once, [&](){
     kv = new LazyKV();
     char const* be_path_cstr = env->GetStringUTFChars(be_path, 0);
     char const* dl_client_path_cstr = env->GetStringUTFChars(dl_client_path, 0);
@@ -19,12 +22,12 @@ JNIEXPORT void JNICALL Java_jni_LazyKVJNI_init(JNIEnv* env, jobject, jstring be_
     std::string dl_client(dl_client_path_cstr);
     std::string rdma(rdma_path_cstr);
 
-    kv->Init(be, dl_client, rdma, client_id);
+    kv->Init(be, dl_client, rdma);
 
     env->ReleaseStringUTFChars(be_path, be_path_cstr);
     env->ReleaseStringUTFChars(dl_client_path, dl_client_path_cstr);
     env->ReleaseStringUTFChars(rdma_path, rdma_path_cstr);
-  }
+   });
 }
 
 JNIEXPORT void JNICALL Java_jni_LazyKVJNI_insert(JNIEnv* env, jobject, jstring jkey, jbyteArray jvalue) {
@@ -54,10 +57,12 @@ JNIEXPORT jbyteArray JNICALL Java_jni_LazyKVJNI_read(JNIEnv* env, jobject, jstri
 }
 
 JNIEXPORT void JNICALL Java_jni_LazyKVJNI_cleanup(JNIEnv*, jobject) {
-  if (kv) {
-    kv->Cleanup();
-    delete kv;
-    kv = nullptr;
-  }
+  LOG(INFO) << "Cleaning up LazyKVJNI";
+  std::call_once(kv_cleanup_once, [&](){
+      kv->Cleanup();
+      // delete kv;
+      // kv = nullptr;
+   });
+   LOG(INFO) << "Cleaning up LazyKVJNI finisged";
 }
 }

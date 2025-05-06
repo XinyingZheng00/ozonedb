@@ -1,10 +1,9 @@
 #include "lazy_kv_client.h"
 #include "utils/properties.h"
 #include <iostream>
+#include <thread>
 
 namespace lazylog {
-
-absl::flat_hash_map<std::string, std::string> LazyKV::kv_store_ = {};
 
 void LazyKV::playlog_func() {
   ll_cli_r = new LazyLogClient();
@@ -34,7 +33,18 @@ void LazyKV::playlog_func() {
   delete ll_cli_r;
 }
 
-void LazyKV::Init(std::string be_path, std::string dl_client_path, std::string rdma_path, int client_id) {
+std::shared_ptr<ClientWrapper> LazyKV::get_available_client() {
+  std::lock_guard<std::mutex> lock(rw_mutex_);
+  for (auto& wrapper : ll_cli_w_pool_) {
+    bool expected = false;
+    if (wrapper->is_busy.compare_exchange_strong(expected, true)) {
+      return wrapper;
+    }
+  }
+  return nullptr;
+}
+
+void LazyKV::Init(std::string be_path, std::string dl_client_path, std::string rdma_path) {
   running = true;
   std::ifstream be(be_path);
   prop.Load(be);
@@ -43,25 +53,27 @@ void LazyKV::Init(std::string be_path, std::string dl_client_path, std::string r
   std::ifstream rdma(rdma_path);
   prop.Load(rdma);
 
-  if (client_id == 0) {
-    is_reader = true;
-    playlog_thread_ = new std::thread(&LazyKV::playlog_func, this);
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  for (int i = 0; i < num_threads -1; i++) {
+    auto wrapper = std::make_shared<ClientWrapper>();
+    wrapper->client = new LazyLogClient();
+    wrapper->is_busy = false;
+    wrapper->client->Initialize(prop);
+    ll_cli_w_pool_.push_back(wrapper);  
   }
-  else{
-    ll_cli_w = new LazyLogClient();
-    ll_cli_w->Initialize(prop);
-  }
+  playlog_thread_ = new std::thread(&LazyKV::playlog_func, this);
 }
 
 void LazyKV::Cleanup() {
   running = false;
-  if (is_reader) {
-    playlog_thread_->join();
+  playlog_thread_->join();
+  delete playlog_thread_;
+
+  for (auto& wrapper : ll_cli_w_pool_) {
+    wrapper->client->Finalize();
+    delete wrapper->client;
   }
-  else{
-    ll_cli_w->Finalize();
-    delete ll_cli_w;
-  }
+  ll_cli_w_pool_.clear();
 }
 
 void LazyKV::Read(std::string const& key, std::string const*& value) {
@@ -77,7 +89,12 @@ void LazyKV::Read(std::string const& key, std::string const*& value) {
 void LazyKV::Insert(std::string const& key, std::string value) {
   uint8_t op = KV_INSERT;
   std::string buffer = Serialize(key, value, op);
-  ll_cli_w->AppendEntryAll(buffer);
+  std::shared_ptr<ClientWrapper> wrapper = get_available_client();
+  if (wrapper == nullptr) {
+    throw std::runtime_error("No available RW client!");
+  }
+  wrapper->client->AppendEntryAll(buffer);
+  wrapper->is_busy.store(false);
 }
 
 std::string LazyKV::Serialize(std::string const& key, std::string const& value, uint8_t op) {

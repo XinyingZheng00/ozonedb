@@ -13,7 +13,7 @@ extern "C" {
  * Signature: (Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V
  */
 JNIEXPORT void JNICALL Java_jni_LazyKVJNI_init
-  (JNIEnv *, jobject, jstring, jstring, jstring, jint);
+  (JNIEnv *, jobject, jstring, jstring, jstring);
 
 /*
  * Class:     jni_LazyKVJNI
