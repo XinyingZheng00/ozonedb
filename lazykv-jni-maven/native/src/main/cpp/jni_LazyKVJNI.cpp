@@ -60,8 +60,8 @@ JNIEXPORT void JNICALL Java_jni_LazyKVJNI_cleanup(JNIEnv*, jobject) {
   LOG(INFO) << "Cleaning up LazyKVJNI";
   std::call_once(kv_cleanup_once, [&](){
       kv->Cleanup();
-      // delete kv;
-      // kv = nullptr;
+      delete kv;
+      kv = nullptr;
    });
    LOG(INFO) << "Cleaning up LazyKVJNI finisged";
 }
