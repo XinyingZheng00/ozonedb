@@ -8,6 +8,11 @@ std::string getPrefix(std::string const& filename);
 // helper function : get suffix of a string, the filename string is always in the format of prefix/number
 std::string getSuffix(std::string const& filename);
 
+#ifdef SHARED_LOG
+int getEndOffset(std::string const& filename);
+int getStartOffset(std::string const& filename);
+#endif
+
 // helper function : get the number in the end of a string, the filename string is always in the format of prefixnumber
 int getNumberInTheEnd(std::string const& filename);
 

@@ -23,12 +23,11 @@ class Metadata {
   std::string container_name;  // only for cloud storage
   std::string DBpath;
   int is_cloud = false;
-  std::string metadata_log = "metadata.log";
-  std::string task_log = "task.log";
-  std::string log_prefix = "datalog";
+  std::string metadata_log_path = "metadata.log";
+  std::string task_log_path = "task.log";
+  std::string data_log_prefix = "sharedlog";  // for file system log, it is datalog, for shared log, it is log
   std::string sstable_level_prefix = "sstable";
   std::string task_prefix;
-  int mode = -1;
 
   /**
    * @brief Limit info for all files
@@ -63,7 +62,6 @@ class Metadata {
     DBpath = result["db_path"];
     task_prefix = result["task_prefix"];
     log_file_size_limit = std::stol(result["log_file_size_limit"]);
-    mode = std::stoi(result["mode"]);
     is_cloud = std::stoi(result["cloud"]);
     if (is_cloud) {
       container_name = result["container_name"];

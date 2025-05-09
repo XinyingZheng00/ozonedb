@@ -13,7 +13,6 @@
 namespace ozonedb {
 class FileMutexManager;
 class EventListener;
-enum class Mode;
 /**
  * @brief Represent a compaction task.
  *
@@ -30,6 +29,14 @@ class CompactionWatcher {
  private:
   Metadata* metadata = nullptr;
   Storage* storage = nullptr;
+#ifdef SHARED_LOG
+  SharedLogStorage* sharedlog_storage = nullptr;
+
+ public:
+  void setSharedLogStorage(SharedLogStorage* sharedlog_storage) { this->sharedlog_storage = sharedlog_storage; }
+
+ private:
+#endif
   LogHandler* task_handler = nullptr;
   LogHandler* log_handler = nullptr;
   SSTableHandler* sstable_handler = nullptr;
@@ -41,7 +48,6 @@ class CompactionWatcher {
   std::string fingerprint;
   View latest_view;
   FileMutexManager* file_mutex_manager = nullptr;
-  Mode mode;
 
   Status watchForCompaction(std::atomic<bool> const* active);
   bool shouldWorkOnTask(TaskRecord::TaskIdentifier* task_id, TaskRecord*& task_record, int owner_generation);
@@ -70,7 +76,6 @@ class CompactionWatcher {
   void setFileMutexManager(FileMutexManager* file_mutex_manager) { this->file_mutex_manager = file_mutex_manager; }
   // set thread pool
   void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }
-  void setMode(Mode mode) { this->mode = mode; }
 
   Status pickCompaction(Compaction*& compaction, TaskRecord*& task_record, bool& has_worked_on_compaction);
   Status startCompaction(Compaction* compaction, TaskRecord* task_record);

@@ -3,6 +3,11 @@
 
 // helper function : get prefix of a string, the filename string is always in the format of prefix/suffix
 std::string getPrefix(std::string const& filename) {
+#ifdef SHARED_LOG
+  if (filename.find("sharedlog") != std::string::npos) {
+    return "sharedlog";
+  }
+#endif
   std::regex re(R"(^([^/]+)/[^/]+$)");
   std::smatch match;
   if (std::regex_search(filename, match, re)) {
@@ -13,6 +18,14 @@ std::string getPrefix(std::string const& filename) {
 
 // helper function : get suffix of a string, the filename string is always in the format of prefix/number
 std::string getSuffix(std::string const& filename) {
+#ifdef SHARED_LOG
+  std::regex reg(R"(^sharedlog:(.*)$)");
+  std::smatch mat;
+  if (std::regex_search(filename, mat, reg)) {
+    return mat[1];
+  }
+  return "";
+#endif
   std::regex re(R"(^[^/]+/([^/]+)$)");
   std::smatch match;
   if (std::regex_search(filename, match, re)) {
@@ -20,6 +33,25 @@ std::string getSuffix(std::string const& filename) {
   }
   return "";
 }
+
+#ifdef SHARED_LOG
+int getEndOffset(std::string const& filename) {
+  std::regex re(R"(^sharedlog:(\d+):\d+$)");
+  std::smatch match;
+  if (std::regex_search(filename, match, re)) {
+    return std::stoi(match[1]);
+  }
+  return -1;
+}
+int getStartOffset(std::string const& filename) {
+  std::regex re(R"(^sharedlog:(\d+):\d+$)");
+  std::smatch match;
+  if (std::regex_search(filename, match, re)) {
+    return std::stoi(match[1]);
+  }
+  return -1;
+}
+#endif
 
 int getNumberBeforeUnderscore(std::string const& filename) {
   // Regular expression to match digits before the first underscore

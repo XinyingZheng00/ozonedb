@@ -18,7 +18,6 @@ class View {
   std::unordered_map<std::string, std::pair<std::string, std::string>> key_range;
   std::unordered_map<std::string, size_t> file_size;
   std::string current_log_tail;
-  size_t tail_size;
 
   int getFileNumber(std::string const& prefix);
 
@@ -28,8 +27,6 @@ class View {
 
   size_t getFileSize(std::string const& file_name);
 
-  size_t getTailSize() { return tail_size; }
-
   std::string getCurrentLogTail() { return current_log_tail; }
 };
 
@@ -37,7 +34,25 @@ class MetadataLogHandler {
  private:
   size_t offset;
   std::string active_unit;
-  Storage* storage = nullptr;
+  Storage* storage = nullptr;  // still using storage in sharedlog case for reading sstable
+#ifdef SHARED_LOG
+  size_t predefined_shared_log_segment_size = 32768;
+  SharedLogStorage* metadata_sharedlog_storage = nullptr;
+  SharedLogStorage* data_sharedlog_storage = nullptr;
+
+ public:
+  void setMetadataSharedLogStorage(SharedLogStorage* metadata_sharedlog_storage) {
+    this->metadata_sharedlog_storage = metadata_sharedlog_storage;
+  }
+  void setDataSharedLogStorage(SharedLogStorage* data_sharedlog_storage) {
+    this->data_sharedlog_storage = data_sharedlog_storage;
+  }
+  void setPredefinedSharedLogSegmentSize(size_t predefined_shared_log_segment_size) {
+    this->predefined_shared_log_segment_size = predefined_shared_log_segment_size;
+  }
+
+ private:
+#endif
   TailCache* tail_cache = nullptr;
   LRUCache* lru_cache = nullptr;
   std::thread* update_view_thread = nullptr;

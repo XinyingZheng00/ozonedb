@@ -6,11 +6,6 @@
 namespace ozonedb {
 DB::DB(std::string const& shared_config_path) {
   this->metadata = new Metadata(shared_config_path);
-  if (this->metadata->mode == 0) {
-    this->mode = Mode::Singleton;
-  } else {
-    this->mode = Mode::MultipleProcesses;
-  }
   if (this->metadata->is_cloud) {
     this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
   } else {
@@ -18,24 +13,35 @@ DB::DB(std::string const& shared_config_path) {
   }
   this->tail_cache = new TailCache();
   this->lru_cache = new LRUCache(33554432, storage);
-  this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log, this->storage, this->tail_cache);
+  this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log_path, this->storage, this->tail_cache);
   this->metadata_log->setLRUCache(this->lru_cache);
   this->metadata_log->setMetadata(this->metadata);
-  this->log_handler = new LogHandler(this->metadata->log_file_size_limit, this->metadata->log_prefix, this->storage, lru_cache, metadata_log);
+  this->log_handler = new LogHandler(this->metadata->log_file_size_limit, this->metadata->data_log_prefix, this->storage, lru_cache, metadata_log);
   this->sstable_handler = new SSTableHandler(this->storage, metadata_log, this->metadata->sstable_level_prefix, lru_cache);
   this->sstable_handler->setMaxLevel(this->metadata->max_level);
-  this->thread_pool = new ThreadPool(std::thread::hardware_concurrency());
+  this->thread_pool = new ThreadPool(std::thread::hardware_concurrency());  // change this to number of log segment in log layer
   this->log_handler->setThreadPool(this->thread_pool);
   this->sstable_handler->setThreadPool(this->thread_pool);
   std::string fingerprint = generateFingerprint();
   this->watcher = new CompactionWatcher(this->metadata, this->storage, this->log_handler, metadata_log, this->sstable_handler, fingerprint);
-  this->watcher->setTaskLogHandler(new TaskLogHandler(this->metadata->task_log, this->storage));
-  this->watcher->setMode(this->mode);
+  this->watcher->setTaskLogHandler(new TaskLogHandler(this->metadata->task_log_path, this->storage));
   this->file_mutex_manager = new FileMutexManager();
   this->lru_cache->setFileMutexManager(this->file_mutex_manager);
   this->watcher->setFileMutexManager(this->file_mutex_manager);
   this->watcher->setThreadPool(this->thread_pool);
   srand(std::hash<std::string>{}(fingerprint));
+#ifdef SHARED_LOG
+  this->shareddatalog_storage = new SharedLogStorage(Type::kDataLog, 0);
+  this->sharedmetadatalog_storage = new SharedLogStorage(Type::kMetadataLog, 1);
+  this->sharedtasklog_storage = new SharedLogStorage(Type::kTaskLog, 2);
+  this->metadata_log->setMetadataSharedLogStorage(this->sharedmetadatalog_storage);
+  this->metadata_log->setDataSharedLogStorage(this->shareddatalog_storage);
+  this->log_handler->setSharedLogStorage(this->shareddatalog_storage);
+  this->lru_cache->setSharedLogStorage(this->shareddatalog_storage);
+  this->watcher->setSharedLogStorage(this->sharedtasklog_storage);
+  this->metadata_log->setPredefinedSharedLogSegmentSize(64);
+  this->lru_cache->setPredefinedSharedLogSegmentSize(64);
+#endif
 };
 
 DB::~DB() {
@@ -55,7 +61,7 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   // init DB Logic
   db = new DB(shared_config_path);
   db->active = true;
-  db->metadata_log->rollForwardMetadataLog();
+  // db->metadata_log->rollForwardMetadataLog();
   db->metadata_log->initSSTMetadata();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl
@@ -71,7 +77,7 @@ Status DB::closeDB(DB*& db) {
     db->watcher->stopCompactionWatcher();
   }
   // db->thread_pool->waitForCompletion();
-  db->metadata_log->stopViewUpdate();
+  // db->metadata_log->stopViewUpdate();
   delete db;
   return Status::kSuccess;
 }

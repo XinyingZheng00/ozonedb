@@ -23,9 +23,15 @@ size_t View::getFileSize(std::string const& file_name) {
 
 // Serialize a FileRecord to a file
 void MetadataLogHandler::appendToMetadataLog(OperationRecord const& record) {
+#ifdef SHARED_LOG
+  std::string data = record.SerializeAsString();
+  this->metadata_sharedlog_storage->append(data);
+  return;
+#endif
+
   int buffer_size;
   unsigned char* buffer = protobuf::serializeMessage(record, buffer_size);
-  std::unique_lock<std::shared_mutex> lock(read_mutex);
+  std::unique_lock<std::shared_mutex> lock(read_mutex);  // todo: remove read_mutex
   this->storage->append(this->active_unit, buffer, buffer_size);
   delete[] buffer;
   buffer = nullptr;
@@ -100,6 +106,22 @@ void MetadataLogHandler::getLatestScore(double& score) {
 // Deserialize FileRecords from a file
 std::vector<OperationRecord*> MetadataLogHandler::readMetadataLog() {
   std::unique_lock<std::shared_mutex> lock(read_mutex);
+#ifdef SHARED_LOG
+  size_t log_size = this->metadata_sharedlog_storage->size();
+  if (log_size == this->offset) {
+    return {};
+  }
+  std::vector<OperationRecord*> records_vec;
+  std::vector<std::string> entries;
+  this->metadata_sharedlog_storage->read(entries, this->offset, log_size);
+  for (auto& entry : entries) {
+    auto* record_tmp = new OperationRecord();
+    (*record_tmp).ParseFromString(entry);
+    records_vec.push_back(record_tmp);
+  }
+  return records_vec;
+#endif
+
   if (!this->storage->exist(this->active_unit)) {
     return {};
   }
@@ -127,7 +149,7 @@ std::vector<OperationRecord*> MetadataLogHandler::readMetadataLog() {
 }
 
 std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord* record) {
-  if (record->op_type() == OperationRecord::LOGCREATE) {
+  if (record->op_type() == OperationRecord::LOGCREATE) {  // there will be no logcreate record in the shared log
     std::string const& input_file = record->input_files()[0];
     std::string const& output_file = record->output_file()[0];
     std::string prefix = getPrefix(output_file);
@@ -136,8 +158,6 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       level_layout.push_back(output_file);
       this->latest_view_w.file_size[input_file] = this->storage->size(input_file);
       this->latest_view_w.current_log_tail = output_file;
-      // this->latest_view_w.tail_size = this->storage->size(output_file);
-      // this->latest_view_w.file_size[output_file] = this->latest_view_w.tail_size; => update at outside
       delete record;
       return "tail" + prefix;
     }
@@ -215,15 +235,38 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
 // Roll forward the metadata log to get the latest view
 void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> const* active) {
   while (*active) {
+    std::cout << "zxy zxy roll forward metadata log" << std::endl;
     std::vector<OperationRecord*> records = readMetadataLog();
     if (records.empty()) {
       std::unique_lock<std::shared_mutex> lock(view_mutex_w);
-      if (!this->latest_view_w.current_log_tail.empty()) {
-        this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
-        this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
-        if (this->event_listener != nullptr)
-          this->event_listener->onViewUpdate();
+#ifdef SHARED_LOG
+      size_t log_size = this->data_sharedlog_storage->size();
+      if (log_size != 0) {
+        int start_offset;
+        int end_offset;
+        if (this->latest_view_w.current_log_tail.empty()) {
+          start_offset = 0;
+          end_offset = 0;
+        } else {
+          start_offset = getStartOffset(this->latest_view_w.current_log_tail);
+          end_offset = getEndOffset(this->latest_view_w.current_log_tail);
+          this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = std::min(predefined_shared_log_segment_size, log_size - start_offset);
+        }
+
+        while (log_size > end_offset) {
+          std::string name = "sharedlog:" + std::to_string(end_offset) + ":" + std::to_string(end_offset + predefined_shared_log_segment_size);
+          std::cout << "push file name: " << name << std::endl;
+          this->latest_view_w.current_log_tail = name;
+          this->latest_view_w.storage_layout["sharedlog"].push_back(name);
+          this->latest_view_w.file_size[name] = std::min(predefined_shared_log_segment_size, log_size - end_offset);
+          end_offset += predefined_shared_log_segment_size;
+        }
       }
+#else
+      if (!this->latest_view_w.current_log_tail.empty()) {
+        this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->storage->size(this->latest_view_w.current_log_tail);
+      }
+#endif
       flushLatestView();
       lock.unlock();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -238,10 +281,35 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
         modified_layer = rollforwardSingleOperationRecord(op_record);
       }
     }
-    if (!this->latest_view_w.current_log_tail.empty()) {
-      this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
-      this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
+#ifdef SHARED_LOG
+    size_t log_size = this->data_sharedlog_storage->size();
+    if (log_size != 0) {
+      int start_offset;
+      int end_offset;
+      if (this->latest_view_w.current_log_tail.empty()) {
+        start_offset = 0;
+        end_offset = 0;
+      } else {
+        start_offset = getStartOffset(this->latest_view_w.current_log_tail);
+        end_offset = getEndOffset(this->latest_view_w.current_log_tail);
+        this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = std::min(predefined_shared_log_segment_size, log_size - start_offset);
+      }
+
+      while (log_size > end_offset) {
+        std::string name = "sharedlog:" + std::to_string(end_offset) + ":" + std::to_string(end_offset + predefined_shared_log_segment_size);
+        std::cout << "push file name: " << name << std::endl;
+        this->latest_view_w.current_log_tail = name;
+        this->latest_view_w.storage_layout["sharedlog"].push_back(name);
+        this->latest_view_w.file_size[name] = std::min(predefined_shared_log_segment_size, log_size - end_offset);
+        end_offset += predefined_shared_log_segment_size;
+      }
     }
+#else
+    if (!this->latest_view_w.current_log_tail.empty()) {
+      this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->storage->size(this->latest_view_w.current_log_tail);
+    }
+#endif
+
     flushLatestView();
     lock.unlock();
     if (this->event_listener != nullptr)
@@ -255,10 +323,34 @@ View MetadataLogHandler::rollForwardMetadataLog() {
   std::vector<OperationRecord*> records = readMetadataLog();
   if (records.empty()) {
     std::unique_lock<std::shared_mutex> lock(view_mutex_w);
-    if (!this->latest_view_w.current_log_tail.empty()) {
-      this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
-      this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
+#ifdef SHARED_LOG
+    size_t log_size = this->data_sharedlog_storage->size();
+    if (log_size != 0) {
+      int start_offset;
+      int end_offset;
+      if (this->latest_view_w.current_log_tail.empty()) {
+        start_offset = 0;
+        end_offset = 0;
+      } else {
+        start_offset = getStartOffset(this->latest_view_w.current_log_tail);
+        end_offset = getEndOffset(this->latest_view_w.current_log_tail);
+        this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = std::min(predefined_shared_log_segment_size, log_size - start_offset);
+      }
+
+      while (log_size > end_offset) {
+        std::string name = "sharedlog:" + std::to_string(end_offset) + ":" + std::to_string(end_offset + predefined_shared_log_segment_size);
+        std::cout << "push file name: " << name << std::endl;
+        this->latest_view_w.current_log_tail = name;
+        this->latest_view_w.storage_layout["sharedlog"].push_back(name);
+        this->latest_view_w.file_size[name] = std::min(predefined_shared_log_segment_size, log_size - end_offset);
+        end_offset += predefined_shared_log_segment_size;
+      }
     }
+#else
+    if (!this->latest_view_w.current_log_tail.empty()) {
+      this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->storage->size(this->latest_view_w.current_log_tail);
+    }
+#endif
     flushLatestView();
     return latest_view_w;
   }
@@ -271,10 +363,34 @@ View MetadataLogHandler::rollForwardMetadataLog() {
       modified_layer = rollforwardSingleOperationRecord(op_record);
     }
   }
-  if (!this->latest_view_w.current_log_tail.empty()) {
-    this->latest_view_w.tail_size = this->storage->size(this->latest_view_w.current_log_tail);
-    this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->latest_view_w.tail_size;
+#ifdef SHARED_LOG
+  size_t log_size = this->data_sharedlog_storage->size();
+  if (log_size != 0) {
+    int start_offset;
+    int end_offset;
+    if (this->latest_view_w.current_log_tail.empty()) {
+      start_offset = 0;
+      end_offset = 0;
+    } else {
+      start_offset = getStartOffset(this->latest_view_w.current_log_tail);
+      end_offset = getEndOffset(this->latest_view_w.current_log_tail);
+      this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = std::min(predefined_shared_log_segment_size, log_size - start_offset);
+    }
+
+    while (log_size > end_offset) {
+      std::string name = "sharedlog:" + std::to_string(end_offset) + ":" + std::to_string(end_offset + predefined_shared_log_segment_size);
+      std::cout << "push file name: " << name << std::endl;
+      this->latest_view_w.current_log_tail = name;
+      this->latest_view_w.storage_layout["sharedlog"].push_back(name);
+      this->latest_view_w.file_size[name] = std::min(predefined_shared_log_segment_size, log_size - end_offset);
+      end_offset += predefined_shared_log_segment_size;
+    }
   }
+#else
+  if (!this->latest_view_w.current_log_tail.empty()) {
+    this->latest_view_w.file_size[this->latest_view_w.current_log_tail] = this->storage->size(this->latest_view_w.current_log_tail);
+  }
+#endif
   flushLatestView();
   return latest_view_w;
 }

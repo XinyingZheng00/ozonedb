@@ -36,7 +36,7 @@ class LazyKV {
 
   void playlog_func();
   std::string Serialize(std::string const& key, std::string const& value, uint8_t op);
-  std::string DeserializeKey(const char* data);
+  std::string DeserializeKey(char const* data);
   bool Deserialize(std::string const& buffer, std::string& key, std::string& value, uint8_t& op);
 };
 

@@ -31,10 +31,6 @@ class EventListener {
   virtual void onNewTail(){};
 };
 
-enum class Mode {
-  Singleton,
-  MultipleProcesses,
-};
 class DB {
  private:
   /**
@@ -42,7 +38,6 @@ class DB {
    *
    */
   std::atomic<bool> active;
-  Mode mode;
   int compaction_per_operation = 10;
   int counter = 0;
 
@@ -51,6 +46,12 @@ class DB {
    *
    */
   Storage* storage;
+#ifdef SHARED_LOG
+  SharedLogStorage* shareddatalog_storage;
+  SharedLogStorage* sharedmetadatalog_storage;
+  SharedLogStorage* sharedtasklog_storage;
+#endif
+
   Metadata* metadata;
   CompactionWatcher* watcher = nullptr;
   View latest_view;

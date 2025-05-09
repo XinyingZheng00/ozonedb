@@ -43,6 +43,11 @@ Status LogHandler::newTail() {
 }
 
 Status LogHandler::addRecord(Record const& record) {
+#ifdef SHARED_LOG
+  std::string data = record.SerializeAsString();
+  return sharedlog_storage->append(data);
+#endif
+
   int buffer_size;
   unsigned char* buffer = protobuf::serializeMessage(record, buffer_size);
   if (this->active_unit.empty()) {
@@ -52,7 +57,7 @@ Status LogHandler::addRecord(Record const& record) {
     newTail();
   }
   View view;
-  // metadata_log->rollForwardMetadataLog();
+  metadata_log->rollForwardMetadataLog();
   metadata_log->getLatestView(view);
   while (view.getFileSize(this->active_unit) >= this->file_size_limit || view.current_log_tail != this->active_unit) {
     newTail();
@@ -78,12 +83,6 @@ Status LogHandler::readRecord(std::string const& key, Record*& record, std::stri
   int count = 0;
   for (int i = files.size() - 1; i >= 0; i--) {
     std::string const& file_name = files[i];
-    // if (i == files.size() - 1 && !this->latest_view.current_log_tail.rrent_log_tail != file_name) {
-    //   if (offset == file_name) {
-    //     break;
-    //   }
-    //   continue;  // The latest file may not be created yet
-    // }
     bool read_more = true;  // not found or the file is tail(not sealed)
     size_t cached_offset = 0;
     size_t size = 0;

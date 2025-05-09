@@ -1,14 +1,14 @@
 #include "lazy_kv_client.h"
 #include "utils/properties.h"
-#include <iostream>
 #include <fstream>
+#include <iostream>
 #include <thread>
 
 namespace lazylog {
 
 thread_local std::unique_ptr<LazyLogClient> LazyKV::thread_local_client_ = nullptr;
 thread_local int LazyKV::thread_local_client_id_ = -1;
-std::atomic<int> LazyKV::global_client_id_{1}; 
+std::atomic<int> LazyKV::global_client_id_{1};
 
 void LazyKV::playlog_func() {
   ll_cli_r = new LazyLogClient();
@@ -97,9 +97,9 @@ std::string LazyKV::Serialize(std::string const& key, std::string const& value, 
   uint32_t value_size = value.size();
 
   buffer.reserve(sizeof(key_size) + key_size + sizeof(value_size) + value_size + sizeof(op));
-  buffer.append(reinterpret_cast<const char*>(&key_size), sizeof(key_size));
+  buffer.append(reinterpret_cast<char const*>(&key_size), sizeof(key_size));
   buffer.append(key.data(), key_size);
-  buffer.append(reinterpret_cast<const char*>(&value_size), sizeof(value_size));
+  buffer.append(reinterpret_cast<char const*>(&value_size), sizeof(value_size));
   buffer.append(value.data(), value_size);
   buffer.push_back(static_cast<char>(op));
   return std::move(buffer);
@@ -109,12 +109,12 @@ bool LazyKV::Deserialize(std::string const& buffer, std::string& key, std::strin
   size_t offset = 0;
 
   if (buffer.size() < sizeof(uint32_t)) return false;
-  uint32_t key_size = *reinterpret_cast<const uint32_t*>(buffer.data() + offset);
+  uint32_t key_size = *reinterpret_cast<uint32_t const*>(buffer.data() + offset);
   offset += sizeof(uint32_t);
   if (buffer.size() < offset + key_size + sizeof(uint32_t)) return false;
   key.assign(buffer.data() + offset, key_size);
   offset += key_size;
-  uint32_t value_size = *reinterpret_cast<const uint32_t*>(buffer.data() + offset);
+  uint32_t value_size = *reinterpret_cast<uint32_t const*>(buffer.data() + offset);
   offset += sizeof(uint32_t);
   if (buffer.size() < offset + value_size + sizeof(uint8_t)) return false;
   value.assign(buffer.data() + offset, value_size);

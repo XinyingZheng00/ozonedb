@@ -5,6 +5,11 @@ namespace ozonedb {
 #include <unistd.h>
 //========================================read and write=======================================
 void TaskLogHandler::appendToTaskLog(TaskRecord const& record) {
+#ifdef SHARED_LOG
+  std::string data = record.SerializeAsString();
+  this->task_sharedlog_storage->append(data);
+  return;
+#endif
   int buffer_size;
   unsigned char* buffer = protobuf::serializeMessage(record, buffer_size);
   std::unique_lock<std::shared_mutex> lock(task_log_mutex);
@@ -15,6 +20,20 @@ void TaskLogHandler::appendToTaskLog(TaskRecord const& record) {
 
 Status TaskLogHandler::readTaskLog(std::vector<TaskRecord*>& result) {
   std::unique_lock<std::shared_mutex> lock(task_log_mutex);
+#ifdef SHARED_LOG
+  size_t log_size = this->task_sharedlog_storage->size();
+  if (log_size == this->offset) {
+    return {};
+  }
+  std::vector<std::string> entries;
+  this->task_sharedlog_storage->read(entries, this->offset, log_size);
+  for (auto& entry : entries) {
+    auto* record_tmp = new TaskRecord();
+    (*record_tmp).ParseFromString(entry);
+    result.push_back(record_tmp);
+  }
+  return Status::kSuccess;
+#endif
   if (!this->storage->exist(this->active_unit)) {
     return Status::kSuccess;
   }

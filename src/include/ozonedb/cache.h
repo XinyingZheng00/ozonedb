@@ -1,5 +1,6 @@
 #ifndef OZONEDB_CACHE_H
 #define OZONEDB_CACHE_H
+#include "shared_log_storage.h"
 #include "sstable/block_handler.h"
 #include "sstable/table_reader.h"
 #include "storage.h"
@@ -83,16 +84,31 @@ class LRUCache {
     CacheEntry(Table* table) : table(table), offset(), sealed(true) {}
   };
   Storage* storage = nullptr;
-  size_t capacity = 33554432;
+
+#ifdef SHARED_LOG
+  size_t predefined_shared_log_segment_size = 32768;  // todo: make it configurable
+  SharedLogStorage* sharedlog_storage;
+
+ public:
+  void setSharedLogStorage(SharedLogStorage* sharedlog_storage) {
+    this->sharedlog_storage = sharedlog_storage;
+  }
+
+  void setPredefinedSharedLogSegmentSize(size_t size) {
+    this->predefined_shared_log_segment_size = size;
+  }
+
+ private:
+#endif
   int log_num_limit = 2;
-  size_t current_size = 0;
   int log_num = 0;
-  std::shared_mutex mutex;  // this is to protect file_to_records_map and lru_list
-  std::unordered_map<std::string, CacheEntry> file_to_entry_map;
+
+  size_t capacity = 33554432;
+  size_t current_size = 0;
+  std::shared_mutex mutex;                                        // this is to protect file_to_records_map and lru_list
+  std::unordered_map<std::string, CacheEntry> file_to_entry_map;  // to sharedlog storage, the file_name is the sharedlog:start_index:end_index
   std::list<std::pair<std::string, std::string>> lru_list;
   std::list<std::string> lru_list_log;
-  // std::unordered_map<std::string, std::shared_mutex> file_to_mutex_map;
-  // std::shared_mutex map_mutex;
   FileMutexManager* file_mutex_manager = nullptr;
   View* latest_view = nullptr;
 
@@ -132,7 +148,6 @@ class LRUCache {
   void setFileMutexManager(FileMutexManager* file_mutex_manager) {
     this->file_mutex_manager = file_mutex_manager;
   }
-
   void checkReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size);
   void readDataLog(std::string const& file_name, size_t cached_offset, size_t size);
   void getSSTable(std::string const& file_name, Table*& table);
@@ -150,47 +165,6 @@ class LRUCache {
     latest_view = view;
   }
 };
-/*
-class LRUCacheForSharedLog{
-  private:
-  struct CacheEntry {
-    std::unordered_map<std::string, Record*> records;
-    std::list<std::string>::iterator lru_itr_log;
-    size_t offset = 0;
-    bool sealed = false;
-
-    CacheEntry() = default;
-    CacheEntry(std::unordered_map<std::string, Record*> records, size_t offset, bool sealed);
-  };
-
-  Storage* storage;
-  size_t capacity;
-  int log_num_limit;
-  size_t current_size;
-  int log_num;
-  std::shared_mutex mutex;
-  std::unordered_map<std::string, CacheEntry> file_to_entry_map;
-  std::list<std::string> lru_list_log;
-  std::list<std::pair<std::string, std::string>> lru_list;
-  FileMutexManager* file_mutex_manager;
-  View* latest_view;
-
-  void updateLRU(const std::string& file_name, const std::string& index_value);
-  void updateLRULog(const std::string& file_name);
-
- public:
-  LRUCacheForSharedLog(size_t capacity, Storage* storage);
-
-  ~LRUCacheForSharedLog();
-
-  void checkReadMoreSharedLog(const std::string& file_name, bool& read_more, size_t& cached_offset, size_t& size);
-  void readSharedLog(const std::string& file_name, size_t cached_offset, size_t size);
-  void putLogRecords(const std::string& key, const std::unordered_map<std::string, Record*>& records, size_t offset, bool sealed);
-  void get(const std::string& file_name, const std::string& key, Record*& record, const std::string& index_value = "");
-
-  void setFileMutexManager(FileMutexManager* file_mutex_manager);
-  void setLatestView(View* view);
-};*/
 
 }  // namespace ozonedb
 #endif

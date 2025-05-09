@@ -18,9 +18,6 @@ bool CompactionWatcher::shouldWorkOnTask(TaskRecord::TaskIdentifier* task_id, Ta
   task_record->set_owner(this->fingerprint);
   task_record->set_status(TaskRecord::TASK_BEGIN);
   task_record->set_owner_generation(owner_generation);
-  if (this->mode == Mode::Singleton) {
-    return true;
-  }
   bool worth_append = this->task_log_handler->worthAppend(*task_record);
   if (!worth_append) {
     return false;
@@ -54,6 +51,7 @@ Status CompactionWatcher::watchForCompaction(std::atomic<bool> const* active) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));  // only sleep when there's nothing to do
 
     } else {
+      std::cout << "Compaction task picked: " << task_record->task_id().ShortDebugString() << std::endl;
       Status status = startCompaction(compaction, task_record);
       delete compaction;
       delete task_record;
@@ -80,11 +78,12 @@ Status CompactionWatcher::taskHeartbeat(Compaction* compaction, TaskRecord* task
 }
 
 Status CompactionWatcher::pickCompaction(Compaction*& compaction, TaskRecord*& task_record, bool& has_worked_on_compaction) {
+  // this->metadata_handler->rollForwardMetadataLog();
   this->metadata_handler->getLatestView(this->latest_view);
 
   // First step: check if there is any log level compaction
   // log level compaction
-  auto files = this->latest_view.getWithPrefix(metadata->log_prefix);
+  auto files = this->latest_view.getWithPrefix(metadata->data_log_prefix);
   while (files.size() >= 2) {
     compaction = new Compaction();
     compaction->task_id = new TaskRecord::TaskIdentifier();
@@ -237,9 +236,6 @@ Status CompactionWatcher::startCompaction(Compaction* compaction, TaskRecord* ta
   //   std::cout << getpid() << ":crashing" << std::endl;
   //   return Status::kFailure;  // crash
   // }
-  if (this->mode == Mode::Singleton) {
-    return doCompactionWork(compaction);
-  }
   std::thread t(&CompactionWatcher::taskHeartbeat, this, compaction, task_record);
   doCompactionWork(compaction);
   t.join();
@@ -253,7 +249,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   bool log_level_compaction = false;
   std::string log_string = "Compacting ";
   std::unordered_map<std::string, Record*> key_record;
-  if (compaction->task_id->input_files(0).find(this->metadata->log_prefix) != std::string::npos) {
+  if (compaction->task_id->input_files(0).find(this->metadata->data_log_prefix) != std::string::npos) {
     log_level_compaction = true;
     if (this->event_listener != nullptr) {
       this->event_listener->onLogCompactionStart();
@@ -268,15 +264,23 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     // read from log level
 
     log_string += input + " ";
-    if (input.find(this->metadata->log_prefix) != std::string::npos) {
-      std::unordered_map<std::string, Record*> records_tmp;
+    if (input.find(this->metadata->data_log_prefix) != std::string::npos) {
+#ifdef SHARED_LOG
+      std::vector<std::string> entries;
+      int start_offset = getStartOffset(input);
+      int end_offset = getEndOffset(input);
+      this->sharedlog_storage->read(entries, start_offset, end_offset);
+      for (auto& entry : entries) {
+        auto* record_tmp = new Record();
+        (*record_tmp).ParseFromString(entry);
+        key_record[record_tmp->key()] = record_tmp;
+      }
+#else
       unsigned char* buffer = nullptr;
       size_t file_size;
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
       std::unique_lock file_lock(file_mutex);
-
       this->storage->read(input, buffer, file_size);
-
       file_lock.unlock();
       std::vector<google::protobuf::Message*> messages;
       protobuf::deserializeMessages(buffer, file_size, messages, []() -> google::protobuf::Message* {
@@ -291,6 +295,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
         }
         key_record[rec->key()] = rec;
       }
+#endif
     } else {
       std::unordered_map<std::string, Record*> records_tmp;
       Table* table = nullptr;
@@ -399,28 +404,28 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     // this->storage->remove(input);
   }
   compaction->finished = true;
-  // std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
+  std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
   // delete the records
   for (auto const& record : records) {
     delete record;
   }
-  if (log_level_compaction) {
-    if (this->event_listener != nullptr) {
-      int input_size = 0;
-      for (auto const& input : compaction->task_id->input_files()) {
-        input_size += this->storage->size(input);
-      }
-      this->event_listener->onLogCompactionCompletion(input_size);
-    }
+  // if (log_level_compaction) {
+  //   if (this->event_listener != nullptr) {
+  //     int input_size = 0;
+  //     for (auto const& input : compaction->task_id->input_files()) {
+  //       input_size += this->storage->size(input);
+  //     }
+  //     this->event_listener->onLogCompactionCompletion(input_size);
+  //   }
 
-  } else if (this->event_listener != nullptr) {
-    int source_level = getSSTLayerNumber(compaction->task_id->input_files(0));
-    int input_size = 0;
-    for (auto const& input : compaction->task_id->input_files()) {
-      input_size += this->latest_view.getFileSize(input);
-    }
-    this->event_listener->onSSTableCompactionCompletion(input_size, source_level);
-  }
+  // } else if (this->event_listener != nullptr) {
+  //   int source_level = getSSTLayerNumber(compaction->task_id->input_files(0));
+  //   int input_size = 0;
+  //   for (auto const& input : compaction->task_id->input_files()) {
+  //     input_size += this->latest_view.getFileSize(input);
+  //   }
+  //   this->event_listener->onSSTableCompactionCompletion(input_size, source_level);
+  // }
   return Status::kSuccess;
 }
 

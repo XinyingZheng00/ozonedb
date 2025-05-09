@@ -12,40 +12,35 @@ extern "C" {
  * Method:    openDB
  * Signature: (Ljava/lang/String;)V
  */
-JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_openDB
-  (JNIEnv *, jobject, jstring);
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_openDB(JNIEnv*, jobject, jstring);
 
 /*
  * Class:     jni_OzoneDBJNI
  * Method:    closeDB
  * Signature: ()V
  */
-JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_closeDB
-  (JNIEnv *, jobject);
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_closeDB(JNIEnv*, jobject);
 
 /*
  * Class:     jni_OzoneDBJNI
  * Method:    put
  * Signature: (Ljava/lang/String;[B)V
  */
-JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_put
-  (JNIEnv *, jobject, jstring, jbyteArray);
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_put(JNIEnv*, jobject, jstring, jbyteArray);
 
 /*
  * Class:     jni_OzoneDBJNI
  * Method:    get
  * Signature: (Ljava/lang/String;)[B
  */
-JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get
-  (JNIEnv *, jobject, jstring);
+JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get(JNIEnv*, jobject, jstring);
 
 /*
  * Class:     jni_OzoneDBJNI
  * Method:    remove
  * Signature: (Ljava/lang/String;)V
  */
-JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove
-  (JNIEnv *, jobject, jstring);
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove(JNIEnv*, jobject, jstring);
 
 #ifdef __cplusplus
 }

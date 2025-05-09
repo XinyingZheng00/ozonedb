@@ -1,5 +1,6 @@
 #include "cache.h"
 #include "db.h"
+#include "helper.h"
 #include "metadata_log_handler.h"
 #include "protobuf_serializer.h"
 
@@ -75,9 +76,23 @@ void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, s
 }
 
 void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, size_t size) {
+  std::unordered_map<std::string, Record*> records_map;
+  bool sealed;
+#ifdef SHARED_LOG
+  std::vector<std::string> entries;
+  int start_offset = getStartOffset(file_name);
+  this->sharedlog_storage->read(entries, start_offset + cached_offset, start_offset + size);
+  for (auto& entry : entries) {
+    auto* record_tmp = new Record();
+    (*record_tmp).ParseFromString(entry);
+    records_map[record_tmp->key()] = record_tmp;
+  }
+  sealed = cached_offset + entries.size() == predefined_shared_log_segment_size;
+#else
+  // file system read
+  unsigned char* buffer = nullptr;
   std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
   std::unique_lock file_lock(file_mutex);
-  unsigned char* buffer = nullptr;
   this->storage->read(file_name, buffer, cached_offset, size - cached_offset);
   file_lock.unlock();
   std::vector<google::protobuf::Message*> messages;
@@ -86,13 +101,13 @@ void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, s
   });
   delete[] buffer;
   buffer = nullptr;
-  std::unordered_map<std::string, Record*> records_tmp;
   for (auto* msg : messages) {
     auto* rec = static_cast<Record*>(msg);
-    records_tmp[rec->key()] = rec;
+    records_map[rec->key()] = rec;
   }
-  bool sealed = file_name != latest_view->current_log_tail;
-  putLogRecords(file_name, records_tmp, size, sealed);
+  sealed = file_name != latest_view->current_log_tail;
+#endif
+  putLogRecords(file_name, records_map, size, sealed);
 }
 
 void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
@@ -196,6 +211,8 @@ void LRUCache::putLogRecords(std::string const& key, std::unordered_map<std::str
     CacheEntry entry(records, offset, sealed);
     file_to_entry_map[key] = entry;
     file_to_entry_map[key].lru_itr_log = lru_list_log.begin();
+    std::cout << "log num: " << log_num << ", log num limit: " << log_num_limit << std::endl;
+    std::cout << "put log file: " << key << ", offset: " << offset << ", size: " << records.size() << std::endl;
   }
 }
 
@@ -216,120 +233,4 @@ void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std:
   updateLRU(key, index_value);
 }
 
-/*
-LRUCacheForSharedLog::CacheEntry::CacheEntry(std::unordered_map<std::string, Record*> records, size_t offset, bool sealed)
-    : records(std::move(records)), offset(offset), sealed(sealed) {}
-
-LRUCacheForSharedLog::LRUCacheForSharedLog(size_t capacity, Storage* storage)
-    : storage(storage),
-      capacity(capacity),
-      log_num_limit(2),
-      current_size(0),
-      log_num(0),
-      file_mutex_manager(nullptr),
-      latest_view(nullptr) {}
-
-LRUCacheForSharedLog::~LRUCacheForSharedLog() {
-  for (auto& entry : file_to_entry_map) {
-    for (auto& record : entry.second.records) {
-      delete record.second;
-    }
-  }
-}
-
-void LRUCacheForSharedLog::checkReadMoreSharedLog(const std::string& file_name, bool& read_more, size_t& cached_offset, size_t& size) {
-  std::shared_lock lock(mutex);
-  if (file_to_entry_map.find(file_name) == file_to_entry_map.end()) {
-    read_more = true;
-    cached_offset = 0;
-    size = 0;
-    return;
-  }
-
-  const CacheEntry& entry = file_to_entry_map[file_name];
-  cached_offset = entry.offset;
-
-  SharedLogStorage log(file_name);
-  size = log.size();
-
-  read_more = (cached_offset < size);
-}
-
-void LRUCacheForSharedLog::readSharedLog(const std::string& file_name, size_t cached_offset, size_t size) {
-  std::vector<std::string> entries;
-  SharedLogStorage log(file_name);
-  Status s = log.read(entries, cached_offset, size);
-  if (!s.ok()) {
-    std::cerr << "[LRUCacheForSharedLog] Read failed for " << file_name << std::endl;
-    return;
-  }
-
-  std::unordered_map<std::string, Record*> records;
-  size_t new_offset = cached_offset;
-
-  for (const auto& entry : entries) {
-    Record* record = new Record();
-    record->parseFromString(entry);  // assumes this method exists
-    records[record->key()] = record;
-    ++new_offset;
-  }
-
-  putLogRecords(file_name, records, new_offset, new_offset == log.size());
-}
-
-void LRUCacheForSharedLog::putLogRecords(const std::string& key, const std::unordered_map<std::string, Record*>& records, size_t offset, bool sealed) {
-  std::unique_lock lock(mutex);
-
-  if (file_to_entry_map.find(key) == file_to_entry_map.end()) {
-    file_to_entry_map[key] = CacheEntry();
-    lru_list_log.push_front(key);
-    file_to_entry_map[key].lru_itr_log = lru_list_log.begin();
-  }
-
-  auto& entry = file_to_entry_map[key];
-  for (auto& kv : records) {
-    entry.records[kv.first] = kv.second;
-  }
-
-  entry.offset = offset;
-  entry.sealed = sealed;
-
-  updateLRULog(key);
-}
-
-void LRUCacheForSharedLog::get(const std::string& file_name, const std::string& key, Record*& record, const std::string& index_value) {
-  std::shared_lock lock(mutex);
-  if (file_to_entry_map.find(file_name) == file_to_entry_map.end()) {
-    record = nullptr;
-    return;
-  }
-
-  auto& entry = file_to_entry_map[file_name];
-  auto it = entry.records.find(key);
-  if (it != entry.records.end()) {
-    record = it->second;
-    updateLRU(file_name, index_value);
-  } else {
-    record = nullptr;
-  }
-}
-
-void LRUCacheForSharedLog::updateLRULog(const std::string& file_name) {
-  auto& lru_itr = file_to_entry_map[file_name].lru_itr_log;
-  lru_list_log.erase(lru_itr);
-  lru_list_log.push_front(file_name);
-  file_to_entry_map[file_name].lru_itr_log = lru_list_log.begin();
-}
-
-void LRUCacheForSharedLog::updateLRU(const std::string& file_name, const std::string& index_value) {
-  // No-op in current version, can be added later
-}
-
-void LRUCacheForSharedLog::setFileMutexManager(FileMutexManager* manager) {
-  file_mutex_manager = manager;
-}
-
-void LRUCacheForSharedLog::setLatestView(View* view) {
-  latest_view = view;
-}*/
 }  // namespace ozonedb

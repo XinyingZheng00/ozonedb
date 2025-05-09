@@ -5,30 +5,54 @@ namespace ozonedb {
 /*
 sudo GLOG_minloglevel=1 -P /sharedfs/LazyLog-Artifact/cfg/be.prop -P /sharedfs/LazyLog-Artifact/cfg/dl_client.prop -P /sharedfs/LazyLog-Artifact/cfg/rdma.prop
 */
+thread_local std::unique_ptr<lazylog::LazyLogClient> SharedLogStorage::shared_log = nullptr;
+thread_local int SharedLogStorage::local_client_id = -1;
+std::atomic<int> SharedLogStorage::global_client_id{1};
 
-SharedLogStorage::SharedLogStorage(int client_id) {
-  lazylog::Properties prop;
-  std::ifstream be("/sharedfs/LazyLog-Artifact/cfg_datalog/be.prop");
-  prop.Load(be);
-  std::ifstream dl_client("/sharedfs/LazyLog-Artifact/cfg_datalog/dl_client.prop");
-  prop.Load(dl_client);
-  std::ifstream rdma("/sharedfs/LazyLog-Artifact/cfg_datalog/rdma.prop");
-  prop.Load(rdma);
-  if (client_id != -1) {
-    prop.SetProperty("dur_log.client_id", std::to_string(client_id));
-  }
+void SharedLogStorage::initSharedLogClient() {
   shared_log = std::make_unique<lazylog::LazyLogClient>();
   shared_log->Initialize(prop);
+}
+
+SharedLogStorage::SharedLogStorage(Type type, int client_id) {
+  auto loadProperties = [this](std::string const& base_path) {
+    std::ifstream be(base_path + "/be.prop");
+    this->prop.Load(be);
+    std::ifstream dl_client(base_path + "/dl_client.prop");
+    this->prop.Load(dl_client);
+    std::ifstream rdma(base_path + "/rdma.prop");
+    this->prop.Load(rdma);
+  };
+  switch (type) {
+    case Type::kDataLog:
+      loadProperties("/sharedfs/LazyLog-Artifact/cfg_datalog");
+      break;
+    case Type::kMetadataLog:
+      loadProperties("/sharedfs/LazyLog-Artifact/cfg_metadatalog");
+      break;
+    case Type::kTaskLog:
+      loadProperties("/sharedfs/LazyLog-Artifact/cfg_tasklog");
+      break;
+  }
+  int my_id = global_client_id.fetch_add(1);
+  local_client_id = my_id;
+  prop.SetProperty("client_id", std::to_string(my_id));
 }
 
 SharedLogStorage::~SharedLogStorage() = default;
 
 Status SharedLogStorage::append(std::string const& data) {
+  if (shared_log == nullptr) {
+    initSharedLogClient();
+  }
   shared_log->AppendEntryAll(data);
   return Status::kSuccess;
 }
 
 Status SharedLogStorage::read(std::vector<std::string>& entries, size_t from, size_t to) {
+  if (shared_log == nullptr) {
+    initSharedLogClient();
+  }
   for (size_t i = from; i < to; ++i) {
     std::string entry;
     if (!shared_log->ReadEntry(i, entry)) {
@@ -48,6 +72,9 @@ size_t SharedLogStorage::size() {
      * What you should fetch is within [ tail[1], tail[0] )
     std::tuple<uint64_t, uint64_t, uint16_t> GetTail();
   */
+  if (shared_log == nullptr) {
+    initSharedLogClient();
+  }
   std::tuple<uint64_t, uint64_t, uint16_t> tail = shared_log->GetTail();
   uint64_t last_index = std::get<0>(tail);
   return last_index;

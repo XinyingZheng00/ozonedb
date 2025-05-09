@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-
+set(CMAKE_BUILD_TYPE DEBUG)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 
@@ -69,7 +69,6 @@ add_library(OzoneDB STATIC
     src/db/compaction.cpp
     src/db/db.cpp
     src/db/log_handler.cpp
-    src/db/log_handler_shared_log.cpp
     src/db/cache.cpp
     src/db/metadata_log_handler.cpp
     src/db/task_log_handler.cpp
@@ -99,6 +98,10 @@ target_link_libraries(OzoneDB
     OpenSSL::SSL OpenSSL::Crypto
     lazylogcli backendcli hdr_histogram ibverbs glog::glog erpc numa
 ) # the order of the libraries matters
+
+if(SHARED_LOG)
+    add_compile_definitions(SHARED_LOG)
+endif()
 
 # Executable for Unit Tests
 add_executable(runUnitTests 

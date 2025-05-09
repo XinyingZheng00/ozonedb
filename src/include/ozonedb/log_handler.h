@@ -2,7 +2,6 @@
 #define LOG_HANDLER_H
 
 #include "cache.h"
-#include "log_handler_base.h"
 #include "metadata.h"
 #include "metadata_log_handler.h"
 #include "protobuf/record.pb.h"
@@ -14,7 +13,7 @@
 #include <vector>
 
 namespace ozonedb {
-class LogHandler : public LogHandlerBase {
+class LogHandler {
  private:
   /**
    * @brief prefix for each file
@@ -27,6 +26,16 @@ class LogHandler : public LogHandlerBase {
   View* latest_view = nullptr;
   size_t file_size_limit;
   Storage* storage = nullptr;
+#ifdef SHARED_LOG
+  SharedLogStorage* sharedlog_storage = nullptr;
+
+ public:
+  void setSharedLogStorage(SharedLogStorage* sharedlog_storage) {
+    this->sharedlog_storage = sharedlog_storage;
+  }
+
+ private:
+#endif
   LRUCache* cache = nullptr;
   MetadataLogHandler* metadata_log = nullptr;
   ThreadPool* thread_pool = nullptr;
@@ -50,7 +59,9 @@ class LogHandler : public LogHandlerBase {
    */
   LogHandler(uint64_t file_size_limit, std::string log_prefix, Storage* storage, LRUCache* global_cache, MetadataLogHandler* metadata_log = nullptr)
       : file_size_limit(file_size_limit), prefix(std::move(log_prefix)), storage(storage) {
-    storage->createDirectory(prefix);
+    if (storage != nullptr) {
+      storage->createDirectory(prefix);
+    }
     cache = global_cache;
     this->metadata_log = metadata_log;
   };
@@ -66,7 +77,7 @@ class LogHandler : public LogHandlerBase {
    * @param record
    * @return Status
    */
-  Status addRecord(Record const& record) override;
+  Status addRecord(Record const& record);
 
   /**
    * @brief read record from this level, end to the offset
@@ -75,7 +86,7 @@ class LogHandler : public LogHandlerBase {
    * @param value
    * @return Status
    */
-  Status readRecord(std::string const& key, Record*& record, std::string const& offset, std::string& latest_offset) override;
+  Status readRecord(std::string const& key, Record*& record, std::string const& offset, std::string& latest_offset);
 
   // set thread pool
   void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }
