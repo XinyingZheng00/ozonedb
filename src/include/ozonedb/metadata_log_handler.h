@@ -1,58 +1,89 @@
-
 #ifndef METADATA_LOG_HANDLER_H
 #define METADATA_LOG_HANDLER_H
 #include "cache.h"
+#include "helper.h"
 #include "metadata.h"
 #include "protobuf/sstable.pb.h"
 #include "protobuf_serializer.h"
-#include "storage.h"
+#include "storage/file_storage.h"
+#include "storage/shared_log_storage.h"
 #include <queue>
 #include <string>
 #include <vector>
 
 namespace ozonedb {
 class EventListener;
-class View {
+
+// Strategy pattern for updating view
+class LogTailUpdater {
  public:
-  std::unordered_map<std::string, std::deque<std::string>> storage_layout;
-  std::unordered_map<std::string, std::pair<std::string, std::string>> key_range;
-  std::unordered_map<std::string, size_t> file_size;
-  std::string current_log_tail;
+  virtual void updateViewTail(View& latest_view) = 0;
+  virtual ~LogTailUpdater() = default;
+};
 
-  int getFileNumber(std::string const& prefix);
+class SharedLogLogTailUpdater : public LogTailUpdater {
+ public:
+  SharedLogStorage* log_storage;
+  int predefined_shared_log_segment_size;  // todo fix predefine size to be put in storage layer
+  SharedLogLogTailUpdater(Storage* s, int predefined_shared_log_segment_size)
+      : predefined_shared_log_segment_size(predefined_shared_log_segment_size) {
+    this->log_storage = dynamic_cast<SharedLogStorage*>(s);
+    if (!this->log_storage) {
+      throw std::runtime_error("Storage pointer is not a SharedLogStorage");
+    }
+  }
 
-  std::deque<std::string> getWithPrefix(std::string const& prefix);
+  void updateViewTail(View& latest_view) override {
+    int log_size = log_storage->size("");
+    if (log_size == 0) return;
 
-  std::pair<std::string, std::string> getKeyRange(std::string const& file_name);
+    int start_offset = 0;
+    int end_offset = 0;
+    if (!latest_view.current_log_tail.empty()) {
+      start_offset = getStartOffset(latest_view.current_log_tail);
+      end_offset = getEndOffset(latest_view.current_log_tail);
+      latest_view.file_size[latest_view.current_log_tail] = std::min(predefined_shared_log_segment_size, log_size - start_offset);
+    }
 
-  size_t getFileSize(std::string const& file_name);
+    while (log_size > end_offset) {
+      std::string name = "sharedlog/" + std::to_string(end_offset) + ":" + std::to_string(end_offset + predefined_shared_log_segment_size);
+      std::cout << "push file name: " << name << std::endl;
+      latest_view.current_log_tail = name;
+      latest_view.storage_layout["sharedlog"].push_back(name);
+      latest_view.file_size[name] =
+          std::min(predefined_shared_log_segment_size, log_size - end_offset);
+      end_offset += predefined_shared_log_segment_size;
+    }
+  }
+};
 
-  std::string getCurrentLogTail() { return current_log_tail; }
+class FileSystemLogTailUpdater : public LogTailUpdater {
+ public:
+  FileStorage* log_storage;
+  explicit FileSystemLogTailUpdater(Storage* s) {
+    this->log_storage = dynamic_cast<FileStorage*>(s);
+    if (!this->log_storage) {
+      throw std::runtime_error("Storage pointer is not a FileStorage");
+    }
+  }
+
+  void updateViewTail(View& latest_view) override {
+    if (!latest_view.current_log_tail.empty()) {
+      latest_view.file_size[latest_view.current_log_tail] =
+          log_storage->size(latest_view.current_log_tail);
+    }
+  }
 };
 
 class MetadataLogHandler {
  private:
   size_t offset;
   std::string active_unit;
-  Storage* storage = nullptr;  // still using storage in sharedlog case for reading sstable
-#ifdef SHARED_LOG
-  size_t predefined_shared_log_segment_size = 32768;
-  SharedLogStorage* metadata_sharedlog_storage = nullptr;
-  SharedLogStorage* data_sharedlog_storage = nullptr;
+  Storage* metadata_log_storage = nullptr;
+  Storage* log_storage = nullptr;
+  FileStorage* sst_storage = nullptr;
+  LogTailUpdater* log_tail_updater = nullptr;
 
- public:
-  void setMetadataSharedLogStorage(SharedLogStorage* metadata_sharedlog_storage) {
-    this->metadata_sharedlog_storage = metadata_sharedlog_storage;
-  }
-  void setDataSharedLogStorage(SharedLogStorage* data_sharedlog_storage) {
-    this->data_sharedlog_storage = data_sharedlog_storage;
-  }
-  void setPredefinedSharedLogSegmentSize(size_t predefined_shared_log_segment_size) {
-    this->predefined_shared_log_segment_size = predefined_shared_log_segment_size;
-  }
-
- private:
-#endif
   TailCache* tail_cache = nullptr;
   LRUCache* lru_cache = nullptr;
   std::thread* update_view_thread = nullptr;
@@ -65,23 +96,26 @@ class MetadataLogHandler {
   std::shared_mutex read_mutex;
   std::unordered_map<std::string, std::priority_queue<std::pair<int, OperationRecord*>, std::vector<std::pair<int, OperationRecord*>>, std::greater<>>> buffer;
 
-  // Deserialize OperationRecords from a file
   std::vector<OperationRecord*> readMetadataLog();
   std::string rollforwardSingleOperationRecord(OperationRecord* record);
 
  public:
   EventListener* event_listener = nullptr;
-  MetadataLogHandler(std::string metadata_log, Storage* storage, TailCache* tail_cache) {
+  MetadataLogHandler(std::string metadata_log, Storage* metadata_log_storage, Storage* log_storage, FileStorage* sst_storage, TailCache* tail_cache, LRUCache* lru_cache) {
     this->offset = 0;
-    this->storage = storage;
+    this->metadata_log_storage = metadata_log_storage;
+    this->log_storage = log_storage;
+    this->sst_storage = sst_storage;
     this->active_unit = metadata_log;
     this->tail_cache = tail_cache;
+    this->lru_cache = lru_cache;
+    if (metadata_log.find("sharedlog") != std::string::npos) {
+      this->log_tail_updater = new SharedLogLogTailUpdater(log_storage, 64);  // need to be changed to be a parameter
+    } else {
+      this->log_tail_updater = new FileSystemLogTailUpdater(log_storage);
+    }
   };
   void setEventListener(EventListener* event_listener) { this->event_listener = event_listener; }
-
-  void setLRUCache(LRUCache* lru_cache) { this->lru_cache = lru_cache; }
-
-  void setMetadata(Metadata* metadata) { this->metadata = metadata; }
 
   ~MetadataLogHandler(){};
 
@@ -95,9 +129,10 @@ class MetadataLogHandler {
 
   void flushLatestView();
 
-  void getLatestScore(double& score);
+  // void getLatestScore(double& score);
 
   // double getLevelScore(std::string level_prefix);
+
   // Serialize a OperationRecord to a file
   void appendToMetadataLog(OperationRecord const& record);
 
@@ -106,5 +141,6 @@ class MetadataLogHandler {
 
   Status stopViewUpdate();
 };
+
 }  // namespace ozonedb
 #endif

@@ -1,8 +1,7 @@
 #ifndef TASK_LOG_HANDLER_H
 #define TASK_LOG_HANDLER_H
 #include "protobuf/record.pb.h"
-#include "shared_log_storage.h"
-#include "storage.h"
+#include "storage/storage.h"
 #include <cstring>
 #include <thread>
 #include <unordered_map>
@@ -54,17 +53,6 @@ class TaskLogHandler {
   uint32_t offset;
   std::string active_unit;
   Storage* storage = nullptr;
-
-#ifdef SHARED_LOG
-  SharedLogStorage* task_sharedlog_storage = nullptr;
-
- public:
-  void setTaskSharedLogStorage(SharedLogStorage* task_sharedlog_storage) {
-    this->task_sharedlog_storage = task_sharedlog_storage;
-  }
-
- private:
-#endif
 
   std::unordered_map<TaskRecord::TaskIdentifier, TaskStatus, TaskIdentifierHash, TaskIdentifierEqual> task_map;
   std::shared_mutex task_map_mutex;

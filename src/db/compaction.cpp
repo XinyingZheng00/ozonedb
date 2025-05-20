@@ -1,5 +1,5 @@
 #include "compaction.h"
-#include "db.h"
+#include "event_listener.h"
 #include "helper.h"
 namespace ozonedb {
 Status CompactionWatcher::startCompactionWatcher(std::atomic<bool> const* active) {
@@ -265,29 +265,12 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
 
     log_string += input + " ";
     if (input.find(this->metadata->data_log_prefix) != std::string::npos) {
-#ifdef SHARED_LOG
-      std::vector<std::string> entries;
-      int start_offset = getStartOffset(input);
-      int end_offset = getEndOffset(input);
-      this->sharedlog_storage->read(entries, start_offset, end_offset);
-      for (auto& entry : entries) {
-        auto* record_tmp = new Record();
-        (*record_tmp).ParseFromString(entry);
-        key_record[record_tmp->key()] = record_tmp;
-      }
-#else
-      unsigned char* buffer = nullptr;
-      size_t file_size;
-      std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
-      std::unique_lock file_lock(file_mutex);
-      this->storage->read(input, buffer, file_size);
-      file_lock.unlock();
       std::vector<google::protobuf::Message*> messages;
-      protobuf::deserializeMessages(buffer, file_size, messages, []() -> google::protobuf::Message* {
-        return new Record();
-      });
-      delete[] buffer;
-      buffer = nullptr;
+      this->log_storage->read(
+          input, []() -> google::protobuf::Message* {
+            return new Record();
+          },
+          messages);
       for (auto* msg : messages) {
         auto* rec = static_cast<Record*>(msg);
         if (key_record.find(rec->key()) != key_record.end()) {
@@ -295,18 +278,11 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
         }
         key_record[rec->key()] = rec;
       }
-#endif
     } else {
       std::unordered_map<std::string, Record*> records_tmp;
       Table* table = nullptr;
-      std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
-      std::unique_lock file_lock(file_mutex);
-
-      Table::open(this->storage, input, table);
+      Table::open(this->sst_storage, input, table);
       records_tmp = table->getAll();
-
-      file_lock.unlock();
-      // print the range of records_tmp
       std::string key_start = records_tmp.begin()->first;
       std::string key_end = records_tmp.begin()->first;
       for (auto const& record : records_tmp) {
@@ -342,8 +318,8 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   std::vector<std::pair<std::string, std::string>> key_ranges;
   std::pair<std::string, std::string> key_range;
   std::string dest_prefix = this->metadata->sstable_level_prefix + std::to_string(compaction->task_id->destinationlevel());
-  if (!this->storage->exist(dest_prefix)) {
-    this->storage->createDirectory(dest_prefix);
+  if (!this->sst_storage->exist(dest_prefix)) {  // tobe done
+    this->sst_storage->createDirectory(dest_prefix);
   }
   for (int i = 0; i < records.size(); i++) {
     if (compaction->outputBuilder == nullptr ||
@@ -366,7 +342,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
         sstable_path.append("/").append(sstable_name);
       output_files.push_back(sstable_path);
       log_string += ":" + sstable_path;
-      compaction->outputBuilder = new TableBuilder(this->storage, sstable_path);
+      compaction->outputBuilder = new TableBuilder(this->sst_storage, sstable_path);
       key_range.first = records[i]->key();
     }
     compaction->outputBuilder->add(records[i]->key(), *records[i]);

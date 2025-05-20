@@ -4,57 +4,72 @@
 #include <algorithm>
 #include <cmath>
 namespace ozonedb {
+
 DB::DB(std::string const& shared_config_path) {
   this->metadata = new Metadata(shared_config_path);
-  if (this->metadata->is_cloud) {
-    this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
+
+  if (this->metadata->storage_type == StorageType::kFileStorage) {
+    FileStorage* fs = new FileStorage(this->metadata->DBdir);
+    this->log_storage = fs;
+    this->sstable_storage = fs;
+    this->metadatalog_storage = fs;
+    this->tasklog_storage = fs;
+  } else if (this->metadata->storage_type == StorageType::kAzureBlobStorage) {
+    // this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBdir);
+  } else if (this->metadata->storage_type == StorageType::kSharedLogStorage) {
+    this->log_storage = new SharedLogStorage("datalog");
+    this->sstable_storage = new FileStorage(this->metadata->DBdir);
+    this->metadatalog_storage = new SharedLogStorage("metadatalog");
+    this->tasklog_storage = new SharedLogStorage("tasklog");
   } else {
-    this->storage = new FileStorage(this->metadata->DBpath);
+    std::cerr << "Invalid storage type" << std::endl;
+    exit(1);
   }
+  this->thread_pool = new ThreadPool(this->metadata->log_file_number_limit);  // think about the number of threads in the embedded case
+  this->lru_cache = new LRUCache(this->metadata->log_file_number_limit, this->metadata->block_cache_capacity,
+                                 this->log_storage, this->sstable_storage);
   this->tail_cache = new TailCache();
-  this->lru_cache = new LRUCache(33554432, storage);
-  this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log_path, this->storage, this->tail_cache);
-  this->metadata_log->setLRUCache(this->lru_cache);
-  this->metadata_log->setMetadata(this->metadata);
-  this->log_handler = new LogHandler(this->metadata->log_file_size_limit, this->metadata->data_log_prefix, this->storage, lru_cache, metadata_log);
-  this->sstable_handler = new SSTableHandler(this->storage, metadata_log, this->metadata->sstable_level_prefix, lru_cache);
-  this->sstable_handler->setMaxLevel(this->metadata->max_level);
-  this->thread_pool = new ThreadPool(std::thread::hardware_concurrency());  // change this to number of log segment in log layer
-  this->log_handler->setThreadPool(this->thread_pool);
-  this->sstable_handler->setThreadPool(this->thread_pool);
+
+  this->metadata_log_handler = new MetadataLogHandler(this->metadata->metadata_log_path, this->metadatalog_storage,
+                                                      this->log_storage, this->sstable_storage, this->tail_cache, this->lru_cache);
+  if (this->metadata->storage_type == StorageType::kSharedLogStorage) {
+    this->data_log_handler = new DataLogHandler(this->lru_cache, this->thread_pool, this->metadata->storage_type);
+  } else {
+    this->data_log_handler = new DataLogHandler(this->metadata->DBdir, this->metadata->log_file_size_limit, this->metadata->data_log_prefix,
+                                                this->lru_cache, this->metadata_log_handler, this->thread_pool, this->metadata->storage_type);
+  }
+  this->sstable_handler = new SSTableHandler(this->metadata->sstable_level_prefix, this->lru_cache, this->metadata->max_level);
+
   std::string fingerprint = generateFingerprint();
-  this->watcher = new CompactionWatcher(this->metadata, this->storage, this->log_handler, metadata_log, this->sstable_handler, fingerprint);
-  this->watcher->setTaskLogHandler(new TaskLogHandler(this->metadata->task_log_path, this->storage));
-  this->file_mutex_manager = new FileMutexManager();
-  this->lru_cache->setFileMutexManager(this->file_mutex_manager);
-  this->watcher->setFileMutexManager(this->file_mutex_manager);
-  this->watcher->setThreadPool(this->thread_pool);
+
+  this->watcher = new CompactionWatcher(this->metadata, this->log_storage, new FileStorage(this->metadata->DBdir), this->data_log_handler,
+                                        this->metadata_log_handler, this->sstable_handler, fingerprint, this->tasklog_storage);
+
   srand(std::hash<std::string>{}(fingerprint));
-#ifdef SHARED_LOG
-  this->shareddatalog_storage = new SharedLogStorage(Type::kDataLog, 0);
-  this->sharedmetadatalog_storage = new SharedLogStorage(Type::kMetadataLog, 1);
-  this->sharedtasklog_storage = new SharedLogStorage(Type::kTaskLog, 2);
-  this->metadata_log->setMetadataSharedLogStorage(this->sharedmetadatalog_storage);
-  this->metadata_log->setDataSharedLogStorage(this->shareddatalog_storage);
-  this->log_handler->setSharedLogStorage(this->shareddatalog_storage);
-  this->lru_cache->setSharedLogStorage(this->shareddatalog_storage);
-  this->watcher->setSharedLogStorage(this->sharedtasklog_storage);
-  this->metadata_log->setPredefinedSharedLogSegmentSize(64);
-  this->lru_cache->setPredefinedSharedLogSegmentSize(64);
-#endif
 };
 
 DB::~DB() {
   delete this->watcher;
   delete this->sstable_handler;
-  delete this->log_handler;
+  delete this->data_log_handler;
   delete this->lru_cache;
-  delete this->metadata_log;
+  delete this->metadata_log_handler;
   delete this->tail_cache;
-  delete this->storage;
+  if (this->metadata->storage_type == StorageType::kFileStorage) {
+    delete this->sstable_storage;
+    this->log_storage = nullptr;
+    this->metadatalog_storage = nullptr;
+    this->tasklog_storage = nullptr;
+  } else if (this->metadata->storage_type == StorageType::kAzureBlobStorage) {
+    // delete this->storage;
+  } else if (this->metadata->storage_type == StorageType::kSharedLogStorage) {
+    delete this->log_storage;
+    delete this->sstable_storage;
+    delete this->metadatalog_storage;
+    delete this->tasklog_storage;
+  }
   delete this->metadata;
   delete this->thread_pool;
-  delete this->file_mutex_manager;
 }
 
 Status DB::openDB(DB*& db, std::string const& shared_config_path) {
@@ -62,12 +77,12 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   db = new DB(shared_config_path);
   db->active = true;
   // db->metadata_log->rollForwardMetadataLog();
-  db->metadata_log->initSSTMetadata();
+  db->metadata_log_handler->initSSTMetadata();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl
     db->watcher->startCompactionWatcher(&(db->active));
   }
-  db->metadata_log->startViewUpdate(&(db->active));
+  db->metadata_log_handler->startViewUpdate(&(db->active));
   return Status::kSuccess;
 }
 
@@ -87,38 +102,38 @@ Status DB::put(std::string const& key, std::string const& value) {
   record.set_key(key);
   record.set_value(value);
   record.set_type(kTypeValue);
-  log_handler->addRecord(record);
-  if (this->metadata->compaction_policy == CompactionPolicy::kHoSe) {
-    counter++;
-    if (counter < this->compaction_per_operation) {
-      return Status::kSuccess;
-    }
-    counter = 0;
+  data_log_handler->addRecord(record);
+  // if (this->metadata->compaction_policy == CompactionPolicy::kHoSe) {
+  //   counter++;
+  //   if (counter < this->compaction_per_operation) {
+  //     return Status::kSuccess;
+  //   }
+  //   counter = 0;
 
-    auto random = static_cast<double>(rand() * 1.0 / RAND_MAX);
-    double score = 0;
-    metadata_log->getLatestScore(score);
-    if (score == 0) {
-      return Status::kSuccess;
-    }
-    double k = 1;
-    double b = (this->metadata->max_level + 1) * 1.0;
-    this->compaction_rate = (std::exp(k * score) - std::exp(k)) / (std::exp(k * b) - std::exp(k));
-    if (random < this->compaction_rate) {
-      bool has_worked_on_compaction = false;
-      Compaction* compaction = nullptr;
-      TaskRecord* task_record = nullptr;
-      this->watcher->pickCompaction(compaction, task_record, has_worked_on_compaction);
-      if (has_worked_on_compaction) {
-        // push the task to thread pool
-        this->thread_pool->enqueue([this, compaction, task_record]() {
-          this->watcher->startCompaction(compaction, task_record);
-          delete compaction;
-          delete task_record;
-        });
-      }
-    }
-  }
+  //   auto random = static_cast<double>(rand() * 1.0 / RAND_MAX);
+  //   double score = 0;
+  //   metadata_log->getLatestScore(score);
+  //   if (score == 0) {
+  //     return Status::kSuccess;
+  //   }
+  //   double k = 1;
+  //   double b = (this->metadata->max_level + 1) * 1.0;
+  //   this->compaction_rate = (std::exp(k * score) - std::exp(k)) / (std::exp(k * b) - std::exp(k));
+  //   if (random < this->compaction_rate) {
+  //     bool has_worked_on_compaction = false;
+  //     Compaction* compaction = nullptr;
+  //     TaskRecord* task_record = nullptr;
+  //     this->watcher->pickCompaction(compaction, task_record, has_worked_on_compaction);
+  //     if (has_worked_on_compaction) {
+  //       // push the task to thread pool
+  //       this->thread_pool->enqueue([this, compaction, task_record]() {
+  //         this->watcher->startCompaction(compaction, task_record);
+  //         delete compaction;
+  //         delete task_record;
+  //       });
+  //     }
+  //   }
+  // }
   return Status::kSuccess;
 }
 
@@ -126,19 +141,19 @@ Status DB::remove(std::string const& key) {
   Record record;
   record.set_key(key);
   record.set_type(kTypeDeletion);
-  this->log_handler->addRecord(record);
+  this->data_log_handler->addRecord(record);
   return Status::kSuccess;
 }
 
 Status DB::get(std::string const& key, std::string const*& value) {
   // Step1: get the latest view and cache state from metadata log
   // metadata_log->rollForwardMetadataLog();
-  metadata_log->getLatestView(this->latest_view);
-  this->log_handler->setLatestView(&this->latest_view);
+  metadata_log_handler->getLatestView(this->latest_view);
+  this->data_log_handler->setLatestView(&this->latest_view);
   this->sstable_handler->setLatestView(&this->latest_view);
   this->lru_cache->setLatestView(&this->latest_view);
   std::pair<Record*, std::string> entry;
-  bool hit = tail_cache->getLatestRecord(key, entry);
+  bool hit = tail_cache->getLatestRecord(key, entry);  // go to loghandler
 
   // Step2: get the latest record from log, sstable
   Record* latest_record = nullptr;
@@ -156,7 +171,7 @@ Status DB::get(std::string const& key, std::string const*& value) {
   // Read from log, from new to old.
   Record* log_record = nullptr;
   std::string latest_offset;
-  log_handler->readRecord(key, log_record, offset, latest_offset);
+  data_log_handler->readRecord(key, log_record, offset, latest_offset);
   if (log_record) {
     latest_record = log_record;
     updated = true;

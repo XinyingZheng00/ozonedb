@@ -17,7 +17,7 @@
 
 #include "comparator.h"
 #include "protobuf/sstable.pb.h"
-#include "storage.h"
+#include "storage/storage.h"
 #include <iostream>
 namespace ozonedb {
 

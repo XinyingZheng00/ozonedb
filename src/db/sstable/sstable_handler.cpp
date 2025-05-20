@@ -31,8 +31,6 @@ Status SSTableHandler::readRecordFromAllLevel(std::string const& key, Record*& r
       }
       /*
       // currently, we don't need to use multi-thread to read the blocks from the sstable
-      std::shared_mutex& file_mutex = this->lru_cache->getMutexForFile(file_name);
-      std::unique_lock file_lock(file_mutex);
       Table* table = nullptr;
       this->lru_cache->getSSTable(file_name, table);
       std::string identifier_value;

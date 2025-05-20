@@ -1,22 +1,18 @@
 #ifndef COMPACTION_H
 #define COMPACTION_H
 
-#include "log_handler.h"
+#include "data_log_handler.h"
+#include "event_listener.h"
 #include "metadata.h"
 #include "sstable/sstable_handler.h"
 #include "sstable/table_builder.h"
-#include "storage.h"
+#include "storage/storage.h"
 #include "task_log_handler.h"
 #include <thread>
 #include <unordered_map>
 #include <vector>
 namespace ozonedb {
-class FileMutexManager;
-class EventListener;
-/**
- * @brief Represent a compaction task.
- *
- */
+
 class Compaction {
  public:
   TaskRecord::TaskIdentifier* task_id = nullptr;
@@ -28,26 +24,17 @@ class Compaction {
 class CompactionWatcher {
  private:
   Metadata* metadata = nullptr;
-  Storage* storage = nullptr;
-#ifdef SHARED_LOG
-  SharedLogStorage* sharedlog_storage = nullptr;
+  Storage* log_storage = nullptr;
+  FileStorage* sst_storage = nullptr;
 
- public:
-  void setSharedLogStorage(SharedLogStorage* sharedlog_storage) { this->sharedlog_storage = sharedlog_storage; }
-
- private:
-#endif
-  LogHandler* task_handler = nullptr;
-  LogHandler* log_handler = nullptr;
+  DataLogHandler* log_handler = nullptr;
   SSTableHandler* sstable_handler = nullptr;
   MetadataLogHandler* metadata_handler = nullptr;
   TaskLogHandler* task_log_handler = nullptr;
   std::thread* compaction_thread = nullptr;
-  ThreadPool* thread_pool = nullptr;
   EventListener* event_listener = nullptr;
   std::string fingerprint;
   View latest_view;
-  FileMutexManager* file_mutex_manager = nullptr;
 
   Status watchForCompaction(std::atomic<bool> const* active);
   bool shouldWorkOnTask(TaskRecord::TaskIdentifier* task_id, TaskRecord*& task_record, int owner_generation);
@@ -60,8 +47,10 @@ class CompactionWatcher {
    * @param storage
    * @param level_handlers
    */
-  CompactionWatcher(Metadata* metadata, Storage* storage, LogHandler* log_handler, MetadataLogHandler* metadata_handler, SSTableHandler* sstable_handler, std::string fingerprint)
-      : metadata(metadata), storage(storage), log_handler(log_handler), metadata_handler(metadata_handler), sstable_handler(sstable_handler), fingerprint(fingerprint) {
+  CompactionWatcher(Metadata* metadata, Storage* log_storage, FileStorage* sst_storage, DataLogHandler* log_handler, MetadataLogHandler* metadata_handler,
+                    SSTableHandler* sstable_handler, std::string fingerprint, Storage* tasklog_storage)
+      : metadata(metadata), log_storage(log_storage), sst_storage(sst_storage), log_handler(log_handler), metadata_handler(metadata_handler), sstable_handler(sstable_handler), fingerprint(fingerprint) {
+    this->task_log_handler = new TaskLogHandler(this->metadata->task_log_path, tasklog_storage);
   }
   ~CompactionWatcher() {
     // delete this->compaction_thread;
@@ -69,13 +58,6 @@ class CompactionWatcher {
   }
   // set event listener
   void setEventListener(EventListener* event_listener) { this->event_listener = event_listener; }
-
-  // set task log handler
-  void setTaskLogHandler(TaskLogHandler* task_log_handler) { this->task_log_handler = task_log_handler; }
-  // set file mutex manager
-  void setFileMutexManager(FileMutexManager* file_mutex_manager) { this->file_mutex_manager = file_mutex_manager; }
-  // set thread pool
-  void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }
 
   Status pickCompaction(Compaction*& compaction, TaskRecord*& task_record, bool& has_worked_on_compaction);
   Status startCompaction(Compaction* compaction, TaskRecord* task_record);

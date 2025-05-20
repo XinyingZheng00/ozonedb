@@ -7,7 +7,7 @@
 
 #include "comparator.h"
 #include "protobuf/sstable.pb.h"
-#include "storage.h"
+#include "storage/file_storage.h"
 #include <string>
 #include <vector>
 #include <stdint.h>
@@ -51,7 +51,7 @@ class BlockBuilder {
   std::string last_key_;
 };
 
-Status readBlock(Storage* storage,
+Status readBlock(FileStorage* storage,
                  std::string const& fileName,
                  //  ReadOptions const& options,
                  BlockIdentifier const& identifier,

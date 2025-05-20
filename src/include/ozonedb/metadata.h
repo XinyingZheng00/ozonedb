@@ -1,6 +1,7 @@
 #ifndef METADATA_H
 #define METADATA_H
 
+#include "ozonedb_common.h"
 #include "protobuf/record.pb.h"
 #include "read_json.h"
 #include <string>
@@ -21,11 +22,11 @@ class Metadata {
    *
    */
   std::string container_name;  // only for cloud storage
-  std::string DBpath;
-  int is_cloud = false;
+  std::string DBdir;
+  StorageType storage_type;
   std::string metadata_log_path = "metadata.log";
   std::string task_log_path = "task.log";
-  std::string data_log_prefix = "sharedlog";  // for file system log, it is datalog, for shared log, it is log
+  std::string data_log_prefix = "sharedlog";
   std::string sstable_level_prefix = "sstable";
   std::string task_prefix;
 
@@ -34,12 +35,13 @@ class Metadata {
    *
    */
   uint64_t log_file_size_limit;
-  int max_level;
-  uint64_t base_file_number_limit;
+  uint64_t log_file_number_limit;
   uint64_t last_file_number_limit = 4;
+  uint64_t block_cache_capacity;
   std::vector<uint64_t> level_size;
   std::vector<uint64_t> level_file_size_limit;
 
+  int max_level;
   CompactionPolicy compaction_policy;
 
   /**
@@ -59,11 +61,11 @@ class Metadata {
   Metadata(std::string const& shared_config_path) {
     // read metadata from shared storage
     std::map<std::string, std::string> result = parseJSON(shared_config_path);
-    DBpath = result["db_path"];
+    DBdir = result["db_path"];
     task_prefix = result["task_prefix"];
     log_file_size_limit = std::stol(result["log_file_size_limit"]);
-    is_cloud = std::stoi(result["cloud"]);
-    if (is_cloud) {
+    storage_type = static_cast<StorageType>(std::stoi(result["storage_type"]));
+    if (storage_type == StorageType::kAzureBlobStorage) {
       container_name = result["container_name"];
     }
 
@@ -83,13 +85,14 @@ class Metadata {
     // assert(level_file_size_limit.size() == max_level - 1);
 
     assert(max_level >= 2);  // otherwise the initoutput logic need to be modified
-    base_file_number_limit = std::stoi(result["base_file_number_limit"]);
+    log_file_number_limit = std::stoi(result["log_file_number_limit"]);
+    block_cache_capacity = std::stol(result["block_cache_capacity"]);
     compaction_policy = static_cast<CompactionPolicy>(std::stoi(result["compaction_policy"]));
 
     // std::cout<<shared_config_path<<std::endl;
     // std::cout << "DBpath: " << DBpath << std::endl;
     // std::cout << "max_log_file_size: " << max_log_file_size << std::endl;
-    // std::cout << "base_file_number_limit: " << base_file_number_limit << std::endl;
+    // std::cout << "log_file_number_limit: " << log_file_number_limit << std::endl;
     // std::cout << "max_level: " << max_level << std::endl;
     // std::cout << "policy: " << static_cast<int>(policy) << std::endl;
   };

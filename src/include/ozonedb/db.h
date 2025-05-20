@@ -3,70 +3,36 @@
 
 #include "cache.h"
 #include "compaction.h"
-#include "log_handler.h"
+#include "data_log_handler.h"
+#include "event_listener.h"
 #include "protobuf/record.pb.h"
 #include "sstable/sstable_handler.h"
 #include <thread>
 #include <assert.h>
 
 namespace ozonedb {
-class FileMutexManager {
-  std::unordered_map<std::string, std::shared_mutex> file_to_mutex_map;
-  std::shared_mutex map_mutex;
-
- public:
-  std::shared_mutex& getMutexForFile(std::string const& filename) {
-    std::unique_lock<std::shared_mutex> lock(map_mutex);
-    return file_to_mutex_map[filename];
-  }
-};
-
-class EventListener {
- public:
-  virtual void onLogCompactionStart(){};
-  virtual void onLogCompactionCompletion(int time){};
-  virtual void onSSTableCompactionStart(){};
-  virtual void onSSTableCompactionCompletion(int time, int level){};
-  virtual void onViewUpdate(){};
-  virtual void onNewTail(){};
-};
 
 class DB {
  private:
-  /**
-   * @brief the state of the database
-   *
-   */
   std::atomic<bool> active;
   int compaction_per_operation = 10;
   int counter = 0;
 
-  /**
-   * @brief different modules of the database
-   *
-   */
-  Storage* storage;
-#ifdef SHARED_LOG
-  SharedLogStorage* shareddatalog_storage;
-  SharedLogStorage* sharedmetadatalog_storage;
-  SharedLogStorage* sharedtasklog_storage;
-#endif
+  Storage* log_storage;
+  FileStorage* sstable_storage;
+  Storage* metadatalog_storage;
+  Storage* tasklog_storage;
 
   Metadata* metadata;
   CompactionWatcher* watcher = nullptr;
   View latest_view;
   std::mutex db_mutex;
 
-  /**
-   * @brief different handlers for read-write
-   *
-   */
-  MetadataLogHandler* metadata_log = nullptr;
-  LogHandler* log_handler = nullptr;
+  MetadataLogHandler* metadata_log_handler = nullptr;
+  DataLogHandler* data_log_handler = nullptr;
   SSTableHandler* sstable_handler = nullptr;
   TailCache* tail_cache = nullptr;
   LRUCache* lru_cache = nullptr;
-  FileMutexManager* file_mutex_manager = nullptr;
   ThreadPool* thread_pool = nullptr;
   EventListener* event_listener = nullptr;
 
@@ -94,7 +60,7 @@ class DB {
   void setEventListener(EventListener* event_listener) {
     this->event_listener = event_listener;
     this->watcher->setEventListener(event_listener);
-    this->metadata_log->setEventListener(event_listener);
+    this->metadata_log_handler->setEventListener(event_listener);
   }
 
   /**

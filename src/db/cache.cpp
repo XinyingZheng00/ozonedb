@@ -1,7 +1,6 @@
 #include "cache.h"
 #include "db.h"
 #include "helper.h"
-#include "metadata_log_handler.h"
 #include "protobuf_serializer.h"
 
 namespace ozonedb {
@@ -17,7 +16,7 @@ void LRUCache::updateLRU(std::string const& file_name, std::string const& index_
 
 // Function to evict the least recently used item
 void LRUCache::evict() {
-  while (current_size > capacity) {
+  while (current_size > block_cache_capacity) {
     auto it = lru_list.rbegin();
     current_size -= file_to_entry_map[it->first].block_size[it->second];
     auto block_records = file_to_entry_map[it->first].block_records[it->second];
@@ -58,7 +57,7 @@ void LRUCache::evictLog() {
     lru_list_log.pop_back();
   }
 }
-void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size) {
+void LRUCache::shouldReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size) {
   std::unique_lock lock(mutex);
   auto it = file_to_entry_map.find(file_name);
   if (it != file_to_entry_map.end()) {
@@ -75,51 +74,31 @@ void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, s
   }
 }
 
-void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, size_t size) {
-  std::unordered_map<std::string, Record*> records_map;
-  bool sealed;
-#ifdef SHARED_LOG
-  std::vector<std::string> entries;
-  int start_offset = getStartOffset(file_name);
-  this->sharedlog_storage->read(entries, start_offset + cached_offset, start_offset + size);
-  for (auto& entry : entries) {
-    auto* record_tmp = new Record();
-    (*record_tmp).ParseFromString(entry);
-    records_map[record_tmp->key()] = record_tmp;
-  }
-  sealed = cached_offset + entries.size() == predefined_shared_log_segment_size;
-#else
-  // file system read
-  unsigned char* buffer = nullptr;
-  std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-  std::unique_lock file_lock(file_mutex);
-  this->storage->read(file_name, buffer, cached_offset, size - cached_offset);
-  file_lock.unlock();
-  std::vector<google::protobuf::Message*> messages;
-  protobuf::deserializeMessages(buffer, size - cached_offset, messages, []() -> google::protobuf::Message* {
-    return new Record();
-  });
-  delete[] buffer;
-  buffer = nullptr;
-  for (auto* msg : messages) {
-    auto* rec = static_cast<Record*>(msg);
-    records_map[rec->key()] = rec;
-  }
-  sealed = file_name != latest_view->current_log_tail;
-#endif
-  putLogRecords(file_name, records_map, size, sealed);
-}
+// void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, size_t size) {
+// std::unordered_map<std::string, Record*> records_map;
+// bool sealed;
+// std::vector<google::protobuf::Message*> messages;
+// this->log_storage->read(
+//     file_name, cached_offset, size,
+//     [&]() -> google::protobuf::Message* {
+//       return new Record();
+//     },
+//     messages);
+// for (auto* msg : messages) {
+//   auto* rec = static_cast<Record*>(msg);
+//   records_map[rec->key()] = rec;
+// }
+// sealed = file_name != latest_view->current_log_tail;
+// putLogRecords(file_name, records_map, size, sealed);
+// }
 
 void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
   std::unique_lock lock(mutex);
   auto it = file_to_entry_map.find(file_name);
   if (it == file_to_entry_map.end()) {
     lock.unlock();
-    std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-    std::unique_lock file_lock(file_mutex);
-    Status status = Table::open(this->storage, file_name, table);
-    file_lock.unlock();
-    table->setCache(this);
+    Status status = Table::open(this->sst_storage, file_name, table);
+    table->setCache(this);  // fix this
     if (status != Status::kSuccess) {
       std::cout << "open table failed" << std::endl;
       return;
@@ -139,11 +118,8 @@ void LRUCache::needReadBlock(std::string const& file_name, bool& read_more, std:
 }
 
 void LRUCache::readDataBlocks(std::string const& file_name, std::string const& index_value) {
-  std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-  std::unique_lock file_lock(file_mutex);
   Table* table = file_to_entry_map[file_name].table;
   Iterator* iter = table->blockReader(table, index_value);
-  file_lock.unlock();
   iter->seekToFirst();
   std::unordered_map<std::string, Record*>* records_tmp = new std::unordered_map<std::string, Record*>();
   size_t size = 0;
@@ -227,7 +203,7 @@ void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std:
   file_to_entry_map[key].block_records[index_value] = records;
   file_to_entry_map[key].block_size[index_value] = size;
   current_size += size;
-  if (current_size > capacity) {
+  if (current_size > block_cache_capacity) {
     evict();
   }
   updateLRU(key, index_value);

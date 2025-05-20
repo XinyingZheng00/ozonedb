@@ -13,7 +13,7 @@ namespace ozonedb {
 #define BLOCK_SIZE 4096  // approximate size of a block
 
 struct TableBuilder::Rep {
-  Storage* storage;
+  FileStorage* storage;
   std::string fileName;
   size_t offset = 0;
   Status status = Status::kSuccess;
@@ -39,16 +39,16 @@ struct TableBuilder::Rep {
   bool pending_index_entry = false;
   BlockIdentifier* pending_index_identifier = nullptr;  // Handle to add to index block
 
-  Rep(Storage* storage, std::string fileName) : storage(storage),
-                                                fileName(std::move(fileName)),
-                                                data_block(8),                           // default to 8, can be changed later
-                                                index_block(1),                          // cannot be changed
-                                                comparator(newBytewiseComparator()),     // default for now
-                                                filter_policy(newBloomFilterPolicy(10))  // default for now
-                                                {};
+  Rep(FileStorage* storage, std::string fileName) : storage(storage),
+                                                    fileName(std::move(fileName)),
+                                                    data_block(8),                           // default to 8, can be changed later
+                                                    index_block(1),                          // cannot be changed
+                                                    comparator(newBytewiseComparator()),     // default for now
+                                                    filter_policy(newBloomFilterPolicy(10))  // default for now
+                                                    {};
 };
 
-TableBuilder::TableBuilder(Storage* storage, std::string file)
+TableBuilder::TableBuilder(FileStorage* storage, std::string file)
     : rep_(new Rep(storage, std::move(file))) {
   if (rep_->filter_policy != nullptr) {
     rep_->filter_block = new FilterBlockBuilder(rep_->filter_policy);
@@ -115,7 +115,7 @@ void TableBuilder::flush() {
   r->data_block.reset();
   if (ok()) {
     r->pending_index_entry = true;
-    // r->status = r->storage->flush(r->fileName);
+    // r->status = r->storage->flush(r->fileName); //to be checked
   }
   if (r->filter_block != nullptr) {
     r->filter_block->startBlock(r->offset);
@@ -125,17 +125,14 @@ void TableBuilder::flush() {
 void TableBuilder::writeBlock(google::protobuf::Message const& block, BlockIdentifier*& identifier) {
   assert(ok());
   Rep* r = rep_;
-  int block_data_vector_size;
-  unsigned char* block_data_vector = protobuf::serializeMessage(block, block_data_vector_size);
+  size_t block_data_size;
+  r->status = r->storage->appendNoFlush(r->fileName, block, block_data_size);
   // write block data
   identifier = new BlockIdentifier();
   identifier->set_offset(r->offset);
-  identifier->set_length(block_data_vector_size);
-  r->status = r->storage->appendNoFlush(r->fileName, block_data_vector, block_data_vector_size);  // change
-  delete[] block_data_vector;
-  block_data_vector = nullptr;
+  identifier->set_length(block_data_size);
   if (ok()) {
-    r->offset += block_data_vector_size;
+    r->offset += block_data_size;
   }
 }
 
@@ -198,17 +195,14 @@ Status TableBuilder::finish() {
     footer.set_allocated_metaindex_identifier(metaindex_block_identifier);
     footer.set_allocated_index_identifier(index_block_identifier);
     footer.set_magic(0xdb4775248b80fb57);
-    int footer_encoding_size;
-    auto* footer_encoding = protobuf::serializeMessage(footer, footer_encoding_size);
-    r->status = r->storage->appendNoFlush(r->fileName, footer_encoding, footer_encoding_size);
-    delete[] footer_encoding;
-    footer_encoding = nullptr;
+    size_t footer_encoding_size;
+    r->status = r->storage->appendNoFlush(r->fileName, footer, footer_encoding_size);
     if (ok()) {
       r->offset += footer_encoding_size;
     }
   }
   r->storage->flush(r->fileName);  // flush at last
-  // r->storage->seal(r->fileName);
+  // r->storage->seal(r->fileName); //tobe checked
   delete filter_block_identifier;
   delete filter_block_for_file_identifier;
   // delete metaindex_block_identifier;

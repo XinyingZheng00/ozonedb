@@ -4,6 +4,7 @@
 
 #include "sstable/table_reader.h"
 #include "cache.h"
+#include "ozonedb_common.h"
 #include "protobuf/sstable.pb.h"
 #include "protobuf_serializer.h"
 #include "sstable/block_handler.h"
@@ -13,7 +14,7 @@ namespace ozonedb {
 #define FOOTER_BLOCK_SIZE 50
 struct Table::Rep {
   Status status = Status::kSuccess;
-  Storage* storage = nullptr;
+  FileStorage* storage = nullptr;
   LRUCache* lru_cache = nullptr;
   Comparator* comparator = nullptr;
   std::string fileName;
@@ -27,20 +28,15 @@ void Table::setCache(LRUCache* cache) {
   rep_->lru_cache = cache;
 }
 
-Status Table::open(Storage* storage,
+Status Table::open(FileStorage* storage,
                    std::string const& fileName,
                    Table*& table) {
   // read the footer
-  size_t size = storage->size(fileName);  // tobe changed.
-  unsigned char* footer_vector = nullptr;
-  Status s = storage->read(fileName, footer_vector, size - FOOTER_BLOCK_SIZE, FOOTER_BLOCK_SIZE);
-  if (s != Status::kSuccess) return s;
-  // Deserialize the footer
+  size_t size = storage->size(fileName);
   std::vector<google::protobuf::Message*> footer;
-  s = protobuf::deserializeMessages(footer_vector, FOOTER_BLOCK_SIZE, footer, []() { return new FooterBlock(); });
+  Status s = storage->read(
+      fileName, size - FOOTER_BLOCK_SIZE, size, []() { return new FooterBlock(); }, footer);
   if (s != Status::kSuccess) return s;
-  delete[] footer_vector;
-  footer_vector = nullptr;
   auto* footer_block = static_cast<FooterBlock*>(footer[0]);
   // read index block based on the index identifier in the footer
   BlockData* index_block;
@@ -56,7 +52,6 @@ Status Table::open(Storage* storage,
     table->readMeta(*footer_block);
     delete footer_block;
   }
-
   return s;
 }
 

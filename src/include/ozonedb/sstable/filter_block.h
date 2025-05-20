@@ -10,7 +10,7 @@
 #define STORAGE_OZONEDB_TABLE_FILTER_BLOCK_H_
 
 #include "protobuf/sstable.pb.h"
-#include "storage.h"
+#include "storage/file_storage.h"
 #include <string>
 #include <vector>
 
@@ -51,7 +51,7 @@ class filterBlockReader {
   FilterBlock* block_;
 };
 
-Status readFilterBlock(Storage* storage, std::string const& fileName,
+Status readFilterBlock(FileStorage* storage, std::string const& fileName,
                        BlockIdentifier const& identifier,
                        FilterBlock*& result);
 

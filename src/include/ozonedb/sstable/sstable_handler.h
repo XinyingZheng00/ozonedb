@@ -1,8 +1,7 @@
 #ifndef SSTABLE_HANDLER_H
 #define SSTABLE_HANDLER_H
 #include "cache.h"
-#include "log_handler.h"
-#include "storage.h"
+#include "storage/file_storage.h"
 #include "thread_pool.h"
 
 namespace ozonedb {
@@ -15,36 +14,20 @@ namespace ozonedb {
 // if a key only has kTypeValue type, then this record will be ignored.
 class SSTableHandler {
  private:
-  Storage* storage = nullptr;
-  MetadataLogHandler* metadata_log = nullptr;
   std::string sstable_prefix;
   LRUCache* lru_cache = nullptr;
-  ThreadPool* thread_pool = nullptr;
   int max_level;
   View* latest_view = nullptr;
 
  public:
-  /**
-   * @brief Construct a new Handler object
-   *
-   * @param file_size_limit
-   * @param log_prefix
-   * @param storage
-   */
-  SSTableHandler(Storage* storage, MetadataLogHandler* metadata_log, std::string sstable_prefix, LRUCache* cache)
-      : storage(storage), metadata_log(metadata_log), sstable_prefix(sstable_prefix), lru_cache(cache){};
+  SSTableHandler(std::string sstable_prefix, LRUCache* cache, int max_level)
+      : sstable_prefix(sstable_prefix), lru_cache(cache), max_level(max_level){};
 
-  // set latest view
   void setLatestView(View* view) { latest_view = view; }
 
-  // set max level
-  void setMaxLevel(int max_level) { this->max_level = max_level; }
   ~SSTableHandler(){};
 
   Status readRecordFromAllLevel(std::string const& key, Record*& record, std::string const& offset);
-
-  // set thread pool
-  void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }
 };
 }  // namespace ozonedb
 #endif

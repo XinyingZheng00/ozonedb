@@ -85,24 +85,19 @@ void BlockBuilder::add(std::string const& key, std::string const& value) {
   counter_++;
 }
 
-Status readBlock(Storage* storage,
-                 std::string const& fileName,
+Status readBlock(FileStorage* storage,
+                 std::string const& file_name,
                  BlockIdentifier const& identifier,
                  BlockData*& result) {
   // Read the block contents
   // See table_builder.cc for the code that built this structure.
   size_t n = identifier.length();
-  unsigned char* block_data_contents = nullptr;
-  Status status = storage->read(fileName, block_data_contents, identifier.offset(), n);
-  if (status != Status::kSuccess) {
-    return status;
-  }
   std::vector<google::protobuf::Message*> block_data;
-  status = protobuf::deserializeMessages(block_data_contents, n, block_data, []() {
-    return new BlockData();
-  });
-  delete[] block_data_contents;
-  block_data_contents = nullptr;
+  Status status = storage->read(
+      file_name, identifier.offset(), identifier.offset() + n, []() {
+        return new BlockData();
+      },
+      block_data);
   if (status != Status::kSuccess) {
     return status;
   }

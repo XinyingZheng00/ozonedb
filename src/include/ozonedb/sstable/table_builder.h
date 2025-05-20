@@ -14,7 +14,7 @@
 #define STORAGE_OZONEDB_INCLUDE_TABLE_BUILDER_H_
 
 #include "sstable/block_handler.h"
-#include "storage.h"
+#include "storage/storage.h"
 #include <stdint.h>
 
 // DB contents are stored in a set of blocks, each of which holds a
@@ -27,7 +27,7 @@ class TableBuilder {
  public:
   // Create a builder that will store the contents of the table it is
   // building in file.
-  TableBuilder(Storage* storage, std::string file);
+  TableBuilder(FileStorage* storage, std::string file);
 
   // REQUIRES: Either Finish() or Abandon() has been called.
   ~TableBuilder();

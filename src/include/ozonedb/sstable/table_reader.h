@@ -8,7 +8,7 @@
 #include "comparator.h"
 #include "protobuf/sstable.pb.h"
 #include "sstable/iterator.h"
-#include "storage.h"
+#include "storage/file_storage.h"
 #include <stdint.h>
 namespace ozonedb {
 class LRUCache;
@@ -29,7 +29,7 @@ class Table {
   // for the duration of the returned table's lifetime.
   //
   // *file must remain live while this Table is in use.
-  static Status open(Storage* storage,
+  static Status open(FileStorage* storage,
                      std::string const& fileName,
                      Table*& table);
   Status get(std::string const& key, Record*& record);

@@ -71,24 +71,22 @@ bool filterBlockReader::keyMayMatch(uint64_t block_offset, std::string const& ke
   return true;  // Errors are treated as potential matches
 }
 
-Status readFilterBlock(Storage* storage,
+Status readFilterBlock(FileStorage* storage,
                        std::string const& fileName,
                        BlockIdentifier const& identifier,
                        FilterBlock*& result) {
   // Read the block contents
   // See table_builder.cc for the code that built this structure.
   size_t n = identifier.length();
-  unsigned char* block_data_contents = nullptr;
-  Status status = storage->read(fileName, block_data_contents, identifier.offset(), n);
+  std::vector<google::protobuf::Message*> block_data;
+  Status status = storage->read(
+      fileName, identifier.offset(), identifier.offset() + n, []() {
+        return new FilterBlock();
+      },
+      block_data);
   if (status != Status::kSuccess) {
     return status;
   }
-  std::vector<google::protobuf::Message*> block_data;
-  status = protobuf::deserializeMessages(block_data_contents, n, block_data, []() {
-    return new FilterBlock();
-  });
-  delete[] block_data_contents;
-  block_data_contents = nullptr;
   result = static_cast<FilterBlock*>(block_data[0]);
   return status;
 }

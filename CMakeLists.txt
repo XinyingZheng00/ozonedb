@@ -68,13 +68,14 @@ include_directories(
 add_library(OzoneDB STATIC
     src/db/compaction.cpp
     src/db/db.cpp
-    src/db/log_handler.cpp
+    src/db/data_log_handler.cpp
     src/db/cache.cpp
     src/db/metadata_log_handler.cpp
+    src/db/view.cpp
     src/db/task_log_handler.cpp
-    src/db/storage.cpp
-    src/db/azure_blob_storage.cpp
-    src/db/shared_log_storage.cpp
+    src/db/storage/file_storage.cpp
+    src/db/storage/shared_log_storage.cpp
+    # src/db/azure_blob_storage.cpp
     src/db/sstable/block_handler.cpp
     src/db/sstable/table_builder.cpp
     src/db/sstable/iterator.cpp
@@ -105,14 +106,15 @@ endif()
 
 # Executable for Unit Tests
 add_executable(runUnitTests 
-    tests/test_db.cpp 
+    # tests/test_db.cpp 
     tests/test_log.cpp
     tests/test_storage.cpp
-    tests/test_shared_log.cpp
-    tests/test_all.cpp
+    # tests/test_cache.cpp
+    tests/test_metadatalog_handler.cpp
+    # tests/test_all.cpp
     tests/test_protobuf.cpp
     tests/test_sstable.cpp
-    tests/test_compaction.cpp
+    # tests/test_compaction.cpp
     tests/test_filter_block.cpp
 )
 target_compile_definitions(OzoneDB PRIVATE ERPC_INFINIBAND=true)

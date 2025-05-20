@@ -5,58 +5,28 @@ namespace ozonedb {
 #include <unistd.h>
 //========================================read and write=======================================
 void TaskLogHandler::appendToTaskLog(TaskRecord const& record) {
-#ifdef SHARED_LOG
-  std::string data = record.SerializeAsString();
-  this->task_sharedlog_storage->append(data);
-  return;
-#endif
-  int buffer_size;
-  unsigned char* buffer = protobuf::serializeMessage(record, buffer_size);
-  std::unique_lock<std::shared_mutex> lock(task_log_mutex);
-  this->storage->append(this->active_unit, buffer, buffer_size);
-  delete[] buffer;
-  buffer = nullptr;
+  size_t size = 0;
+  this->storage->append(this->active_unit, record, size);
 }
 
 Status TaskLogHandler::readTaskLog(std::vector<TaskRecord*>& result) {
-  std::unique_lock<std::shared_mutex> lock(task_log_mutex);
-#ifdef SHARED_LOG
-  size_t log_size = this->task_sharedlog_storage->size();
-  if (log_size == this->offset) {
-    return {};
-  }
-  std::vector<std::string> entries;
-  this->task_sharedlog_storage->read(entries, this->offset, log_size);
-  for (auto& entry : entries) {
-    auto* record_tmp = new TaskRecord();
-    (*record_tmp).ParseFromString(entry);
-    result.push_back(record_tmp);
-  }
-  return Status::kSuccess;
-#endif
-  if (!this->storage->exist(this->active_unit)) {
-    return Status::kSuccess;
-  }
+  std::unique_lock<std::shared_mutex> lock(task_log_mutex);  // tobe fixed
   size_t file_size = this->storage->size(this->active_unit);
-  if (file_size == this->offset) {
+  if (file_size <= this->offset) {
     return Status::kSuccess;
   }
   size_t size = file_size - this->offset;
-  std::vector<google::protobuf::Message*> records;
-  unsigned char* buffer = nullptr;
-  this->storage->read(this->active_unit, buffer, this->offset, size);
+  std::vector<google::protobuf::Message*> messages;
+  this->storage->read(
+      this->active_unit, this->offset, size, []() -> google::protobuf::Message* {
+        return new TaskRecord();
+      },
+      messages);
   this->offset = file_size;
   lock.unlock();
-  if (protobuf::deserializeMessages(buffer, size, records, []() -> google::protobuf::Message* {
-        return new TaskRecord();
-      }) == Status::kFailure) {
-    return Status::kFailure;
-  }
-  delete[] buffer;
-  buffer = nullptr;
-  result.reserve(records.size());
-  for (auto const& record : records) {
-    result.push_back(static_cast<TaskRecord*>(record));
+  result.reserve(messages.size());
+  for (auto const& message : messages) {
+    result.push_back(static_cast<TaskRecord*>(message));
   }
   return Status::kSuccess;
 }

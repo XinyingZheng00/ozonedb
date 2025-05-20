@@ -1,9 +1,11 @@
 #ifndef OZONEDB_CACHE_H
 #define OZONEDB_CACHE_H
-#include "shared_log_storage.h"
 #include "sstable/block_handler.h"
 #include "sstable/table_reader.h"
-#include "storage.h"
+#include "storage/shared_log_storage.h"
+#include "storage/storage.h"
+#include "view.h"
+#include <condition_variable>
 #include <list>
 #include <mutex>
 #include <shared_mutex>
@@ -12,8 +14,6 @@
 #include <unordered_map>
 namespace ozonedb {
 
-class View;
-class FileMutexManager;
 class TailCache {
  public:
   // mutex for tail_cache
@@ -83,33 +83,18 @@ class LRUCache {
     // contructor for table
     CacheEntry(Table* table) : table(table), offset(), sealed(true) {}
   };
-  Storage* storage = nullptr;
+  Storage* log_storage = nullptr;
+  FileStorage* sst_storage = nullptr;
 
-#ifdef SHARED_LOG
-  size_t predefined_shared_log_segment_size = 32768;  // todo: make it configurable
-  SharedLogStorage* sharedlog_storage;
-
- public:
-  void setSharedLogStorage(SharedLogStorage* sharedlog_storage) {
-    this->sharedlog_storage = sharedlog_storage;
-  }
-
-  void setPredefinedSharedLogSegmentSize(size_t size) {
-    this->predefined_shared_log_segment_size = size;
-  }
-
- private:
-#endif
   int log_num_limit = 2;
   int log_num = 0;
 
-  size_t capacity = 33554432;
+  size_t block_cache_capacity = 33554432;
   size_t current_size = 0;
   std::shared_mutex mutex;                                        // this is to protect file_to_records_map and lru_list
-  std::unordered_map<std::string, CacheEntry> file_to_entry_map;  // to sharedlog storage, the file_name is the sharedlog:start_index:end_index
+  std::unordered_map<std::string, CacheEntry> file_to_entry_map;  // to sharedlog storage, the file_name is the sharedlog/start_index:end_index
   std::list<std::pair<std::string, std::string>> lru_list;
   std::list<std::string> lru_list_log;
-  FileMutexManager* file_mutex_manager = nullptr;
   View* latest_view = nullptr;
 
   // Function to move a key to the front of the LRU list
@@ -120,7 +105,11 @@ class LRUCache {
   void evictLog();
 
  public:
-  LRUCache(int capacity, Storage* storage) : capacity(capacity), storage(storage) {}
+  std::mutex inflight_mu_;
+  std::unordered_map<std::string, std::shared_ptr<std::condition_variable>> inflight_;
+
+  LRUCache(int log_num_limit, int capacity, Storage* log_storage, FileStorage* sst_storage)
+      : log_num_limit(log_num_limit), block_cache_capacity(capacity), log_storage(log_storage), sst_storage(sst_storage) {}
 
   ~LRUCache() {
     for (auto& entry : file_to_entry_map) {
@@ -144,12 +133,8 @@ class LRUCache {
     return file_to_entry_map;
   }
 
-  // set file_mutex_manager
-  void setFileMutexManager(FileMutexManager* file_mutex_manager) {
-    this->file_mutex_manager = file_mutex_manager;
-  }
-  void checkReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size);
-  void readDataLog(std::string const& file_name, size_t cached_offset, size_t size);
+  void shouldReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size);
+  // void readDataLog(std::string const& file_name, size_t cached_offset, size_t size);
   void getSSTable(std::string const& file_name, Table*& table);
   void needReadBlock(std::string const& file_name, bool& read_more, std::string const& index_value);
   void readDataBlocks(std::string const& file_name, std::string const& index_value);
@@ -160,7 +145,6 @@ class LRUCache {
   void putSSTableMeta(std::string const& key, Table* table);
   void putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*>* records, std::string const& index_value, size_t size);
 
-  // set latest view
   void setLatestView(View* view) {
     latest_view = view;
   }
