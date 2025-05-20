@@ -66,6 +66,7 @@ void DataLogHandler::fetchLogToCache(std::string const& file_name, size_t cached
         return new Record();
       },
       messages);
+  std::cout << "thread id: " << std::this_thread::get_id() << " fetchLogToCache file_name: " << file_name << " offset: " << cached_offset << " size: " << size << std::endl;
   for (auto* msg : messages) {
     auto* rec = static_cast<Record*>(msg);
     records_map[rec->key()] = rec;
@@ -101,7 +102,6 @@ Status DataLogHandler::readRecord(std::string const& key, Record*& record, std::
     bool read_more = this->shouldReadMoreLog(file_name, cached_offset, size);
     if (read_more) {
       count++;
-      std::cout << "enqueueFetchOnceWithEndOffset file_name: " << file_name << " offset: " << cached_offset << " size: " << size << std::endl;
       this->thread_pool->enqueueFetchOnceWithEndOffset(
           file_name,
           size,
@@ -126,6 +126,7 @@ Status DataLogHandler::readRecord(std::string const& key, Record*& record, std::
             cv.notify_one();
           });
     } else {
+      std::cout << "thread id: " << std::this_thread::get_id() << " readmore: false" << std::endl;
       Record* record_tmp = nullptr;
       this->cache->get(file_name, key, record_tmp);
       if (record_tmp) {

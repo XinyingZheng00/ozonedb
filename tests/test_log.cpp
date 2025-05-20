@@ -1,12 +1,12 @@
 #include "cache.h"
 #include "data_log_handler.h"
 #include "metadata_log_handler.h"
+#include "ozonedb_common.h"
 #include "storage/file_storage.h"
 #include "storage/shared_log_storage.h"
 #include "storage/storage.h"
 #include "thread_pool.h"
 #include <gtest/gtest.h>
-#include "ozonedb_common.h"
 #include <memory>
 
 using namespace ozonedb;
@@ -86,7 +86,7 @@ TEST_F(DataLogHandlerTest, AddRecordSharedLog) {
 }
 
 TEST_F(DataLogHandlerTest, MultiThreadAddRecordFileStorage) {
-  const int num_threads = 4;
+  int const num_threads = 4;
 
   std::vector<std::thread> threads;
 
@@ -114,7 +114,7 @@ TEST_F(DataLogHandlerTest, MultiThreadAddRecordFileStorage) {
 }
 
 TEST_F(DataLogHandlerTest, MultiThreadAddRecordSharedLog) {
-  const int num_threads = 4;
+  int const num_threads = 4;
 
   std::unique_ptr<Storage> log_storage = std::make_unique<SharedLogStorage>("datalog");
   std::unique_ptr<Storage> metadatalog_storage = std::make_unique<SharedLogStorage>("metadatalog");
@@ -125,8 +125,7 @@ TEST_F(DataLogHandlerTest, MultiThreadAddRecordSharedLog) {
   std::unique_ptr<DataLogHandler> data_log_handler = std::make_unique<DataLogHandler>(
       cache.get(),
       thread_pool.get(),
-      StorageType::kSharedLogStorage
-  );
+      StorageType::kSharedLogStorage);
 
   std::vector<std::thread> threads;
 
@@ -154,32 +153,176 @@ TEST_F(DataLogHandlerTest, MultiThreadAddRecordSharedLog) {
 }
 // Test reading a record
 TEST_F(DataLogHandlerTest, ReadRecordFileStorage) {
-    //first add some records to make log files: 3 log files
-    for (int i = 0; i < 100; i++) {
-        Record record;
-        record.set_key("test_key" + std::to_string(i));
-        record.set_value("test_value" + std::to_string(i));
-        record.set_type(kTypeValue);
+  // first add some records to make log files: 3 log files
+  for (int i = 0; i < 100; i++) {
+    Record record;
+    record.set_key("test_key" + std::to_string(i));
+    record.set_value("test_value" + std::to_string(i));
+    record.set_type(kTypeValue);
 
-        size_t size = 0;
-        Status status = data_log_handler->addRecord(record);
-        EXPECT_EQ(status, Status::kSuccess);
-    }
-    View view = metadata_handler->rollForwardMetadataLog();
-    data_log_handler->setLatestView(&view);
-    cache->setLatestView(&view);
-    PrintView(view);
+    size_t size = 0;
+    Status status = data_log_handler->addRecord(record);
+    EXPECT_EQ(status, Status::kSuccess);
+  }
+  View view = metadata_handler->rollForwardMetadataLog();
+  data_log_handler->setLatestView(&view);
+  cache->setLatestView(&view);
+  PrintView(view);
 
-    Record* found_record = nullptr;
-    std::string latest_offset;
-    for (int i = 0; i < 100; i++) {
-        Status status = data_log_handler->readRecord("test_key" + std::to_string(i), found_record, "", latest_offset);
-        EXPECT_EQ(status, Status::kSuccess);
-        EXPECT_EQ(found_record->key(), "test_key" + std::to_string(i));
-        EXPECT_EQ(found_record->value(), "test_value" + std::to_string(i));
-        EXPECT_EQ(latest_offset, "datalog/3");
-    }
+  Record* found_record = nullptr;
+  std::string latest_offset;
+  for (int i = 0; i < 100; i++) {
+    Status status = data_log_handler->readRecord("test_key" + std::to_string(i), found_record, "", latest_offset);
+    EXPECT_EQ(status, Status::kSuccess);
+    EXPECT_EQ(found_record->key(), "test_key" + std::to_string(i));
+    EXPECT_EQ(found_record->value(), "test_value" + std::to_string(i));
+    EXPECT_EQ(latest_offset, "datalog/3");
+  }
 }
+
+TEST_F(DataLogHandlerTest, TestDeduplicatedReadRecordFileStorage) {
+  int const num_threads = 10;
+  const std::string key_prefix = "test_key_";
+  // Add some records first (simulate write)
+  for (int i = 0; i < 100; ++i) {
+    Record record;
+    record.set_key(key_prefix + std::to_string(i));
+    record.set_value("val_" + std::to_string(i));
+    record.set_type(kTypeValue);
+    Status status = data_log_handler->addRecord(record);
+    assert(status == Status::kSuccess);
+  }
+
+  // Roll metadata log forward
+  View view = metadata_handler->rollForwardMetadataLog();
+  data_log_handler->setLatestView(&view);
+  cache->setLatestView(&view);
+
+  // Simulate read from multiple threads
+  std::vector<std::thread> threads;
+  std::atomic<int> success_count{0};
+  std::mutex cout_mu;
+
+  std::mutex start_mu;
+  std::condition_variable start_cv;
+  bool start_flag = false;
+
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back([&, i]() {
+      {
+        std::unique_lock<std::mutex> lock(start_mu);
+        start_cv.wait(lock, [&] { return start_flag; });  // Wait until signaled
+      }
+
+      Record* out_record = nullptr;
+      std::string offset = "";
+      std::string latest_offset;
+      Status s = data_log_handler->readRecord(key_prefix + std::to_string(i), out_record, offset, latest_offset);
+      if (s == Status::kSuccess && out_record && out_record->value() == "val_" + std::to_string(i)) {
+        success_count++;
+      } else {
+        std::lock_guard<std::mutex> lock(cout_mu);
+        std::cerr << "[Thread " << i << "] failed to read expected record!\n";
+      }
+    });
+  }
+
+  // Sleep a short moment to ensure all threads are waiting
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Signal all threads to start
+  {
+    std::lock_guard<std::mutex> lock(start_mu);
+    start_flag = true;
+  }
+  start_cv.notify_all();
+
+  for (auto& t : threads) t.join();
+
+  thread_pool->waitForCompletion();
+
+  std::cout << "Read success: " << success_count.load() << " / " << num_threads << std::endl;
+  assert(success_count == num_threads);
+}
+
+TEST_F(DataLogHandlerTest, TestDifferentViewFileStorage) {
+  int const num_threads = 10;
+  const std::string key_prefix = "test_key_";
+  // Add some records first (simulate write)
+  for (int i = 0; i < 100; ++i) {
+    Record record;
+    record.set_key(key_prefix + std::to_string(i));
+    record.set_value("val_" + std::to_string(i));
+    record.set_type(kTypeValue);
+    Status status = data_log_handler->addRecord(record);
+    assert(status == Status::kSuccess);
+  }
+
+  View old_view = metadata_handler->rollForwardMetadataLog();
+  for (int i = 0; i < 10; ++i) {
+    Record record;
+    record.set_key(key_prefix + std::to_string(i));
+    record.set_value("val_" + std::to_string(i));
+    record.set_type(kTypeValue);
+    Status status = data_log_handler->addRecord(record);
+    assert(status == Status::kSuccess);
+  }
+
+  View new_view = metadata_handler->rollForwardMetadataLog();
+  // Simulate read from multiple threads
+  std::vector<std::thread> threads;
+  std::atomic<int> success_count{0};
+  std::mutex cout_mu;
+
+  std::mutex start_mu;
+  std::condition_variable start_cv;
+  bool start_flag = false;
+
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back([&, i]() {
+      {
+        std::unique_lock<std::mutex> lock(start_mu);
+        start_cv.wait(lock, [&] { return start_flag; });  // Wait until signaled
+      }
+      if (i % 2 == 0) {
+        data_log_handler->setLatestView(&old_view);
+        cache->setLatestView(&old_view);
+      } else {
+        data_log_handler->setLatestView(&new_view);
+        cache->setLatestView(&new_view);
+      }
+      Record* out_record = nullptr;
+      std::string offset = "";
+      std::string latest_offset;
+      Status s = data_log_handler->readRecord(key_prefix + std::to_string(i), out_record, offset, latest_offset);
+      if (s == Status::kSuccess && out_record && out_record->value() == "val_" + std::to_string(i)) {
+        success_count++;
+      } else {
+        std::lock_guard<std::mutex> lock(cout_mu);
+        std::cerr << "[Thread " << i << "] failed to read expected record!\n";
+      }
+    });
+  }
+
+  // Sleep a short moment to ensure all threads are waiting
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Signal all threads to start
+  {
+    std::lock_guard<std::mutex> lock(start_mu);
+    start_flag = true;
+  }
+  start_cv.notify_all();
+
+  for (auto& t : threads) t.join();
+
+  thread_pool->waitForCompletion();
+
+  std::cout << "Read success: " << success_count.load() << " / " << num_threads << std::endl;
+  assert(success_count == num_threads);
+}
+
+
 
 // // Test reading a record with cache miss
 // TEST_F(DataLogHandlerTest, ReadRecordCacheMiss) {

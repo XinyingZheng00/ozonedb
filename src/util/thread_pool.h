@@ -91,7 +91,7 @@ inline ThreadPool::ThreadPool(size_t numThreads) : stopFlag(false), activeTasks(
 inline void ThreadPool::enqueueFetchOnceWithEndOffset(
     std::string const& file,
     size_t required_end_offset,
-    std::function<void(size_t begin, size_t end)> fetch_func,  // you provide this
+    std::function<void(size_t begin, size_t end)> fetch_func,
     std::function<void()> post_func) {
   bool need_fetch = false;
   size_t begin_offset = 0;
@@ -101,7 +101,6 @@ inline void ThreadPool::enqueueFetchOnceWithEndOffset(
 
     size_t current_max = max_fetched_end_[file];
     if (required_end_offset <= current_max) {
-      // Already fetched — run post_func immediately
       this->enqueue(post_func, Priority::High);
       return;
     }
@@ -113,6 +112,10 @@ inline void ThreadPool::enqueueFetchOnceWithEndOffset(
       fetch_in_progress_[file] = true;
       begin_offset = current_max;
       need_fetch = true;
+      std::cout << "thread id: " << std::this_thread::get_id() << " need_fetch: " << need_fetch << " file: " << file << " begin_offset: " << begin_offset << " required_end_offset: " << required_end_offset << std::endl;
+    }
+    else {
+      std::cout << "thread id: " << std::this_thread::get_id() << " skip fetch" << std::endl;
     }
   }
 

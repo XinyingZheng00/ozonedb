@@ -187,8 +187,6 @@ void LRUCache::putLogRecords(std::string const& key, std::unordered_map<std::str
     CacheEntry entry(records, offset, sealed);
     file_to_entry_map[key] = entry;
     file_to_entry_map[key].lru_itr_log = lru_list_log.begin();
-    std::cout << "log num: " << log_num << ", log num limit: " << log_num_limit << std::endl;
-    std::cout << "put log file: " << key << ", offset: " << offset << ", size: " << records.size() << std::endl;
   }
 }
 
