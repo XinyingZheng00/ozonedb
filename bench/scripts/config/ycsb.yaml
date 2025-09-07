@@ -1,40 +1,41 @@
 local:
   load:
     record_cnt: 
-      - 10000000
+      - 1000
     key_size:
       - "1KB"
     db_name:
       # - "rocksdb"
-      - "ozonedb"
+      # - "ozonedb"
       # - "sqlite"
       # - "raw_sync_io"
+      - "lazykv"
     repeated: 1
     ycsb_data_path: "/tank/ycsb_data"
     threads: 
-      - 64
-      - 32  
-      - 16 
-      - 8 # 10
-      - 4
+      # - 64
+      # - 32  
+      # - 16 
+      # - 8 # 10
+      # - 4
       - 1
       
   run:
     workload_name:
       - "a"
-      - "b"
-      - "c"
-      - "d"
-      - "f"
+      # - "b"
+      # - "c"
+      # - "d"
+      # - "f"
     operation_cnt:
-      - 10000000
-    record_cnt: 10000000
+      - 100000
+    record_cnt: 100000
     key_size:
       - "1KB"
     db_name:
       - "ozonedb"
       # - "sqlite"
-      - "rocksdb"
+      # - "rocksdb"
     threads: 
       - 1
       # - 4 # 25
@@ -44,6 +45,46 @@ local:
       # - 64
     repeated: 1
     ycsb_data_path: "/tank/ycsb_data"
+
+lazy:
+  load:
+    record_cnt: 
+      - 1000
+    key_size:
+      - "1KB"
+    db_name:
+      - "lazykv"
+    repeated: 1
+    threads: 
+      # - 64
+      # - 32  
+      # - 16 
+      # - 8 # 10
+      # - 4
+      - 1
+      
+  run:
+    workload_name:
+      - "a"
+      # - "b"
+      # - "c"
+      # - "d"
+      # - "f"
+    operation_cnt:
+      - 1000
+    record_cnt: 1000
+    key_size:
+      - "1KB"
+    db_name:
+      - "lazykv"
+    threads: 
+      - 1
+      # - 4 # 25
+      # - 8 # 10
+      # - 16 # 
+      # - 32
+      # - 64
+    repeated: 1
 
 cloud:
   load:

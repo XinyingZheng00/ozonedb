@@ -6,6 +6,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <shared_mutex>
 
 namespace lazylog {
 
@@ -27,6 +28,7 @@ class LazyKV {
   LazyLogClient* ll_cli_r = nullptr;
   std::thread* playlog_thread_ = nullptr;
   uint64_t next_idx_ = 0;
+  std::shared_mutex kv_rwlock;
   absl::flat_hash_map<std::string, std::string> kv_store_;
 
   // NEW: per-thread client

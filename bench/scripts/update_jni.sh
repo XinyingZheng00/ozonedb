@@ -4,11 +4,12 @@ mkdir -p $OZONEDB_HOME/build
 rm -rf $OZONEDB_HOME/build/CMakeCache.txt
 cd $OZONEDB_HOME/build
 cmake .. -DSHARED_LOG=ON && make -j20
-# mkdir -p ../ozonedb-jni-maven/native/src/main/cpp/lib
-# cp libOzoneDB.a ../ozonedb-jni-maven/native/src/main/cpp/lib/.
-# cd ../ozonedb-jni-maven
-# sudo rm /tank/* -rf
-# sudo mkdir -p /tank && sudo chmod 777 /tank && mvn clean package
-# sudo cp ${OZONEDB_HOME}/ozonedb-jni-maven/jni/target/classes/libozonedb.so /usr/lib/
-# mvn install:install-file -Dfile=${OZONEDB_HOME}/ozonedb-jni-maven/jni/target/demoproc-jni-1.0-jar-with-dependencies.jar -DgroupId=ozonedbjnimaven -DartifactId=demoproc-jni -Dversion=1.0 -Dpackaging=jar
-cd $OZONEDB_HOME/bench/scripts
+mkdir -p ../ozonedb-jni-maven/native/src/main/cpp/lib
+cp libOzoneDB.a ../ozonedb-jni-maven/native/src/main/cpp/lib/.
+cd ../ozonedb-jni-maven
+# sudo rm /tank/* -rf && sudo mkdir -p /tank && sudo chmod 777 /tank
+# run once at the beginning
+# cd /sharedfs/ozonedb-tmp/build/vcpkg_installed/x64-linux/lib &&  bash ${OZONEDB_HOME}/bench/scripts/install_absl.sh && cd $OZONEDB_HOME/ozonedb-jni-maven 
+mvn clean package
+sudo cp ${OZONEDB_HOME}/ozonedb-jni-maven/jni/target/classes/libozonedb.so /usr/lib/
+mvn install:install-file -Dfile=${OZONEDB_HOME}/ozonedb-jni-maven/jni/target/demoproc-jni-1.0-jar-with-dependencies.jar -DgroupId=ozonedbjnimaven -DartifactId=demoproc-jni -Dversion=1.0 -Dpackaging=jar

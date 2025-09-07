@@ -76,7 +76,7 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   // init DB Logic
   db = new DB(shared_config_path);
   db->active = true;
-  // db->metadata_log->rollForwardMetadataLog();
+  db->metadata_log_handler->rollForwardMetadataLog();
   db->metadata_log_handler->initSSTMetadata();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl

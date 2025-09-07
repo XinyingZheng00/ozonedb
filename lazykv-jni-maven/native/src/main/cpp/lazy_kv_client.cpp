@@ -14,10 +14,8 @@ void LazyKV::playlog_func() {
   ll_cli_r = new LazyLogClient();
   prop.SetProperty("client_id", std::to_string(0));
   ll_cli_r->Initialize(prop);
-
   while (running) {
-    LOG(INFO) << "Playlog thread is running";
-    int tail = std::get<0>(ll_cli_r->GetTail());
+    int tail = std::get<1>(ll_cli_r->GetTail());
     for (auto i = next_idx_; i < tail; i++) {
       std::string data;
       ll_cli_r->ReadEntry(i, data);
@@ -29,6 +27,7 @@ void LazyKV::playlog_func() {
         continue;
       }
       if (op == KV_INSERT) {
+        std::unique_lock<std::shared_mutex> lock(kv_rwlock);
         kv_store_[key] = value;
       } else {
         LOG(ERROR) << "Unknown operation " << op;
@@ -65,13 +64,14 @@ void LazyKV::Cleanup() {
 }
 
 void LazyKV::Read(std::string const& key, std::string const*& value) {
-  auto it = kv_store_.find(key);
-  if (it != kv_store_.end()) {
-    value = &(it->second);
-    LOG(INFO) << "Found value for key: " << key << " = " << *value;
-  } else {
-    LOG(INFO) << "Cannot find the value for key";
+  
+  std::unique_lock<std::shared_mutex> lock(kv_rwlock);  // lock while checking
+  while (kv_store_.find(key) == kv_store_.end()) {
+      lock.unlock();      // release lock to let other threads insert
+      std::this_thread::yield(); // let other threads run
+      lock.lock();        // re-acquire lock to check again
   }
+  value = &(kv_store_.find(key)->second);
 }
 
 void LazyKV::Insert(std::string const& key, std::string value) {
@@ -87,7 +87,7 @@ void LazyKV::Insert(std::string const& key, std::string value) {
   uint8_t op = KV_INSERT;
   std::string buffer = Serialize(key, value, op);
   thread_local_client_->AppendEntryAll(buffer);
-  LOG(INFO) << "Finish Insert: key=" << key << " thread_id=" << std::this_thread::get_id() << " client_id=" << thread_local_client_id_;
+  // LOG(INFO) << "Finish Insert: key=" << key << " thread_id=" << std::this_thread::get_id() << " client_id=" << thread_local_client_id_;
 }
 
 std::string LazyKV::Serialize(std::string const& key, std::string const& value, uint8_t op) {

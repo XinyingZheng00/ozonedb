@@ -106,7 +106,7 @@ endif()
 
 # Executable for Unit Tests
 add_executable(runUnitTests 
-    # tests/test_db.cpp 
+    tests/test_db.cpp 
     tests/test_log.cpp
     tests/test_storage.cpp
     # tests/test_cache.cpp

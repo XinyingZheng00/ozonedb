@@ -172,13 +172,15 @@ TEST_F(FileStorageTest, SizeAndSeal) {
 
 void write_func(std::string fname, int idx) {
   FileStorage local_storage("/tank/test/storage/" + fname + "/");
-  size_t written_size;
-  Record record;
-  record.set_key("key_" + std::to_string(idx));
-  record.set_value("value_" + std::to_string(idx));
-  record.set_type(idx % 2 == 0 ? kTypeValue : kTypeDeletion);
-  Status status = local_storage.append("1", record, written_size);
-  EXPECT_EQ(status, Status::kSuccess);
+  for (int i=0; i<100; i++) {
+    size_t written_size;
+    Record record;
+    record.set_key("key_Thread" + std::to_string(idx) + "_index" + std::to_string(i));
+    record.set_value("value_Thread" + std::to_string(idx) + "_index" + std::to_string(i));
+    record.set_type(idx % 2 == 0 ? kTypeValue : kTypeDeletion);
+    Status status = local_storage.append("1", record, written_size);
+    EXPECT_EQ(status, Status::kSuccess);
+  }
 }
 
 TEST_F(FileStorageTest, ConcurrentWrites) {
@@ -191,16 +193,24 @@ TEST_F(FileStorageTest, ConcurrentWrites) {
   Status status = local_storage->read(
       "1", []() { return new Record(); }, messages);
   ASSERT_EQ(status, Status::kSuccess);
-  ASSERT_EQ(messages.size(), num_processes);
+  ASSERT_EQ(messages.size(), num_processes * num_processes);
 
   for (size_t i = 0; i < messages.size(); i++) {
     Record* read_record = dynamic_cast<Record*>(messages[i]);
     ASSERT_NE(read_record, nullptr);
     std::string key = read_record->key();
-    int idx = std::stoi(key.substr(key.find_last_of("_") + 1));
-    EXPECT_EQ(read_record->key(), "key_" + std::to_string(idx));
-    EXPECT_EQ(read_record->value(), "value_" + std::to_string(idx));
-    EXPECT_EQ(read_record->type(), idx % 2 == 0 ? kTypeValue : kTypeDeletion);
+    std::string key_tag = key.substr(key.find_first_of("_")+1, key.length());
+    std::string value = read_record->value();
+    std::string value_tag = value.substr(value.find_first_of("_")+1, value.length());
+    ASSERT_EQ(key_tag, value_tag);
+    size_t thread_pos = key.find("Thread");
+    size_t index_pos = key.find("_index");
+    int thread_idx = -1;
+    if (thread_pos != std::string::npos && index_pos != std::string::npos) {
+      std::string idx_str = key.substr(thread_pos + 6, index_pos - (thread_pos + 6));
+      thread_idx = std::stoi(idx_str);
+    }
+    EXPECT_EQ(read_record->type(), thread_idx % 2 == 0 ? kTypeValue : kTypeDeletion);
   }
   // Cleanup
   for (auto* msg : messages) {
@@ -261,8 +271,7 @@ TEST_F(SharedLogStorageTest, BasicWriteRead) {
   ASSERT_EQ(status, Status::kSuccess);
   ASSERT_GE(messages.size(), 1);
 
-  // Verify last record (since shared log might have other records)
-  Record* read_record = dynamic_cast<Record*>(messages.back());
+  Record* read_record = dynamic_cast<Record*>(messages.front());
   ASSERT_NE(read_record, nullptr);
   EXPECT_EQ(read_record->key(), records[0].key());
   EXPECT_EQ(read_record->value(), records[0].value());

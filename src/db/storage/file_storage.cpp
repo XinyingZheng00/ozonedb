@@ -9,8 +9,9 @@ FileStorage::FileStorage(std::string path) : Storage(path) {
   if (!std::filesystem::exists(path)) {
     if (!std::filesystem::create_directories(path)) {
       if (std::filesystem::exists(path)) {
-        std::cerr << "Directory already created." << std::endl;
+        // std::cerr << "Directory already created." << std::endl;
       } else {
+        // only print error
         std::cerr << "Failed to create db directory." << std::endl;
       }
     }
@@ -55,8 +56,15 @@ size_t FileStorage::size(std::string fileName) {
   std::error_code ec;  // To avoid throwing exceptions
   auto file_size = std::filesystem::file_size(full_path, ec);
   if (ec) {
-    std::cout << "File does not exist or some other error occurred" << std::endl;
-    return 0;
+    if (ec == std::errc::no_such_file_or_directory) {
+        // File does not exist → return 0 quietly
+        return 0;
+    } else {
+        // Some other error (permissions, I/O, etc.)
+        std::cerr << "Error accessing " << full_path 
+                  << ": " << ec.message() << std::endl;
+        return 0;
+    }
   }
   return file_size;
 }
@@ -126,7 +134,10 @@ Status FileStorage::append(std::string const& fileName, std::string const& data)
   if (isSealed(fileName)) {
     return Status::kSealed;
   } else if (!output_file->is_open()) {
-    std::cerr << "Failed to open output file: " << fileName << std::endl;
+    // print the error message
+    std::cerr << getpid() << ":Failed to open output file: " << fileName
+              << ". Error: " << std::strerror(errno) << std::endl;
+    // std::cerr << "Failed to open output file: " << fileName << std::endl;
     return Status::kFailure;
   }
 

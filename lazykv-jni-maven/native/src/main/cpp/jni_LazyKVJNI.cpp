@@ -48,9 +48,12 @@ JNIEXPORT void JNICALL Java_jni_LazyKVJNI_update(JNIEnv* env, jobject, jstring j
 JNIEXPORT jbyteArray JNICALL Java_jni_LazyKVJNI_read(JNIEnv* env, jobject, jstring jkey) {
   char const* nativeKey = env->GetStringUTFChars(jkey, 0);
   std::string key(nativeKey);
-  std::string const* value;
+  std::string const* value = nullptr;
   kv->Read(key, value);
   env->ReleaseStringUTFChars(jkey, nativeKey);
+  if (value == nullptr) {
+    return nullptr;
+  }
   jbyteArray byteArray = env->NewByteArray(value->length());
   env->SetByteArrayRegion(byteArray, 0, value->length(), reinterpret_cast<jbyte const*>(value->c_str()));
   return byteArray;

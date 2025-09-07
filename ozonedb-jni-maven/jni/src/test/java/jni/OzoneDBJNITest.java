@@ -8,7 +8,6 @@ public class OzoneDBJNITest {
 
     @Test
     void simpleTest() {
-
         OzoneDBJNI db = new OzoneDBJNI();
         String ozonedbHome = System.getenv("OZONEDB_HOME");
         int threadNum = 4;

@@ -140,7 +140,7 @@ def plot_throughput(result_graph_name, add_event):
 def main():
     global started
     if len(sys.argv) < 3:
-        print("Usage: python3 latency.py local/cloud result-path regex 1/0 to indicate add event or not")
+        print("Usage: python3 throughput_over_time.py local/cloud result-path regex 1/0 to indicate add event or not")
         sys.exit(1)
 
     result_files = []

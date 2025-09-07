@@ -137,7 +137,7 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
 
 // Function to get the latest records for a given filename, return records and offset
 void LRUCache::get(std::string const& file_name, std::string const& key, Record*& record, std::string const& index_value) {
-  std::shared_lock lock(mutex);
+  std::unique_lock lock(mutex);
   if (file_name.find("log") != std::string::npos) {
     if (file_to_entry_map.find(file_name) == file_to_entry_map.end()) {
       // the latest tail may not be created yet

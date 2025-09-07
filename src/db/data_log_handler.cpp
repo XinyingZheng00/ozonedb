@@ -66,7 +66,7 @@ void DataLogHandler::fetchLogToCache(std::string const& file_name, size_t cached
         return new Record();
       },
       messages);
-  std::cout << "thread id: " << std::this_thread::get_id() << " fetchLogToCache file_name: " << file_name << " offset: " << cached_offset << " size: " << size << std::endl;
+  // std::cout << "thread id: " << std::this_thread::get_id() << " fetchLogToCache file_name: " << file_name << " offset: " << cached_offset << " size: " << size << std::endl;
   for (auto* msg : messages) {
     auto* rec = static_cast<Record*>(msg);
     records_map[rec->key()] = rec;
@@ -93,7 +93,6 @@ Status DataLogHandler::readRecord(std::string const& key, Record*& record, std::
   int record_file = -1;
   std::mutex cv_mutex;
   std::condition_variable cv;
-
   int count = 0;
   for (int i = files.size() - 1; i >= 0; i--) {
     std::string const& file_name = files[i];
@@ -126,7 +125,7 @@ Status DataLogHandler::readRecord(std::string const& key, Record*& record, std::
             cv.notify_one();
           });
     } else {
-      std::cout << "thread id: " << std::this_thread::get_id() << " readmore: false" << std::endl;
+      // std::cout << "thread id: " << std::this_thread::get_id() << " readmore: false" << std::endl;
       Record* record_tmp = nullptr;
       this->cache->get(file_name, key, record_tmp);
       if (record_tmp) {

@@ -16,7 +16,7 @@ int main(int argc, const char *argv[]) {
 
     if (prop.GetProperty("mode", "w") == "w") {
         for (int i = 0; i < 10; i++){
-            cli.AppendEntryAll("this is a log entrytask11111");
+            cli.AppendEntryAll("this is a log entry tasklog");
             std::cout << "Wrote entry " << i << std::endl;
         }
     } else {

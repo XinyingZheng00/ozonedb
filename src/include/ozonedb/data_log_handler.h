@@ -57,6 +57,9 @@ class FileRecordAppender : public RecordAppender {
         log_prefix(std::move(log_prefix)),
         file_size_limit(file_size_limit) {
   }
+  ~FileRecordAppender() {
+    this->log_storage.reset();
+  }
 
   Status newTail() {
     if (!this->active_unit.empty()) {

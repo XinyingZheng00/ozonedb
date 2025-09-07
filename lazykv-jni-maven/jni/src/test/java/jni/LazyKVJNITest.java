@@ -13,15 +13,13 @@ public class LazyKVJNITest {
     java.util.concurrent.atomic.AtomicLong startTime = new java.util.concurrent.atomic.AtomicLong();
     Thread[] threads = new Thread[6];
     for (int i = 0; i < 3; i++) {
+      final int index = i;
       threads[i] = new Thread(() -> {
         LazyKVJNI kvWriter = new LazyKVJNI();
         kvWriter.init(bePropPath, dlClientPath, rdmaPath);
         for (int j = 0; j < 10000; j++) {
-          String key = "key" + j;
-          char[] chars = new char[1024]; // 1KB value
-          java.util.Arrays.fill(chars, 'a');
-          String value = new String(chars);
-          kvWriter.insert(key, value.getBytes());
+          String key = index + "key" + j;
+          kvWriter.insert(key, key.getBytes());
         }
       });
       threads[i + 3] = new Thread(() -> {
@@ -35,11 +33,8 @@ public class LazyKVJNITest {
           System.err.println("Reader thread interrupted: " + e.getMessage());
         }
         for (int j = 0; j < 10000; j++) {
-          String key = "key" + j;
+          String key = index + "key" + j;
           byte[] value = kvReader.read(key);
-          if (value != null) {
-            System.out.println("Read key: " + key + ", value length: " + value.length);
-          }
         }
       });
     }

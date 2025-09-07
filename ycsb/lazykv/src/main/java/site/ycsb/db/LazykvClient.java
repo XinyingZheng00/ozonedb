@@ -82,6 +82,9 @@ public class LazykvClient extends DB {
   public Status update(String table, String key, Map<String, ByteIterator> values) {
     final Map<String, ByteIterator> result = new HashMap<>();
     byte[] currentValue = kv.read(key);
+    if (currentValue == null) {
+      return Status.ERROR;
+    }
     deserializeValues(currentValue, null, result);
 
     result.putAll(values);

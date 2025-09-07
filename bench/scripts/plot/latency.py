@@ -132,7 +132,8 @@ plt.show()
 
 def main(result_files):
     for file in result_files:
-        if file.endswith(".result"):  
+        if file.endswith(".result"): 
+            print(f"Processing file: {file}") 
             get_data_from_file(file)
     plot_individual_graphs()
 
