@@ -1,6 +1,19 @@
 import os
 import math
 import argparse
+from pathlib import Path
+
+
+def get_ozonedb_home() -> str:
+    env = os.environ.get("OZONEDB_HOME")
+    if env:
+        return env
+    cur = Path(__file__).resolve()
+    for parent in cur.parents:
+        if (parent / "ycsb").is_dir() or (parent / ".git").is_dir():
+            return str(parent)
+    return str(cur.parents[-1])
+
 
 def convert_to_bytes(key_size_str):
     """Convert a key size string (e.g., '1KB', '100MB') to bytes."""
@@ -20,10 +33,7 @@ def convert_to_bytes(key_size_str):
     raise ValueError(f"Invalid key size format: '{key_size_str}'")
 
 def generate_workload(workload_name, key_size_str, operations_cnt, record_cnt):
-    ozonedb_home = os.environ.get("OZONEDB_HOME")
-    if not ozonedb_home:
-        raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
-
+    ozonedb_home = get_ozonedb_home()
     ycsb_path = os.path.join(ozonedb_home, "ycsb")
     key_size = convert_to_bytes(key_size_str)
     workload_name = "workload"+workload_name

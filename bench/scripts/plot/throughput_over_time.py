@@ -84,7 +84,16 @@ def plot_throughput(result_graph_name, add_event):
         key=lambda x: extract_numeric_suffix(x[0])
     )  # Sort by numeric suffix in db_name
     for db_name, times in elapsed_time:
-        times = list(map(lambda x: (datetime.strptime(x, fmt) - datetime.strptime(start_time[db_name], fmt)).total_seconds(), times))
+        # Skip if no timestamps or no throughput data
+        if not times or not throughput.get(db_name):
+            continue
+
+        # If start_time for this DB isn't recorded (some result files never include a "0 sec" line),
+        # use the earliest timestamp found in the file as the start time to avoid KeyError.
+        if db_name not in start_time or not start_time.get(db_name):
+            start_time[db_name] = times[0]
+
+        times = [ (datetime.strptime(x, fmt) - datetime.strptime(start_time[db_name], fmt)).total_seconds() for x in times ]
         plt.plot(times, throughput[db_name], marker='o', markersize=2,  linewidth=2, label=db_name,linestyle='-')
     
     

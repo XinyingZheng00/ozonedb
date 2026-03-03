@@ -6,6 +6,7 @@ import json
 import sqlite3
 import time
 from datetime import datetime
+from pathlib import Path
 
 """
 --rocksdb.write-buffer-size
@@ -18,7 +19,18 @@ The maximum number of write buffers that built up in memory. If this number is r
 """
 
 
-ozonedb_home = os.environ.get("OZONEDB_HOME")
+def get_ozonedb_home() -> str:
+    env = os.environ.get("OZONEDB_HOME")
+    if env:
+        return env
+    cur = Path(__file__).resolve()
+    for parent in cur.parents:
+        if (parent / "ycsb").is_dir() or (parent / ".git").is_dir():
+            return str(parent)
+    return str(cur.parents[-1])
+
+
+ozonedb_home = get_ozonedb_home()
 
 def generate_config_for_ozonedb_local(new_dir):
     json_file_path = ozonedb_home + "/src/config/local/shared_config_rocksdb_base.json"
@@ -53,8 +65,9 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
 
     # Define paths based on OZONEDB_HOME
     ycsb_path = os.path.join(ozonedb_home, "ycsb")
-    result_path = os.path.join(ozonedb_home, "bench", "results/local")
-    script_path = os.path.join(ozonedb_home, "bench", "scripts")
+    result_path = os.path.join(ozonedb_home, "bench", "results", "local")
+    script_dir = Path(__file__).resolve().parents[1]  # bench/scripts
+    generate_script = script_dir / "generate_workload.py"
     subprocess.run(['mkdir', '-p', result_path])
 
     os.chdir(ycsb_path) # enter into ycsb dir
@@ -62,11 +75,22 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
         each_record_cnt = str(each_record_cnt)
         for each_key_size in key_size:
             #for load, the workload is set to a and operation_cnt is set to record_cnt
-            subprocess.run(['python3', script_path +'/generate_workload.py','--key_size', each_key_size, "--record_cnt", each_record_cnt, 
+            subprocess.run(['python3', str(generate_script), '--key_size', each_key_size, "--record_cnt", each_record_cnt,
                             '--workload_name', "a", '--operation_cnt', each_record_cnt,
                             ]) #generate workload 
             workload_path = ycsb_path + "/workloads/generated_workloads/" + "workloada" + "_" + each_key_size + "_" + each_record_cnt +"_" + each_record_cnt
             
+            # resolve YCSB binary once per record_cnt/key_size combo
+            ycsb_bin_candidates = [
+                os.path.join(ycsb_path, "bin", "ycsb"),
+                os.path.join(ycsb_path, "ycsb"),
+            ]
+            ycsb_bin = "ycsb"
+            for cand in ycsb_bin_candidates:
+                if os.path.exists(cand):
+                    ycsb_bin = cand
+                    break
+
             for db_name in db_names:
                 result_file_insert = os.path.join(result_path, f'{each_key_size}-{each_record_cnt}-insert-{db_name}_t1.result')
                 cached_data_path = os.path.join(ycsb_data_path, f'cached_data-{db_name}-{each_key_size}-{each_record_cnt}/')
@@ -110,7 +134,7 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
 
                     continue
                 
-                command = ["python3", f'bin/ycsb', 'load', db_name, '-threads', str(1), '-s', '-P', workload_path]
+                command = ["python3", ycsb_bin, 'load', db_name, '-threads', str(1), '-s', '-P', workload_path]
                 if db_name == "rocksdb":
                     command.append("-p")
                     command.append("rocksdb.dir="+cached_data_path)
@@ -121,7 +145,7 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
                 elif db_name == "sqlite":
                     command[3] = "jdbc" # change to jdbc               
                     #add url to db properties
-                    config_path = os.path.join(ozonedb_home, "bench/scripts/config/sqlite.properties")
+                    config_path = os.path.join(ozonedb_home, "bench", "scripts", "config", "sqlite.properties")
                     db_file = os.path.join(cached_data_path, "mydb.db")
                     with open(config_path, 'w') as f:
                         f.write("db.driver=org.sqlite.JDBC\n")
