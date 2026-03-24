@@ -12,7 +12,7 @@ DB::DB(std::string const& shared_config_path) {
     this->mode = Mode::MultipleProcesses;
   }
   if (this->metadata->is_cloud) {
-    this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
+    this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=RRKjiP5iHjd+8lC36H6+IKf1F1WO7M8F3g5VgIqDT1NTbAQXX19xNY2pipUGtGJU9f1/j17jsmtD+AStPt3y4A==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
   }
   else{
     this->storage = new FileStorage(this->metadata->DBpath);

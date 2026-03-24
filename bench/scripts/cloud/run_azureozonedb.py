@@ -1,24 +1,93 @@
 import argparse
 import os
-import yaml
-import sys
 import subprocess
 import threading
+import sys
+import yaml
 from azure.identity import AzureCliCredential
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
-from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
 from azure.storage.blob import BlobServiceClient
 
 sys.path.append(os.environ.get("OZONEDB_HOME") + '/bench/scripts/cloud/cache')
-from azureozonedb_data_cache import *
+from cache.azureozonedb_data_cache import *
 
 # Utility functions
 
-def server_exec(server, command, tmux_session=None, wait=True):
+def _expand_ssh_identity_path(path):
+    """Expand ~ in the path to the SSH private key file passed to ssh/scp -i."""
+    return os.path.expanduser(path or "~/.ssh/id_rsa")
+
+
+def resolve_ssh_private_key_path(config):
+    """Filesystem path to the SSH private key for ssh/scp -i (not key material)."""
+    cloud = config.get("cloud") or {}
+    cl = config.get("cloudlab") or {}
+    vm = config.get("vm") or {}
+    if cloud.get("vmprovider") == "cloudlab":
+        p = cl.get("ssh_private_key_path") or cl.get("ssh_private_key")
+        if p:
+            return _expand_ssh_identity_path(p)
+    p = vm.get("ssh_private_key_path") or vm.get("ssh_private_key")
+    return _expand_ssh_identity_path(p or "~/.ssh/id_rsa")
+
+
+def create_blob_service_client(config):
+    """Blob client for cached YCSB data; key from env/yaml or Azure ARM."""
+    storage_account_name = config["storage"]["account_name"]
+    account_url = f"https://{storage_account_name}.blob.core.windows.net"
+
+    access_key = os.environ.get("AZURE_STORAGE_KEY") or (config.get("storage") or {}).get("account_key")
+    if access_key:
+        return BlobServiceClient(account_url=account_url, credential=access_key)
+
+    subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID")
+    if not subscription_id:
+        raise ValueError(
+            "Storage access: set AZURE_STORAGE_KEY or storage.account_key (secret string, not a path) "
+            "in config, or set AZURE_SUBSCRIPTION_ID to fetch the key via Azure CLI."
+        )
+    credential = AzureCliCredential()
+    storage_client = StorageManagementClient(credential, subscription_id)
+    resource_group = config["resource_group"]["name"]
+    access_key = storage_client.storage_accounts.list_keys(resource_group, storage_account_name).keys[0].value
+    return BlobServiceClient(account_url=account_url, credential=access_key)
+
+
+def resolve_ssh_servers(config, compute_client=None, network_client=None, resource_group=None):
+    """Build list of user@host for Azure VMs or CloudLab hosts."""
+    vmprovider = (config.get("cloud") or {}).get("vmprovider", "azure")
+    if vmprovider == "cloudlab":
+        cl = config.get("cloudlab") or {}
+        hosts = [h.strip() for h in (cl.get("hosts") or []) if h and str(h).strip()]
+        if not hosts:
+            raise ValueError("cloud.vmprovider is cloudlab but cloudlab.hosts is missing or empty")
+        ssh_user = cl.get("ssh_user") or (config.get("azure") or {}).get("username")
+        if not ssh_user:
+            raise ValueError("Set cloudlab.ssh_user (or azure.username) for cloudlab SSH targets.")
+        want = (config.get("vm") or {}).get("num", len(hosts))
+        selected = hosts[: min(want, len(hosts))]
+        if len(selected) < want:
+            print(f"Warning: only {len(selected)} cloudlab host(s); vm.num asks for {want}")
+        return [f"{ssh_user}@{h}" for h in selected]
+
+    vm_list = list(compute_client.virtual_machines.list(resource_group))
+    if len(vm_list) < config["vm"]["num"]:
+        print(f"Only {len(vm_list)} VMs found, expected {config['vm']['num']}")
+        sys.exit(1)
+    vm_list = vm_list[: config["vm"]["num"]]
+    servers = []
+    for vm in vm_list:
+        ip_name = vm.name.replace(config["vm"]["name"], config["network"]["ip_name"])
+        public_ip_address = network_client.public_ip_addresses.get(resource_group, ip_name)
+        servers.append(f"{config['azure']['username']}@{public_ip_address.ip_address}")
+    return servers
+
+def server_exec(server, command, tmux_session=None, wait=True, ssh_identity_path="~/.ssh/id_rsa"):
     """Executes a command on a remote server with optional tmux session support."""
-    ssh_base_cmd = ["ssh", "-i", "~/.ssh/id_rsa", "-oStrictHostKeyChecking=no", "-p", "22", server]
+    key = _expand_ssh_identity_path(ssh_identity_path)
+    ssh_base_cmd = ["ssh", "-i", key, "-oStrictHostKeyChecking=no", "-p", "22", server]
     if tmux_session:
         if wait:
             command = f"tmux send -t {tmux_session} '{command}; tmux wait-for -S 0' ENTER"
@@ -31,7 +100,7 @@ def server_exec(server, command, tmux_session=None, wait=True):
         subprocess.run(ssh_base_cmd + [command])
 
 
-def run_ycsb(node, i, ycsb_t_start, config, blob_client):
+def run_ycsb(node, i, ycsb_t_start, config, blob_client, ssh_identity_path="~/.ssh/id_rsa"):
     workload_config = config["cloud"]["run"]
     workloads, record_cnt, operation_cnts, key_sizes, threads, ycsb_data_path = (
         workload_config["workload_name"], str(workload_config["record_cnt"]), 
@@ -43,51 +112,53 @@ def run_ycsb(node, i, ycsb_t_start, config, blob_client):
     result_path = os.path.join("$OZONEDB_HOME", "bench", "results", "cloud")
     script_path = os.path.join("$OZONEDB_HOME", "bench", "scripts")
 
-    server_exec(node, "tmux kill-server")
-    server_exec(node, "tmux new -s ozonedb_run -d")
-    server_exec(node, "source ~/.profile", tmux_session="ozonedb_run")
-    server_exec(node, f"mkdir -p {result_path}", tmux_session="ozonedb_run")
-    server_exec(node, f"cd {ycsb_path}", tmux_session="ozonedb_run")
+    server_exec(node, "tmux kill-server", ssh_identity_path=ssh_identity_path)
+    server_exec(node, "tmux new -s ozonedb_run -d", ssh_identity_path=ssh_identity_path)
+    server_exec(node, "source ~/.profile", tmux_session="ozonedb_run", ssh_identity_path=ssh_identity_path)
+    server_exec(node, f"mkdir -p {result_path}", tmux_session="ozonedb_run", ssh_identity_path=ssh_identity_path)
+    server_exec(node, f"cd {ycsb_path}", tmux_session="ozonedb_run", ssh_identity_path=ssh_identity_path)
 
     for each_operation_cnt in operation_cnts:
         each_operation_cnt = str(each_operation_cnt)
         for each_key_size in key_sizes:
             for workload in workloads:
                 gen_command = f"python3 {script_path}/generate_workload.py --workload_name {workload} --key_size {each_key_size} --operation_cnt {each_operation_cnt} --record_cnt {record_cnt}"
-                server_exec(node, gen_command, tmux_session="ozonedb_run")
+                server_exec(node, gen_command, tmux_session="ozonedb_run", ssh_identity_path=ssh_identity_path)
                 workload_path = os.path.join(ycsb_path, "workloads/generated_workloads", f"workload{workload}_{each_key_size}_{each_operation_cnt}_{record_cnt}")
                 
-                db_name = "azureozonedb"
+                db_name = "ozonedb"
                 run_result = os.path.join(result_path, f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
                 # server_exec(node, "rm -rf" + run_result, tmux_session="ozonedb_run")
                 
                 run_data_path = f"usertable".lower()
                 gen_config_command = f"python3 {script_path}/generate_config_for_ozonedb.py --new_dir {run_data_path}/"
-                server_exec(node, gen_config_command, tmux_session="ozonedb_run")                    
+                server_exec(node, gen_config_command, tmux_session="ozonedb_run", ssh_identity_path=ssh_identity_path)
                 cached_data_path = f"cached-data-{db_name}-{each_key_size}-workload{workload}-{record_cnt}".lower()                   
                 load_cached_data(blob_client, cached_data_path, run_data_path, ycsb_data_path)
                 command = ["python3", "bin/ycsb", "run", db_name,'-threads', f'{threads}', "-s", "-P", workload_path, "-p", f"shared_config=$OZONEDB_HOME/src/config/cloud/shared_config_rocksdb.json",  f"-p statusinterval=1 2>&1 | tee -a {run_result}"]
                 ycsb_t_start.wait()
-                server_exec(node, " ".join(command), tmux_session="ozonedb_run")
+                server_exec(node, " ".join(command), tmux_session="ozonedb_run", ssh_identity_path=ssh_identity_path)
                     
-def get_remote_ozonedb_home(server):
+def get_remote_ozonedb_home(server, ssh_identity_path="~/.ssh/id_rsa"):
     """Fetches the OZONEDB_HOME environment variable from the remote server."""
-    command = ["ssh", "-i", "~/.ssh/id_rsa", "-oStrictHostKeyChecking=no",
+    key = _expand_ssh_identity_path(ssh_identity_path)
+    command = ["ssh", "-i", key, "-oStrictHostKeyChecking=no",
                server, "source .profile && echo $OZONEDB_HOME"]
    
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     return result.stdout.strip()
 
-def download_file_from_server(server, remote_file_path, local_destination_path):
+def download_file_from_server(server, remote_file_path, local_destination_path, ssh_identity_path="~/.ssh/id_rsa"):
     """Downloads a file from a remote server using SCP."""
-    scp_command = ["scp", "-i", "~/.ssh/id_rsa", "-oStrictHostKeyChecking=no", 
+    key = _expand_ssh_identity_path(ssh_identity_path)
+    scp_command = ["scp", "-i", key, "-oStrictHostKeyChecking=no", 
                    f"{server}:{remote_file_path}", local_destination_path]
     print(" ".join(scp_command))
     subprocess.run(scp_command)
 
-def download_results(node, config):
+def download_results(node, config, ssh_identity_path="~/.ssh/id_rsa"):
     """Downloads experiment results from the server."""
-    remote_ozonedb_home = get_remote_ozonedb_home(node)
+    remote_ozonedb_home = get_remote_ozonedb_home(node, ssh_identity_path=ssh_identity_path)
     if not remote_ozonedb_home:
         raise RuntimeError(f"Failed to retrieve OZONEDB_HOME from {node}")
     remote_result_path = os.path.join(remote_ozonedb_home, "bench", "results", "cloud")
@@ -98,52 +169,42 @@ def download_results(node, config):
     for op_cnt in map(str, workload_config["operation_cnt"]):
         for key_size in workload_config["key_size"]:
             for workload in workload_config["workload_name"]:
-                db_name = "azureozonedb"
-                remote_insert_result = os.path.join(remote_result_path, f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
-                local_insert_result = os.path.join(local_result_path, f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
-                subprocess.run(["rm", "-rf", local_insert_result])
-                download_file_from_server(node, remote_insert_result, local_insert_result)
+                db_name = "ozonedb"
+                record_cnt = workload_config["record_cnt"]
+                threads = workload_config["threads"]
+                remote_run_result = os.path.join(remote_result_path, f"{key_size}-{op_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
+                local_run_result = os.path.join(local_result_path, f"{key_size}-{op_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
+                # subprocess.run(["rm", "-rf", local_run_result])
+                download_file_from_server(node, remote_run_result, local_run_result, ssh_identity_path=ssh_identity_path)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run YCSB on Azure VMs and Ozonedb")
+    parser = argparse.ArgumentParser(description="Run YCSB on cloud VMs (Azure or CloudLab) and AzureOzoneDB")
     parser.add_argument("--config", type=str, default=os.environ.get("OZONEDB_HOME") + "/bench/scripts/config/ycsb.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r") as file:
         config = yaml.safe_load(file)
 
-    credential = AzureCliCredential()
-    subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID")
-    if not subscription_id:
-        raise ValueError("AZURE_SUBSCRIPTION_ID environment variable is not set")
-
-    # Azure resource clients
-    resource_client = ResourceManagementClient(credential, subscription_id)
-    network_client = NetworkManagementClient(credential, subscription_id)
-    compute_client = ComputeManagementClient(credential, subscription_id)
-    storage_client = StorageManagementClient(credential, subscription_id)
-
+    ssh_identity_path = resolve_ssh_private_key_path(config)
+    blob_client = create_blob_service_client(config)
     resource_group = config["resource_group"]["name"]
-    storage_account_name = config["storage"]["account_name"]
-    access_key = storage_client.storage_accounts.list_keys(resource_group, storage_account_name).keys[0].value
-    blob_client = BlobServiceClient(
-        account_url=f"https://{storage_account_name}.blob.core.windows.net",
-        credential=access_key,
-    )
 
-    # VM Setup
-    resource_group = config["resource_group"]["name"]
-    vm_list = list(compute_client.virtual_machines.list(resource_group))
-    if len(vm_list) < config["vm"]["num"]:
-        print(f"Only {len(vm_list)} VMs found, expected {config['vm']['num']}")
-        sys.exit(1)
-    vm_list = vm_list[:config["vm"]["num"]]
+    if (config.get("cloud") or {}).get("vmprovider", "azure") == "azure":
+        subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID")
+        if not subscription_id:
+            raise ValueError("AZURE_SUBSCRIPTION_ID is required when cloud.vmprovider is azure")
+        credential = AzureCliCredential()
+        network_client = NetworkManagementClient(credential, subscription_id)
+        compute_client = ComputeManagementClient(credential, subscription_id)
+        server_list = resolve_ssh_servers(config, compute_client, network_client, resource_group)
+    else:
+        server_list = resolve_ssh_servers(config)
 
     # delete all results in all vms
     result_path = os.path.join("$OZONEDB_HOME", "bench", "results", "cloud")    
     workload_config = config["cloud"]["run"]
-    operation_cnt, record_cnt, key_sizes, repeated, threads, workload = (
+    operation_cnt, record_cnt, key_sizes, repeated, threads, workloads = (
         workload_config["operation_cnt"],
         workload_config["record_cnt"], 
         workload_config["key_size"], 
@@ -153,14 +214,11 @@ if __name__ == "__main__":
     )
     for each_operation_cnt in map(str, operation_cnt):
         for each_key_size in key_sizes:
-            for workload in workload:
-                for i, vm in enumerate(vm_list): 
-                    ip_name = vm.name.replace(config["vm"]["name"], config["network"]["ip_name"])
-                    public_ip_address = network_client.public_ip_addresses.get(resource_group, ip_name)
-                    server = f"{config['azure']['username']}@{public_ip_address.ip_address}"
+            for workload in workloads:
+                for server in server_list:
                     db_name = "azureozonedb"
                     run_result = os.path.join(result_path, f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload}-{db_name}_t{threads}.result")
-                    server_exec(server, "source ~/.profile && rm -rf " + run_result)
+                    server_exec(server, "source ~/.profile && rm -rf " + run_result, ssh_identity_path=ssh_identity_path)
     
     
     
@@ -171,15 +229,19 @@ if __name__ == "__main__":
         ycsb_run = []
         ycsb_t_start = threading.Event()
         
-        for i, vm in enumerate(vm_list):
-            ip_name = vm.name.replace(config["vm"]["name"], config["network"]["ip_name"])
-            public_ip_address = network_client.public_ip_addresses.get(resource_group, ip_name)
-            server = f"{config['azure']['username']}@{public_ip_address.ip_address}"
-            
-            ycsb_run.append(threading.Thread(target=run_ycsb, args=(server, i, ycsb_t_start, config, blob_client)))
+        for i, server in enumerate(server_list):
+            ycsb_run.append(threading.Thread(
+                target=run_ycsb,
+                args=(server, i, ycsb_t_start, config, blob_client),
+                kwargs={"ssh_identity_path": ssh_identity_path},
+            ))
             if _ == repeated - 1:
                 # Download results only in the last iteration
-                result_downloader.append(threading.Thread(target=download_results, args=(server, config)))
+                result_downloader.append(threading.Thread(
+                    target=download_results,
+                    args=(server, config),
+                    kwargs={"ssh_identity_path": ssh_identity_path},
+                ))
 
         print("Setup complete")
         

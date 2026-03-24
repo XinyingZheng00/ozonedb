@@ -149,19 +149,22 @@ if __name__ == "__main__":
     password = config["azure"]["password"]
     vm_size = config["vm"]["vm_size"]
     image_reference = config["vm"]["image_reference"]
-    ssh_key = config["vm"]["ssh_key"]
+    ssh_public_key_path = config["vm"].get("ssh_public_key_path") or config["vm"].get("ssh_key")
+    if not ssh_public_key_path:
+        raise ValueError("vm.ssh_public_key_path (or legacy vm.ssh_key) must be set in config")
 
-    ssh_key_data = open(os.path.expanduser(ssh_key)).read()
+    with open(os.path.expanduser(ssh_public_key_path), encoding="utf-8") as f:
+        ssh_public_key_material = f.read()
 
     try:
         vm_list = list(compute_client.virtual_machines.list(resource_group_name))
     except:
         vm_list = []
 
-    # add ssh_key_data to vm's authorized_keys
+    # add public key material to vm's authorized_keys
     for vm in vm_list:
         print(f"Adding SSH key to {vm.name}...")
-        command = f'echo "{ssh_key_data.strip()}" >> /home/{username}/.ssh/authorized_keys'
+        command = f'echo "{ssh_public_key_material.strip()}" >> /home/{username}/.ssh/authorized_keys'
         poller = compute_client.virtual_machines.begin_run_command(
             resource_group_name,
             vm.name,
@@ -231,7 +234,7 @@ if __name__ == "__main__":
                             "public_keys": [
                                 {
                                     "path": f"/home/{username}/.ssh/authorized_keys",
-                                    "key_data": ssh_key_data,
+                                    "key_data": ssh_public_key_material,
                                 }
                             ]
                         }

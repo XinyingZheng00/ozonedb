@@ -39,7 +39,10 @@ local:
     repeated: 1
     ycsb_data_path: "/tank/ycsb_data"
 
+# azure: discover VMs via Azure Resource Manager (needs AZURE_SUBSCRIPTION_ID).
+# cloudlab: SSH targets from cloudlab.hosts below (no Azure VM APIs).
 cloud:
+  vmprovider: cloudlab
   load:
     record_cnt: 
       - 1000
@@ -50,7 +53,7 @@ cloud:
     threads: 8
   run:
     workload_name:
-      - "c"
+      - "a"
     operation_cnt:
       - 1000
     record_cnt: 1000
@@ -72,6 +75,16 @@ azure:
 
 storage:
   account_name: "ozonedbstorage"
+  # Optional secret string (not a file path): for cloudlab or when not using Azure CLI
+  # to list storage keys. Or export AZURE_STORAGE_KEY instead.
+  # account_key: ""
+
+# Used when cloud.vmprovider is cloudlab: list each node (hostname or IP from CloudLab).
+cloudlab:
+  ssh_user: "Xinying"
+  ssh_private_key_path: "~/.ssh/id_rsa"
+  # Example: [ "Xinying@hp111.utah.cloudlab.us"]
+  hosts: ["hp111.utah.cloudlab.us"]
 
 postgres:
   server_name: "ozonedb-postgresql-server"
@@ -116,7 +129,10 @@ network:
 vm:
   num: 1
   name: "test-vm"
-  ssh_key: "~/.ssh/id_rsa.pub"
+  # Path to the SSH *public* key file (.pub) for Azure VM provisioning / authorized_keys.
+  ssh_public_key_path: "~/.ssh/id_rsa.pub"
+  # Path to the matching *private* key for ssh/scp -i when vmprovider is azure (default ~/.ssh/id_rsa if unset).
+  ssh_private_key_path: "~/.ssh/id_rsa"
   vm_size: "Standard_D4s_v3"
   image_reference:
     publisher: "Canonical"
