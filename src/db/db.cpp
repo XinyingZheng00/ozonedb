@@ -1,6 +1,9 @@
 #include "db.h"
 #include "helper.h"
 #include "thread_pool.h"
+#ifdef OZONEDB_ENABLE_CORFU
+#include "corfu_storage.h"
+#endif
 #include <algorithm>
 #include <cmath>
 namespace ozonedb {
@@ -11,11 +14,25 @@ DB::DB(std::string const& shared_config_path) {
   } else {
     this->mode = Mode::MultipleProcesses;
   }
-  if (this->metadata->is_cloud) {
-    this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=RRKjiP5iHjd+8lC36H6+IKf1F1WO7M8F3g5VgIqDT1NTbAQXX19xNY2pipUGtGJU9f1/j17jsmtD+AStPt3y4A==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
-  }
-  else{
-    this->storage = new FileStorage(this->metadata->DBpath);
+  switch (this->metadata->backend_kind) {
+    case BackendKind::kLocal:
+      this->storage = new FileStorage(this->metadata->DBpath);
+      break;
+    case BackendKind::kAzure:
+      this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=RRKjiP5iHjd+8lC36H6+IKf1F1WO7M8F3g5VgIqDT1NTbAQXX19xNY2pipUGtGJU9f1/j17jsmtD+AStPt3y4A==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
+      break;
+    case BackendKind::kCorfu:
+#ifdef OZONEDB_ENABLE_CORFU
+      this->storage = new CorfuDBStorage(
+          this->metadata->corfu_endpoint,
+          this->metadata->corfu_jar_path,
+          this->metadata->corfu_jvm_opts,
+          this->metadata->corfu_stream_name,
+          this->metadata->DBpath);
+#else
+      throw std::runtime_error("OzoneDB was built without CorfuDB support (rebuild with -DOZONEDB_ENABLE_CORFU=ON)");
+#endif
+      break;
   }
   this->tail_cache = new TailCache();
   this->lru_cache = new LRUCache(33554432, storage);
@@ -74,6 +91,7 @@ Status DB::closeDB(DB*& db) {
   // db->thread_pool->waitForCompletion();
   db->metadata_log->stopViewUpdate();
   // delete db;
+  delete db;
   return Status::kSuccess;
 }
 

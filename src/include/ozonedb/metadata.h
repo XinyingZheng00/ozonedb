@@ -14,15 +14,27 @@ enum class CompactionPolicy {
   kHoSe   // Distribute by the number of put operations.
 };
 
+enum class BackendKind {
+  kLocal,
+  kAzure,
+  kCorfu
+};
+
 class Metadata {
  public:
   /**
    * @brief Path info for all files
    *
    */
-  std::string container_name; // only for cloud storage
+  std::string container_name; // only for Azure blob storage
   std::string DBpath;
-  int is_cloud = false;
+  BackendKind backend_kind = BackendKind::kLocal;
+  int is_cloud = false;  // legacy flag, still populated from "cloud" for backward compat
+  // Corfu backend settings
+  std::string corfu_endpoint;
+  std::string corfu_jar_path;
+  std::string corfu_jvm_opts;
+  std::string corfu_stream_name = "ozonedb";
   std::string metadata_log = "metadata.log";
   std::string task_log = "task.log";
   std::string log_prefix = "datalog";
@@ -64,9 +76,34 @@ class Metadata {
     task_prefix = result["task_prefix"];
     log_file_size_limit = std::stol(result["log_file_size_limit"]);
     mode = std::stoi(result["mode"]);
-    is_cloud = std::stoi(result["cloud"]);
-    if (is_cloud) {
+
+    auto backend_it = result.find("backend");
+    if (backend_it != result.end()) {
+      std::string const& b = backend_it->second;
+      if (b == "local") {
+        backend_kind = BackendKind::kLocal;
+      } else if (b == "azure") {
+        backend_kind = BackendKind::kAzure;
+      } else if (b == "corfu") {
+        backend_kind = BackendKind::kCorfu;
+      } else {
+        throw std::runtime_error("Unknown backend in config: " + b);
+      }
+    } else {
+      is_cloud = std::stoi(result["cloud"]);
+      backend_kind = is_cloud ? BackendKind::kAzure : BackendKind::kLocal;
+    }
+    is_cloud = (backend_kind == BackendKind::kAzure) ? 1 : 0;
+
+    if (backend_kind == BackendKind::kAzure) {
       container_name = result["container_name"];
+    } else if (backend_kind == BackendKind::kCorfu) {
+      corfu_endpoint = result["corfu_endpoint"];
+      corfu_jar_path = result["corfu_jar_path"];
+      auto opts_it = result.find("corfu_jvm_opts");
+      if (opts_it != result.end()) corfu_jvm_opts = opts_it->second;
+      auto stream_it = result.find("corfu_stream_name");
+      if (stream_it != result.end()) corfu_stream_name = stream_it->second;
     }
 
     std::string level_size_str = result["level_size"];

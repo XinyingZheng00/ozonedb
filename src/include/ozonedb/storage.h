@@ -33,7 +33,7 @@ class Storage {
   Storage(std::string storage_path) {
     this->storage_path = storage_path;
   };
-  ~Storage() = default;
+  virtual ~Storage() = default;
 
   /**
    * @brief Create Directory

@@ -13,8 +13,12 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # set(CMAKE_BUILD_TYPE DEBUG) # enable debug symbols
+
+# Optional backends
+option(OZONEDB_ENABLE_CORFU "Build the CorfuDB storage backend (requires JDK + Maven)" OFF)
+
 # Find Packages
-link_directories("$ENV{OZONEDB_HOME}/build/vcpkg_installed/x64-linux/lib")
+link_directories("$ENV{OZONEDB_HOME}/build/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
 find_package(azure-identity-cpp CONFIG REQUIRED)
 find_package(azure-storage-blobs-cpp CONFIG REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
@@ -25,7 +29,13 @@ find_package(OpenSSL CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(log4cxx CONFIG REQUIRED)
 
+if (OZONEDB_ENABLE_CORFU)
+    find_package(JNI REQUIRED)
+    find_program(MAVEN_EXECUTABLE mvn REQUIRED)
+endif()
+
 # Protobuf Compilation
+file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/include/ozonedb/protobuf)
 protobuf_generate_cpp(
     PROTO_SRCS PROTO_HDRS 
     ${PROJECT_SOURCE_DIR}/src/include/ozonedb/record.proto 
@@ -43,7 +53,7 @@ include_directories(
 )
 
 # Library Target
-add_library(OzoneDB SHARED
+set(OZONEDB_SOURCES
     src/db/compaction.cpp
     src/db/db.cpp
     src/db/log_handler.cpp
@@ -67,17 +77,41 @@ add_library(OzoneDB SHARED
     src/util/test_tool.cpp
     ${PROTO_SRCS} ${PROTO_HDRS}
 )
+if (OZONEDB_ENABLE_CORFU)
+    list(APPEND OZONEDB_SOURCES src/db/corfu_storage.cpp)
+endif()
+
+add_library(OzoneDB SHARED ${OZONEDB_SOURCES})
 
 target_link_libraries(OzoneDB
-    protobuf::libprotoc protobuf::libprotobuf protobuf::libprotobuf-lite 
-    ${Boost_LIBRARIES} 
-    Azure::azure-identity Azure::azure-storage-blobs 
+    protobuf::libprotoc protobuf::libprotobuf protobuf::libprotobuf-lite
+    ${Boost_LIBRARIES}
+    Azure::azure-identity Azure::azure-storage-blobs
     OpenSSL::SSL OpenSSL::Crypto
 )
 
+if (OZONEDB_ENABLE_CORFU)
+    target_compile_definitions(OzoneDB PUBLIC OZONEDB_ENABLE_CORFU)
+    target_include_directories(OzoneDB PUBLIC ${JNI_INCLUDE_DIRS})
+    target_link_libraries(OzoneDB ${JNI_LIBRARIES})
+
+    set(CORFU_BRIDGE_POM "${PROJECT_SOURCE_DIR}/ozonedb-jni-maven/corfu-bridge/pom.xml")
+    set(CORFU_BRIDGE_JAR "${PROJECT_SOURCE_DIR}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-all.jar")
+    add_custom_command(
+        OUTPUT ${CORFU_BRIDGE_JAR}
+        COMMAND ${MAVEN_EXECUTABLE} -f ${CORFU_BRIDGE_POM} package -DskipTests
+        DEPENDS ${CORFU_BRIDGE_POM}
+                ${PROJECT_SOURCE_DIR}/ozonedb-jni-maven/corfu-bridge/src/main/java/site/ycsb/db/corfu/CorfuBridge.java
+        COMMENT "Building corfu-bridge fat jar"
+        VERBATIM
+    )
+    add_custom_target(corfu-bridge ALL DEPENDS ${CORFU_BRIDGE_JAR})
+    add_dependencies(OzoneDB corfu-bridge)
+endif()
+
 # Executable for Unit Tests
-add_executable(runUnitTests 
-    tests/test_db.cpp 
+set(OZONEDB_TEST_SOURCES
+    tests/test_db.cpp
     tests/test_log.cpp
     tests/test_storage.cpp
     tests/test_all.cpp
@@ -86,6 +120,19 @@ add_executable(runUnitTests
     tests/test_compaction.cpp
     tests/test_filter_block.cpp
 )
+if (OZONEDB_ENABLE_CORFU)
+    list(APPEND OZONEDB_TEST_SOURCES tests/test_corfu_storage.cpp)
+endif()
+add_executable(runUnitTests ${OZONEDB_TEST_SOURCES})
+if (OZONEDB_ENABLE_CORFU)
+    target_compile_definitions(runUnitTests PRIVATE OZONEDB_ENABLE_CORFU)
+    target_include_directories(runUnitTests PRIVATE ${JNI_INCLUDE_DIRS})
+    target_link_libraries(runUnitTests ${JNI_LIBRARIES})
+
+    add_executable(corfu_smoke tests/corfu_smoke.cpp)
+    target_include_directories(corfu_smoke PRIVATE ${JNI_INCLUDE_DIRS})
+    target_link_libraries(corfu_smoke OzoneDB ${JNI_LIBRARIES})
+endif()
 
 target_link_libraries(runUnitTests 
     protobuf::libprotoc protobuf::libprotobuf protobuf::libprotobuf-lite 
