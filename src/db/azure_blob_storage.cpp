@@ -66,27 +66,40 @@ void AzureBlobStorage::logBatch(std::string const& fileName, unsigned char* cons
 }
 
 Status AzureBlobStorage::appendInBatch(std::string const& fileName, unsigned char* const& data, int length) {
-  // logBatch(fileName, data, length);
   appendNoFlush(fileName, data, length);
-  auto now = std::chrono::high_resolution_clock::now();
+
+  std::unique_lock lock(mtx);
   commit_count_++;
-  if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_commited_time_).count() > commit_interval_) {
-    std::cout<<std::this_thread::get_id()<<":committing batch for "<<commit_count_<<std::endl;
-    commit_count_=0;
-    std::unique_lock lock(mtx);
+  auto now = std::chrono::high_resolution_clock::now();
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_commited_time_).count();
+
+  bool should_flush = elapsed > commit_interval_;
+
+  if (!should_flush && sync_mode_) {
+    auto remaining_ms = commit_interval_ - elapsed;
+    batch_flushed_cv_.wait_for(lock, std::chrono::milliseconds(remaining_ms));
+    // Check if another thread already flushed our data
+    if (cached_file.find(fileName) == cached_file.end()) {
+      return Status::kSuccess;
+    }
+    should_flush = true;
+  }
+
+  if (should_flush) {
     auto it = cached_file.find(fileName);
     if (it == cached_file.end()) {
-      return Status::kNotFound;
+      return Status::kSuccess;
     }
     auto& buffer = it->second;
     try {
       Azure::Core::IO::MemoryBodyStream content(buffer.data(), buffer.size());
       auto blobClient = getAppendBlobClient(fileName);
       blobClient.AppendBlock(content);
-      // std::cout<<"uploading blob : "<< std::to_string(buffer.size())<<std::endl;
       cached_file.erase(it);
-      // std::filesystem::remove(fileName);
       last_commited_time_ = std::chrono::high_resolution_clock::now();
+      commit_count_ = 0;
+      lock.unlock();
+      batch_flushed_cv_.notify_all();
       return Status::kSuccess;
     } catch (Azure::Core::RequestFailedException const& e) {
       if (e.ErrorCode == "BlobIsSealed") {
@@ -96,27 +109,8 @@ Status AzureBlobStorage::appendInBatch(std::string const& fileName, unsigned cha
     } catch (std::exception const& e) {
       return Status::kFailure;
     }
-  /*
-  std::thread([this, fileName, buffer = std::move(buffer)]() {
-          try {
-              // Perform blob upload asynchronously
-              std::cout<<"uploading blob : "<< std::to_string(buffer.size())<<std::endl;
-              Azure::Core::IO::MemoryBodyStream content(buffer.data(), buffer.size());
-              auto blobClient = getAppendBlobClient(fileName);
-              blobClient.AppendBlock(content);
-              cached_file.erase(fileName);
-              // std::filesystem::remove(fileName);
-          } catch (Azure::Core::RequestFailedException const& e) {
-              if (e.ErrorCode == "BlobIsSealed") {
-                  // Handle sealed blob error
-              }
-              // Handle other errors
-          } catch (std::exception const& e) {
-              // Handle general exceptions
-          }
-      }).detach();  // Detach the thread to run asynchronously  
-  */
   }
+
   return Status::kSuccess;
 }
 

@@ -114,7 +114,7 @@ def load_ycsb(node, i, ycsb_t_start, config, blob_client, ssh_identity_path="~/.
     result_path = os.path.join("$OZONEDB_HOME", "bench", "results", "cloud")
     script_path = os.path.join("$OZONEDB_HOME", "bench", "scripts")
 
-    server_exec(node, "tmux kill-server", ssh_identity_path=ssh_identity_path)
+    server_exec(node, "tmux kill-session -t ozonedb_load 2>/dev/null || true", ssh_identity_path=ssh_identity_path)
     server_exec(node, "tmux new -s ozonedb_load -d", ssh_identity_path=ssh_identity_path)
     server_exec(node, "source ~/.profile", tmux_session="ozonedb_load", ssh_identity_path=ssh_identity_path)
     server_exec(node, f"mkdir -p {result_path}", tmux_session="ozonedb_load", ssh_identity_path=ssh_identity_path)

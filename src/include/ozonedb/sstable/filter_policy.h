@@ -16,6 +16,7 @@
 #ifndef STORAGE_OZONEDB_INCLUDE_FILTER_POLICY_H_
 #define STORAGE_OZONEDB_INCLUDE_FILTER_POLICY_H_
 
+#include <cstdint>
 #include <string>
 #ifndef FALLTHROUGH_INTENDED
 #define FALLTHROUGH_INTENDED \
@@ -36,8 +37,8 @@ inline uint32_t DecodeFixed32(char const* ptr) {
 
 inline uint32_t Hash(char const* data, size_t n, uint32_t seed) {
   // Similar to murmur hash
-  const uint32_t m = 0xc6a4a793;
-  const uint32_t r = 24;
+  uint32_t const m = 0xc6a4a793;
+  uint32_t const r = 24;
   char const* limit = data + n;
   uint32_t h = seed ^ (n * m);
 

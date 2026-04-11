@@ -3,6 +3,7 @@
 #include "protobuf/record.pb.h"
 #include <azure/identity/client_secret_credential.hpp>
 #include <azure/storage/blobs.hpp>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -181,15 +182,18 @@ class FileStorage : public Storage {
 using namespace Azure::Storage::Blobs;
 using namespace Azure::Identity;
 class AzureBlobStorage : public Storage {
-public:
+ public:
   std::shared_ptr<BlobServiceClient> blobServiceClient;
   std::shared_ptr<BlobContainerClient> containerClient;
   std::string containerName;
-  std::mutex mtx;  // Mutex for the cached_file
+  std::mutex mtx;                                                           // Mutex for the cached_file
   std::unordered_map<std::string, std::vector<unsigned char>> cached_file;  // In-memory cache for sstable data
   std::chrono::_V2::system_clock::time_point last_commited_time_;
-  int commit_count_ = 0;  // Commit count
-  int commit_interval_ = 10;  // Commit interval in milliseconds
+  int commit_count_ = 0;                      // Commit count
+  int commit_interval_ = 10;                  // Commit interval in milliseconds
+  bool sync_mode_ = false;                    // When true, appendInBatch blocks until batch is flushed to Azure
+  std::condition_variable batch_flushed_cv_;  // Notifies blocked writers after batch flush
+  void setSyncMode(bool sync) { sync_mode_ = sync; }
 
   // vp7eifiiqeHobq0nFpHv6MOI/J53UXgOKYxg0xIwOQj0NHe2cbOcVmdtgh6KE/9cu2UU9z3oPjvI+AStoe1A2Q==
   AzureBlobStorage(std::string const& connectionString, std::string const& containerName, std::string const& db_path)
