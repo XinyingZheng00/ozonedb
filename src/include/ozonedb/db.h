@@ -49,8 +49,13 @@ class DB {
   /**
    * @brief different modules of the database
    *
+   * log_storage holds append-coordinated files (log layer, metadata log,
+   * task log). sstable_storage holds SSTables. When the config does not
+   * set a separate sstable_backend the two pointers alias and the
+   * destructor's guard prevents a double-free. Paper §3.5 split.
    */
-  Storage* storage;
+  Storage* log_storage = nullptr;
+  Storage* sstable_storage = nullptr;
   Metadata* metadata;
   CompactionWatcher* watcher = nullptr;
   View latest_view;

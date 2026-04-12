@@ -2,10 +2,14 @@ import subprocess
 import os
 import argparse
 import yaml
-from load_local_ycsb import generate_config_for_ozonedb_local
+from load_local_ycsb import (
+    generate_config_for_ozonedb_local,
+    generate_config_for_ozonedb_corfu,
+    corfu_bridge_jar_path,
+)
 ozonedb_home = os.environ.get("OZONEDB_HOME")
 
-def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, repeated, ycsb_data_path, threads):
+def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, repeated, ycsb_data_path, threads, corfu_settings=None, s3_settings=None):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
     
@@ -26,12 +30,16 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                 for db_name in db_names:
                     result_file_readwrite = os.path.join(result_path, f'{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_t1.result')
                     cached_data_path = ycsb_data_path + "/" + "cached_data-"+f'{db_name}-{each_key_size}-{record_cnt}/'
-                    if not os.path.exists(cached_data_path):
+                    # For corfu-backed ozonedb the post-load state lives on the
+                    # remote Corfu stream, not in a local directory. Don't
+                    # require cached_data_path to exist and don't copy it.
+                    if db_name != "ozonedb-corfu" and not os.path.exists(cached_data_path):
                         print(f"cached_data_path {cached_data_path} does not exist, skipping...")
                         continue
                     run_data_path = ycsb_data_path + "/" + f'{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}/'
                     subprocess.run(['rm', '-rf', result_file_readwrite])
-                    command = ['python3', f'bin/ycsb', 'run', db_name, '-threads', str(1), '-s','-P', workload_path, '-p', 'status.interval=1']
+                    ycsb_db_name = "ozonedb" if db_name == "ozonedb-corfu" else db_name
+                    command = ['python3', f'bin/ycsb', 'run', ycsb_db_name, '-threads', str(1), '-s','-P', workload_path, '-p', 'status.interval=1']
                     if db_name == "rocksdb":
                         command.append("-p")
                         command.append("rocksdb.dir="+run_data_path)
@@ -39,6 +47,12 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                         config = generate_config_for_ozonedb_local(run_data_path)
                         command.append("-p")
                         command.append(f"shared_config={config}")
+                    elif db_name == "ozonedb-corfu":
+                        config = generate_config_for_ozonedb_corfu(run_data_path, corfu_settings, s3_settings)
+                        command.append("-p")
+                        command.append(f"shared_config={config}")
+                        command.append("-cp")
+                        command.append(corfu_bridge_jar_path())
                     elif db_name == "sqlite":
                         command[3] = "jdbc"
                         db_file = os.path.join(run_data_path, "mydb.db")
@@ -52,11 +66,16 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                         command.append(ycsb_path + "/jdbc/target/dependency/sqlite-jdbc-3.49.1.0.jar")
                     
                     for _ in range(repeated):
-                        if db_name == "ozonedb":
+                        if db_name == "ozonedb" or db_name == "ozonedb-corfu":
                             for thread in threads:
                                 thread = str(thread)
-                                subprocess.run(['rm', '-rf', run_data_path]) # clean cached data 
-                                subprocess.run(['cp', '-r', cached_data_path, run_data_path]) 
+                                subprocess.run(['rm', '-rf', run_data_path]) # clean cached data
+                                if db_name == "ozonedb-corfu":
+                                    # Corfu state is remote; just create an
+                                    # empty local dir for metadata scratch.
+                                    os.makedirs(run_data_path, exist_ok=True)
+                                else:
+                                    subprocess.run(['cp', '-r', cached_data_path, run_data_path])
                                 result_file_readwrite = os.path.join(result_path, f'{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_t{thread}.result')
                                 subprocess.run(['rm', '-rf', result_file_readwrite]) # remove the result data if is exist
                                 with open(result_file_readwrite, "a") as f:
@@ -92,5 +111,7 @@ if __name__ == "__main__":
         repeated = load_config["repeated"]
         ycsb_data_path = load_config["ycsb_data_path"]
         threads = load_config["threads"]
+        corfu_settings = config.get("corfu")
+        s3_settings = config.get("s3")
 
-        run_ycsb(workload_names, record_cnts, operation_cnts, key_sizes, db_names, repeated, ycsb_data_path, threads)
+        run_ycsb(workload_names, record_cnts, operation_cnts, key_sizes, db_names, repeated, ycsb_data_path, threads, corfu_settings, s3_settings)

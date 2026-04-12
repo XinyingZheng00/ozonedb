@@ -48,15 +48,39 @@ Status LogHandler::addRecord(Record const& record) {
   if (this->active_unit.empty()) {
     newTail();
   }
-  while (this->storage->appendInBatch(this->active_unit, buffer, buffer_size) == Status::kSealed) {
-    newTail();
-  }
-  View view;
-  metadata_log->getLatestView(view);
-  while (view.getFileSize(this->active_unit) >= this->file_size_limit || view.current_log_tail != this->active_unit) {
-    newTail();
+
+  // Outer retry loop handles the multi-writer race where a concurrent
+  // writer rolls the log (LOGCREATE) while our append is in flight.
+  // When that happens our record lands on the now-stale tail whose
+  // view-frozen file_size won't include it — the record becomes
+  // invisible. Detect via the post-append tail check and re-issue
+  // against the new active_unit. Paper §5.2 state-independent ingest.
+  constexpr int kMaxRetries = 8;
+  for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
+    std::string target = this->active_unit;
+
+    while (this->storage->appendInBatch(target, buffer, buffer_size) == Status::kSealed) {
+      newTail();
+      target = this->active_unit;
+    }
+
+    View view;
     metadata_log->getLatestView(view);
+    if (view.current_log_tail == target &&
+        view.getFileSize(target) < this->file_size_limit) {
+      break;
+    }
+
+    // Tail moved or the file is full. Roll forward and retry the record
+    // on the new tail so the previous (now-orphaned) append doesn't
+    // silently lose data.
+    while (view.getFileSize(this->active_unit) >= this->file_size_limit ||
+           view.current_log_tail != this->active_unit) {
+      newTail();
+      metadata_log->getLatestView(view);
+    }
   }
+
   delete[] buffer;
   buffer = nullptr;
   return Status::kSuccess;

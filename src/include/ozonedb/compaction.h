@@ -29,7 +29,8 @@ class Compaction {
 class CompactionWatcher {
  private:
   Metadata* metadata = nullptr;
-  Storage* storage = nullptr;
+  Storage* storage = nullptr;          // log_storage — atomic-append backend
+  Storage* sstable_storage = nullptr;  // sstable_storage — regular object storage
   LogHandler* task_handler = nullptr;
   LogHandler* log_handler = nullptr;
   SSTableHandler* sstable_handler = nullptr;
@@ -55,7 +56,10 @@ class CompactionWatcher {
    * @param level_handlers
    */
   CompactionWatcher(Metadata* metadata, Storage* storage, LogHandler* log_handler, MetadataLogHandler* metadata_handler, SSTableHandler* sstable_handler, std::string fingerprint)
-      : metadata(metadata), storage(storage), log_handler(log_handler), metadata_handler(metadata_handler), sstable_handler(sstable_handler), fingerprint(fingerprint) {
+      : metadata(metadata), storage(storage), sstable_storage(storage), log_handler(log_handler), metadata_handler(metadata_handler), sstable_handler(sstable_handler), fingerprint(fingerprint) {
+    // sstable_storage defaults to the same backend as the log layer for
+    // backward compat. setSSTableStorage(...) overrides it after construction
+    // when the config splits SSTable storage off (paper §3.5).
   }
   ~CompactionWatcher() {
     // delete this->compaction_thread;
@@ -66,6 +70,9 @@ class CompactionWatcher {
 
   // set task log handler
   void setTaskLogHandler(TaskLogHandler* task_log_handler) { this->task_log_handler = task_log_handler; }
+  // set the SSTable-only storage backend (paper §3.5 split). When unset
+  // sstable_storage falls back to the same Storage* as the log layer.
+  void setSSTableStorage(Storage* s) { this->sstable_storage = s; }
   // set file mutex manager
   void setFileMutexManager(FileMutexManager* file_mutex_manager) { this->file_mutex_manager = file_mutex_manager; }
   // set thread pool

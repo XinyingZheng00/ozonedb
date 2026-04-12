@@ -19,6 +19,10 @@ class TailCache {
   std::shared_mutex mutex;
   TailCache() = default;
   ~TailCache() = default;
+  // Disable the cache for multi-writer backends (e.g. Corfu) where
+  // entries can go stale from remote writes. When disabled, all
+  // lookups miss and the read path falls through to the storage layer.
+  void disable() { enabled_ = false; }
   // Update the cache with a key, record, and offset
   void updateCache(std::string key, Record* record, std::string new_tail, std::string old_tail) {
     std::unique_lock<std::shared_mutex> lock(mutex);
@@ -40,6 +44,7 @@ class TailCache {
   // Retrieve the latest record for a given key up to a specified offset
   // also check if the tail has changed
   bool getLatestRecord(std::string key, std::pair<Record*, std::string>& entry) {
+    if (!enabled_) return false;
     if (cache_.find(key) != cache_.end()) {
       std::string old_tail = cache_[key].second;
       while (tail_to_tail_map.find(old_tail) != tail_to_tail_map.end()) {
@@ -56,6 +61,7 @@ class TailCache {
   }
 
  private:
+  bool enabled_ = true;
   std::unordered_map<std::string, std::pair<Record*, std::string>> cache_;
   std::unordered_map<std::string, std::string> tail_to_tail_map;  // old tail -> new tail
 };
@@ -80,7 +86,13 @@ class LRUCache {
     // contructor for table
     CacheEntry(Table* table) : table(table), offset(), sealed(true) {}
   };
-  Storage* storage = nullptr;
+  // Separate pointers for log vs sstable files. In a backward-compat
+  // single-backend configuration the two pointers alias; in a split
+  // configuration (e.g. Corfu log + S3 sstables) they point at different
+  // Storage instances and the per-method routing below keeps reads on the
+  // right backend. Paper §3.5 motivation.
+  Storage* log_storage_ = nullptr;
+  Storage* sstable_storage_ = nullptr;
   size_t capacity = 33554432;
   size_t current_size = 0;
   std::shared_mutex mutex;  // this is to protect file_to_records_map and lru_list
@@ -98,7 +110,19 @@ class LRUCache {
   void evict();
 
  public:
-  LRUCache(int capacity, Storage* storage) : capacity(capacity), storage(storage) {}
+  // Legacy single-storage constructor — both log and sstable reads go
+  // through the same backend. Kept for backward-compat with tests and
+  // configs that don't split storage.
+  LRUCache(int capacity, Storage* storage)
+      : log_storage_(storage), sstable_storage_(storage), capacity(capacity) {}
+
+  // Split-storage constructor — log reads go through log_storage and
+  // sstable reads go through sstable_storage. Used when the config sets
+  // sstable_backend separately from the main backend.
+  LRUCache(int capacity, Storage* log_storage, Storage* sstable_storage)
+      : log_storage_(log_storage),
+        sstable_storage_(sstable_storage),
+        capacity(capacity) {}
 
   ~LRUCache() {
     for (auto& entry : file_to_entry_map) {

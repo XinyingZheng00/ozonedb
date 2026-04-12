@@ -96,6 +96,7 @@ class CorfuDBStorage : public Storage {
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
   void drainInitialEntries();
   void tailerLoop();
+  long globalFenceTarget();
   void waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target);
 };
 

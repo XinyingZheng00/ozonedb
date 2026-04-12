@@ -284,6 +284,24 @@ void CorfuDBStorage::tailerLoop() {
   detachThread();
 }
 
+long CorfuDBStorage::globalFenceTarget() {
+  // For multi-writer reads: the fence target must include both our own
+  // writes (last_written_addr_) AND any remote writer's commits that
+  // have already been sequenced. CorfuBridge::tailAddress() returns the
+  // highest address currently in the stream. max() ensures we never
+  // regress the target if our own in-flight write hasn't been sequenced
+  // yet but a remote write has a higher address.
+  long local = last_written_addr_.load(std::memory_order_acquire);
+  JNIEnv* env = attachThread();
+  if (!env) return local;
+  jlong global = env->CallLongMethod(bridge_global_, mid_tailAddress_);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return local;
+  }
+  return std::max(local, static_cast<long>(global));
+}
+
 void CorfuDBStorage::waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target) {
   tailer_cv_.wait(lock, [&] {
     return !running_ || last_applied_addr_.load(std::memory_order_acquire) >= target;
@@ -387,8 +405,9 @@ Status CorfuDBStorage::flush(std::string const& fileName) {
 }
 
 Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, size_t& size) {
+  long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
-  waitForTailerLocked(lock, last_written_addr_.load(std::memory_order_acquire));
+  waitForTailerLocked(lock, target);
   auto it = file_buffers_.find(fileName);
   if (it == file_buffers_.end() || removed_files_.count(fileName)) {
     return Status::kNotFound;
@@ -400,8 +419,9 @@ Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, s
 }
 
 Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) {
+  long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
-  waitForTailerLocked(lock, last_written_addr_.load(std::memory_order_acquire));
+  waitForTailerLocked(lock, target);
   auto it = file_buffers_.find(fileName);
   if (it == file_buffers_.end() || removed_files_.count(fileName)) {
     return Status::kNotFound;
@@ -413,14 +433,43 @@ Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, s
 }
 
 size_t CorfuDBStorage::size(std::string fileName) {
+  long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
-  waitForTailerLocked(lock, last_written_addr_.load(std::memory_order_acquire));
+  waitForTailerLocked(lock, target);
   auto it = file_buffers_.find(fileName);
   if (it == file_buffers_.end()) return 0;
   return it->second.size();
 }
 
 void CorfuDBStorage::seal(std::string fileName) {
+  // Flush any pending batched data for this file BEFORE the SEAL marker so
+  // the seal is the authoritative terminator on the shared stream. Without
+  // this, an appendInBatch commit-interval race can leave a tail batch in
+  // cached_file_[fileName]; when the destructor eventually drains it, the
+  // late APPEND lands after SEAL on the stream and readers that trust the
+  // metadata-log size miss those records on reopen.
+  {
+    std::unique_lock<std::mutex> lock(mtx_);
+    auto it = cached_file_.find(fileName);
+    if (it != cached_file_.end() && !it->second.empty()) {
+      std::vector<unsigned char> payload = std::move(it->second);
+      cached_file_.erase(it);
+      lock.unlock();
+      JNIEnv* env = attachThread();
+      if (env) {
+        long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
+                                   payload.data(), static_cast<int>(payload.size()));
+        if (addr >= 0) {
+          long prev = last_written_addr_.load(std::memory_order_acquire);
+          while (addr > prev &&
+                 !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+          }
+        } else {
+          std::cerr << "[corfu] seal: pre-seal flush failed for " << fileName << "\n";
+        }
+      }
+    }
+  }
   JNIEnv* env = attachThread();
   if (!env) return;
   long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_SEAL, nullptr, 0);
@@ -434,8 +483,9 @@ void CorfuDBStorage::seal(std::string fileName) {
 }
 
 bool CorfuDBStorage::isSealed(std::string fileName) {
+  long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
-  waitForTailerLocked(lock, last_written_addr_.load(std::memory_order_acquire));
+  waitForTailerLocked(lock, target);
   return sealed_files_.count(fileName) > 0;
 }
 
@@ -455,8 +505,9 @@ void CorfuDBStorage::remove(std::string fileName) {
 }
 
 bool CorfuDBStorage::exist(std::string fileName) {
+  long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
-  waitForTailerLocked(lock, last_written_addr_.load(std::memory_order_acquire));
+  waitForTailerLocked(lock, target);
   if (removed_files_.count(fileName)) return false;
   return file_buffers_.count(fileName) > 0;
 }

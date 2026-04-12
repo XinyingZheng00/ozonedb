@@ -45,7 +45,7 @@ void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, s
   std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
   std::unique_lock file_lock(file_mutex);
   unsigned char* buffer = nullptr;
-  this->storage->read(file_name, buffer, cached_offset, size - cached_offset);
+  this->log_storage_->read(file_name, buffer, cached_offset, size - cached_offset);
   file_lock.unlock();
   std::vector<google::protobuf::Message*> messages;
   protobuf::deserializeMessages(buffer, size - cached_offset, messages, []() -> google::protobuf::Message* {
@@ -69,7 +69,7 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
     lock.unlock();
     std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
     std::unique_lock file_lock(file_mutex);
-    Status status = Table::open(this->storage, file_name, table);
+    Status status = Table::open(this->sstable_storage_, file_name, table);
     file_lock.unlock();
     table->setCache(this);
     if (status != Status::kSuccess) {

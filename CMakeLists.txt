@@ -16,6 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Optional backends
 option(OZONEDB_ENABLE_CORFU "Build the CorfuDB storage backend (requires JDK + Maven)" OFF)
+option(OZONEDB_ENABLE_S3 "Build the S3/MinIO/R2 storage backend (requires aws-sdk-cpp)" ON)
 
 # Find Packages
 link_directories("$ENV{OZONEDB_HOME}/build/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
@@ -32,6 +33,10 @@ find_package(log4cxx CONFIG REQUIRED)
 if (OZONEDB_ENABLE_CORFU)
     find_package(JNI REQUIRED)
     find_program(MAVEN_EXECUTABLE mvn REQUIRED)
+endif()
+
+if (OZONEDB_ENABLE_S3)
+    find_package(AWSSDK CONFIG REQUIRED COMPONENTS s3)
 endif()
 
 # Protobuf Compilation
@@ -80,6 +85,9 @@ set(OZONEDB_SOURCES
 if (OZONEDB_ENABLE_CORFU)
     list(APPEND OZONEDB_SOURCES src/db/corfu_storage.cpp)
 endif()
+if (OZONEDB_ENABLE_S3)
+    list(APPEND OZONEDB_SOURCES src/db/s3_storage.cpp)
+endif()
 
 add_library(OzoneDB SHARED ${OZONEDB_SOURCES})
 
@@ -89,6 +97,11 @@ target_link_libraries(OzoneDB
     Azure::azure-identity Azure::azure-storage-blobs
     OpenSSL::SSL OpenSSL::Crypto
 )
+
+if (OZONEDB_ENABLE_S3)
+    target_compile_definitions(OzoneDB PUBLIC OZONEDB_ENABLE_S3)
+    target_link_libraries(OzoneDB ${AWSSDK_LINK_LIBRARIES})
+endif()
 
 if (OZONEDB_ENABLE_CORFU)
     target_compile_definitions(OzoneDB PUBLIC OZONEDB_ENABLE_CORFU)
@@ -132,6 +145,10 @@ if (OZONEDB_ENABLE_CORFU)
     add_executable(corfu_smoke tests/corfu_smoke.cpp)
     target_include_directories(corfu_smoke PRIVATE ${JNI_INCLUDE_DIRS})
     target_link_libraries(corfu_smoke OzoneDB ${JNI_LIBRARIES})
+
+    add_executable(corfu_multiwriter_smoke tests/corfu_multiwriter_smoke.cpp)
+    target_include_directories(corfu_multiwriter_smoke PRIVATE ${JNI_INCLUDE_DIRS})
+    target_link_libraries(corfu_multiwriter_smoke OzoneDB ${JNI_LIBRARIES})
 endif()
 
 target_link_libraries(runUnitTests 

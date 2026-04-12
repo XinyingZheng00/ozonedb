@@ -303,7 +303,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
       std::unique_lock file_lock(file_mutex);
       
-      Table::open(this->storage, input, table);
+      Table::open(this->sstable_storage, input, table);
       records_tmp = table->getAll();
       
       file_lock.unlock();
@@ -343,8 +343,8 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   std::vector<std::pair<std::string, std::string>> key_ranges;
   std::pair<std::string, std::string> key_range;
   std::string dest_prefix = this->metadata->sstable_level_prefix + std::to_string(compaction->task_id->destinationlevel());
-  if (!this->storage->exist(dest_prefix)) {
-    this->storage->createDirectory(dest_prefix);
+  if (!this->sstable_storage->exist(dest_prefix)) {
+    this->sstable_storage->createDirectory(dest_prefix);
   }
   for (int i = 0; i < records.size(); i++) {
     if (compaction->outputBuilder == nullptr ||
@@ -367,7 +367,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
         sstable_path.append("/").append(sstable_name);
       output_files.push_back(sstable_path);
       log_string += ":" + sstable_path;
-      compaction->outputBuilder = new TableBuilder(this->storage, sstable_path);
+      compaction->outputBuilder = new TableBuilder(this->sstable_storage, sstable_path);
       key_range.first = records[i]->key();
     }
     compaction->outputBuilder->add(records[i]->key(), *records[i]);

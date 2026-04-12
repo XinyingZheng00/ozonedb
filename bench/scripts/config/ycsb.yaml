@@ -1,17 +1,14 @@
 local:
   load:
-    record_cnt: 
-      - 1000000
+    record_cnt:
+      - 100000
     key_size:
       - "1KB"
     db_name:
-      - "rocksdb"
-      - "ozonedb"
-      - "sqlite"
-      - "raw_sync_io"
+      - "ozonedb-corfu"
     repeated: 1
-    ycsb_data_path: "/tank/ycsb_data"
-    threads: 
+    ycsb_data_path: "/tmp/ycsb_data"
+    threads:
       - 1
       # - 4
       # - 8
@@ -26,42 +23,66 @@ local:
       # - "d"
       # - "f"
     operation_cnt:
-      - 1000000
-    record_cnt: 1000000
+      - 100000
+    record_cnt: 100000
     key_size:
       - "1KB"
     db_name:
-      - "ozonedb"
-      # - "sqlite"
-      # - "rocksdb"
-    threads: 
+      - "ozonedb-corfu"
+    threads:
       - 1
     repeated: 1
-    ycsb_data_path: "/tank/ycsb_data"
+    ycsb_data_path: "/tmp/ycsb_data"
 
 # azure: discover VMs via Azure Resource Manager (needs AZURE_SUBSCRIPTION_ID).
 # cloudlab: SSH targets from cloudlab.hosts below (no Azure VM APIs).
 cloud:
   vmprovider: cloudlab
   load:
-    record_cnt: 
-      - 1000
+    record_cnt:
+      - 10000
     key_size:
       - "1KB"
     repeated: 1
     ycsb_data_path: "ycsb-data"
-    threads: 8
+    threads: 1
   run:
     workload_name:
       - "a"
     operation_cnt:
       - 1000
-    record_cnt: 1000
+    record_cnt: 10000
     key_size:
       - "1KB"
     threads: 1
     repeated: 1
     ycsb_data_path: "ycsb-data"
+
+# Corfu backend settings (only consumed when db_name includes "ozonedb-corfu").
+# The jar path is derived from $OZONEDB_HOME/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-all.jar
+# and does not need to be listed here.
+corfu:
+  endpoint: "[::1]:9000"
+  stream_name: "ozonedb-ycsb"
+  jvm_opts: "-Xmx2g --add-opens=java.base/java.util=ALL-UNNAMED"
+
+# S3-compatible storage for SSTables (paper §3.5 split). When set, SSTables
+# are written to this object store instead of the main backend. Works with
+# any service that speaks the S3 API: real AWS S3, MinIO, R2, Wasabi,
+# SeaweedFS, B2. For MinIO local dev:
+#   docker run --rm -p 9000:9000 -p 9001:9001 \
+#     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+#     minio/minio server /data --console-address ":9001"
+#   mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+#   mc mb local/ozonedb-sstables
+s3:
+  endpoint: "http://127.0.0.1:9090"
+  region: "us-east-1"
+  bucket: "ozonedb-sstables"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  use_path_style: true
+  sstable_dir: "ycsb-cluster"
 
 github_username: "XinyingZheng00"
 github_token: "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"
@@ -81,10 +102,10 @@ storage:
 
 # Used when cloud.vmprovider is cloudlab: list each node (hostname or IP from CloudLab).
 cloudlab:
-  ssh_user: "Xinying"
-  ssh_private_key_path: "~/.ssh/id_rsa"
+  ssh_user: "oliverr3"
+  ssh_private_key_path: "~/.ssh/cloudlab"
   # Example: [ "Xinying@hp111.utah.cloudlab.us"]
-  hosts: ["hp111.utah.cloudlab.us"]
+  hosts: ["amd019.utah.cloudlab.us"]
 
 postgres:
   server_name: "ozonedb-postgresql-server"
@@ -99,7 +120,7 @@ cosmosdb:
   account_name: "ozonedb-cosmosdb-account"
   consistency_level: "Eventual"
   mode: "serverless"
-  
+
 mysql:
   server_name: "ozonedb-mysql-server1234"
   port: 3306

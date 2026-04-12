@@ -4,9 +4,55 @@
 #ifdef OZONEDB_ENABLE_CORFU
 #include "corfu_storage.h"
 #endif
+#ifdef OZONEDB_ENABLE_S3
+#include "s3_storage.h"
+#endif
 #include <algorithm>
 #include <cmath>
 namespace ozonedb {
+
+namespace {
+// Build a Storage instance for one of the supported backend kinds.
+// Used twice from DB::DB — once for the log layer (always required) and
+// optionally a second time for SSTable storage if the config picks a
+// separate backend per paper §3.5.
+Storage* makeStorage(BackendKind kind, Metadata const& md, bool for_sstables) {
+  switch (kind) {
+    case BackendKind::kLocal:
+      return new FileStorage(for_sstables && !md.sstable_dir.empty()
+                                 ? md.sstable_dir
+                                 : md.DBpath);
+    case BackendKind::kAzure:
+      return new AzureBlobStorage(
+          "DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=RRKjiP5iHjd+8lC36H6+IKf1F1WO7M8F3g5VgIqDT1NTbAQXX19xNY2pipUGtGJU9f1/j17jsmtD+AStPt3y4A==;EndpointSuffix=core.windows.net",
+          for_sstables ? md.sstable_container_name : md.container_name,
+          md.DBpath);
+    case BackendKind::kCorfu:
+#ifdef OZONEDB_ENABLE_CORFU
+      return new CorfuDBStorage(md.corfu_endpoint, md.corfu_jar_path,
+                                md.corfu_jvm_opts, md.corfu_stream_name,
+                                md.DBpath);
+#else
+      throw std::runtime_error(
+          "OzoneDB was built without CorfuDB support (rebuild with "
+          "-DOZONEDB_ENABLE_CORFU=ON)");
+#endif
+    case BackendKind::kS3:
+#ifdef OZONEDB_ENABLE_S3
+      return new S3Storage(md.s3_endpoint, md.s3_region, md.s3_bucket,
+                           md.s3_access_key, md.s3_secret_key,
+                           md.s3_use_path_style,
+                           for_sstables ? md.sstable_dir : md.DBpath);
+#else
+      throw std::runtime_error(
+          "OzoneDB was built without S3 support (rebuild with "
+          "-DOZONEDB_ENABLE_S3=ON)");
+#endif
+  }
+  throw std::runtime_error("makeStorage: unhandled BackendKind");
+}
+}  // namespace
+
 DB::DB(std::string const& shared_config_path) {
   this->metadata = new Metadata(shared_config_path);
   if (this->metadata->mode == 0) {
@@ -14,40 +60,37 @@ DB::DB(std::string const& shared_config_path) {
   } else {
     this->mode = Mode::MultipleProcesses;
   }
-  switch (this->metadata->backend_kind) {
-    case BackendKind::kLocal:
-      this->storage = new FileStorage(this->metadata->DBpath);
-      break;
-    case BackendKind::kAzure:
-      this->storage = new AzureBlobStorage("DefaultEndpointsProtocol=https;AccountName=ozonedbstorage;AccountKey=RRKjiP5iHjd+8lC36H6+IKf1F1WO7M8F3g5VgIqDT1NTbAQXX19xNY2pipUGtGJU9f1/j17jsmtD+AStPt3y4A==;EndpointSuffix=core.windows.net", this->metadata->container_name, this->metadata->DBpath);
-      break;
-    case BackendKind::kCorfu:
-#ifdef OZONEDB_ENABLE_CORFU
-      this->storage = new CorfuDBStorage(
-          this->metadata->corfu_endpoint,
-          this->metadata->corfu_jar_path,
-          this->metadata->corfu_jvm_opts,
-          this->metadata->corfu_stream_name,
-          this->metadata->DBpath);
-#else
-      throw std::runtime_error("OzoneDB was built without CorfuDB support (rebuild with -DOZONEDB_ENABLE_CORFU=ON)");
-#endif
-      break;
+
+  this->log_storage = makeStorage(this->metadata->backend_kind,
+                                  *this->metadata, /*for_sstables=*/false);
+  if (this->metadata->sstable_backend_set) {
+    this->sstable_storage = makeStorage(this->metadata->sstable_backend_kind,
+                                        *this->metadata, /*for_sstables=*/true);
+  } else {
+    // Backward-compat: SSTables share the main backend.
+    this->sstable_storage = this->log_storage;
   }
+
   this->tail_cache = new TailCache();
-  this->lru_cache = new LRUCache(33554432, storage);
-  this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log, this->storage, this->tail_cache);
+  // TailCache is safe for now even under multi-writer Corfu — the
+  // write-side population path (db.cpp:190-194) is commented out, so
+  // the cache is only updated by addTailChange during compaction
+  // replay (file-name remaps, not key-value pairs). If the write path
+  // is ever re-enabled, add tail_cache->disable() here for kCorfu.
+  this->lru_cache = new LRUCache(33554432, this->log_storage, this->sstable_storage);
+  this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log, this->log_storage, this->tail_cache);
   this->metadata_log->setLRUCache(this->lru_cache);
   this->metadata_log->setMetadata(this->metadata);
-  this->log_handler = new LogHandler(this->metadata->log_file_size_limit, this->metadata->log_prefix, this->storage, lru_cache, metadata_log);
-  this->sstable_handler = new SSTableHandler(this->storage, metadata_log, this->metadata->sstable_level_prefix, lru_cache);
+  this->log_handler = new LogHandler(this->metadata->log_file_size_limit, this->metadata->log_prefix, this->log_storage, lru_cache, metadata_log);
+  this->sstable_handler = new SSTableHandler(this->sstable_storage, metadata_log, this->metadata->sstable_level_prefix, lru_cache);
   this->sstable_handler->setMaxLevel(this->metadata->max_level);
   this->thread_pool = new ThreadPool(std::thread::hardware_concurrency());
   this->log_handler->setThreadPool(this->thread_pool);
   this->sstable_handler->setThreadPool(this->thread_pool);
   std::string fingerprint = generateFingerprint();
-  this->watcher = new CompactionWatcher(this->metadata, this->storage, this->log_handler, metadata_log, this->sstable_handler, fingerprint);
-  this->watcher->setTaskLogHandler(new TaskLogHandler(this->metadata->task_log, this->storage));
+  this->watcher = new CompactionWatcher(this->metadata, this->log_storage, this->log_handler, metadata_log, this->sstable_handler, fingerprint);
+  this->watcher->setSSTableStorage(this->sstable_storage);
+  this->watcher->setTaskLogHandler(new TaskLogHandler(this->metadata->task_log, this->log_storage));
   this->watcher->setMode(this->mode);
   this->file_mutex_manager = new FileMutexManager();
   this->lru_cache->setFileMutexManager(this->file_mutex_manager);
@@ -63,7 +106,14 @@ DB::~DB() {
   delete this->lru_cache;
   delete this->metadata_log;
   delete this->tail_cache;
-  delete this->storage;
+  // Guard against double-free when SSTable storage isn't split off the
+  // log backend (the legacy single-storage case where both pointers
+  // alias). When split, the SSTable backend is destroyed first to flush
+  // any pending PutObject requests before the log backend tears down.
+  if (this->sstable_storage != this->log_storage) {
+    delete this->sstable_storage;
+  }
+  delete this->log_storage;
   delete this->metadata;
   delete this->thread_pool;
   delete this->file_mutex_manager;
