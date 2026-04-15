@@ -4,8 +4,6 @@ set -euo pipefail
 REPO_URL="https://github.com/CorfuDB/CorfuDB.git"
 CLONE_DIR="${CLONE_DIR:-$HOME/CorfuDB}"
 
-export DEBIAN_FRONTEND=noninteractive
-
 sudo apt-get update
 sudo apt-get install -y openjdk-25-jdk maven
 
