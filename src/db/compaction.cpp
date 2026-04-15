@@ -340,6 +340,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     return a->key() < b->key();
   });
   std::vector<std::string> output_files;
+  std::vector<uint64_t> output_file_bytes;
   std::vector<std::pair<std::string, std::string>> key_ranges;
   std::pair<std::string, std::string> key_range;
   std::string dest_prefix = this->metadata->sstable_level_prefix + std::to_string(compaction->task_id->destinationlevel());
@@ -353,6 +354,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
         compaction->outputBuilder->finish();
         key_range.second = records[i - 1]->key();
         key_ranges.push_back(key_range);
+        output_file_bytes.push_back(compaction->outputBuilder->fileSize());
         delete compaction->outputBuilder;
         compaction->outputBuilder = nullptr;
       }
@@ -378,6 +380,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     key_range.second = records[records.size() - 1]->key();
     // std::cout << "key range: " << key_range.first << " to " << key_range.second << std::endl;
     key_ranges.push_back(key_range);
+    output_file_bytes.push_back(compaction->outputBuilder->fileSize());
     delete compaction->outputBuilder;
     compaction->outputBuilder = nullptr;
   }
@@ -391,6 +394,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     operation_record.add_key_start(key_ranges[i].first);
     operation_record.add_key_end(key_ranges[i].second);
     operation_record.add_output_file(output_files[i]);
+    operation_record.add_output_bytes(static_cast<int64_t>(output_file_bytes[i]));
   }
   if (compaction->task_id->compactintonextlevel()) {
     operation_record.set_compact_in_last_level(false);

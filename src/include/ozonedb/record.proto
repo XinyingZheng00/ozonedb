@@ -23,6 +23,18 @@ message OperationRecord {
   repeated string key_start = 4;
   repeated string key_end = 5;
   repeated string input_files = 6;  // for COMPACT operations, it's the input files, for CREATE operations, it's the identified current tail.
+  // Byte length of each entry in output_file, populated by the compactor so
+  // peer writers can avoid a fenced storage->size() call while holding
+  // view_mutex during rollforward. Parallel array with output_file. Older
+  // records without this field fall back to 0 (heuristic-only, no correctness
+  // impact — only feeds getLatestScore()).
+  repeated int64 output_bytes = 7;
+  // For LOGCREATE: byte length of the sealed log file at input_files[0],
+  // populated by the log-rolling writer so peer rollforward can update
+  // latest_view.file_size without calling storage->size() under view_mutex.
+  // Unset for the very first LOGCREATE (no prior tail); older records
+  // without this field fall back to 0 (heuristic-only, feeds getLatestScore).
+  optional int64 sealed_input_bytes = 8;
 }
 
 message CorfuEntry {

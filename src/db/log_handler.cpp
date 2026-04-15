@@ -33,6 +33,15 @@ Status LogHandler::newTail() {
   record.set_op_type(OperationRecord::LOGCREATE);
   record.add_input_files(current_tail);
   record.add_output_file(name);
+  // Ship the sealed tail's size so peer rollforward can refresh its
+  // file_size map without calling storage->size(input_file) under
+  // view_mutex. We use the emitter's locally cached size, which is
+  // already >= file_size_limit (checked at :24). Heuristic-only:
+  // feeds getLatestScore(), not correctness.
+  if (!current_tail.empty()) {
+    record.set_sealed_input_bytes(
+        static_cast<int64_t>(view.getFileSize(current_tail)));
+  }
   this->metadata_log->appendToMetadataLog(record);
   view = this->metadata_log->rollForwardMetadataLog();
   this->active_unit = view.current_log_tail;
@@ -59,7 +68,7 @@ Status LogHandler::addRecord(Record const& record) {
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
     std::string target = this->active_unit;
 
-    while (this->storage->appendInBatch(target, buffer, buffer_size) == Status::kSealed) {
+    while (this->storage->append(target, buffer, buffer_size) == Status::kSealed) {
       newTail();
       target = this->active_unit;
     }
@@ -130,7 +139,8 @@ Status LogHandler::readRecord(std::string const& key, Record*& record, std::stri
           finished_threads++;
         }
         cv.notify_one();
-      }, ThreadPool::Priority::High);
+      },
+                           ThreadPool::Priority::High);
     } else {
       Record* record_tmp = nullptr;
       cache->get(file_name, key, record_tmp);

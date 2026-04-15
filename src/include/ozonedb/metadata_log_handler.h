@@ -56,6 +56,9 @@ class MetadataLogHandler {
   // Deserialize OperationRecords from a file
   std::vector<OperationRecord*> readMetadataLog();
   std::string rollforwardSingleOperationRecord(OperationRecord* record);
+  // Refresh latest_view.tail_size without holding view_mutex across
+  // storage->size() — keeps the Corfu fence out of the critical section.
+  void refreshTailSizeUnlocked();
 
  public:
   EventListener* event_listener = nullptr;
