@@ -3,6 +3,8 @@
 #include "metadata_log_handler.h"
 #include "protobuf_serializer.h"
 
+#include <iostream>
+
 namespace ozonedb {
 // Function to move a key to the front of the LRU list
 void LRUCache::updateLRU(std::string const& file_name, std::string const& index_value) {
@@ -72,84 +74,168 @@ void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, s
 }
 
 void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
-  std::unique_lock lock(mutex);
-  auto it = file_to_entry_map.find(file_name);
-  if (it == file_to_entry_map.end()) {
-    lock.unlock();
-    std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-    std::shared_lock file_lock(file_mutex);
-    Status status = Table::open(this->sstable_storage_, file_name, table);
-    file_lock.unlock();
-    table->setCache(this);
-    if (status != Status::kSuccess) {
-      std::cout << "open table failed" << std::endl;
+  // Singleflight: only one thread opens a given file; concurrent
+  // readers wait on the same future. Without this, N readers that hit
+  // a cold file each issue 4–5 S3 GETs in Table::open and the later
+  // putSSTableMeta calls leak all but the last Table*.
+  std::shared_future<void> waiter;
+  std::shared_ptr<std::promise<void>> my_promise;
+
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    auto it = file_to_entry_map.find(file_name);
+    if (it != file_to_entry_map.end() && it->second.table != nullptr) {
+      table = it->second.table;
       return;
     }
-    putSSTableMeta(file_name, table);
-  } else {
-    table = it->second.table;
-    // updateLRU(file_name);
+    auto in_it = table_inflight_.find(file_name);
+    if (in_it != table_inflight_.end()) {
+      waiter = in_it->second;
+    } else {
+      my_promise = std::make_shared<std::promise<void>>();
+      table_inflight_[file_name] = my_promise->get_future().share();
+    }
   }
+
+  if (waiter.valid()) {
+    waiter.wait();
+    std::shared_lock<std::shared_mutex> lock(mutex);
+    auto it = file_to_entry_map.find(file_name);
+    table = (it != file_to_entry_map.end()) ? it->second.table : nullptr;
+    return;
+  }
+
+  // Leader: open the table without holding the cache mutex.
+  Table* opened = nullptr;
+  {
+    std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
+    std::shared_lock<std::shared_mutex> file_lock(file_mutex);
+    Status status = Table::open(this->sstable_storage_, file_name, opened);
+    if (status != Status::kSuccess) {
+      std::cout << "open table failed" << std::endl;
+      opened = nullptr;
+    }
+  }
+  if (opened != nullptr) {
+    opened->setCache(this);
+  }
+
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    if (opened != nullptr) {
+      CacheEntry entry(opened);
+      file_to_entry_map[file_name] = std::move(entry);
+    }
+    table_inflight_.erase(file_name);
+  }
+  my_promise->set_value();
+  table = opened;
 }
 
 void LRUCache::needReadBlock(std::string const& file_name, bool& read_more, std::string const& index_value) {
-  std::unique_lock lock(mutex);
-  // updateLRU(file_name);
+  std::shared_lock<std::shared_mutex> lock(mutex);
   auto it = file_to_entry_map.find(file_name);
-  if (it->second.block_records.find(index_value) != it->second.block_records.end()) {
+  if (it != file_to_entry_map.end() &&
+      it->second.block_records.find(index_value) != it->second.block_records.end()) {
     read_more = false;
+    sstable_cache_hits_.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
 void LRUCache::readDataBlocks(std::string const& file_name, std::string const& index_value) {
-  std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-  std::shared_lock file_lock(file_mutex);
-  // if sstable not in cache, read from storage and put it in cache
-  Table* table = file_to_entry_map[file_name].table;
-  // read block from storage
-  Iterator* iter = table->blockReader(table, index_value);
-  file_lock.unlock();
+  // Singleflight on (file, block). Without this, concurrent readers on
+  // a cold block each S3-GET it AND each call putSSTableRecords —
+  // double-counting current_size, leaking prior records maps, and
+  // evicting hot blocks immediately. Separator must never appear in
+  // either component of the key; '\0' is safe for both file paths and
+  // serialized BlockIdentifier protos.
+  std::string inflight_key = file_name;
+  inflight_key.push_back('\0');
+  inflight_key.append(index_value);
+
+  std::shared_future<void> waiter;
+  std::shared_ptr<std::promise<void>> my_promise;
+  Table* table = nullptr;
+
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    auto it = file_to_entry_map.find(file_name);
+    // Re-check under the write lock: a leader may have published
+    // between Table::get's needReadBlock and this call.
+    if (it != file_to_entry_map.end() &&
+        it->second.block_records.find(index_value) != it->second.block_records.end()) {
+      sstable_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    auto in_it = block_inflight_.find(inflight_key);
+    if (in_it != block_inflight_.end()) {
+      waiter = in_it->second;
+    } else {
+      my_promise = std::make_shared<std::promise<void>>();
+      block_inflight_[inflight_key] = my_promise->get_future().share();
+      table = (it != file_to_entry_map.end()) ? it->second.table : nullptr;
+      sstable_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  if (waiter.valid()) {
+    waiter.wait();
+    return;
+  }
+
+  // Leader: fetch the block from storage.
+  Iterator* iter = nullptr;
+  {
+    std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
+    std::shared_lock<std::shared_mutex> file_lock(file_mutex);
+    iter = table->blockReader(table, index_value);
+  }
   iter->seekToFirst();
-  std::unordered_map<std::string, Record*>* records_tmp = new std::unordered_map<std::string, Record*>();
+  auto* records_tmp = new std::unordered_map<std::string, Record*>();
   size_t size = 0;
   while (iter->valid()) {
     std::string const& value = iter->value();
     auto* record = new Record();
-    (*record).ParseFromArray(value.data(), value.size());
+    record->ParseFromArray(value.data(), value.size());
     (*records_tmp)[iter->key()] = record;
     size += record->ByteSizeLong();
     iter->next();
   }
   delete iter;
-  putSSTableRecords(file_name, records_tmp, index_value, size);
+
+  {
+    std::unique_lock<std::shared_mutex> lock(mutex);
+    auto& entry = file_to_entry_map[file_name];
+    entry.block_records[index_value] = records_tmp;
+    entry.block_size[index_value] = size;
+    current_size += size;
+    lru_list.push_front({file_name, index_value});
+    entry.lru_itr[index_value] = lru_list.begin();
+    if (current_size > capacity) {
+      evict();
+    }
+    block_inflight_.erase(inflight_key);
+  }
+  my_promise->set_value();
 }
 
 // Function to get the latest records for a given filename, return records and offset
 void LRUCache::get(std::string const& file_name, std::string const& key, Record*& record, std::string const& index_value) {
-  // Get the records from the cache
-  // if it is log file:
-  std::shared_lock lock(mutex);
+  // Log reads are read-only against the cache; sstable reads touch the
+  // LRU list on every hit so they need a write lock. A shared_lock
+  // here with updateLRU below was a data race that corrupted lru_list
+  // under concurrent zipfian reads, compounding the singleflight bug.
   if (file_name.find("log") != std::string::npos) {
+    std::shared_lock<std::shared_mutex> lock(mutex);
     auto& records = file_to_entry_map[file_name].records;
-    // Find the record corresponding to the key
     auto record_it = records.find(key);
-    if (record_it != records.end()) {
-      // Key found, assign the record
-      record = record_it->second;
-    } else {
-      record = nullptr;  // empty record
-    }
+    record = (record_it != records.end()) ? record_it->second : nullptr;
   } else {
+    std::unique_lock<std::shared_mutex> lock(mutex);
     auto& records = file_to_entry_map[file_name].block_records[index_value];
     updateLRU(file_name, index_value);
-    // Find the record corresponding to the key
     auto record_it = records->find(key);
-    if (record_it != records->end()) {
-      // Key found, assign the record
-      record = record_it->second;
-    } else {
-      record = nullptr;  // empty record
-    }
+    record = (record_it != records->end()) ? record_it->second : nullptr;
   }
 }
 
@@ -177,6 +263,37 @@ void LRUCache::putLogRecords(std::string const& key, std::unordered_map<std::str
   }
 }
 
+void LRUCache::putLogRecordSingle(std::string const& file_name, Record* record) {
+  std::unique_lock lock(mutex);
+  auto it = file_to_entry_map.find(file_name);
+  if (it == file_to_entry_map.end()) {
+    // No cache entry yet — create one with offset=0 so a later
+    // checkReadMoreLog will still trigger a full readDataLog. The index
+    // gets a valid borrowed pointer either way.
+    CacheEntry entry;
+    entry.records[record->key()] = record;
+    entry.offset = 0;
+    entry.sealed = false;
+    file_to_entry_map[file_name] = std::move(entry);
+    return;
+  }
+  // Overwrite the prior pointer without freeing it — matches the
+  // existing putLogRecords merge contract (cache.cpp:161-163) and
+  // avoids a use-after-free for readers that borrowed the old pointer
+  // from the cache or the key index. The old pointer leaks until the
+  // cache is destroyed; this is the existing invariant and a broader
+  // fix belongs in a separate change.
+  it->second.records[record->key()] = record;
+}
+
+void LRUCache::snapshotLogFileRecords(std::string const& file_name,
+                                     std::unordered_map<std::string, Record*>& out) {
+  std::shared_lock lock(mutex);
+  auto it = file_to_entry_map.find(file_name);
+  if (it == file_to_entry_map.end()) return;
+  out = it->second.records;
+}
+
 void LRUCache::putSSTableMeta(std::string const& key, Table* table) {
   std::unique_lock lock(mutex);
   // if (lru_list.size() >= capacity) {
@@ -188,15 +305,40 @@ void LRUCache::putSSTableMeta(std::string const& key, Table* table) {
 }
 
 void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*>* records, std::string const& index_value, size_t size) {
-  std::unique_lock lock(mutex);
-  file_to_entry_map[key].block_records[index_value] = records;
-  file_to_entry_map[key].block_size[index_value] = size;
+  // Defensive: the singleflight path in readDataBlocks now handles
+  // publishing. If this is still called directly by older callers and
+  // races publish the same block twice, drop the duplicate instead of
+  // double-counting current_size and leaking the prior records map.
+  std::unique_lock<std::shared_mutex> lock(mutex);
+  auto& entry = file_to_entry_map[key];
+  auto existing = entry.block_records.find(index_value);
+  if (existing != entry.block_records.end()) {
+    for (auto& kv : *records) delete kv.second;
+    delete records;
+    return;
+  }
+  entry.block_records[index_value] = records;
+  entry.block_size[index_value] = size;
   current_size += size;
+  lru_list.push_front({key, index_value});
+  entry.lru_itr[index_value] = lru_list.begin();
   if (current_size > capacity) {
     evict();
   }
-  lru_list.push_front({key, index_value});
-  file_to_entry_map[key].lru_itr[index_value] = lru_list.begin();
+}
+
+void LRUCache::printCacheStats() const {
+  auto hits = sstable_cache_hits_.load(std::memory_order_relaxed);
+  auto misses = sstable_cache_misses_.load(std::memory_order_relaxed);
+  auto total = hits + misses;
+  double hit_rate = total ? (100.0 * hits / static_cast<double>(total)) : 0.0;
+  std::cerr << "[lru_cache] sstable hits=" << hits
+            << " misses=" << misses
+            << " hit_rate=" << hit_rate << "%"
+            << " capacity=" << capacity
+            << " current_size=" << current_size
+            << " files=" << file_to_entry_map.size()
+            << std::endl;
 }
 
 }  // namespace ozonedb

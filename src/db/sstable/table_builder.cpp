@@ -10,7 +10,7 @@
 #include "sstable/filter_policy.h"
 #include <cassert>
 namespace ozonedb {
-#define BLOCK_SIZE 4096  // approximate size of a block
+#define BLOCK_SIZE 65536  // approximate size of a block
 
 struct TableBuilder::Rep {
   Storage* storage;
@@ -99,7 +99,7 @@ void TableBuilder::add(std::string const& key, Record const& record) {
   std::string value = record.SerializeAsString();
   r->data_block.add(key, value);
 
-  const size_t estimated_block_size = r->data_block.currentSizeEstimate();
+  size_t const estimated_block_size = r->data_block.currentSizeEstimate();
   if (estimated_block_size >= BLOCK_SIZE) {
     flush();
   }
@@ -207,7 +207,7 @@ Status TableBuilder::finish() {
       r->offset += footer_encoding_size;
     }
   }
-  r->storage->flush(r->fileName); //flush at last
+  r->storage->flush(r->fileName);  // flush at last
   // r->storage->seal(r->fileName);
   delete filter_block_identifier;
   delete filter_block_for_file_identifier;

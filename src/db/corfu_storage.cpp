@@ -12,7 +12,7 @@ namespace ozonedb {
 
 namespace {
 constexpr char const* kBridgeClass = "site/ycsb/db/corfu/CorfuBridge";
-constexpr long kPollTimeoutMs = 100;
+constexpr long kPollTimeoutMs = 1000;
 
 std::vector<std::string> splitJvmOpts(std::string const& opts) {
   std::vector<std::string> out;
@@ -228,6 +228,17 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
     return false;
   }
 
+  // Fire the remote-append listener for every applied entry that
+  // wasn't self-written (APPEND) or that is a REMOVE. We stage the
+  // payload+op out of the critical section and invoke the listener
+  // after dropping mtx_, so a listener that acquires its own locks
+  // can't deadlock against storage. Local APPENDs are skipped: the
+  // writer path already updates any listener-visible index itself.
+  bool notify = false;
+  RemoteOp notify_op = RemoteOp::kAppend;
+  std::string notify_file;
+  std::vector<unsigned char> notify_payload;
+  RemoteAppendListener listener_snapshot;
   {
     std::lock_guard<std::mutex> lk(mtx_);
     std::string const& fn = entry.file_name();
@@ -243,6 +254,13 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
         auto& buf = file_buffers_[fn];
         auto const& payload = entry.payload();
         buf.insert(buf.end(), payload.begin(), payload.end());
+        if (remote_listener_) {
+          notify = true;
+          notify_op = RemoteOp::kAppend;
+          notify_file = fn;
+          notify_payload.assign(payload.begin(), payload.end());
+          listener_snapshot = remote_listener_;
+        }
         break;
       }
       case ::CorfuEntry_Op_SEAL:
@@ -253,11 +271,21 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
         sealed_files_.erase(fn);
         removed_files_.insert(fn);
         pending_.erase(fn);
+        if (remote_listener_) {
+          notify = true;
+          notify_op = RemoteOp::kRemove;
+          notify_file = fn;
+          listener_snapshot = remote_listener_;
+        }
         break;
     }
     last_applied_addr_.store(addr, std::memory_order_release);
   }
   tailer_cv_.notify_all();
+  if (notify && listener_snapshot) {
+    listener_snapshot(notify_file, notify_payload.data(),
+                      notify_payload.size(), notify_op);
+  }
   return true;
 }
 

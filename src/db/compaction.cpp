@@ -402,7 +402,19 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     operation_record.set_compact_in_last_level(true);
   }
   this->metadata_handler->appendToMetadataLog(operation_record);
-  
+
+  // Invalidate the LogHandler's in-memory key index for compacted-away
+  // log files *before* the source Record*s are freed below, so no
+  // reader can lift a freed pointer out of the index.
+  if (log_level_compaction && this->log_handler != nullptr) {
+    std::vector<std::string> log_inputs;
+    log_inputs.reserve(compaction->task_id->input_files_size());
+    for (auto const& input : compaction->task_id->input_files()) {
+      log_inputs.push_back(input);
+    }
+    this->log_handler->invalidateCompactedLog(log_inputs);
+  }
+
   // Step4: delete the input files: append to metadata log first, then delete
   for (auto const& input : compaction->task_id->input_files()) {
     // std::cout << "Deleting " << input << std::endl;

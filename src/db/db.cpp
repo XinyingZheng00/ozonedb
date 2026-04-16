@@ -77,11 +77,21 @@ DB::DB(std::string const& shared_config_path) {
   // the cache is only updated by addTailChange during compaction
   // replay (file-name remaps, not key-value pairs). If the write path
   // is ever re-enabled, add tail_cache->disable() here for kCorfu.
-  this->lru_cache = new LRUCache(33554432, this->log_storage, this->sstable_storage);
+  this->lru_cache = new LRUCache(this->metadata->lru_cache_bytes,
+                                 this->log_storage, this->sstable_storage);
   this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log, this->log_storage, this->tail_cache);
   this->metadata_log->setLRUCache(this->lru_cache);
   this->metadata_log->setMetadata(this->metadata);
-  this->log_handler = new LogHandler(this->metadata->log_file_size_limit, this->metadata->log_prefix, this->log_storage, lru_cache, metadata_log);
+  // Enable the in-memory key index on all backends. On Corfu, the
+  // storage layer's remote-append listener (see CorfuDBStorage and
+  // LogHandler::onRemoteAppend) keeps the index in sync with peer
+  // writes; on non-shared backends the writer path is the only
+  // updater, so the listener hook defaults to a no-op.
+  this->log_handler = new LogHandler(
+      this->metadata->log_file_size_limit, this->metadata->log_prefix,
+      this->log_storage, lru_cache, metadata_log, /*enable_key_index=*/true,
+      /*key_index_capacity=*/1000000,
+      /*trust_background_tail=*/this->metadata->trust_background_tail);
   this->sstable_handler = new SSTableHandler(this->sstable_storage, metadata_log, this->metadata->sstable_level_prefix, lru_cache);
   this->sstable_handler->setMaxLevel(this->metadata->max_level);
   this->thread_pool = new ThreadPool(std::thread::hardware_concurrency());
@@ -125,6 +135,14 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   db->active = true;
   db->metadata_log->rollForwardMetadataLog();
   db->metadata_log->initSSTMetadata();
+  // Seed the log key index from any log files already materialized in
+  // the cache by rollforward. Set latest_view on both log_handler and
+  // lru_cache first — warmKeyIndex calls cache->checkReadMoreLog which
+  // dereferences the cache's latest_view pointer.
+  db->metadata_log->getLatestView(db->latest_view);
+  db->log_handler->setLatestView(&db->latest_view);
+  db->lru_cache->setLatestView(&db->latest_view);
+  db->log_handler->warmKeyIndex();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl
     db->watcher->startCompactionWatcher(&(db->active));
@@ -140,7 +158,7 @@ Status DB::closeDB(DB*& db) {
   }
   // db->thread_pool->waitForCompletion();
   db->metadata_log->stopViewUpdate();
-  // delete db;
+  db->lru_cache->printCacheStats();
   delete db;
   return Status::kSuccess;
 }
@@ -194,6 +212,21 @@ Status DB::remove(std::string const& key) {
 }
 
 Status DB::get(std::string const& key, std::string const*& value) {
+  // Fast path: probe the log key index before refreshing the view.
+  // When trust_background_tail is enabled, the index is authoritative
+  // for log reads — kept current by local addRecord and, on Corfu, by
+  // the tailer's onRemoteAppend callback. A hit here avoids the O(N)
+  // View deep-copy at getLatestView, the tail_cache lock, and the
+  // setLatestView calls below. Tombstones still terminate the read.
+  if (this->metadata->trust_background_tail) {
+    Record* fast_hit = nullptr;
+    if (this->log_handler->tryIndexLookup(key, fast_hit)) {
+      if (fast_hit->type() == kTypeDeletion) return Status::kFailure;
+      value = &(fast_hit->value());
+      return Status::kSuccess;
+    }
+  }
+
   // Step1: get the latest view and cache state from metadata log
   metadata_log->getLatestView(this->latest_view);
   this->log_handler->setLatestView(&this->latest_view);

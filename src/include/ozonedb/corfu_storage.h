@@ -57,6 +57,10 @@ class CorfuDBStorage : public Storage {
   bool exist(std::string fileName) override;
 
   void setSyncMode(bool sync) { sync_mode_ = sync; }
+  void setRemoteAppendListener(RemoteAppendListener listener) override {
+    std::lock_guard<std::mutex> lk(mtx_);
+    remote_listener_ = std::move(listener);
+  }
   int commit_interval_ = 10;
   bool sync_mode_ = false;
 
@@ -107,6 +111,12 @@ class CorfuDBStorage : public Storage {
 
   std::thread tailer_thread_;
   std::atomic<bool> running_{false};
+
+  // Notified for every applied entry that did NOT originate from this
+  // process (i.e. remote APPENDs and any REMOVE). Invoked by the tailer
+  // outside mtx_ so a listener that acquires its own locks can't
+  // deadlock against storage. Installed by LogHandler at startup.
+  RemoteAppendListener remote_listener_;
 
   void startJvm(std::string const& jar_path, std::string const& jvm_opts);
   JNIEnv* attachThread();

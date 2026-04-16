@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,15 @@ enum class Status { kSuccess,
                     kFailure,
                     kSealed,
                     kNotFound };
+
+// Signalled by shared-log backends (e.g. Corfu) when a *remote* writer
+// appends/removes a file entry. Lets the LogHandler maintain a key
+// index that stays correct under multi-writer semantics without
+// requiring every reader to fence against the shared log.
+enum class RemoteOp { kAppend, kRemove };
+using RemoteAppendListener =
+    std::function<void(std::string const& file_name,
+                       unsigned char const* data, size_t len, RemoteOp op)>;
 
 /**
  * @brief Base class for all the storage classes
@@ -103,6 +113,13 @@ class Storage {
    *
    */
   virtual bool exist(std::string fileName) { throw std::runtime_error("exist() is not implemented"); };
+
+  /**
+   * @brief Register a callback for remote (peer-writer) appends and
+   * removes. Default no-op — only shared-log backends like CorfuDB
+   * override. Should be called once before reads begin.
+   */
+  virtual void setRemoteAppendListener(RemoteAppendListener /*listener*/) {}
 
 #include <unistd.h>  // For fsync()
   int GetFileDescriptor(std::filebuf& filebuf) {

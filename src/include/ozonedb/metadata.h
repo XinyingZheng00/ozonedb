@@ -74,6 +74,21 @@ class Metadata {
 
   CompactionPolicy compaction_policy;
 
+  // SSTable block cache capacity in bytes. Governs how much data the
+  // LRU cache holds across all SSTables; when exceeded, least-recently-
+  // used blocks are evicted and re-fetched on next read (an S3 GetObject
+  // round-trip on the Corfu + object-store setup). Default 32 MB matches
+  // the pre-config behavior; bump to hundreds of MB / GBs when the
+  // working set is bigger than the default.
+  uint64_t lru_cache_bytes = 33554432;
+
+  // When true, log reads trust the in-memory key index (kept fresh by
+  // local addRecord and, on Corfu, the tailer's remote-append listener)
+  // and skip the synchronous log-file scan entirely. Removes the
+  // fenced storage->size() round-trip on the active tail. Index miss
+  // => log miss; the DB layer still consults SSTables as usual.
+  bool trust_background_tail = false;
+
   /**
    * @brief Local Metadata, read from local config file
    *
@@ -174,6 +189,16 @@ class Metadata {
     assert(max_level >= 2);  // otherwise the initoutput logic need to be modified
     base_file_number_limit = std::stoi(result["base_file_number_limit"]);
     compaction_policy = static_cast<CompactionPolicy>(std::stoi(result["compaction_policy"]));
+
+    auto lru_it = result.find("lru_cache_bytes");
+    if (lru_it != result.end()) {
+      lru_cache_bytes = std::stoull(lru_it->second);
+    }
+
+    auto tbt_it = result.find("trust_background_tail");
+    if (tbt_it != result.end()) {
+      trust_background_tail = (tbt_it->second == "true" || tbt_it->second == "1");
+    }
 
     // std::cout<<shared_config_path<<std::endl;
     // std::cout << "DBpath: " << DBpath << std::endl;

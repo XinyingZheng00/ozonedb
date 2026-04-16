@@ -3,7 +3,11 @@
 #include "sstable/block_handler.h"
 #include "sstable/table_reader.h"
 #include "storage.h"
+#include <atomic>
+#include <cstdint>
+#include <future>
 #include <list>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -103,6 +107,20 @@ class LRUCache {
   FileMutexManager* file_mutex_manager = nullptr;
   View* latest_view = nullptr;
 
+  // Singleflight for concurrent block/table loads. Without these, N
+  // readers that race on the same cold block each issue an S3 GET and
+  // each call putSSTableRecords — double-counting current_size, leaking
+  // the parsed records map, and triggering spurious eviction that
+  // kicks out hot blocks. See putSSTableRecords docstring below.
+  std::unordered_map<std::string, std::shared_future<void>> block_inflight_;
+  std::unordered_map<std::string, std::shared_future<void>> table_inflight_;
+
+  // Steady-state counters for diagnosing cache behavior. Printed at
+  // LRUCache destruction. A healthy zipfian workload should show
+  // hits >> misses once the hot set fits in `capacity`.
+  std::atomic<uint64_t> sstable_cache_hits_{0};
+  std::atomic<uint64_t> sstable_cache_misses_{0};
+
   // Function to move a key to the front of the LRU list
   void updateLRU(std::string const& file_name, std::string const& index_value);
 
@@ -113,13 +131,13 @@ class LRUCache {
   // Legacy single-storage constructor — both log and sstable reads go
   // through the same backend. Kept for backward-compat with tests and
   // configs that don't split storage.
-  LRUCache(int capacity, Storage* storage)
+  LRUCache(size_t capacity, Storage* storage)
       : log_storage_(storage), sstable_storage_(storage), capacity(capacity) {}
 
   // Split-storage constructor — log reads go through log_storage and
   // sstable reads go through sstable_storage. Used when the config sets
   // sstable_backend separately from the main backend.
-  LRUCache(int capacity, Storage* log_storage, Storage* sstable_storage)
+  LRUCache(size_t capacity, Storage* log_storage, Storage* sstable_storage)
       : log_storage_(log_storage),
         sstable_storage_(sstable_storage),
         capacity(capacity) {}
@@ -160,6 +178,16 @@ class LRUCache {
   void get(std::string const& file_name, std::string const& key, Record*& record, std::string const& index_value = "");
   // Function to update the cache with a file_name, records, offset, and sealed status
   void putLogRecords(std::string const& key, std::unordered_map<std::string, Record*> const& records, size_t offset, bool sealed);
+  // Insert or overwrite a single Record for a log file. Cache takes
+  // ownership of the Record*. If a prior Record* existed at the same
+  // key+file, it is deleted. Used by LogHandler to push freshly-written
+  // records into the cache so LogKeyIndex can safely borrow the pointer.
+  void putLogRecordSingle(std::string const& file_name, Record* record);
+  // Copy the per-file records map (pointers only) into `out`. Cache
+  // retains ownership of Record*. Used by LogKeyIndex::warm to seed
+  // itself from already-cached log files on startup.
+  void snapshotLogFileRecords(std::string const& file_name,
+                              std::unordered_map<std::string, Record*>& out);
   void putSSTableMeta(std::string const& key, Table* table);
   void putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*>* records, std::string const& index_value, size_t size);
 
@@ -167,6 +195,9 @@ class LRUCache {
   void setLatestView(View* view) {
     latest_view = view;
   }
+
+  // Dump steady-state cache counters to stderr. Safe to call at shutdown.
+  void printCacheStats() const;
 };
 }  // namespace ozonedb
 #endif

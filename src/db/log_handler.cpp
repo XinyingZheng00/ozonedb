@@ -65,6 +65,7 @@ Status LogHandler::addRecord(Record const& record) {
   // invisible. Detect via the post-append tail check and re-issue
   // against the new active_unit. Paper §5.2 state-independent ingest.
   constexpr int kMaxRetries = 8;
+  std::string final_target;
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
     std::string target = this->active_unit;
 
@@ -77,6 +78,7 @@ Status LogHandler::addRecord(Record const& record) {
     metadata_log->getLatestView(view);
     if (view.current_log_tail == target &&
         view.getFileSize(target) < this->file_size_limit) {
+      final_target = target;
       break;
     }
 
@@ -92,10 +94,47 @@ Status LogHandler::addRecord(Record const& record) {
 
   delete[] buffer;
   buffer = nullptr;
+
+  // Push the just-written record into the cache + index so subsequent
+  // readRecord calls short-circuit the fenced multi-file scan. The
+  // cache takes ownership of the clone; the index borrows the stored
+  // pointer. If the retry loop never succeeded, final_target is empty
+  // and we skip (the append failed upstream anyway).
+  if (key_index_ && !final_target.empty()) {
+    auto* clone = new Record(record);
+    cache->putLogRecordSingle(final_target, clone);
+    key_index_->upsert(record.key(), clone, final_target);
+  }
   return Status::kSuccess;
 }
 
+bool LogHandler::tryIndexLookup(std::string const& key, Record*& record) {
+  if (!key_index_) return false;
+  Record* hit = key_index_->lookup(key);
+  if (hit == nullptr) return false;
+  record = hit;
+  return true;
+}
+
 Status LogHandler::readRecord(std::string const& key, Record*& record, std::string const& offset, std::string& latest_offset) {
+  // Fast path: check the in-memory key index first. This skips the
+  // multi-file backward scan (and, on Corfu, the per-file fenced
+  // storage->size() call in checkReadMoreLog). On miss, fall through
+  // to the existing scan and backfill on success.
+  if (key_index_) {
+    if (Record* hit = key_index_->lookup(key)) {
+      record = hit;
+      return Status::kSuccess;
+    }
+    // Trust-the-tailer mode: skip the synchronous multi-file log scan
+    // (and the fenced storage->size() call it triggers on Corfu). The
+    // index is kept fresh by local addRecord and the tailer's
+    // onRemoteAppend callback, so a miss here is a true log miss and
+    // the DB layer will fall through to SSTables.
+    if (trust_background_tail_) {
+      return Status::kFailure;
+    }
+  }
   auto const& files = this->latest_view->getWithPrefix(this->prefix);
   if (files.empty()) {
     // std::cout << "No files found with prefix " << this->prefix << std::endl;
@@ -169,8 +208,75 @@ Status LogHandler::readRecord(std::string const& key, Record*& record, std::stri
   }
 
   if (record) {
+    // Backfill the index from the slow-path hit so the next lookup
+    // for this key is O(1). `record` is already cache-owned.
+    if (key_index_ && record_file >= 0 &&
+        record_file < static_cast<int>(files.size())) {
+      key_index_->upsert(key, record, files[record_file]);
+    }
     return Status::kSuccess;
   }
   return Status::kFailure;
+}
+
+Status LogHandler::warmKeyIndex() {
+  if (!key_index_ || latest_view == nullptr) return Status::kSuccess;
+  auto const& files = this->latest_view->getWithPrefix(this->prefix);
+  for (auto const& file_name : files) {
+    bool read_more = true;
+    size_t cached_offset = 0;
+    size_t size = 0;
+    this->cache->checkReadMoreLog(file_name, read_more, cached_offset, size);
+    if (read_more) {
+      this->cache->readDataLog(file_name, cached_offset, size);
+    }
+    std::unordered_map<std::string, Record*> snapshot;
+    this->cache->snapshotLogFileRecords(file_name, snapshot);
+    // Iterating files oldest-to-newest means the last write wins, which
+    // matches readRecord's backward-scan semantics (newest file first).
+    for (auto const& kv : snapshot) {
+      key_index_->upsert(kv.first, kv.second, file_name);
+    }
+  }
+  return Status::kSuccess;
+}
+
+void LogHandler::invalidateCompactedLog(std::vector<std::string> const& files) {
+  if (!key_index_) return;
+  for (auto const& f : files) {
+    key_index_->invalidateFile(f);
+  }
+}
+
+void LogHandler::onRemoteAppend(std::string const& file_name,
+                                unsigned char const* data, size_t len,
+                                RemoteOp op) {
+  if (!key_index_) return;
+  // Reject anything outside our log prefix: SSTable writes, other
+  // handlers' log streams, metadata log entries. Cheap O(n) rejection
+  // before we pay to parse the payload.
+  if (file_name.compare(0, prefix.size(), prefix) != 0) return;
+
+  if (op == RemoteOp::kRemove) {
+    key_index_->invalidateFile(file_name);
+    return;
+  }
+
+  // APPEND: payload is a sequence of varint-prefixed Record protos
+  // (same format produced by protobuf::serializeMessage in addRecord).
+  std::vector<google::protobuf::Message*> messages;
+  protobuf::deserializeMessages(const_cast<unsigned char*>(data), len, messages,
+                                []() -> google::protobuf::Message* {
+                                  return new Record();
+                                });
+  for (auto* msg : messages) {
+    auto* rec = static_cast<Record*>(msg);
+    // Hand ownership to the cache so the index's borrowed pointer
+    // stays alive as long as the cache entry does. If the cache
+    // already holds this key for this file, the prior Record* is
+    // freed inside putLogRecordSingle.
+    cache->putLogRecordSingle(file_name, rec);
+    key_index_->upsert(rec->key(), rec, file_name);
+  }
 }
 }  // namespace ozonedb
