@@ -11,6 +11,15 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+
+# Profiling build: `cmake -DOZONEDB_PROFILING=ON ..` adds frame pointers
+# and line-table debug info so perf/flamegraph produces readable stacks
+# without dropping Release optimizations.
+option(OZONEDB_PROFILING "Build with frame pointers + debug info for perf/flamegraph" OFF)
+if (OZONEDB_PROFILING)
+    add_compile_options(-fno-omit-frame-pointer -g)
+    add_link_options(-rdynamic)
+endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # set(CMAKE_BUILD_TYPE DEBUG) # enable debug symbols
 
@@ -62,6 +71,7 @@ set(OZONEDB_SOURCES
     src/db/compaction.cpp
     src/db/db.cpp
     src/db/log_handler.cpp
+    src/db/log_key_index.cpp
     src/db/cache.cpp
     src/db/metadata_log_handler.cpp
     src/db/task_log_handler.cpp
