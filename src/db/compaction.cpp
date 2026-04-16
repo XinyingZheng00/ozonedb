@@ -277,8 +277,8 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       unsigned char* buffer = nullptr;
       size_t file_size;
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
-      std::unique_lock file_lock(file_mutex);
-      
+      std::shared_lock file_lock(file_mutex);
+
       this->storage->read(input, buffer, file_size);
       
       file_lock.unlock();
@@ -301,8 +301,8 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       std::unordered_map<std::string, Record*> records_tmp;
       Table* table = nullptr;
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
-      std::unique_lock file_lock(file_mutex);
-      
+      std::shared_lock file_lock(file_mutex);
+
       Table::open(this->sstable_storage, input, table);
       records_tmp = table->getAll();
       

@@ -35,7 +35,16 @@ void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, s
       cached_offset = it->second.offset;
     }
   }
-  size = latest_view->getFileSize(file_name);
+  // latest_view->getFileSize lags behind the storage layer for the active
+  // tail whenever the writer uses appendInBatch: the view is refreshed on
+  // a ~100ms cycle and ignores the local cached_file_ buffer. Ask storage
+  // directly for the tail so the read covers not-yet-flushed bytes too.
+  // Sealed files never grow, so the view size is authoritative.
+  if (file_name == latest_view->current_log_tail) {
+    size = log_storage_->size(file_name);
+  } else {
+    size = latest_view->getFileSize(file_name);
+  }
   if (size <= cached_offset) {
     read_more = false;
   }
@@ -43,7 +52,7 @@ void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, s
 
 void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, size_t size) {
   std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-  std::unique_lock file_lock(file_mutex);
+  std::shared_lock file_lock(file_mutex);
   unsigned char* buffer = nullptr;
   this->log_storage_->read(file_name, buffer, cached_offset, size - cached_offset);
   file_lock.unlock();
@@ -68,7 +77,7 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
   if (it == file_to_entry_map.end()) {
     lock.unlock();
     std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-    std::unique_lock file_lock(file_mutex);
+    std::shared_lock file_lock(file_mutex);
     Status status = Table::open(this->sstable_storage_, file_name, table);
     file_lock.unlock();
     table->setCache(this);
@@ -94,7 +103,7 @@ void LRUCache::needReadBlock(std::string const& file_name, bool& read_more, std:
 
 void LRUCache::readDataBlocks(std::string const& file_name, std::string const& index_value) {
   std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-  std::unique_lock file_lock(file_mutex);
+  std::shared_lock file_lock(file_mutex);
   // if sstable not in cache, read from storage and put it in cache
   Table* table = file_to_entry_map[file_name].table;
   // read block from storage

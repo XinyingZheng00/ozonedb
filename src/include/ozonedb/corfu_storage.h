@@ -5,12 +5,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <jni.h>
+#include <list>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace ozonedb {
@@ -76,6 +79,18 @@ class CorfuDBStorage : public Storage {
   // Pending batched writes (same role as AzureBlobStorage::cached_file)
   std::unordered_map<std::string, std::vector<unsigned char>> cached_file_;
 
+  // Drained bytes that have been handed to JNI but are not yet in
+  // file_buffers_. Readers splice file_buffers_ + pending_ + cached_file_
+  // so every byte is visible exactly once. The writer owns reconciliation:
+  // after JNI returns, it copies the placeholder payload into file_buffers_
+  // under mtx_ and erases the placeholder in one atomic section. The tailer
+  // does *not* touch pending_ at all — locally-originated APPEND entries
+  // are tagged with client_id_ and the tailer skips them, leaving the
+  // reconcile job to the writer. std::list is chosen so the iterator the
+  // writer saves after push_back remains valid while mtx_ is released for
+  // the JNI round-trip.
+  std::unordered_map<std::string, std::list<std::pair<long, std::vector<unsigned char>>>> pending_;
+
   std::mutex mtx_;
   std::condition_variable batch_flushed_cv_;
   std::condition_variable tailer_cv_;
@@ -83,6 +98,12 @@ class CorfuDBStorage : public Storage {
 
   std::atomic<long> last_applied_addr_{-1};
   std::atomic<long> last_written_addr_{-1};
+
+  // Randomly-generated id that tags every APPEND this process writes to
+  // the shared stream. The tailer uses it to distinguish our own entries
+  // (which the writer already self-applied into file_buffers_) from peer
+  // entries (which the tailer must apply).
+  uint64_t client_id_ = 0;
 
   std::thread tailer_thread_;
   std::atomic<bool> running_{false};
@@ -98,6 +119,7 @@ class CorfuDBStorage : public Storage {
   void tailerLoop();
   long globalFenceTarget();
   void waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target);
+  void reconcilePendingFrontLocked(std::string const& fileName);
 };
 
 }  // namespace ozonedb

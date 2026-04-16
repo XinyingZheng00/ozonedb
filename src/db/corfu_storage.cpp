@@ -1,8 +1,10 @@
 #ifdef OZONEDB_ENABLE_CORFU
 #include "corfu_storage.h"
 #include "protobuf/record.pb.h"
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 
@@ -27,6 +29,12 @@ CorfuDBStorage::CorfuDBStorage(std::string const& endpoint,
                                std::string const& stream_name,
                                std::string const& db_path)
     : Storage(db_path) {
+  {
+    std::random_device rd;
+    std::mt19937_64 rng(rd());
+    client_id_ = rng();
+    if (client_id_ == 0) client_id_ = 1;  // reserve 0 as "unset / legacy entry"
+  }
   startJvm(jar_path, jvm_opts);
   loadBridge(endpoint, stream_name);
   last_commited_time_ = std::chrono::system_clock::now();
@@ -179,6 +187,7 @@ long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, i
   ::CorfuEntry entry;
   entry.set_file_name(file_name);
   entry.set_op(static_cast<::CorfuEntry_Op>(op));
+  entry.set_client_id(client_id_);
   if (data != nullptr && length > 0) {
     entry.set_payload(data, length);
   }
@@ -224,6 +233,13 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
     std::string const& fn = entry.file_name();
     switch (entry.op()) {
       case ::CorfuEntry_Op_APPEND: {
+        // Skip locally-originated APPENDs: the writer thread already copied
+        // (or will copy) the bytes into file_buffers_ itself as part of the
+        // post-JNI reconcile step. Applying them here would double-count
+        // the bytes until the writer's own reconcile erases the placeholder.
+        if (entry.has_client_id() && entry.client_id() == client_id_) {
+          break;
+        }
         auto& buf = file_buffers_[fn];
         auto const& payload = entry.payload();
         buf.insert(buf.end(), payload.begin(), payload.end());
@@ -236,6 +252,7 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
         file_buffers_.erase(fn);
         sealed_files_.erase(fn);
         removed_files_.insert(fn);
+        pending_.erase(fn);
         break;
     }
     last_applied_addr_.store(addr, std::memory_order_release);
@@ -312,19 +329,65 @@ void CorfuDBStorage::createDirectory(std::string /*name*/) {
   // No-op: Corfu has no directory concept.
 }
 
+// Helper: drain leading stamped (addr != -1) placeholders from
+// pending_[fn] into file_buffers_[fn]. Called with mtx_ held. This
+// preserves enqueue order in file_buffers_: a writer whose JNI returned
+// out of order will stamp its placeholder but leave reconciliation to
+// the earliest-enqueued writer once that writer's JNI returns.
+void CorfuDBStorage::reconcilePendingFrontLocked(std::string const& fileName) {
+  auto pit = pending_.find(fileName);
+  if (pit == pending_.end()) return;
+  auto& lst = pit->second;
+  while (!lst.empty() && lst.front().first != -1) {
+    auto& buf = file_buffers_[fileName];
+    auto const& payload = lst.front().second;
+    buf.insert(buf.end(), payload.begin(), payload.end());
+    lst.pop_front();
+  }
+  if (lst.empty()) pending_.erase(pit);
+}
+
 Status CorfuDBStorage::append(std::string const& fileName, unsigned char* const& data, int length) {
+  // Stage a placeholder first so local readers see the bytes while the JNI
+  // round-trip is in flight; then stamp it with the returned addr and
+  // reconcile leading stamped entries into file_buffers_. The tailer skips
+  // our entries via client_id so the writer owns the reconcile.
+  std::list<std::pair<long, std::vector<unsigned char>>>::iterator placeholder_it;
   {
     std::lock_guard<std::mutex> lk(mtx_);
     if (sealed_files_.count(fileName)) return Status::kSealed;
+    std::vector<unsigned char> payload(data, data + length);
+    auto& lst = pending_[fileName];
+    lst.push_back({-1, std::move(payload)});
+    placeholder_it = std::prev(lst.end());
   }
+
   JNIEnv* env = attachThread();
-  if (!env) return Status::kFailure;
-  long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND, data, length);
-  if (addr < 0) return Status::kFailure;
-  long prev = last_written_addr_.load(std::memory_order_acquire);
-  while (addr > prev &&
-         !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+  long addr = -1;
+  if (env) {
+    addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
+                          placeholder_it->second.data(),
+                          static_cast<int>(placeholder_it->second.size()));
   }
+
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (addr >= 0) {
+      placeholder_it->first = addr;
+      long prev = last_written_addr_.load(std::memory_order_acquire);
+      while (addr > prev &&
+             !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+      }
+      reconcilePendingFrontLocked(fileName);
+    } else {
+      auto pit = pending_.find(fileName);
+      if (pit != pending_.end()) {
+        pit->second.erase(placeholder_it);
+        if (pit->second.empty()) pending_.erase(pit);
+      }
+    }
+  }
+  if (!env || addr < 0) return Status::kFailure;
   return Status::kSuccess;
 }
 
@@ -343,78 +406,179 @@ Status CorfuDBStorage::appendInBatch(std::string const& fileName, unsigned char*
     buf.insert(buf.end(), data, data + length);
   }
 
-  std::unique_lock<std::mutex> lock(mtx_);
-  auto now = std::chrono::system_clock::now();
-  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_commited_time_).count();
-  bool should_flush = elapsed > commit_interval_;
-
-  if (!should_flush && sync_mode_) {
-    auto remaining_ms = commit_interval_ - elapsed;
-    batch_flushed_cv_.wait_for(lock, std::chrono::milliseconds(remaining_ms));
-    if (cached_file_.find(fileName) == cached_file_.end()) {
-      return Status::kSuccess;
-    }
-    should_flush = true;
-  }
-
-  if (!should_flush) return Status::kSuccess;
-
-  auto it = cached_file_.find(fileName);
-  if (it == cached_file_.end()) return Status::kSuccess;
-
-  std::vector<unsigned char> payload = std::move(it->second);
-  cached_file_.erase(it);
-  lock.unlock();
-
-  JNIEnv* env = attachThread();
-  if (!env) return Status::kFailure;
-  long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND, payload.data(),
-                             static_cast<int>(payload.size()));
-  if (addr < 0) return Status::kFailure;
-  long prev = last_written_addr_.load(std::memory_order_acquire);
-  while (addr > prev &&
-         !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
-  }
-
+  // Phase 1 (under mtx_): decide whether to drain, and if so, stage the
+  // drained bytes into a pending_ placeholder. mtx_ is then released so
+  // the JNI round-trip runs in parallel with readers, the tailer, and
+  // writers on other files.
+  std::list<std::pair<long, std::vector<unsigned char>>>::iterator placeholder_it;
   {
-    std::lock_guard<std::mutex> lk(mtx_);
+    std::unique_lock<std::mutex> lock(mtx_);
+    auto now = std::chrono::system_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_commited_time_).count();
+    bool should_flush = elapsed > commit_interval_;
+
+    if (!should_flush && sync_mode_) {
+      auto remaining_ms = commit_interval_ - elapsed;
+      batch_flushed_cv_.wait_for(lock, std::chrono::milliseconds(remaining_ms));
+      if (cached_file_.find(fileName) == cached_file_.end()) {
+        return Status::kSuccess;
+      }
+      should_flush = true;
+    }
+
+    if (!should_flush) return Status::kSuccess;
+
+    auto it = cached_file_.find(fileName);
+    if (it == cached_file_.end() || it->second.empty()) return Status::kSuccess;
+
+    std::vector<unsigned char> payload = std::move(it->second);
+    cached_file_.erase(it);
+    auto& lst = pending_[fileName];
+    lst.push_back({-1, std::move(payload)});
+    placeholder_it = std::prev(lst.end());
     last_commited_time_ = std::chrono::system_clock::now();
   }
+  // mtx_ released — JNI runs without blocking readers or the tailer.
+
+  // Phase 2: JNI submit. placeholder_it remains valid because pending_ is
+  // a std::list (iterator stability across unrelated inserts/erases).
+  JNIEnv* env = attachThread();
+  long addr = -1;
+  if (env) {
+    addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
+                          placeholder_it->second.data(),
+                          static_cast<int>(placeholder_it->second.size()));
+  }
+
+  // Phase 3 (under mtx_): stamp the placeholder with the returned addr,
+  // then drain leading stamped placeholders into file_buffers_. This
+  // preserves pending_ enqueue order in file_buffers_ — a writer whose
+  // JNI returns out of order stamps its placeholder and leaves the copy
+  // to whichever writer is currently at the front when its own JNI
+  // returns. The tailer never touches this placeholder because entries
+  // we wrote carry our client_id and are skipped in applyEntryFromJava.
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (addr >= 0) {
+      placeholder_it->first = addr;
+      long prev = last_written_addr_.load(std::memory_order_acquire);
+      while (addr > prev &&
+             !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+      }
+      reconcilePendingFrontLocked(fileName);
+    } else {
+      auto pit = pending_.find(fileName);
+      if (pit != pending_.end()) {
+        pit->second.erase(placeholder_it);
+        if (pit->second.empty()) pending_.erase(pit);
+      }
+    }
+  }
   batch_flushed_cv_.notify_all();
+  if (!env || addr < 0) return Status::kFailure;
   return Status::kSuccess;
 }
 
 Status CorfuDBStorage::flush(std::string const& fileName) {
-  std::unique_lock<std::mutex> lock(mtx_);
-  auto it = cached_file_.find(fileName);
-  if (it == cached_file_.end()) return Status::kNotFound;
-  std::vector<unsigned char> payload = std::move(it->second);
-  cached_file_.erase(it);
-  lock.unlock();
+  // Three-phase drain/JNI/reconcile identical to appendInBatch so flush()
+  // (TableBuilder, sstable finalize, etc.) does not serialize writers or
+  // block readers on the JNI round-trip.
+  std::list<std::pair<long, std::vector<unsigned char>>>::iterator placeholder_it;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = cached_file_.find(fileName);
+    if (it == cached_file_.end()) return Status::kNotFound;
+    std::vector<unsigned char> payload = std::move(it->second);
+    cached_file_.erase(it);
+    auto& lst = pending_[fileName];
+    lst.push_back({-1, std::move(payload)});
+    placeholder_it = std::prev(lst.end());
+  }
 
   JNIEnv* env = attachThread();
-  if (!env) return Status::kFailure;
-  long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND, payload.data(),
-                             static_cast<int>(payload.size()));
-  if (addr < 0) return Status::kFailure;
-  long prev = last_written_addr_.load(std::memory_order_acquire);
-  while (addr > prev &&
-         !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+  long addr = -1;
+  if (env) {
+    addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
+                          placeholder_it->second.data(),
+                          static_cast<int>(placeholder_it->second.size()));
   }
+
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (addr >= 0) {
+      placeholder_it->first = addr;
+      long prev = last_written_addr_.load(std::memory_order_acquire);
+      while (addr > prev &&
+             !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+      }
+      reconcilePendingFrontLocked(fileName);
+    } else {
+      auto pit = pending_.find(fileName);
+      if (pit != pending_.end()) {
+        pit->second.erase(placeholder_it);
+        if (pit->second.empty()) pending_.erase(pit);
+      }
+    }
+  }
+  if (!env || addr < 0) return Status::kFailure;
   return Status::kSuccess;
 }
+
+// Reads splice file_buffers_ (tailer-applied, cross-process-visible),
+// pending_ (committed to the Corfu stream but not yet applied by our
+// local tailer), and cached_file_ (local, not-yet-flushed appendInBatch
+// bytes) so every drained byte is visible exactly once at every moment.
+// Logical layout:
+//   [0, applied)                                 from file_buffers_
+//   [applied, applied + sum(pending lens))       from pending_ in order
+//   [.., .. + cached)                            from cached_file_
+// Remote processes still only see file_buffers_ for bytes *this* process
+// wrote — cross-process read-after-write still requires a commit_interval
+// flush from the writer side.
+namespace {
+struct Segment {
+  unsigned char const* data;
+  size_t len;
+};
+}  // namespace
 
 Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, size_t& size) {
   long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
+  if (removed_files_.count(fileName)) return Status::kNotFound;
   auto it = file_buffers_.find(fileName);
-  if (it == file_buffers_.end() || removed_files_.count(fileName)) {
-    return Status::kNotFound;
+  auto pit = pending_.find(fileName);
+  auto cit = cached_file_.find(fileName);
+  bool has_any = (it != file_buffers_.end()) ||
+                 (pit != pending_.end() && !pit->second.empty()) ||
+                 (cit != cached_file_.end() && !cit->second.empty());
+  if (!has_any) return Status::kNotFound;
+
+  std::vector<Segment> segs;
+  size_t total = 0;
+  if (it != file_buffers_.end()) {
+    segs.push_back({it->second.data(), it->second.size()});
+    total += it->second.size();
   }
-  size = it->second.size();
-  data = new unsigned char[size];
-  std::memcpy(data, it->second.data(), size);
+  if (pit != pending_.end()) {
+    for (auto const& p : pit->second) {
+      segs.push_back({p.second.data(), p.second.size()});
+      total += p.second.size();
+    }
+  }
+  if (cit != cached_file_.end()) {
+    segs.push_back({cit->second.data(), cit->second.size()});
+    total += cit->second.size();
+  }
+  size = total;
+  data = new unsigned char[total];
+  size_t off = 0;
+  for (auto const& s : segs) {
+    if (s.len == 0) continue;
+    std::memcpy(data + off, s.data, s.len);
+    off += s.len;
+  }
   return Status::kSuccess;
 }
 
@@ -422,13 +586,50 @@ Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, s
   long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
+  if (removed_files_.count(fileName)) return Status::kNotFound;
   auto it = file_buffers_.find(fileName);
-  if (it == file_buffers_.end() || removed_files_.count(fileName)) {
-    return Status::kNotFound;
+  auto pit = pending_.find(fileName);
+  auto cit = cached_file_.find(fileName);
+  bool has_any = (it != file_buffers_.end()) ||
+                 (pit != pending_.end() && !pit->second.empty()) ||
+                 (cit != cached_file_.end() && !cit->second.empty());
+  if (!has_any) return Status::kNotFound;
+
+  std::vector<Segment> segs;
+  size_t total = 0;
+  if (it != file_buffers_.end()) {
+    segs.push_back({it->second.data(), it->second.size()});
+    total += it->second.size();
   }
-  if (a + length > it->second.size()) return Status::kFailure;
+  if (pit != pending_.end()) {
+    for (auto const& p : pit->second) {
+      segs.push_back({p.second.data(), p.second.size()});
+      total += p.second.size();
+    }
+  }
+  if (cit != cached_file_.end()) {
+    segs.push_back({cit->second.data(), cit->second.size()});
+    total += cit->second.size();
+  }
+  if (a + length > total) return Status::kFailure;
+
   data = new unsigned char[length];
-  std::memcpy(data, it->second.data() + a, length);
+  size_t seg_start = 0;
+  size_t written = 0;
+  for (auto const& s : segs) {
+    if (written == length) break;
+    size_t seg_end = seg_start + s.len;
+    if (a + written >= seg_end) {
+      seg_start = seg_end;
+      continue;
+    }
+    size_t local_off = (a + written > seg_start) ? (a + written - seg_start) : 0;
+    size_t avail = s.len - local_off;
+    size_t to_copy = std::min(avail, length - written);
+    std::memcpy(data + written, s.data + local_off, to_copy);
+    written += to_copy;
+    seg_start = seg_end;
+  }
   return Status::kSuccess;
 }
 
@@ -436,50 +637,77 @@ size_t CorfuDBStorage::size(std::string fileName) {
   long target = globalFenceTarget();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
-  auto it = file_buffers_.find(fileName);
-  if (it == file_buffers_.end()) return 0;
-  return it->second.size();
+  if (removed_files_.count(fileName)) return 0;
+  size_t total = 0;
+  if (auto it = file_buffers_.find(fileName); it != file_buffers_.end())
+    total += it->second.size();
+  if (auto pit = pending_.find(fileName); pit != pending_.end()) {
+    for (auto const& p : pit->second) total += p.second.size();
+  }
+  if (auto cit = cached_file_.find(fileName); cit != cached_file_.end())
+    total += cit->second.size();
+  return total;
 }
 
 void CorfuDBStorage::seal(std::string fileName) {
-  // Flush any pending batched data for this file BEFORE the SEAL marker so
-  // the seal is the authoritative terminator on the shared stream. Without
-  // this, an appendInBatch commit-interval race can leave a tail batch in
-  // cached_file_[fileName]; when the destructor eventually drains it, the
-  // late APPEND lands after SEAL on the stream and readers that trust the
-  // metadata-log size miss those records on reopen.
+  // Pre-seal flush: drain any batched bytes BEFORE the SEAL marker so the
+  // seal terminates a consistent byte sequence on the shared stream. Uses
+  // the same drain/JNI/reconcile split as appendInBatch so the JNI submit
+  // does not hold mtx_.
+  std::list<std::pair<long, std::vector<unsigned char>>>::iterator placeholder_it;
+  bool has_placeholder = false;
   {
-    std::unique_lock<std::mutex> lock(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
     auto it = cached_file_.find(fileName);
     if (it != cached_file_.end() && !it->second.empty()) {
       std::vector<unsigned char> payload = std::move(it->second);
       cached_file_.erase(it);
-      lock.unlock();
-      JNIEnv* env = attachThread();
-      if (env) {
-        long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
-                                   payload.data(), static_cast<int>(payload.size()));
-        if (addr >= 0) {
-          long prev = last_written_addr_.load(std::memory_order_acquire);
-          while (addr > prev &&
-                 !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
-          }
-        } else {
-          std::cerr << "[corfu] seal: pre-seal flush failed for " << fileName << "\n";
+      auto& lst = pending_[fileName];
+      lst.push_back({-1, std::move(payload)});
+      placeholder_it = std::prev(lst.end());
+      has_placeholder = true;
+    }
+  }
+
+  JNIEnv* env = attachThread();
+  if (has_placeholder) {
+    long addr = -1;
+    if (env) {
+      addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
+                            placeholder_it->second.data(),
+                            static_cast<int>(placeholder_it->second.size()));
+    }
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (addr >= 0) {
+        placeholder_it->first = addr;
+        long prev = last_written_addr_.load(std::memory_order_acquire);
+        while (addr > prev &&
+               !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+        }
+        reconcilePendingFrontLocked(fileName);
+      } else {
+        std::cerr << "[corfu] seal: pre-seal flush failed for " << fileName << "\n";
+        auto pit = pending_.find(fileName);
+        if (pit != pending_.end()) {
+          pit->second.erase(placeholder_it);
+          if (pit->second.empty()) pending_.erase(pit);
         }
       }
     }
   }
-  JNIEnv* env = attachThread();
+
   if (!env) return;
   long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_SEAL, nullptr, 0);
   if (addr < 0) return;
-  long prev = last_written_addr_.load(std::memory_order_acquire);
-  while (addr > prev &&
-         !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    long prev = last_written_addr_.load(std::memory_order_acquire);
+    while (addr > prev &&
+           !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+    }
+    sealed_files_.insert(fileName);
   }
-  std::lock_guard<std::mutex> lk(mtx_);
-  sealed_files_.insert(fileName);
 }
 
 bool CorfuDBStorage::isSealed(std::string fileName) {

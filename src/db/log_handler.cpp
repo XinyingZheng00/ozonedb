@@ -68,7 +68,7 @@ Status LogHandler::addRecord(Record const& record) {
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
     std::string target = this->active_unit;
 
-    while (this->storage->append(target, buffer, buffer_size) == Status::kSealed) {
+    while (this->storage->appendInBatch(target, buffer, buffer_size) == Status::kSealed) {
       newTail();
       target = this->active_unit;
     }
