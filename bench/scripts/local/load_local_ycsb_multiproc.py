@@ -34,6 +34,84 @@ Set `num_writers` under `local.load` in ycsb.yaml, or pass --num_writers.
 ozonedb_home = os.environ.get("OZONEDB_HOME")
 
 
+YCSB_DB_CLASSNAMES = {
+    "ozonedb": "site.ycsb.db.OzoneDBClient",
+    "rocksdb": "site.ycsb.db.rocksdb.RocksDBClient",
+    "jdbc": "site.ycsb.db.JdbcDBClient",
+}
+
+
+def _resolve_binding(db_name):
+    if db_name in ("ozonedb", "ozonedb-corfu"):
+        return "ozonedb"
+    if db_name == "sqlite":
+        return "jdbc"
+    return db_name
+
+
+_classpath_cache = {}
+
+
+def _resolve_ycsb_classpath(ycsb_path, binding):
+    """Resolve the full YCSB classpath for `binding` by running Maven once,
+    serially, in the parent process. Results are cached so parallel writer
+    processes can skip bin/ycsb's Maven invocation entirely and avoid racing
+    on ~/.m2 and the binding's target/ directory.
+    """
+    if binding in _classpath_cache:
+        return _classpath_cache[binding]
+    project = binding + "-binding"
+    print(f"[classpath] resolving {project} via Maven (one-time, serial)...")
+    try:
+        out = subprocess.check_output(
+            [
+                "mvn",
+                "-pl", f"site.ycsb:{project}",
+                "-am",
+                "package",
+                "-DskipTests",
+                "dependency:build-classpath",
+                "-DincludeScope=compile",
+                "-Dmdep.outputFilterFile=true",
+            ],
+            cwd=ycsb_path,
+            text=True,
+        )
+    except subprocess.CalledProcessError as err:
+        raise RuntimeError(
+            f"Failed to resolve classpath for {project} via Maven:\n{err.output}"
+        )
+    cp_lines = [ln for ln in out.splitlines() if ln.startswith("classpath=")]
+    if not cp_lines:
+        raise RuntimeError(f"Maven produced no classpath= line for {project}")
+    maven_cp = cp_lines[-1][len("classpath="):]
+
+    db_dir = os.path.join(ycsb_path, binding)
+    target_dir = os.path.join(db_dir, "target")
+    target_jars = []
+    if os.path.isdir(target_dir):
+        for root, _dirs, files in os.walk(target_dir):
+            for fn in files:
+                if fn.endswith(".jar") and fn.startswith(project):
+                    target_jars.append(os.path.join(root, fn))
+
+    cp_parts = [os.path.join(db_dir, "conf")] + target_jars + [maven_cp]
+    classpath = os.pathsep.join(cp_parts)
+    _classpath_cache[binding] = classpath
+    print(
+        f"[classpath] {project} resolved "
+        f"({len(target_jars)} target jar(s) + mvn deps)"
+    )
+    return classpath
+
+
+def _java_binary():
+    jh = os.environ.get("JAVA_HOME")
+    if jh:
+        return os.path.join(jh, "bin", "java")
+    return "java"
+
+
 def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settings):
     """Write a per-writer shared_config_rocksdb_w{i}.json.
 
@@ -310,6 +388,11 @@ def load_ycsb(
                 else:
                     thread_list = ["1"]
 
+                binding = _resolve_binding(db_name)
+                base_cp = _resolve_ycsb_classpath(ycsb_path, binding)
+                db_classname = YCSB_DB_CLASSNAMES[binding]
+                java_bin = _java_binary()
+
                 for repeat_round in range(repeated):
                     print(
                         f"[round {repeat_round}] db={db_name} writers={num_writers} partitions={partitions}"
@@ -324,38 +407,27 @@ def load_ycsb(
                             )
                             subprocess.run(["rm", "-rf", per_writer_data_path])
 
-                            ycsb_db_name = (
-                                "ozonedb" if db_name == "ozonedb-corfu" else db_name
-                            )
-                            cmd = [
-                                "python3",
-                                "bin/ycsb",
-                                "load",
-                                ycsb_db_name,
-                                "-threads",
-                                thread,
+                            ycsb_props = [
+                                "-threads", thread,
                                 "-s",
-                                "-P",
-                                workload_path,
-                                "-p",
-                                f"recordcount={total_records}",
-                                "-p",
-                                f"insertstart={start}",
-                                "-p",
-                                f"insertcount={count}",
-                                "-p",
-                                f"operationcount={count}",
-                                "-p",
-                                "status.interval=1",
+                                "-P", workload_path,
+                                "-p", f"recordcount={total_records}",
+                                "-p", f"insertstart={start}",
+                                "-p", f"insertcount={count}",
+                                "-p", f"operationcount={count}",
+                                "-p", "status.interval=1",
                             ]
+                            extra_cp_entries = []
 
                             if db_name == "rocksdb":
-                                cmd += ["-p", f"rocksdb.dir={per_writer_data_path}"]
+                                ycsb_props += [
+                                    "-p", f"rocksdb.dir={per_writer_data_path}"
+                                ]
                             elif db_name == "ozonedb":
                                 cfg = generate_config_for_ozonedb_local(
                                     per_writer_data_path
                                 )
-                                cmd += ["-p", f"shared_config={cfg}"]
+                                ycsb_props += ["-p", f"shared_config={cfg}"]
                             elif db_name == "ozonedb-corfu":
                                 cfg = _make_corfu_config_per_writer(
                                     writer_idx,
@@ -363,12 +435,8 @@ def load_ycsb(
                                     corfu_settings,
                                     s3_settings,
                                 )
-                                cmd += [
-                                    "-p",
-                                    f"shared_config={cfg}",
-                                    "-cp",
-                                    corfu_bridge_jar_path(),
-                                ]
+                                ycsb_props += ["-p", f"shared_config={cfg}"]
+                                extra_cp_entries.append(corfu_bridge_jar_path())
                             elif db_name == "sqlite":
                                 os.makedirs(per_writer_data_path, exist_ok=True)
                                 db_file = os.path.join(per_writer_data_path, "mydb.db")
@@ -394,16 +462,29 @@ def load_ycsb(
                                 )
                                 conn.commit()
                                 conn.close()
-                                cmd[3] = "jdbc"
-                                cmd += [
-                                    "-P",
-                                    sqlite_cfg,
-                                    "-cp",
+                                ycsb_props += ["-P", sqlite_cfg]
+                                extra_cp_entries.append(
                                     os.path.join(
                                         ycsb_path,
                                         "jdbc/target/dependency/sqlite-jdbc-3.49.1.0.jar",
-                                    ),
+                                    )
+                                )
+
+                            full_cp = (
+                                os.pathsep.join(extra_cp_entries + [base_cp])
+                                if extra_cp_entries
+                                else base_cp
+                            )
+                            cmd = (
+                                [
+                                    java_bin,
+                                    "-cp", full_cp,
+                                    "site.ycsb.Client",
+                                    "-db", db_classname,
                                 ]
+                                + ycsb_props
+                                + ["-load"]
+                            )
 
                             result_file = os.path.join(
                                 result_path,

@@ -10,6 +10,10 @@ from load_local_ycsb import (
 )
 from load_local_ycsb_multiproc import (
     _make_corfu_config_per_writer,
+    _resolve_binding,
+    _resolve_ycsb_classpath,
+    _java_binary,
+    YCSB_DB_CLASSNAMES,
     partition_records,
     spawn_parallel,
     write_aggregate,
@@ -92,6 +96,11 @@ def run_ycsb(
                     else:
                         thread_list = ["1"]
 
+                    binding = _resolve_binding(db_name)
+                    base_cp = _resolve_ycsb_classpath(ycsb_path, binding)
+                    db_classname = YCSB_DB_CLASSNAMES[binding]
+                    java_bin = _java_binary()
+
                     for _round in range(repeated):
                         for thread in thread_list:
                             jobs = []
@@ -120,34 +129,23 @@ def run_ycsb(
                                     subprocess.run(["rm", "-rf", run_data_path])
                                     os.makedirs(run_data_path, exist_ok=True)
 
-                                ycsb_db_name = (
-                                    "ozonedb"
-                                    if db_name == "ozonedb-corfu"
-                                    else db_name
-                                )
-                                cmd = [
-                                    "python3",
-                                    "bin/ycsb",
-                                    "run",
-                                    ycsb_db_name,
-                                    "-threads",
-                                    thread,
+                                ycsb_props = [
+                                    "-threads", thread,
                                     "-s",
-                                    "-P",
-                                    workload_path,
-                                    "-p",
-                                    f"recordcount={total_records}",
-                                    "-p",
-                                    f"operationcount={writer_ops}",
-                                    "-p",
-                                    "status.interval=1",
+                                    "-P", workload_path,
+                                    "-p", f"recordcount={total_records}",
+                                    "-p", f"operationcount={writer_ops}",
+                                    "-p", "status.interval=1",
                                 ]
+                                extra_cp_entries = []
 
                                 if db_name == "rocksdb":
-                                    cmd += ["-p", f"rocksdb.dir={run_data_path}"]
+                                    ycsb_props += [
+                                        "-p", f"rocksdb.dir={run_data_path}"
+                                    ]
                                 elif db_name == "ozonedb":
                                     cfg = generate_config_for_ozonedb_local(run_data_path)
-                                    cmd += ["-p", f"shared_config={cfg}"]
+                                    ycsb_props += ["-p", f"shared_config={cfg}"]
                                 elif db_name == "ozonedb-corfu":
                                     cfg = _make_corfu_config_per_writer(
                                         writer_idx,
@@ -155,12 +153,8 @@ def run_ycsb(
                                         corfu_settings,
                                         s3_settings,
                                     )
-                                    cmd += [
-                                        "-p",
-                                        f"shared_config={cfg}",
-                                        "-cp",
-                                        corfu_bridge_jar_path(),
-                                    ]
+                                    ycsb_props += ["-p", f"shared_config={cfg}"]
+                                    extra_cp_entries.append(corfu_bridge_jar_path())
                                 elif db_name == "sqlite":
                                     db_file = os.path.join(run_data_path, "mydb.db")
                                     sqlite_cfg = os.path.join(
@@ -170,16 +164,29 @@ def run_ycsb(
                                     with open(sqlite_cfg, "w") as pf:
                                         pf.write("db.driver=org.sqlite.JDBC\n")
                                         pf.write(f"db.url=jdbc:sqlite:{db_file}\n")
-                                    cmd[3] = "jdbc"
-                                    cmd += [
-                                        "-P",
-                                        sqlite_cfg,
-                                        "-cp",
+                                    ycsb_props += ["-P", sqlite_cfg]
+                                    extra_cp_entries.append(
                                         os.path.join(
                                             ycsb_path,
                                             "jdbc/target/dependency/sqlite-jdbc-3.49.1.0.jar",
-                                        ),
+                                        )
+                                    )
+
+                                full_cp = (
+                                    os.pathsep.join(extra_cp_entries + [base_cp])
+                                    if extra_cp_entries
+                                    else base_cp
+                                )
+                                cmd = (
+                                    [
+                                        java_bin,
+                                        "-cp", full_cp,
+                                        "site.ycsb.Client",
+                                        "-db", db_classname,
                                     ]
+                                    + ycsb_props
+                                    + ["-t"]
+                                )
 
                                 result_file = os.path.join(
                                     result_path,
