@@ -23,6 +23,8 @@
 // compression method (if any) is used to compress a block.
 namespace ozonedb {
 
+class LRUCache;
+
 class TableBuilder {
  public:
   // Create a builder that will store the contents of the table it is
@@ -31,6 +33,14 @@ class TableBuilder {
 
   // REQUIRES: Either Finish() or Abandon() has been called.
   ~TableBuilder();
+
+  // Optional: register an LRU cache to receive each data block's
+  // records as a write-through cache entry. When set, every data
+  // block published via flush() is also inserted into the cache so
+  // readers immediately after compaction hit the cache instead of
+  // paying a cold S3 GET. Safe to leave unset; tests and abandon()
+  // paths then skip the write-through entirely.
+  void setLRUCache(LRUCache* cache);
 
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.

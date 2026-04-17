@@ -3,12 +3,15 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "sstable/table_builder.h"
+#include "cache.h"
 #include "protobuf_serializer.h"
 #include "sstable/block_handler.h"
 #include "sstable/comparator.h"
 #include "sstable/filter_block.h"
 #include "sstable/filter_policy.h"
 #include <cassert>
+#include <utility>
+#include <vector>
 namespace ozonedb {
 #define BLOCK_SIZE 65536  // approximate size of a block
 
@@ -26,6 +29,15 @@ struct TableBuilder::Rep {
   FilterPolicy const* filter_policy = nullptr;
   FilterBlockBuilder* filter_block = nullptr;
   FilterBlockBuilder* filter_block_for_file = nullptr;
+
+  // Write-through block cache. Null = no-op; set by setLRUCache()
+  // during compaction setup. See TableBuilder::flush for publication.
+  LRUCache* lru_cache = nullptr;
+  // Records buffered for the currently-open data block, in insertion
+  // order. Copied out at flush() into the heap-owned map the cache
+  // expects, then cleared. Holds Record by value so the cache gets an
+  // independent clone and compaction is free to drop its own copy.
+  std::vector<std::pair<std::string, Record>> pending_records;
 
   // We do not emit the index entry for a block until we have seen the
   // first key for the next data block.  This allows us to use shorter
@@ -57,6 +69,10 @@ TableBuilder::TableBuilder(Storage* storage, std::string file)
     rep_->filter_block_for_file->startBlock(0);
   }
 }
+void TableBuilder::setLRUCache(LRUCache* cache) {
+  rep_->lru_cache = cache;
+}
+
 TableBuilder::~TableBuilder() {
   assert(rep_->closed);  // Catch errors where caller forgot to call Finish()
   delete rep_->filter_block;
@@ -98,6 +114,13 @@ void TableBuilder::add(std::string const& key, Record const& record) {
   r->num_entries++;
   std::string value = record.SerializeAsString();
   r->data_block.add(key, value);
+  if (r->lru_cache != nullptr) {
+    // Buffer a copy so flush() can publish a heap-owned record map
+    // to the block cache. Only the last-wins entry per key in this
+    // block needs to survive — but add() asserts keys are strictly
+    // increasing, so duplicates aren't possible within a block.
+    r->pending_records.emplace_back(key, record);
+  }
 
   size_t const estimated_block_size = r->data_block.currentSizeEstimate();
   if (estimated_block_size >= BLOCK_SIZE) {
@@ -120,6 +143,26 @@ void TableBuilder::flush() {
   if (r->filter_block != nullptr) {
     r->filter_block->startBlock(r->offset);
   }
+  // Write-through cache publish. Must run AFTER writeBlock populated
+  // pending_index_identifier's offset+length — readers use the exact
+  // SerializeAsString bytes of the same-shaped BlockIdentifier as the
+  // cache key (via the index iterator), so serializing the identifier
+  // here produces an identical key deterministically for the two
+  // uint64 fields BlockIdentifier carries.
+  if (r->lru_cache != nullptr && !r->pending_records.empty() && ok() &&
+      r->pending_index_identifier != nullptr) {
+    std::string id_bytes = r->pending_index_identifier->SerializeAsString();
+    auto* records_map = new std::unordered_map<std::string, Record*>();
+    size_t size = 0;
+    records_map->reserve(r->pending_records.size());
+    for (auto& kv : r->pending_records) {
+      auto* rec = new Record(kv.second);
+      size += rec->ByteSizeLong();
+      (*records_map)[kv.first] = rec;
+    }
+    r->lru_cache->putSSTableRecords(r->fileName, records_map, id_bytes, size);
+  }
+  r->pending_records.clear();
 }
 
 void TableBuilder::writeBlock(google::protobuf::Message const& block, BlockIdentifier*& identifier) {
@@ -220,6 +263,9 @@ void TableBuilder::abandon() {
   Rep* r = rep_;
   assert(!r->closed);
   r->closed = true;
+  // Drop any buffered records for the in-progress block. Not publishing
+  // them matches the on-disk state — abandon() never wrote the block.
+  r->pending_records.clear();
 }
 
 uint64_t TableBuilder::numEntries() const {

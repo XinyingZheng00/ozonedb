@@ -123,8 +123,11 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
   {
     std::unique_lock<std::shared_mutex> lock(mutex);
     if (opened != nullptr) {
-      CacheEntry entry(opened);
-      file_to_entry_map[file_name] = std::move(entry);
+      // Merge: a prior compaction write-through may have populated
+      // block_records before any reader opened the file. Only the
+      // Table* needs setting; wiping the CacheEntry wholesale would
+      // throw away those warm blocks.
+      file_to_entry_map[file_name].table = opened;
     }
     table_inflight_.erase(file_name);
   }

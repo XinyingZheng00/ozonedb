@@ -6,6 +6,7 @@
 #include "log_handler.h"
 #include "protobuf/record.pb.h"
 #include "sstable/sstable_handler.h"
+#include <memory>
 #include <thread>
 #include <assert.h>
 
@@ -58,7 +59,13 @@ class DB {
   Storage* sstable_storage = nullptr;
   Metadata* metadata;
   CompactionWatcher* watcher = nullptr;
-  View latest_view;
+  // Holds an immutable snapshot of the metadata-log view. Refreshed
+  // once per DB::get via std::atomic_load on the handler's internal
+  // shared_ptr — the shared_ptr extends the View's lifetime across
+  // the get's child-handler dispatch without deep-copying three
+  // hashmaps on every call. The raw pointer each child handler
+  // stores (setLatestView) aliases into this snapshot.
+  std::shared_ptr<View const> latest_view_snapshot;
   std::mutex db_mutex;
 
   /**

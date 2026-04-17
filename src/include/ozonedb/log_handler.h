@@ -25,7 +25,7 @@ class LogHandler {
    */
   std::string prefix;
   std::string active_unit;
-  View* latest_view = nullptr;
+  View const* latest_view = nullptr;
   size_t file_size_limit;
   Storage* storage = nullptr;
   LRUCache* cache = nullptr;
@@ -85,7 +85,7 @@ class LogHandler {
   };
 
   // set latest view
-  void setLatestView(View* view) { latest_view = view; }
+  void setLatestView(View const* view) { latest_view = view; }
 
   /**
    * @brief write record into this level

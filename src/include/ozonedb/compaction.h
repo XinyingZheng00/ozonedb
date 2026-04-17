@@ -39,6 +39,7 @@ class CompactionWatcher {
   std::thread* compaction_thread = nullptr;
   ThreadPool* thread_pool = nullptr;
   EventListener* event_listener = nullptr;
+  LRUCache* lru_cache = nullptr;
   std::string fingerprint;
   View latest_view;
   FileMutexManager* file_mutex_manager = nullptr;
@@ -73,6 +74,11 @@ class CompactionWatcher {
   // set the SSTable-only storage backend (paper §3.5 split). When unset
   // sstable_storage falls back to the same Storage* as the log layer.
   void setSSTableStorage(Storage* s) { this->sstable_storage = s; }
+  // Register the block cache for write-through on compaction output.
+  // When set, every data block written by compaction's TableBuilder is
+  // also inserted into the cache so readers skip the cold S3 GET on
+  // freshly-produced SSTables.
+  void setLRUCache(LRUCache* cache) { this->lru_cache = cache; }
   // set file mutex manager
   void setFileMutexManager(FileMutexManager* file_mutex_manager) { this->file_mutex_manager = file_mutex_manager; }
   // set thread pool

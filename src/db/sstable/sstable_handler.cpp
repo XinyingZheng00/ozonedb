@@ -10,7 +10,11 @@ Status SSTableHandler::readRecordFromAllLevel(std::string const& key, Record*& r
   for (int i = 1; i <= max_level; i++) {
     std::string prefix = this->sstable_prefix + std::to_string(i);
 
-    std::deque<std::string> tables = this->latest_view->getWithPrefix(prefix);
+    // Reference into the view snapshot — avoids a per-level deque
+    // copy on every get. Valid for the duration of DB::get (the
+    // caller holds the shared_ptr<View const> until the frame
+    // returns).
+    std::deque<std::string> const& tables = this->latest_view->getWithPrefix(prefix);
     std::shared_mutex record_mutex;
     int finished_threads = 0;
     int record_file = -1;

@@ -21,7 +21,7 @@ class SSTableHandler {
   LRUCache* lru_cache = nullptr;
   ThreadPool* thread_pool = nullptr;
   int max_level;
-  View* latest_view = nullptr;
+  View const* latest_view = nullptr;
 
  public:
   /**
@@ -35,7 +35,7 @@ class SSTableHandler {
       : storage(storage), metadata_log(metadata_log), sstable_prefix(sstable_prefix), lru_cache(cache){};
 
   // set latest view
-  void setLatestView(View* view) { latest_view = view; }
+  void setLatestView(View const* view) { latest_view = view; }
 
   // set max level
   void setMaxLevel(int max_level) { this->max_level = max_level; }

@@ -105,7 +105,7 @@ class LRUCache {
   // std::unordered_map<std::string, std::shared_mutex> file_to_mutex_map;
   // std::shared_mutex map_mutex;
   FileMutexManager* file_mutex_manager = nullptr;
-  View* latest_view = nullptr;
+  View const* latest_view = nullptr;
 
   // Singleflight for concurrent block/table loads. Without these, N
   // readers that race on the same cold block each issue an S3 GET and
@@ -192,7 +192,7 @@ class LRUCache {
   void putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*>* records, std::string const& index_value, size_t size);
 
   // set latest view
-  void setLatestView(View* view) {
+  void setLatestView(View const* view) {
     latest_view = view;
   }
 

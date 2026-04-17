@@ -100,6 +100,7 @@ DB::DB(std::string const& shared_config_path) {
   std::string fingerprint = generateFingerprint();
   this->watcher = new CompactionWatcher(this->metadata, this->log_storage, this->log_handler, metadata_log, this->sstable_handler, fingerprint);
   this->watcher->setSSTableStorage(this->sstable_storage);
+  this->watcher->setLRUCache(this->lru_cache);
   this->watcher->setTaskLogHandler(new TaskLogHandler(this->metadata->task_log, this->log_storage));
   this->watcher->setMode(this->mode);
   this->file_mutex_manager = new FileMutexManager();
@@ -138,10 +139,13 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   // Seed the log key index from any log files already materialized in
   // the cache by rollforward. Set latest_view on both log_handler and
   // lru_cache first — warmKeyIndex calls cache->checkReadMoreLog which
-  // dereferences the cache's latest_view pointer.
-  db->metadata_log->getLatestView(db->latest_view);
-  db->log_handler->setLatestView(&db->latest_view);
-  db->lru_cache->setLatestView(&db->latest_view);
+  // dereferences the cache's latest_view pointer. Pin the snapshot on
+  // the DB so the raw pointers handed to children stay valid past
+  // openDB.
+  db->latest_view_snapshot = db->metadata_log->latestViewSnapshot();
+  View const* view_ptr = db->latest_view_snapshot.get();
+  db->log_handler->setLatestView(view_ptr);
+  db->lru_cache->setLatestView(view_ptr);
   db->log_handler->warmKeyIndex();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl
@@ -227,54 +231,42 @@ Status DB::get(std::string const& key, std::string const*& value) {
     }
   }
 
-  // Step1: get the latest view and cache state from metadata log
-  metadata_log->getLatestView(this->latest_view);
-  this->log_handler->setLatestView(&this->latest_view);
-  this->sstable_handler->setLatestView(&this->latest_view);
-  this->lru_cache->setLatestView(&this->latest_view);
-  std::pair<Record*, std::string> entry;
-  bool hit = tail_cache->getLatestRecord(key, entry);
-
-  // Step2: get the latest record from log, sstable
-  Record* latest_record = nullptr;
-
-  Record* cached_record = nullptr;
-  std::string offset;
-  bool updated = false;
-  if (hit) {
-    cached_record = entry.first;
-    offset = entry.second;
-    // std::cout << "db cache hit! Latest offset is " << offset << std::endl;
+  // Atomic snapshot of the metadata-log view — no deep copy, no lock.
+  // Held locally so children's raw latest_view pointers stay valid
+  // until this frame returns. Refresh publishes happen only on log
+  // rollforward / tail-size refresh, not per get.
+  this->latest_view_snapshot = metadata_log->latestViewSnapshot();
+  View const* view_ptr = this->latest_view_snapshot.get();
+  if (view_ptr == nullptr) {
+    return Status::kFailure;
   }
-  latest_record = cached_record;
+  this->log_handler->setLatestView(view_ptr);
+  this->sstable_handler->setLatestView(view_ptr);
+  this->lru_cache->setLatestView(view_ptr);
 
-  // Read from log, from new to old.
+  // tail_cache path removed — TailCache::getLatestRecord was dead
+  // code: the write side that populated it (db.cpp:~190 in put)
+  // was commented out, so every call was a shared-lock + empty
+  // hashmap lookup. The `offset` we used to feed into readRecord
+  // and readRecordFromAllLevel came from that dead cache and was
+  // always empty, so drop both the call and the condition.
+
+  Record* latest_record = nullptr;
   Record* log_record = nullptr;
+  std::string const empty_offset;
   std::string latest_offset;
-  log_handler->readRecord(key, log_record, offset, latest_offset);
+  log_handler->readRecord(key, log_record, empty_offset, latest_offset);
   if (log_record) {
     latest_record = log_record;
-    updated = true;
   }
 
-  // If the latest file is in sstable and no record in log layer,
-  // read from sstable, from new to old.
-  Record* sstable_record = nullptr;
-  std::string prefix = this->metadata->sstable_level_prefix;
-  if ((cached_record == nullptr || offset.substr(0, prefix.size()) == prefix) && log_record == nullptr) {
-    sstable_handler->readRecordFromAllLevel(key, sstable_record, offset);
+  if (log_record == nullptr) {
+    Record* sstable_record = nullptr;
+    sstable_handler->readRecordFromAllLevel(key, sstable_record, empty_offset);
     if (sstable_record) {
-      updated = true;
       latest_record = sstable_record;
     }
   }
-
-  // if (updated) {
-  //   // Perform cache update asynchronously to avoid blocking the critical path
-  //   this->thread_pool->enqueue([this, key, latest_record, latest_offset, offset]() {
-  //       tail_cache->updateCache(key, latest_record, latest_offset, offset);
-  //   });
-  // }
 
   if (latest_record) {
     if (latest_record->type() == kTypeDeletion) {

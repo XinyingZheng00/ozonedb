@@ -4,21 +4,30 @@
 
 namespace ozonedb {
 
-// get file number in the view
-int View::getFileNumber(std::string const& prefix) {
-  return storage_layout[prefix].size();
+// All accessors use find() so probing for a missing prefix/file
+// doesn't mutate the underlying maps. This is required now that
+// View instances are shared behind a shared_ptr<View const>.
+int View::getFileNumber(std::string const& prefix) const {
+  auto it = storage_layout.find(prefix);
+  return it == storage_layout.end() ? 0 : static_cast<int>(it->second.size());
 }
 
-std::deque<std::string> View::getWithPrefix(std::string const& prefix) {
-  return storage_layout[prefix];
+std::deque<std::string> const& View::getWithPrefix(std::string const& prefix) const {
+  static std::deque<std::string> const kEmpty;
+  auto it = storage_layout.find(prefix);
+  return it == storage_layout.end() ? kEmpty : it->second;
 }
 
-std::pair<std::string, std::string> View::getKeyRange(std::string const& file_name) {
-  return key_range[file_name];
+std::pair<std::string, std::string> View::getKeyRange(std::string const& file_name) const {
+  auto it = key_range.find(file_name);
+  return it == key_range.end()
+             ? std::pair<std::string, std::string>{}
+             : it->second;
 }
 
-size_t View::getFileSize(std::string const& file_name) {
-  return file_size[file_name];
+size_t View::getFileSize(std::string const& file_name) const {
+  auto it = file_size.find(file_name);
+  return it == file_size.end() ? 0 : it->second;
 }
 
 // Serialize a FileRecord to a file
@@ -51,6 +60,22 @@ Status MetadataLogHandler::stopViewUpdate() {
 void MetadataLogHandler::getLatestView(View& view) {
   std::shared_lock<std::shared_mutex> lock(view_mutex);
   view = latest_view;
+}
+
+std::shared_ptr<View const> MetadataLogHandler::latestViewSnapshot() const {
+  // Free-function std::atomic_load on shared_ptr works in C++17. A
+  // null result is possible before the first publishSnapshotLocked()
+  // runs; callers treat that as "no files yet". This is the hot path
+  // from DB::get — keep it lock-free.
+  return std::atomic_load(&latest_snapshot_);
+}
+
+void MetadataLogHandler::publishSnapshotLocked() {
+  // Called under unique_lock<view_mutex> after every mutation. One
+  // deep copy per mutation amortizes into a refcount bump per read.
+  auto snap = std::make_shared<View>(latest_view);
+  std::atomic_store(&latest_snapshot_,
+                    std::shared_ptr<View const>(std::move(snap)));
 }
 
 void MetadataLogHandler::getLatestScore(double& score) {
@@ -270,6 +295,7 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
           modified_layer = rollforwardSingleOperationRecord(op_record);
         }
       }
+      publishSnapshotLocked();
     }
     refreshTailSizeUnlocked();
     if (this->event_listener != nullptr)
@@ -295,6 +321,7 @@ void MetadataLogHandler::refreshTailSizeUnlocked() {
   if (tail_name == this->latest_view.current_log_tail) {
     this->latest_view.tail_size = tail_size;
     this->latest_view.file_size[tail_name] = tail_size;
+    publishSnapshotLocked();
   }
 }
 
@@ -303,7 +330,7 @@ void MetadataLogHandler::refreshTailSizeUnlocked() {
 // variant: keep storage->size() out of unique_lock<view_mutex>.
 View MetadataLogHandler::rollForwardMetadataLog() {
   std::vector<OperationRecord*> records = readMetadataLog();
-  if (!records.empty()) {
+  {
     std::unique_lock<std::shared_mutex> lock(view_mutex);
     for (auto const& record : records) {
       std::string modified_layer = rollforwardSingleOperationRecord(record);
@@ -313,6 +340,11 @@ View MetadataLogHandler::rollForwardMetadataLog() {
         modified_layer = rollforwardSingleOperationRecord(op_record);
       }
     }
+    // Publish unconditionally: even on an empty-records call during
+    // openDB, readers need a non-null snapshot to load. The cost is
+    // one shared_ptr construction, amortized against per-read
+    // latestViewSnapshot() calls.
+    publishSnapshotLocked();
   }
   refreshTailSizeUnlocked();
   std::shared_lock<std::shared_mutex> lock(view_mutex);

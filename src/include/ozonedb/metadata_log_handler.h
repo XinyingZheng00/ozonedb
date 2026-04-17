@@ -6,6 +6,8 @@
 #include "protobuf/sstable.pb.h"
 #include "protobuf_serializer.h"
 #include "storage.h"
+#include <atomic>
+#include <memory>
 #include <queue>
 #include <string>
 #include <vector>
@@ -18,25 +20,30 @@ class View {
   std::unordered_map<std::string, std::pair<std::string, std::string>> key_range;
   std::unordered_map<std::string, size_t> file_size;
   std::string current_log_tail;
-  size_t tail_size;
+  size_t tail_size = 0;
 
-  // get file number in the view
-  int getFileNumber(std::string const& prefix);
+  // All accessors are const and non-mutating so a View can be held
+  // immutably behind a shared_ptr<View const> and read concurrently
+  // from many threads without copying. Prior versions used
+  // operator[] which silently inserted default entries, making the
+  // View unsafe to share across threads.
+  int getFileNumber(std::string const& prefix) const;
 
-  // get files with prefix
-  std::deque<std::string> getWithPrefix(std::string const& prefix);
+  // Returns a reference into the map (no copy). On miss returns a
+  // reference to a shared static empty deque so callers can still
+  // write `auto const& files = view.getWithPrefix(p);` without
+  // special-casing the not-found path. Only valid as long as the
+  // caller holds a reference to the View (i.e. the enclosing
+  // shared_ptr is alive).
+  std::deque<std::string> const& getWithPrefix(std::string const& prefix) const;
 
-  // get key range of a file
-  std::pair<std::string, std::string> getKeyRange(std::string const& file_name);
+  std::pair<std::string, std::string> getKeyRange(std::string const& file_name) const;
 
-  // get file size of a file
-  size_t getFileSize(std::string const& file_name);
+  size_t getFileSize(std::string const& file_name) const;
 
-  // get tail size
-  size_t getTailSize() { return tail_size; }
+  size_t getTailSize() const { return tail_size; }
 
-  // get current log tail
-  std::string getCurrentLogTail() { return current_log_tail; }
+  std::string const& getCurrentLogTail() const { return current_log_tail; }
 };
 
 class MetadataLogHandler {
@@ -48,6 +55,14 @@ class MetadataLogHandler {
   LRUCache* lru_cache = nullptr;
   std::thread* update_view_thread = nullptr;
   View latest_view;
+  // Immutable snapshot of latest_view, swapped atomically by
+  // publishSnapshotLocked after each mutation. Readers (DB::get hot
+  // path) atomically load this instead of deep-copying latest_view
+  // under a shared_lock per call — converts an O(files) per-get copy
+  // into a refcount bump. std::atomic free functions on
+  // std::shared_ptr are used; C++20's atomic<shared_ptr> isn't
+  // required.
+  std::shared_ptr<View const> latest_snapshot_;
   Metadata* metadata = nullptr;
   std::shared_mutex view_mutex;
   std::shared_mutex read_mutex;
@@ -59,6 +74,9 @@ class MetadataLogHandler {
   // Refresh latest_view.tail_size without holding view_mutex across
   // storage->size() — keeps the Corfu fence out of the critical section.
   void refreshTailSizeUnlocked();
+  // Publish a fresh shared_ptr<View const> snapshot from the current
+  // latest_view. Caller must hold view_mutex as a unique_lock.
+  void publishSnapshotLocked();
 
  public:
   EventListener* event_listener = nullptr;
@@ -90,6 +108,12 @@ class MetadataLogHandler {
   void initSSTMetadata();
 
   void getLatestView(View& view);
+
+  // Atomic load of the latest View snapshot. Returns a shared_ptr by
+  // value; the refcount bump keeps the View alive for the caller's
+  // use regardless of subsequent mutations. Preferred over
+  // getLatestView for read-only hot paths — no lock, no copy.
+  std::shared_ptr<View const> latestViewSnapshot() const;
 
   void getLatestScore(double& score);
 

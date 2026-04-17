@@ -370,6 +370,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       output_files.push_back(sstable_path);
       log_string += ":" + sstable_path;
       compaction->outputBuilder = new TableBuilder(this->sstable_storage, sstable_path);
+      compaction->outputBuilder->setLRUCache(this->lru_cache);
       key_range.first = records[i]->key();
     }
     compaction->outputBuilder->add(records[i]->key(), *records[i]);
