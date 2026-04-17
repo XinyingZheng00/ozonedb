@@ -6,7 +6,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <jni.h>
 #include <list>
 #include <mutex>
 #include <string>
@@ -15,6 +14,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <jni.h>
 
 namespace ozonedb {
 
@@ -61,7 +61,7 @@ class CorfuDBStorage : public Storage {
     std::lock_guard<std::mutex> lk(mtx_);
     remote_listener_ = std::move(listener);
   }
-  int commit_interval_ = 10;
+  int commit_interval_ = 0;
   bool sync_mode_ = false;
 
  private:

@@ -3,6 +3,7 @@
 #include "metadata_log_handler.h"
 #include "protobuf_serializer.h"
 
+#include <functional>
 #include <iostream>
 
 namespace ozonedb {
@@ -25,24 +26,35 @@ void LRUCache::evict() {
   }
 }
 void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size) {
-  std::unique_lock lock(mutex);
-  auto it = file_to_entry_map.find(file_name);
-  if (it != file_to_entry_map.end()) {
-    // Key found in the cache
-    // updateLRU(file_name);
-    if (it->second.sealed) {
-      read_more = false;
-      return;
-    } else {
+  // Sample cache state under a shared lock, then release before any
+  // storage->size() call. Holding LRUCache::mutex across the Corfu
+  // fence inverted locks against the tailer's remote-append listener
+  // (which calls putLogRecordSingle → LRUCache::mutex): the tailer
+  // could not advance past an entry it was trying to publish, and
+  // this thread could not wake because last_applied_addr_ was stuck
+  // behind that same entry. The sampled state is eventually
+  // consistent — a stale (low) cached_offset at worst triggers one
+  // extra no-op readDataLog on the next tick; sealed only flips once
+  // so a stale "unsealed" resolves on the next call.
+  bool is_tail = false;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex);
+    auto it = file_to_entry_map.find(file_name);
+    if (it != file_to_entry_map.end()) {
+      if (it->second.sealed) {
+        read_more = false;
+        return;
+      }
       cached_offset = it->second.offset;
     }
+    is_tail = (file_name == latest_view->current_log_tail);
   }
   // latest_view->getFileSize lags behind the storage layer for the active
   // tail whenever the writer uses appendInBatch: the view is refreshed on
   // a ~100ms cycle and ignores the local cached_file_ buffer. Ask storage
   // directly for the tail so the read covers not-yet-flushed bytes too.
   // Sealed files never grow, so the view size is authoritative.
-  if (file_name == latest_view->current_log_tail) {
+  if (is_tail) {
     size = log_storage_->size(file_name);
   } else {
     size = latest_view->getFileSize(file_name);
@@ -105,9 +117,35 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
     return;
   }
 
-  // Leader: open the table without holding the cache mutex.
+  // Leader path. Any exception from Table::open / setCache must not
+  // leave a dangling entry in table_inflight_ or an unset promise —
+  // doing so would wedge every future reader of this file on a
+  // broken_promise future and the block would never be refetched.
+  // The scope guard fires on both normal and exceptional exit.
   Table* opened = nullptr;
-  {
+  bool cleanup_done = false;
+  auto cleanup = [&]() {
+    if (cleanup_done) return;
+    cleanup_done = true;
+    {
+      std::unique_lock<std::shared_mutex> lock(mutex);
+      if (opened != nullptr) {
+        // Merge: a prior compaction write-through may have populated
+        // block_records before any reader opened the file. Only the
+        // Table* needs setting; wiping the CacheEntry wholesale would
+        // throw away those warm blocks.
+        file_to_entry_map[file_name].table = opened;
+      }
+      table_inflight_.erase(file_name);
+    }
+    try { my_promise->set_value(); } catch (...) {}
+  };
+  struct Guard {
+    std::function<void()>& f;
+    ~Guard() { f(); }
+  } guard{cleanup};
+
+  try {
     std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
     std::shared_lock<std::shared_mutex> file_lock(file_mutex);
     Status status = Table::open(this->sstable_storage_, file_name, opened);
@@ -115,23 +153,17 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
       std::cout << "open table failed" << std::endl;
       opened = nullptr;
     }
+  } catch (...) {
+    opened = nullptr;
   }
   if (opened != nullptr) {
-    opened->setCache(this);
-  }
-
-  {
-    std::unique_lock<std::shared_mutex> lock(mutex);
-    if (opened != nullptr) {
-      // Merge: a prior compaction write-through may have populated
-      // block_records before any reader opened the file. Only the
-      // Table* needs setting; wiping the CacheEntry wholesale would
-      // throw away those warm blocks.
-      file_to_entry_map[file_name].table = opened;
+    try {
+      opened->setCache(this);
+    } catch (...) {
+      // Table* is still usable; just log.
+      std::cerr << "[lru_cache] setCache threw for " << file_name << "\n";
     }
-    table_inflight_.erase(file_name);
   }
-  my_promise->set_value();
   table = opened;
 }
 
@@ -186,40 +218,82 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
     return;
   }
 
-  // Leader: fetch the block from storage.
+  // Leader path. Any exception from blockReader / iterator / parse
+  // must not leave block_inflight_ populated with an unset promise;
+  // if that happened, all subsequent readers for this block would
+  // wait on a broken_promise future and then return without fetching,
+  // wedging the block permanently. Under multi-writer Corfu loads
+  // these errors do happen, so we guard with a scope that always
+  // runs the publish-or-drop cleanup.
   Iterator* iter = nullptr;
-  {
-    std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
-    std::shared_lock<std::shared_mutex> file_lock(file_mutex);
-    iter = table->blockReader(table, index_value);
-  }
-  iter->seekToFirst();
-  auto* records_tmp = new std::unordered_map<std::string, Record*>();
+  std::unordered_map<std::string, Record*>* records_tmp = nullptr;
   size_t size = 0;
-  while (iter->valid()) {
-    std::string const& value = iter->value();
-    auto* record = new Record();
-    record->ParseFromArray(value.data(), value.size());
-    (*records_tmp)[iter->key()] = record;
-    size += record->ByteSizeLong();
-    iter->next();
-  }
-  delete iter;
-
-  {
-    std::unique_lock<std::shared_mutex> lock(mutex);
-    auto& entry = file_to_entry_map[file_name];
-    entry.block_records[index_value] = records_tmp;
-    entry.block_size[index_value] = size;
-    current_size += size;
-    lru_list.push_front({file_name, index_value});
-    entry.lru_itr[index_value] = lru_list.begin();
-    if (current_size > capacity) {
-      evict();
+  bool fetch_ok = false;
+  bool cleanup_done = false;
+  auto cleanup = [&]() {
+    if (cleanup_done) return;
+    cleanup_done = true;
+    {
+      std::unique_lock<std::shared_mutex> lock(mutex);
+      if (fetch_ok) {
+        auto& entry = file_to_entry_map[file_name];
+        auto existing = entry.block_records.find(index_value);
+        if (existing != entry.block_records.end()) {
+          // Lost a race with another publisher (shouldn't happen
+          // given singleflight, but defensive). Drop our clone.
+          if (records_tmp) {
+            for (auto& kv : *records_tmp) delete kv.second;
+            delete records_tmp;
+            records_tmp = nullptr;
+          }
+        } else {
+          entry.block_records[index_value] = records_tmp;
+          entry.block_size[index_value] = size;
+          current_size += size;
+          lru_list.push_front({file_name, index_value});
+          entry.lru_itr[index_value] = lru_list.begin();
+          if (current_size > capacity) {
+            evict();
+          }
+        }
+      } else if (records_tmp) {
+        for (auto& kv : *records_tmp) delete kv.second;
+        delete records_tmp;
+        records_tmp = nullptr;
+      }
+      block_inflight_.erase(inflight_key);
     }
-    block_inflight_.erase(inflight_key);
+    try { my_promise->set_value(); } catch (...) {}
+  };
+  struct Guard {
+    std::function<void()>& f;
+    ~Guard() { f(); }
+  } guard{cleanup};
+
+  try {
+    {
+      std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
+      std::shared_lock<std::shared_mutex> file_lock(file_mutex);
+      iter = table->blockReader(table, index_value);
+    }
+    iter->seekToFirst();
+    records_tmp = new std::unordered_map<std::string, Record*>();
+    while (iter->valid()) {
+      std::string const& value = iter->value();
+      auto* record = new Record();
+      record->ParseFromArray(value.data(), value.size());
+      (*records_tmp)[iter->key()] = record;
+      size += record->ByteSizeLong();
+      iter->next();
+    }
+    fetch_ok = true;
+  } catch (...) {
+    std::cerr << "[lru_cache] readDataBlocks threw for " << file_name << "\n";
+    fetch_ok = false;
   }
-  my_promise->set_value();
+  if (iter) delete iter;
+  // cleanup() publishes + erases + signals the promise; Guard
+  // guarantees it fires exactly once even if anything below throws.
 }
 
 // Function to get the latest records for a given filename, return records and offset
