@@ -113,17 +113,17 @@ def _java_binary():
 
 
 def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settings):
-    """Write a per-writer shared_config_rocksdb_w{i}.json.
+    """Write a per-writer shared_config_w{i}.json.
 
     Corfu endpoint/stream stays shared across writers (that's the point),
     but db_path must be unique so each process has its own local metadata
     scratch directory.
     """
     base_json = os.path.join(
-        ozonedb_home, "src/config/corfu/shared_config_rocksdb_base.json"
+        ozonedb_home, "src/config/corfu/shared_config_base.json"
     )
     out_json = os.path.join(
-        ozonedb_home, f"src/config/corfu/shared_config_rocksdb_w{writer_idx}.json"
+        ozonedb_home, f"src/config/corfu/shared_config_w{writer_idx}.json"
     )
     with open(base_json, "r") as f:
         data = json.load(f)

@@ -25,7 +25,17 @@ import org.corfudb.runtime.view.stream.IStreamView;
  */
 public class CorfuBridge {
   private final CorfuRuntime runtime;
-  private final IStreamView streamView;
+  // Separate stream views for append and poll so Corfu's
+  // ThreadSafeStreamView monitor is NOT shared across the two
+  // call-sites. Sharing one view meant an in-flight append() (which
+  // holds the monitor for the full server round-trip) blocked the
+  // tailer's next() call, capping tailer throughput at roughly
+  // "one poll per gap between appends." Two views == two monitors
+  // == writer and tailer run concurrently. Both views subscribe to
+  // the same stream UUID so the poll view sees every entry the
+  // append view writes (ordered via the Corfu sequencer).
+  private final IStreamView appendView;
+  private final IStreamView pollView;
   private volatile boolean closed = false;
 
   public CorfuBridge(String endpoint, String streamName) {
@@ -34,7 +44,8 @@ public class CorfuBridge {
         .parseConfigurationString(endpoint)
         .connect();
     UUID streamId = CorfuRuntime.getStreamID(streamName);
-    this.streamView = runtime.getStreamsView().get(streamId);
+    this.appendView = runtime.getStreamsView().get(streamId);
+    this.pollView = runtime.getStreamsView().get(streamId);
   }
 
   /**
@@ -43,7 +54,7 @@ public class CorfuBridge {
    * @return the global log address assigned to the entry.
    */
   public long append(byte[] payload) {
-    return streamView.append(payload);
+    return appendView.append(payload);
   }
 
   /**
@@ -57,7 +68,7 @@ public class CorfuBridge {
   public byte[] pollNext(long timeoutMs) {
     long deadline = System.currentTimeMillis() + timeoutMs;
     while (!closed) {
-      ILogData data = streamView.next();
+      ILogData data = pollView.next();
       if (data != null) {
         long addr = data.getGlobalAddress();
         Object raw = data.getPayload(runtime);

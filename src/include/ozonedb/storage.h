@@ -208,7 +208,7 @@ class AzureBlobStorage : public Storage {
   std::unordered_map<std::string, std::vector<unsigned char>> cached_file;  // In-memory cache for sstable data
   std::chrono::_V2::system_clock::time_point last_commited_time_;
   int commit_count_ = 0;                      // Commit count
-  int commit_interval_ = 0;                   // Commit interval in milliseconds
+  int commit_interval_ = 10;                  // Commit interval in milliseconds
   bool sync_mode_ = false;                    // When true, appendInBatch blocks until batch is flushed to Azure
   std::condition_variable batch_flushed_cv_;  // Notifies blocked writers after batch flush
   void setSyncMode(bool sync) { sync_mode_ = sync; }

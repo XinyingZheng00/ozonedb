@@ -140,8 +140,13 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
     }
     try { my_promise->set_value(); } catch (...) {}
   };
+  // Store the callable by value — a reference member can't bind to
+  // the lambda-to-std::function rvalue conversion. The held
+  // std::function still references the surrounding locals (lambda
+  // captures are [&]); Guard is in the same scope, so it is
+  // destroyed before those captures go out of scope.
   struct Guard {
-    std::function<void()>& f;
+    std::function<void()> f;
     ~Guard() { f(); }
   } guard{cleanup};
 
@@ -265,8 +270,9 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
     }
     try { my_promise->set_value(); } catch (...) {}
   };
+  // See getSSTable above for why this is by value, not by reference.
   struct Guard {
-    std::function<void()>& f;
+    std::function<void()> f;
     ~Guard() { f(); }
   } guard{cleanup};
 

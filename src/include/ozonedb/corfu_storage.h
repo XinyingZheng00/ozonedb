@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <mutex>
 #include <string>
@@ -58,10 +59,21 @@ class CorfuDBStorage : public Storage {
 
   void setSyncMode(bool sync) { sync_mode_ = sync; }
   void setRemoteAppendListener(RemoteAppendListener listener) override {
-    std::lock_guard<std::mutex> lk(mtx_);
-    remote_listener_ = std::move(listener);
+    bool cleared;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      remote_listener_ = std::move(listener);
+      cleared = !remote_listener_;
+    }
+    // When a listener is cleared (typically LogHandler::~LogHandler),
+    // block until the dispatcher has finished running every event
+    // that was enqueued under the old listener. Each queued event
+    // holds a std::function copy that captured the caller's `this`
+    // pointer; running those events after `this` is destroyed would
+    // be a use-after-free. Draining here closes that window.
+    if (cleared) drainDispatchQueue();
   }
-  int commit_interval_ = 0;
+  int commit_interval_ = 10;
   bool sync_mode_ = false;
 
  private:
@@ -113,10 +125,45 @@ class CorfuDBStorage : public Storage {
   std::atomic<bool> running_{false};
 
   // Notified for every applied entry that did NOT originate from this
-  // process (i.e. remote APPENDs and any REMOVE). Invoked by the tailer
-  // outside mtx_ so a listener that acquires its own locks can't
-  // deadlock against storage. Installed by LogHandler at startup.
+  // process (i.e. remote APPENDs and any REMOVE). Installed by
+  // LogHandler at startup. Invocation goes through dispatch_thread_
+  // below — the tailer never calls the listener synchronously.
   RemoteAppendListener remote_listener_;
+
+  // Queue of remote-append events awaiting listener dispatch. The
+  // listener (LogHandler::onRemoteAppend) takes LRUCache::mutex,
+  // which is sometimes held by a foreground thread fencing on this
+  // tailer via storage->size(). Invoking the listener directly from
+  // the tailer would create a cycle: foreground holds LRU mutex,
+  // waits for tailer; tailer waits for LRU mutex inside the listener.
+  // A dedicated dispatch thread drains this queue and runs the
+  // listener off the tailer's critical path so the tailer never
+  // blocks on a foreground lock.
+  //
+  // Queue is unbounded intentionally. A bounded queue would require
+  // the tailer to block on a full queue, which reintroduces the
+  // inversion. In practice the listener is O(1) per record and
+  // keeps pace with the tailer; the queue stays short.
+  struct RemoteEvent {
+    RemoteOp op;
+    std::string file_name;
+    std::vector<unsigned char> payload;
+    RemoteAppendListener listener;
+  };
+  std::mutex dispatch_mtx_;
+  std::condition_variable dispatch_cv_;
+  // Signaled by the dispatcher when it finishes an event and the
+  // queue is empty. drainDispatchQueue() (called when the listener
+  // is cleared) waits on this so a teardown caller knows all events
+  // that captured the old listener have finished.
+  std::condition_variable drain_cv_;
+  std::deque<RemoteEvent> dispatch_queue_;
+  // True while the dispatcher is mid-invocation of a listener — i.e.
+  // the event has been popped from dispatch_queue_ but the listener
+  // hasn't returned yet. drainDispatchQueue() must block on this in
+  // addition to an empty queue.
+  bool dispatch_in_flight_ = false;
+  std::thread dispatch_thread_;
 
   void startJvm(std::string const& jar_path, std::string const& jvm_opts);
   JNIEnv* attachThread();
@@ -127,6 +174,8 @@ class CorfuDBStorage : public Storage {
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
   void drainInitialEntries();
   void tailerLoop();
+  void dispatchLoop();
+  void drainDispatchQueue();
   long globalFenceTarget();
   void waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target);
   void reconcilePendingFrontLocked(std::string const& fileName);

@@ -50,6 +50,7 @@ def run_ycsb(
     num_writers,
     corfu_settings=None,
     s3_settings=None,
+    max_exec_time=None,
 ):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
@@ -137,6 +138,10 @@ def run_ycsb(
                                     "-p", f"operationcount={writer_ops}",
                                     "-p", "status.interval=1",
                                 ]
+                                if max_exec_time:
+                                    ycsb_props += [
+                                        "-p", f"maxexecutiontime={int(max_exec_time)}"
+                                    ]
                                 extra_cp_entries = []
 
                                 if db_name == "rocksdb":
@@ -237,6 +242,12 @@ if __name__ == "__main__":
         default=None,
         help="Number of parallel writer processes (overrides local.run.num_writers).",
     )
+    parser.add_argument(
+        "--workloads",
+        type=str,
+        default=None,
+        help="Comma-separated workload letters (overrides local.run.workload_name).",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -244,6 +255,8 @@ if __name__ == "__main__":
 
     run_config = config["local"]["run"]
     workload_names = run_config["workload_name"]
+    if args.workloads:
+        workload_names = [w.strip() for w in args.workloads.split(",") if w.strip()]
     record_cnts = run_config["record_cnt"]
     operation_cnts = run_config["operation_cnt"]
     key_sizes = run_config["key_size"]
@@ -258,6 +271,7 @@ if __name__ == "__main__":
     )
     corfu_settings = config.get("corfu")
     s3_settings = config.get("s3")
+    max_exec_time = run_config.get("max_exec_time")
 
     print(f"Launching {num_writers} parallel runner processes")
     run_ycsb(
@@ -272,4 +286,5 @@ if __name__ == "__main__":
         num_writers,
         corfu_settings,
         s3_settings,
+        max_exec_time,
     )

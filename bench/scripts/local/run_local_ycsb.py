@@ -9,7 +9,7 @@ from load_local_ycsb import (
 )
 ozonedb_home = os.environ.get("OZONEDB_HOME")
 
-def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, repeated, ycsb_data_path, threads, corfu_settings=None, s3_settings=None):
+def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, repeated, ycsb_data_path, threads, corfu_settings=None, s3_settings=None, max_exec_time=None):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
     
@@ -40,6 +40,8 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                     subprocess.run(['rm', '-rf', result_file_readwrite])
                     ycsb_db_name = "ozonedb" if db_name == "ozonedb-corfu" else db_name
                     command = ['python3', f'bin/ycsb', 'run', ycsb_db_name, '-threads', str(1), '-s','-P', workload_path, '-p', 'status.interval=1']
+                    if max_exec_time:
+                        command += ['-p', f'maxexecutiontime={int(max_exec_time)}']
                     if db_name == "rocksdb":
                         command.append("-p")
                         command.append("rocksdb.dir="+run_data_path)
@@ -113,5 +115,6 @@ if __name__ == "__main__":
         threads = load_config["threads"]
         corfu_settings = config.get("corfu")
         s3_settings = config.get("s3")
+        max_exec_time = load_config.get("max_exec_time")
 
-        run_ycsb(workload_names, record_cnts, operation_cnts, key_sizes, db_names, repeated, ycsb_data_path, threads, corfu_settings, s3_settings)
+        run_ycsb(workload_names, record_cnts, operation_cnts, key_sizes, db_names, repeated, ycsb_data_path, threads, corfu_settings, s3_settings, max_exec_time)

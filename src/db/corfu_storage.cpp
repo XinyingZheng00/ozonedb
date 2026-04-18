@@ -12,7 +12,7 @@ namespace ozonedb {
 
 namespace {
 constexpr char const* kBridgeClass = "site/ycsb/db/corfu/CorfuBridge";
-constexpr long kPollTimeoutMs = 1000;
+constexpr long kPollTimeoutMs = 100;
 
 std::vector<std::string> splitJvmOpts(std::string const& opts) {
   std::vector<std::string> out;
@@ -44,6 +44,11 @@ CorfuDBStorage::CorfuDBStorage(std::string const& endpoint,
   drainInitialEntries();
   running_ = true;
   tailer_thread_ = std::thread(&CorfuDBStorage::tailerLoop, this);
+  // Dispatch thread must be running by the time the tailer starts
+  // enqueueing events. remote_listener_ is installed by LogHandler
+  // after this constructor returns, so the tailer won't generate any
+  // events until then — either start order is safe.
+  dispatch_thread_ = std::thread(&CorfuDBStorage::dispatchLoop, this);
 }
 
 CorfuDBStorage::~CorfuDBStorage() {
@@ -82,6 +87,11 @@ CorfuDBStorage::~CorfuDBStorage() {
 
   running_ = false;
   if (tailer_thread_.joinable()) tailer_thread_.join();
+  // Tailer is stopped; no more events will be enqueued. Wake the
+  // dispatch thread so it can drain any remaining queued events and
+  // observe running_=false to exit.
+  dispatch_cv_.notify_all();
+  if (dispatch_thread_.joinable()) dispatch_thread_.join();
   JNIEnv* env = attachThread();
   if (env && bridge_global_ && mid_close_) {
     env->CallVoidMethod(bridge_global_, mid_close_);
@@ -228,12 +238,14 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
     return false;
   }
 
-  // Fire the remote-append listener for every applied entry that
-  // wasn't self-written (APPEND) or that is a REMOVE. We stage the
-  // payload+op out of the critical section and invoke the listener
-  // after dropping mtx_, so a listener that acquires its own locks
-  // can't deadlock against storage. Local APPENDs are skipped: the
-  // writer path already updates any listener-visible index itself.
+  // Stage a remote-append event for the dispatch thread. We do NOT
+  // invoke the listener inline here — the listener takes
+  // LRUCache::mutex, and inlining that call on the tailer thread
+  // creates a deadlock cycle with any foreground op that holds
+  // LRUCache::mutex while fencing on this tailer via storage->size().
+  // The dispatch thread runs the listener off the tailer's critical
+  // path. Local APPENDs are skipped: the writer path already updates
+  // any listener-visible index itself.
   bool notify = false;
   RemoteOp notify_op = RemoteOp::kAppend;
   std::string notify_file;
@@ -280,12 +292,25 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
         break;
     }
     last_applied_addr_.store(addr, std::memory_order_release);
+    // Enqueue while still holding mtx_ so "listener check" and
+    // "event enqueue" are atomic with respect to
+    // setRemoteAppendListener. Without this, a concurrent clear
+    // could run between the check above and the push below — the
+    // listener would be cleared, then this enqueue would slip in
+    // with a snapshot of the stale listener and leak past the
+    // drainDispatchQueue() call in setRemoteAppendListener, causing
+    // a use-after-free at LogHandler teardown. dispatch_mtx_ is
+    // only ever taken here and in dispatchLoop/drainDispatchQueue,
+    // none of which ever take mtx_, so no cycle.
+    if (notify && listener_snapshot) {
+      std::lock_guard<std::mutex> dlk(dispatch_mtx_);
+      dispatch_queue_.push_back(RemoteEvent{
+          notify_op, std::move(notify_file), std::move(notify_payload),
+          std::move(listener_snapshot)});
+    }
   }
   tailer_cv_.notify_all();
-  if (notify && listener_snapshot) {
-    listener_snapshot(notify_file, notify_payload.data(),
-                      notify_payload.size(), notify_op);
-  }
+  if (notify) dispatch_cv_.notify_one();
   return true;
 }
 
@@ -327,6 +352,64 @@ void CorfuDBStorage::tailerLoop() {
     applyEntryFromJava(env, jbuf);
   }
   detachThread();
+}
+
+// Drain remote-append events enqueued by applyEntryFromJava and
+// invoke the registered listener off the tailer thread. Exits when
+// running_ is false and the queue is fully drained — the destructor
+// joins the tailer first, so at that point no more events can be
+// enqueued and the drain is bounded.
+void CorfuDBStorage::dispatchLoop() {
+  for (;;) {
+    RemoteEvent ev;
+    {
+      std::unique_lock<std::mutex> lock(dispatch_mtx_);
+      dispatch_cv_.wait(lock, [this] {
+        return !running_.load() || !dispatch_queue_.empty();
+      });
+      if (dispatch_queue_.empty()) return;  // !running_ && drained
+      ev = std::move(dispatch_queue_.front());
+      dispatch_queue_.pop_front();
+      dispatch_in_flight_ = true;
+    }
+    // Invoke the listener outside dispatch_mtx_ so the tailer can
+    // continue enqueueing while the listener runs. A throwing
+    // listener must not kill the dispatcher — swallow and continue
+    // so subsequent events still get delivered.
+    if (ev.listener) {
+      try {
+        ev.listener(ev.file_name, ev.payload.data(), ev.payload.size(),
+                    ev.op);
+      } catch (std::exception const& e) {
+        std::cerr << "[corfu] remote-append listener threw: " << e.what()
+                  << "\n";
+      } catch (...) {
+        std::cerr << "[corfu] remote-append listener threw unknown exception\n";
+      }
+    }
+    // Clear in-flight and notify drain_cv_ only when the queue has
+    // gone fully quiescent. A drainer (setRemoteAppendListener with
+    // an empty listener) is guaranteed to observe this state before
+    // returning.
+    {
+      std::lock_guard<std::mutex> lock(dispatch_mtx_);
+      dispatch_in_flight_ = false;
+      if (dispatch_queue_.empty()) drain_cv_.notify_all();
+    }
+  }
+}
+
+// Block until no event is being processed and the queue is empty.
+// Called from setRemoteAppendListener when the listener is cleared
+// so the caller (typically ~LogHandler) can tear down safely —
+// every in-flight event has finished running the old listener and
+// no new events will be enqueued (the tailer checks remote_listener_
+// under mtx_, which we already cleared).
+void CorfuDBStorage::drainDispatchQueue() {
+  std::unique_lock<std::mutex> lock(dispatch_mtx_);
+  drain_cv_.wait(lock, [this] {
+    return dispatch_queue_.empty() && !dispatch_in_flight_;
+  });
 }
 
 long CorfuDBStorage::globalFenceTarget() {

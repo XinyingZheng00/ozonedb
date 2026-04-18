@@ -22,9 +22,9 @@ ozonedb_home = os.environ.get("OZONEDB_HOME")
 
 
 def generate_config_for_ozonedb_local(new_dir):
-    json_file_path = ozonedb_home + "/src/config/local/shared_config_rocksdb_base.json"
+    json_file_path = ozonedb_home + "/src/config/local/shared_config_base.json"
     result_json_file_path = (
-        ozonedb_home + "/src/config/local/shared_config_rocksdb.json"
+        ozonedb_home + "/src/config/local/shared_config.json"
     )
 
     with open(json_file_path, "r") as f:
@@ -43,9 +43,9 @@ def corfu_bridge_jar_path():
 
 
 def generate_config_for_ozonedb_corfu(new_dir, corfu_settings, s3_settings=None):
-    json_file_path = ozonedb_home + "/src/config/corfu/shared_config_rocksdb_base.json"
+    json_file_path = ozonedb_home + "/src/config/corfu/shared_config_base.json"
     result_json_file_path = (
-        ozonedb_home + "/src/config/corfu/shared_config_rocksdb.json"
+        ozonedb_home + "/src/config/corfu/shared_config.json"
     )
 
     with open(json_file_path, "r") as f:
