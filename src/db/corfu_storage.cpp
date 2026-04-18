@@ -194,8 +194,10 @@ void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& 
   mid_pollNext_ = env->GetMethodID(bridge_class_global_, "pollNext", "(J)[B");
   mid_pollBatch_ = env->GetMethodID(bridge_class_global_, "pollBatch", "(JI)[B");
   mid_tailAddress_ = env->GetMethodID(bridge_class_global_, "tailAddress", "()J");
+  mid_gcPollView_ = env->GetMethodID(bridge_class_global_, "gcPollView", "(J)V");
   mid_close_ = env->GetMethodID(bridge_class_global_, "close", "()V");
-  if (!mid_append_ || !mid_pollNext_ || !mid_pollBatch_ || !mid_tailAddress_ || !mid_close_) {
+  if (!mid_append_ || !mid_pollNext_ || !mid_pollBatch_ || !mid_tailAddress_ ||
+      !mid_gcPollView_ || !mid_close_) {
     throw std::runtime_error("CorfuBridge method lookup failed");
   }
 }
@@ -406,6 +408,17 @@ void CorfuDBStorage::tailerLoop() {
   // place during multi-writer diagnosis; remove once stable.
   auto stat_window_start = std::chrono::steady_clock::now();
   uint64_t stat_entries = 0;
+  // Periodically prune the Corfu IStreamView's resolvedQueue/readQueue
+  // (TreeSet<Long>). Without this they grow one entry per address the
+  // tailer reads, indefinitely — heap dumps from long runs show ~85 MB
+  // of TreeMap$Entry attributable to this one stream view. gc() is
+  // two-phase (the first call sets the trim mark, the next call prunes
+  // below the previously-set mark), so fire it on a steady cadence.
+  // kGcTrimInterval chosen so each gc spans many thousands of entries
+  // of progress, keeping gc cost amortized and the resident queue size
+  // bounded by ~kGcTrimInterval * (applied rate / gc rate).
+  uint64_t entries_since_gc = 0;
+  constexpr uint64_t kGcTrimInterval = 50000;
   while (running_) {
     auto poll_before = std::chrono::steady_clock::now();
     jbyteArray jbuf = static_cast<jbyteArray>(
@@ -429,16 +442,56 @@ void CorfuDBStorage::tailerLoop() {
       continue;
     }
     if (jbuf != nullptr) {
-      stat_entries += applyBatchFromJava(env, jbuf);
+      int applied = applyBatchFromJava(env, jbuf);
+      stat_entries += applied;
+      entries_since_gc += applied;
+    }
+    if (entries_since_gc >= kGcTrimInterval) {
+      long trim = last_applied_addr_.load(std::memory_order_acquire);
+      if (trim >= 0) {
+        env->CallVoidMethod(bridge_global_, mid_gcPollView_,
+                            static_cast<jlong>(trim));
+        if (env->ExceptionCheck()) {
+          env->ExceptionDescribe();
+          env->ExceptionClear();
+        }
+      }
+      entries_since_gc = 0;
     }
     auto now = std::chrono::steady_clock::now();
     if (now - stat_window_start >= std::chrono::seconds(1)) {
       long applied_now = last_applied_addr_.load(std::memory_order_acquire);
       long written_now = last_written_addr_.load(std::memory_order_acquire);
+      // Sample C++-side memory residency. file_buffers_ is the main
+      // suspect when process RSS grows without bound — every byte
+      // written to every file by every writer lives here until the
+      // file is REMOVE'd. Sampling every second is cheap: we only
+      // traverse the map of ~hundreds-of-thousands entries at most,
+      // all under mtx_.
+      size_t n_files = 0, fb_bytes = 0, pend_bytes = 0, cache_bytes = 0;
+      size_t dispatch_len = 0;
+      {
+        std::lock_guard<std::mutex> lk(mtx_);
+        n_files = file_buffers_.size();
+        for (auto const& kv : file_buffers_) fb_bytes += kv.second.size();
+        for (auto const& kv : pending_) {
+          for (auto const& p : kv.second) pend_bytes += p.second.size();
+        }
+        for (auto const& kv : cached_file_) cache_bytes += kv.second.size();
+      }
+      {
+        std::lock_guard<std::mutex> dlk(dispatch_mtx_);
+        dispatch_len = dispatch_queue_.size();
+      }
       std::cerr << "[corfu-tailer] applied=" << applied_now
                 << " written=" << written_now
                 << " gap=" << (written_now - applied_now)
-                << " rate=" << stat_entries << "/s\n";
+                << " rate=" << stat_entries << "/s"
+                << " files=" << n_files
+                << " fb_MB=" << (fb_bytes >> 20)
+                << " pend_MB=" << (pend_bytes >> 20)
+                << " cache_MB=" << (cache_bytes >> 20)
+                << " disp_q=" << dispatch_len << "\n";
       stat_window_start = now;
       stat_entries = 0;
     }

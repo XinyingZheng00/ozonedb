@@ -18,10 +18,24 @@ void LRUCache::updateLRU(std::string const& file_name, std::string const& index_
 void LRUCache::evict() {
   while (current_size > capacity) {
     auto it = lru_list.rbegin();
-    current_size -= file_to_entry_map[it->first].block_size[it->second];
-    file_to_entry_map[it->first].block_records.erase(it->second);
-    file_to_entry_map[it->first].block_size.erase(it->second);
-    file_to_entry_map[it->first].lru_itr.erase(it->second);
+    auto& entry = file_to_entry_map[it->first];
+    current_size -= entry.block_size[it->second];
+    // block_records values are RAW POINTERS to heap-allocated
+    // unordered_map<std::string, Record*>. Erasing the outer map entry
+    // only drops the pointer — without the explicit deletes below, the
+    // inner map AND every Record* inside it leak. Under workloads whose
+    // sstable working set exceeds `capacity`, this leaks at the full
+    // miss rate (hundreds of MB/sec once the cap is hit).
+    auto block_it = entry.block_records.find(it->second);
+    if (block_it != entry.block_records.end()) {
+      for (auto& kv : *block_it->second) {
+        delete kv.second;
+      }
+      delete block_it->second;
+      entry.block_records.erase(block_it);
+    }
+    entry.block_size.erase(it->second);
+    entry.lru_itr.erase(it->second);
     lru_list.pop_back();
   }
 }
@@ -333,14 +347,19 @@ void LRUCache::putLogRecords(std::string const& key, std::unordered_map<std::str
       }
       it->second.offset = offset;
       it->second.sealed = sealed;
+    } else {
+      // Another caller already advanced `offset` past ours. The caller
+      // transferred ownership of these Record*s to us, but we don't
+      // need them — free them instead of leaking. Under concurrent
+      // readDataLog calls for the same tail file (or a reader racing
+      // with putLogRecordSingle's entry creation) this branch fires
+      // for every lost race and would leak every parsed Record.
+      for (auto const& record : records) {
+        delete record.second;
+      }
     }
-    // updateLRU(key);
   } else {
     // Key does not exist, insert new entry
-    // if (lru_list.size() >= capacity) {
-    //   evict();
-    // }
-    // lru_list.push_front(key);
     CacheEntry entry(records, offset, sealed);
     file_to_entry_map[key] = entry;
   }
@@ -367,6 +386,29 @@ void LRUCache::putLogRecordSingle(std::string const& file_name, Record* record) 
   // cache is destroyed; this is the existing invariant and a broader
   // fix belongs in a separate change.
   it->second.records[record->key()] = record;
+}
+
+void LRUCache::invalidateLogFile(std::string const& file_name) {
+  std::unique_lock lock(mutex);
+  auto it = file_to_entry_map.find(file_name);
+  if (it == file_to_entry_map.end()) return;
+  for (auto& record : it->second.records) {
+    delete record.second;
+  }
+  // Log entries shouldn't carry sstable state, but clean up defensively.
+  for (auto& block : it->second.block_records) {
+    for (auto& record : *block.second) delete record.second;
+    delete block.second;
+    auto itr = it->second.lru_itr.find(block.first);
+    if (itr != it->second.lru_itr.end()) lru_list.erase(itr->second);
+    auto size_it = it->second.block_size.find(block.first);
+    if (size_it != it->second.block_size.end() &&
+        current_size >= size_it->second) {
+      current_size -= size_it->second;
+    }
+  }
+  if (it->second.table != nullptr) delete it->second.table;
+  file_to_entry_map.erase(it);
 }
 
 void LRUCache::snapshotLogFileRecords(std::string const& file_name,

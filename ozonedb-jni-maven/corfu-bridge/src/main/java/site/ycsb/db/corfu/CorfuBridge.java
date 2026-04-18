@@ -41,18 +41,14 @@ public class CorfuBridge {
   private volatile boolean closed = false;
 
   public CorfuBridge(String endpoint, String streamName) {
-    // maxCacheEntries default is 2500. For a shared-log workload
-    // producing millions of entries, a 2500-entry cache guarantees
-    // that any tailer more than ~2500 entries behind the stream tail
-    // falls into a cache-miss death spiral — every pollView.next()
-    // round-trips to the log unit server at 50–400 ms per entry and
-    // the gap grows faster than the tailer can shrink it. 5M entries
-    // gives us enough headroom to survive typical multi-writer bursts;
-    // at ~500 bytes/LogData in old-gen that's ~2.5 GiB, which fits in
-    // an 8 GiB client heap. Tune via -Xmx in corfu_jvm_opts.
+    // maxCacheEntries default is 2500 — too small, the tailer falls
+    // into a cache-miss spiral (50–400 ms/entry) as soon as it's more
+    // than 2500 behind the writer. 500K caps Corfu's ILogData LRU at
+    // ~500 MB (at ~1 KB/LogData) while leaving plenty of headroom for
+    // multi-writer bursts; tune via -Xmx in corfu_jvm_opts if needed.
     CorfuRuntimeParameters params = CorfuRuntimeParameters.builder()
         .cacheDisabled(false)
-        .maxCacheEntries(5_000_000L)
+        .maxCacheEntries(500_000L)
         .build();
     this.runtime = CorfuRuntime.fromParameters(params)
         .parseConfigurationString(endpoint)
@@ -168,6 +164,22 @@ public class CorfuBridge {
   /** @return the last known global log tail (for read-after-write waits). */
   public long tailAddress() {
     return runtime.getSequencerView().query().getSequence();
+  }
+
+  /**
+   * Prune the poll view's internal {@code resolvedQueue}/{@code readQueue}
+   * (TreeSet&lt;Long&gt;) of addresses strictly below {@code trimMark}. Without
+   * this, those queues grow by one Long per applied entry forever — a
+   * stream that has seen ~1M entries accumulates ~85 MB of TreeMap state.
+   *
+   * Corfu's {@code gc()} is two-phase: the first call records the trim mark,
+   * the next call (once the stream pointer has advanced past it) actually
+   * clears the queues. So we must call this repeatedly; one-shot doesn't
+   * prune. Safe to pass {@code lastAppliedAddress} as the trim mark — the
+   * tailer never re-reads already-applied addresses via this view.
+   */
+  public void gcPollView(long trimMark) {
+    pollView.gc(trimMark);
   }
 
   public void close() {

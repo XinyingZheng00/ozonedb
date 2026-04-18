@@ -183,6 +183,11 @@ class LRUCache {
   // key+file, it is deleted. Used by LogHandler to push freshly-written
   // records into the cache so LogKeyIndex can safely borrow the pointer.
   void putLogRecordSingle(std::string const& file_name, Record* record);
+  // Drop a log file's cache entry and free every Record* it owns.
+  // Called when a log file is compacted away. Caller MUST invalidate
+  // LogKeyIndex pointers for the same file before this runs, or a
+  // concurrent tryIndexLookup will dereference freed memory.
+  void invalidateLogFile(std::string const& file_name);
   // Copy the per-file records map (pointers only) into `out`. Cache
   // retains ownership of Record*. Used by LogKeyIndex::warm to seed
   // itself from already-cached log files on startup.

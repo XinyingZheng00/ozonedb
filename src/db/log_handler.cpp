@@ -242,9 +242,9 @@ Status LogHandler::warmKeyIndex() {
 }
 
 void LogHandler::invalidateCompactedLog(std::vector<std::string> const& files) {
-  if (!key_index_) return;
   for (auto const& f : files) {
-    key_index_->invalidateFile(f);
+    if (key_index_) key_index_->invalidateFile(f);
+    if (cache) cache->invalidateLogFile(f);
   }
 }
 
@@ -259,6 +259,7 @@ void LogHandler::onRemoteAppend(std::string const& file_name,
 
   if (op == RemoteOp::kRemove) {
     key_index_->invalidateFile(file_name);
+    if (cache) cache->invalidateLogFile(file_name);
     return;
   }
 

@@ -86,6 +86,7 @@ class CorfuDBStorage : public Storage {
   jmethodID mid_pollNext_ = nullptr;
   jmethodID mid_pollBatch_ = nullptr;
   jmethodID mid_tailAddress_ = nullptr;
+  jmethodID mid_gcPollView_ = nullptr;
   jmethodID mid_close_ = nullptr;
 
   // Per-file reconstructed state (populated by tailer)

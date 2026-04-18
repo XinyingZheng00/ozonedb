@@ -416,10 +416,16 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     this->log_handler->invalidateCompactedLog(log_inputs);
   }
 
-  // Step4: delete the input files: append to metadata log first, then delete
+  // Step4: delete the input files from storage. MUST run after the
+  // metadata log entry above is durable so replay can observe that the
+  // inputs are superseded by the output sstables. Without this, compacted
+  // log files and sstables are retained in the backend forever — for the
+  // Corfu backend that means unbounded growth in every process's
+  // file_buffers_ + LRUCache records (confirmed via heaptrack as the
+  // dominant sustained allocators). For local/disk backends it means
+  // disk-space exhaustion across long runs.
   for (auto const& input : compaction->task_id->input_files()) {
-    // std::cout << "Deleting " << input << std::endl;
-    // this->storage->remove(input);
+    this->storage->remove(input);
   }
   compaction->finished = true;
   std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
