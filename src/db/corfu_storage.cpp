@@ -13,6 +13,13 @@ namespace ozonedb {
 namespace {
 constexpr char const* kBridgeClass = "site/ycsb/db/corfu/CorfuBridge";
 constexpr long kPollTimeoutMs = 100;
+// Max entries per pollBatch JNI round-trip. Bigger amortizes JNI and
+// Java-side fixed overhead over more entries, smaller bounds the time
+// we spend out of the running_ check. 256 is a compromise: with a
+// warm Corfu cache (~1 ms/entry) one batch takes ~256 ms worst case;
+// with a cold cache (50-400 ms/entry) we'll return partial batches
+// via the in-Java short-circuit.
+constexpr int kPollBatchSize = 256;
 
 std::vector<std::string> splitJvmOpts(std::string const& opts) {
   std::vector<std::string> out;
@@ -185,9 +192,10 @@ void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& 
 
   mid_append_ = env->GetMethodID(bridge_class_global_, "append", "([B)J");
   mid_pollNext_ = env->GetMethodID(bridge_class_global_, "pollNext", "(J)[B");
+  mid_pollBatch_ = env->GetMethodID(bridge_class_global_, "pollBatch", "(JI)[B");
   mid_tailAddress_ = env->GetMethodID(bridge_class_global_, "tailAddress", "()J");
   mid_close_ = env->GetMethodID(bridge_class_global_, "close", "()V");
-  if (!mid_append_ || !mid_pollNext_ || !mid_tailAddress_ || !mid_close_) {
+  if (!mid_append_ || !mid_pollNext_ || !mid_pollBatch_ || !mid_tailAddress_ || !mid_close_) {
     throw std::runtime_error("CorfuBridge method lookup failed");
   }
 }
@@ -217,23 +225,16 @@ long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, i
   return static_cast<long>(addr);
 }
 
-bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
-  jsize len = env->GetArrayLength(jbuf);
-  if (len < 8) {
-    env->DeleteLocalRef(jbuf);
-    return false;
-  }
-  std::vector<unsigned char> raw(len);
-  env->GetByteArrayRegion(jbuf, 0, len, reinterpret_cast<jbyte*>(raw.data()));
-  env->DeleteLocalRef(jbuf);
+bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
+  if (len < 8) return false;
 
   long addr = 0;
   for (int i = 0; i < 8; ++i) {
-    addr = (addr << 8) | raw[i];
+    addr = (addr << 8) | data[i];
   }
 
   ::CorfuEntry entry;
-  if (!entry.ParseFromArray(raw.data() + 8, static_cast<int>(raw.size() - 8))) {
+  if (!entry.ParseFromArray(data + 8, static_cast<int>(len - 8))) {
     std::cerr << "[corfu] failed to parse entry at addr=" << addr << "\n";
     return false;
   }
@@ -314,6 +315,63 @@ bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
   return true;
 }
 
+bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
+  jsize len = env->GetArrayLength(jbuf);
+  if (len < 8) {
+    env->DeleteLocalRef(jbuf);
+    return false;
+  }
+  std::vector<unsigned char> raw(len);
+  env->GetByteArrayRegion(jbuf, 0, len, reinterpret_cast<jbyte*>(raw.data()));
+  env->DeleteLocalRef(jbuf);
+  return applyEntryBytes(raw.data(), raw.size());
+}
+
+// Parse the pollBatch wire format (big-endian int32 count followed by
+// `count` length-prefixed entries, each in the same addr+payload
+// layout as pollNext) and apply each entry. This is the steady-state
+// tailer hot path — a single JNI crossing delivers up to
+// kPollBatchSize entries, amortizing JNI+Java fixed overhead across
+// the batch and letting a healthy Corfu client cache stream entries
+// at tens-of-thousands per second.
+int CorfuDBStorage::applyBatchFromJava(JNIEnv* env, jbyteArray jbuf) {
+  jsize total_len = env->GetArrayLength(jbuf);
+  if (total_len < 4) {
+    env->DeleteLocalRef(jbuf);
+    return 0;
+  }
+  std::vector<unsigned char> raw(total_len);
+  env->GetByteArrayRegion(jbuf, 0, total_len,
+                          reinterpret_cast<jbyte*>(raw.data()));
+  env->DeleteLocalRef(jbuf);
+
+  size_t pos = 0;
+  auto read_be32 = [&]() -> int32_t {
+    uint32_t v = (static_cast<uint32_t>(raw[pos]) << 24) |
+                 (static_cast<uint32_t>(raw[pos + 1]) << 16) |
+                 (static_cast<uint32_t>(raw[pos + 2]) << 8) |
+                 static_cast<uint32_t>(raw[pos + 3]);
+    pos += 4;
+    return static_cast<int32_t>(v);
+  };
+
+  int32_t count = read_be32();
+  int applied = 0;
+  for (int i = 0; i < count; ++i) {
+    if (pos + 4 > raw.size()) break;
+    int32_t entry_len = read_be32();
+    if (entry_len < 0 ||
+        pos + static_cast<size_t>(entry_len) > raw.size()) {
+      break;  // truncated / malformed — drop the rest of the batch
+    }
+    if (applyEntryBytes(raw.data() + pos, static_cast<size_t>(entry_len))) {
+      ++applied;
+    }
+    pos += entry_len;
+  }
+  return applied;
+}
+
 void CorfuDBStorage::drainInitialEntries() {
   JNIEnv* env = attachThread();
   if (!env) return;
@@ -340,16 +398,50 @@ void CorfuDBStorage::tailerLoop() {
     std::cerr << "[corfu] tailer failed to attach JVM thread\n";
     return;
   }
+  // Diagnostic counters — 1-second rolling window. rate = entries
+  // applied per second, gap = how many Corfu addresses behind our
+  // own last local write we are. A growing gap means production
+  // outpaces the tailer; a frozen `applied` for seconds means the
+  // tailer is blocked (likely inside pollView.next()). Leave in
+  // place during multi-writer diagnosis; remove once stable.
+  auto stat_window_start = std::chrono::steady_clock::now();
+  uint64_t stat_entries = 0;
   while (running_) {
+    auto poll_before = std::chrono::steady_clock::now();
     jbyteArray jbuf = static_cast<jbyteArray>(
-        env->CallObjectMethod(bridge_global_, mid_pollNext_, static_cast<jlong>(kPollTimeoutMs)));
+        env->CallObjectMethod(bridge_global_, mid_pollBatch_,
+                              static_cast<jlong>(kPollTimeoutMs),
+                              static_cast<jint>(kPollBatchSize)));
+    auto poll_after = std::chrono::steady_clock::now();
+    auto poll_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                       poll_after - poll_before)
+                       .count();
+    // Only log unusually-slow polls (>50 ms) so steady-state runs
+    // don't drown in output. A null jbuf with poll_us ~ 100 ms is
+    // just the timeout; log "null=1" so we can tell at a glance.
+    if (poll_us > 50000) {
+      std::cerr << "[corfu-tailer] slow pollBatch " << poll_us << "us null="
+                << (jbuf == nullptr ? 1 : 0) << "\n";
+    }
     if (env->ExceptionCheck()) {
       env->ExceptionDescribe();
       env->ExceptionClear();
       continue;
     }
-    if (jbuf == nullptr) continue;  // timeout
-    applyEntryFromJava(env, jbuf);
+    if (jbuf != nullptr) {
+      stat_entries += applyBatchFromJava(env, jbuf);
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now - stat_window_start >= std::chrono::seconds(1)) {
+      long applied_now = last_applied_addr_.load(std::memory_order_acquire);
+      long written_now = last_written_addr_.load(std::memory_order_acquire);
+      std::cerr << "[corfu-tailer] applied=" << applied_now
+                << " written=" << written_now
+                << " gap=" << (written_now - applied_now)
+                << " rate=" << stat_entries << "/s\n";
+      stat_window_start = now;
+      stat_entries = 0;
+    }
   }
   detachThread();
 }

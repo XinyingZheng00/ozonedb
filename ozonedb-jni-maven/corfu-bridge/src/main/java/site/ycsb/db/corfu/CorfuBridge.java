@@ -1,6 +1,8 @@
 package site.ycsb.db.corfu;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 import org.corfudb.protocols.wireprotocol.ILogData;
@@ -39,7 +41,19 @@ public class CorfuBridge {
   private volatile boolean closed = false;
 
   public CorfuBridge(String endpoint, String streamName) {
-    CorfuRuntimeParameters params = CorfuRuntimeParameters.builder().build();
+    // maxCacheEntries default is 2500. For a shared-log workload
+    // producing millions of entries, a 2500-entry cache guarantees
+    // that any tailer more than ~2500 entries behind the stream tail
+    // falls into a cache-miss death spiral — every pollView.next()
+    // round-trips to the log unit server at 50–400 ms per entry and
+    // the gap grows faster than the tailer can shrink it. 5M entries
+    // gives us enough headroom to survive typical multi-writer bursts;
+    // at ~500 bytes/LogData in old-gen that's ~2.5 GiB, which fits in
+    // an 8 GiB client heap. Tune via -Xmx in corfu_jvm_opts.
+    CorfuRuntimeParameters params = CorfuRuntimeParameters.builder()
+        .cacheDisabled(false)
+        .maxCacheEntries(5_000_000L)
+        .build();
     this.runtime = CorfuRuntime.fromParameters(params)
         .parseConfigurationString(endpoint)
         .connect();
@@ -92,6 +106,63 @@ public class CorfuBridge {
       }
     }
     return null;
+  }
+
+  /**
+   * Batched variant of pollNext. Fetches up to {@code maxEntries}
+   * entries in a single JNI round-trip, amortizing the cross-language
+   * and pollView.next() fixed overhead across many log entries. Under
+   * warm-cache steady state this gives the tailer roughly a 10–50x
+   * higher entry-apply rate than per-call pollNext.
+   *
+   * Wire format (big-endian, mirrors Java DataOutputStream):
+   *   int32  count
+   *   count × (int32 entryLen, entryLen bytes same-as-pollNext-payload)
+   *
+   * @return {@code null} if no entries were available before
+   *         {@code timeoutMs} elapsed; otherwise a length-prefixed
+   *         concatenation of 1..maxEntries entries.
+   */
+  public byte[] pollBatch(long timeoutMs, int maxEntries) {
+    long deadline = System.currentTimeMillis() + timeoutMs;
+    List<byte[]> batch = new ArrayList<>(Math.min(maxEntries, 256));
+    while (!closed && batch.size() < maxEntries) {
+      ILogData data = pollView.next();
+      if (data == null) {
+        // No entry ready right now. If we already have some, return
+        // them immediately — holding them back to pad a full batch
+        // adds latency for no throughput gain.
+        if (!batch.isEmpty()) break;
+        if (System.currentTimeMillis() >= deadline) return null;
+        try {
+          Thread.sleep(5);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return null;
+        }
+        continue;
+      }
+      long addr = data.getGlobalAddress();
+      Object raw = data.getPayload(runtime);
+      if (!(raw instanceof byte[])) {
+        continue;  // skip foreign entries on a mixed stream
+      }
+      byte[] payload = (byte[]) raw;
+      ByteBuffer entry = ByteBuffer.allocate(8 + payload.length);
+      entry.putLong(addr);
+      entry.put(payload);
+      batch.add(entry.array());
+    }
+    if (batch.isEmpty()) return null;
+    int totalLen = 4;  // count header
+    for (byte[] e : batch) totalLen += 4 + e.length;
+    ByteBuffer out = ByteBuffer.allocate(totalLen);
+    out.putInt(batch.size());
+    for (byte[] e : batch) {
+      out.putInt(e.length);
+      out.put(e);
+    }
+    return out.array();
   }
 
   /** @return the last known global log tail (for read-after-write waits). */

@@ -84,6 +84,7 @@ class CorfuDBStorage : public Storage {
   jclass bridge_class_global_ = nullptr;
   jmethodID mid_append_ = nullptr;
   jmethodID mid_pollNext_ = nullptr;
+  jmethodID mid_pollBatch_ = nullptr;
   jmethodID mid_tailAddress_ = nullptr;
   jmethodID mid_close_ = nullptr;
 
@@ -172,6 +173,14 @@ class CorfuDBStorage : public Storage {
   long jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
                       unsigned char const* data, int length);
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
+  // Core apply logic, takes already-JNI-extracted bytes. Shared by
+  // applyEntryFromJava (single-entry path, kept for drainInitialEntries)
+  // and applyBatchFromJava (steady-state path driven by pollBatch).
+  bool applyEntryBytes(unsigned char const* data, size_t len);
+  // Parse a pollBatch-formatted byte array (big-endian count +
+  // length-prefixed entries) and apply each via applyEntryBytes.
+  // Returns the number of entries successfully applied.
+  int applyBatchFromJava(JNIEnv* env, jbyteArray jbuf);
   void drainInitialEntries();
   void tailerLoop();
   void dispatchLoop();
