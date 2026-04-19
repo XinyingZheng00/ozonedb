@@ -5,26 +5,26 @@ local:
     key_size:
       - "1KB"
     db_name:
-      - "rocksdb"
+      # - "rocksdb"
       - "ozonedb"
-      - "sqlite"
-      - "raw_sync_io"
+      # - "sqlite"
+      # - "hctree"
     repeated: 1
-    ycsb_data_path: "/tank/ycsb_data"
+    ycsb_data_path: "/data/ycsb_data"
     threads: 
-      - 1
+      # - 1
       # - 4
       # - 8
-      # - 16
+      - 16
       # - 32
       # - 64
   run:
+    run_duration_sec: 300
     workload_name:
       - "a"
-      # - "b"
-      # - "c"
-      # - "d"
-      # - "f"
+      - "b"
+      - "c"
+      - "f"
     operation_cnt:
       - 1000000
     record_cnt: 1000000
@@ -36,8 +36,14 @@ local:
       # - "rocksdb"
     threads: 
       - 1
-    repeated: 1
-    ycsb_data_path: "/tank/ycsb_data"
+      # - 2
+      # - 4
+      # - 8
+      # - 16
+      # - 32
+      # - 64
+    repeated: 3
+    ycsb_data_path: "/data/ycsb_data"
 
 cloud:
   load:
@@ -49,6 +55,7 @@ cloud:
     ycsb_data_path: "ycsb-data"
     threads: 8
   run:
+    run_duration_sec: 60
     workload_name:
       - "c"
     operation_cnt:

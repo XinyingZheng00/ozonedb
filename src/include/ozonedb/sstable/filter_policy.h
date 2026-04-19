@@ -17,6 +17,7 @@
 #define STORAGE_OZONEDB_INCLUDE_FILTER_POLICY_H_
 
 #include <string>
+#include <cstdint>
 #ifndef FALLTHROUGH_INTENDED
 #define FALLTHROUGH_INTENDED \
   do {                       \
