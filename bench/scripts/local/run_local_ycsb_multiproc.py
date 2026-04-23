@@ -4,12 +4,10 @@ import argparse
 import yaml
 import time
 
-from load_local_ycsb import (
-    generate_config_for_ozonedb_local,
-    corfu_bridge_jar_path,
-)
+from load_local_ycsb import corfu_bridge_jar_path
 from load_local_ycsb_multiproc import (
     _make_corfu_config_per_writer,
+    _make_local_config_per_writer,
     _resolve_binding,
     _resolve_ycsb_classpath,
     _java_binary,
@@ -24,15 +22,26 @@ Multi-process YCSB runner that emulates distributed readers/writers by
 spawning N YCSB processes in parallel against the dataset loaded by
 load_local_ycsb_multiproc.py.
 
-Operation space is split across writers: each process executes
-operationcount / N operations over the full recordcount key range.
-For ozonedb-corfu all processes share the Corfu stream; for other
-backends each process reads from its own per-writer cached dir.
+Operation space is split across total_writers: each process executes
+operationcount / total_writers operations over the full recordcount
+key range. For ozonedb-corfu all processes share the Corfu stream;
+for other backends each process reads from its own per-writer cached
+dir keyed by the global writer index.
 
-After all processes exit, per-writer results are aggregated into:
-  {ks}-{opcnt}-{rc}-workload{w}-{db}_agg_w{N}_t{thread}.result
+For multi-machine runs, pass --offset (starting writer index for
+this machine) and --total_writers (total writers across all
+machines). This machine runs writer indices [offset, offset +
+num_writers). Defaults (offset=0, total_writers=num_writers) match
+the original single-machine behavior.
 
-Set `num_writers` under `local.run` in ycsb.yaml, or pass --num_writers.
+Per-writer results are written as:
+  {ks}-{opcnt}-{rc}-workload{w}-{db}_w{writer_idx}of{total}_t{thread}.result
+Aggregate is:
+  ..._agg_w{total}_t{thread}.result                        (single-machine)
+  ..._agg_w{num}of{total}_off{offset}_t{thread}.result     (partial / multi-machine)
+
+Set `num_writers`, `offset`, `total_writers` under `local.run` in
+ycsb.yaml, or pass the matching --flags.
 """
 
 ozonedb_home = os.environ.get("OZONEDB_HOME")
@@ -48,6 +57,8 @@ def run_ycsb(
     ycsb_data_path,
     threads,
     num_writers,
+    offset=0,
+    total_writers=None,
     corfu_settings=None,
     s3_settings=None,
     max_exec_time=None,
@@ -56,6 +67,15 @@ def run_ycsb(
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
     if num_writers < 1:
         raise ValueError("num_writers must be >= 1")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if total_writers is None:
+        total_writers = num_writers
+    if total_writers < offset + num_writers:
+        raise ValueError(
+            f"total_writers ({total_writers}) must be >= offset + num_writers "
+            f"({offset} + {num_writers} = {offset + num_writers})"
+        )
 
     record_cnt = str(record_cnt)
     total_records = int(record_cnt)
@@ -67,7 +87,8 @@ def run_ycsb(
     for each_operation_cnt in operation_cnts:
         each_operation_cnt = str(each_operation_cnt)
         total_ops = int(each_operation_cnt)
-        op_partitions = partition_records(total_ops, num_writers)
+        op_partitions = partition_records(total_ops, total_writers)
+        local_partitions = op_partitions[offset : offset + num_writers]
 
         for each_key_size in key_size:
             for workload_name in workload_names:
@@ -106,7 +127,8 @@ def run_ycsb(
                         for thread in thread_list:
                             jobs = []
                             per_writer_files = []
-                            for writer_idx, (_, writer_ops) in enumerate(op_partitions):
+                            for local_idx, (_, writer_ops) in enumerate(local_partitions):
+                                writer_idx = offset + local_idx
                                 cached_data_path = os.path.join(
                                     ycsb_data_path,
                                     f"cached_data-{db_name}-{each_key_size}-{record_cnt}-w{writer_idx}/",
@@ -131,25 +153,31 @@ def run_ycsb(
                                     os.makedirs(run_data_path, exist_ok=True)
 
                                 ycsb_props = [
-                                    "-threads", thread,
+                                    "-threads",
+                                    thread,
                                     "-s",
-                                    "-P", workload_path,
-                                    "-p", f"recordcount={total_records}",
-                                    "-p", f"operationcount={writer_ops}",
-                                    "-p", "status.interval=1",
+                                    "-P",
+                                    workload_path,
+                                    "-p",
+                                    f"recordcount={total_records}",
+                                    "-p",
+                                    f"operationcount={writer_ops}",
+                                    "-p",
+                                    "status.interval=1",
                                 ]
                                 if max_exec_time:
                                     ycsb_props += [
-                                        "-p", f"maxexecutiontime={int(max_exec_time)}"
+                                        "-p",
+                                        f"maxexecutiontime={int(max_exec_time)}",
                                     ]
                                 extra_cp_entries = []
 
                                 if db_name == "rocksdb":
-                                    ycsb_props += [
-                                        "-p", f"rocksdb.dir={run_data_path}"
-                                    ]
+                                    ycsb_props += ["-p", f"rocksdb.dir={run_data_path}"]
                                 elif db_name == "ozonedb":
-                                    cfg = generate_config_for_ozonedb_local(run_data_path)
+                                    cfg = _make_local_config_per_writer(
+                                        writer_idx, run_data_path
+                                    )
                                     ycsb_props += ["-p", f"shared_config={cfg}"]
                                 elif db_name == "ozonedb-corfu":
                                     cfg = _make_corfu_config_per_writer(
@@ -185,9 +213,11 @@ def run_ycsb(
                                 cmd = (
                                     [
                                         java_bin,
-                                        "-cp", full_cp,
+                                        "-cp",
+                                        full_cp,
                                         "site.ycsb.Client",
-                                        "-db", db_classname,
+                                        "-db",
+                                        db_classname,
                                     ]
                                     + ycsb_props
                                     + ["-t"]
@@ -195,7 +225,7 @@ def run_ycsb(
 
                                 result_file = os.path.join(
                                     result_path,
-                                    f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_w{writer_idx}of{num_writers}_t{thread}.result",
+                                    f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_w{writer_idx}of{total_writers}_t{thread}.result",
                                 )
                                 jobs.append((cmd, result_file))
                                 per_writer_files.append(result_file)
@@ -209,15 +239,22 @@ def run_ycsb(
                             if any(r != 0 for r in rcs):
                                 print(f"[warning] writer return codes: {rcs}")
 
+                            if num_writers == total_writers and offset == 0:
+                                agg_tag = f"_agg_w{total_writers}"
+                            else:
+                                agg_tag = (
+                                    f"_agg_w{num_writers}of{total_writers}_off{offset}"
+                                )
                             agg_file = os.path.join(
                                 result_path,
-                                f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_agg_w{num_writers}_t{thread}.result",
+                                f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}{agg_tag}_t{thread}.result",
                             )
                             write_aggregate(
                                 agg_file, per_writer_files, wall_ms, num_writers
                             )
 
-                            for writer_idx in range(num_writers):
+                            for local_idx in range(num_writers):
+                                writer_idx = offset + local_idx
                                 run_data_path = os.path.join(
                                     ycsb_data_path,
                                     f"{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}-w{writer_idx}/",
@@ -248,6 +285,18 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated workload letters (overrides local.run.workload_name).",
     )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=None,
+        help="Starting writer index for this machine (overrides local.run.offset, default 0).",
+    )
+    parser.add_argument(
+        "--total_writers",
+        type=int,
+        default=None,
+        help="Total writer count across all machines (overrides local.run.total_writers, default = num_writers).",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -269,11 +318,24 @@ if __name__ == "__main__":
         if args.num_writers is not None
         else run_config.get("num_writers", 2)
     )
+    offset = (
+        args.offset
+        if args.offset is not None
+        else run_config.get("offset", 0)
+    )
+    total_writers = (
+        args.total_writers
+        if args.total_writers is not None
+        else run_config.get("total_writers", num_writers)
+    )
     corfu_settings = config.get("corfu")
     s3_settings = config.get("s3")
     max_exec_time = run_config.get("max_exec_time")
 
-    print(f"Launching {num_writers} parallel runner processes")
+    print(
+        f"Launching {num_writers} parallel runner processes "
+        f"(offset={offset}, total_writers={total_writers})"
+    )
     run_ycsb(
         workload_names,
         record_cnts,
@@ -284,7 +346,9 @@ if __name__ == "__main__":
         ycsb_data_path,
         threads,
         num_writers,
-        corfu_settings,
-        s3_settings,
-        max_exec_time,
+        offset=offset,
+        total_writers=total_writers,
+        corfu_settings=corfu_settings,
+        s3_settings=s3_settings,
+        max_exec_time=max_exec_time,
     )

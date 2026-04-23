@@ -122,7 +122,7 @@ start_corfu() {
   # the subshell would wait synchronously on corfu_server, holding ssh's
   # stdout/stderr pipes open, and ssh would hang forever.
   remote_sh "cd $CORFU_DIR && rm -rf /data/run_batch/corfu && cp -r /data/load_batch/corfu /data/run_batch && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /data/run_batch -s -a $REMOTE_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
-  sleep 2
+  sleep 10
   remote_sh "pgrep -af 'org.corfudb.infrastructure.CorfuServer' | head -n1 || echo '[corfu] WARNING: no CorfuServer process found after start'"
 }
 

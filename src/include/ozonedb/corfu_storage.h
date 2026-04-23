@@ -73,7 +73,7 @@ class CorfuDBStorage : public Storage {
     // be a use-after-free. Draining here closes that window.
     if (cleared) drainDispatchQueue();
   }
-  int commit_interval_ = 10;
+  int commit_interval_ = 0;
   bool sync_mode_ = false;
 
  private:

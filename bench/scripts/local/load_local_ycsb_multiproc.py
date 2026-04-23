@@ -8,10 +8,7 @@ import sqlite3
 import time
 from datetime import datetime
 
-from load_local_ycsb import (
-    generate_config_for_ozonedb_local,
-    corfu_bridge_jar_path,
-)
+from load_local_ycsb import corfu_bridge_jar_path
 
 """
 Multi-process YCSB loader that emulates multiple distributed writers by
@@ -171,6 +168,31 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         json.dump(data, f, indent=4)
     print(
         f"[writer {writer_idx}] corfu config written: {out_json} (db_path={db_path})"
+    )
+    return out_json
+
+
+def _make_local_config_per_writer(writer_idx, db_path):
+    """Write a per-writer shared_config_w{i}.json for the local-FS backend.
+
+    Parallel writers must each get their own config file — otherwise they
+    race on a single shared_config.json and all end up pointed at whichever
+    db_path was written last.
+    """
+    base_json = os.path.join(
+        ozonedb_home, "src/config/local/shared_config_base.json"
+    )
+    out_json = os.path.join(
+        ozonedb_home, f"src/config/local/shared_config_w{writer_idx}.json"
+    )
+    with open(base_json, "r") as f:
+        data = json.load(f)
+    data["db_path"] = db_path
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
+    with open(out_json, "w") as f:
+        json.dump(data, f, indent=4)
+    print(
+        f"[writer {writer_idx}] local config written: {out_json} (db_path={db_path})"
     )
     return out_json
 
@@ -424,8 +446,8 @@ def load_ycsb(
                                     "-p", f"rocksdb.dir={per_writer_data_path}"
                                 ]
                             elif db_name == "ozonedb":
-                                cfg = generate_config_for_ozonedb_local(
-                                    per_writer_data_path
+                                cfg = _make_local_config_per_writer(
+                                    writer_idx, per_writer_data_path
                                 )
                                 ycsb_props += ["-p", f"shared_config={cfg}"]
                             elif db_name == "ozonedb-corfu":
