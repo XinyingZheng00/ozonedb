@@ -33,6 +33,7 @@ import numpy as np
 
 
 THROUGHPUT_RE = re.compile(r"\[OVERALL\],\s*Throughput\(ops/sec\),\s*([0-9]+(?:\.[0-9]+)?)")
+HCTREE_THROUGHPUT_RE = re.compile(r"^Run throughput\(ops/sec\):\s*([0-9]+(?:\.[0-9]+)?)", re.MULTILINE)
 WORKLOAD_RE = re.compile(r"(workload[a-z])", re.IGNORECASE)
 
 # Tries a few common patterns for writer/thread count in filenames.
@@ -45,11 +46,14 @@ WRITER_PATTERNS = [
 
 # Adjust this mapping if your actual filenames use different system tags.
 SYSTEM_ALIASES = {
-    "ozonedb": "ozonedb"
+    "ozonedb": "ozonedb",
+    "hctree": "hctree",
+    "bcw2": "bcw2",
+    "rocksdb": "rocksdb",
 }
 
 DEFAULT_WORKLOAD_ORDER = ["workloada", "workloadb", "workloadc", "workloadd", "workloadf"]
-DEFAULT_SYSTEM_ORDER = ["ozonedb", "hctree"]
+DEFAULT_SYSTEM_ORDER = ["ozonedb", "hctree", "bcw2", "rocksdb"]
 
 
 def extract_writer_count(stem: str) -> int:
@@ -78,11 +82,35 @@ def extract_system(stem: str) -> str:
     )
 
 
-def parse_throughput_runs(result_file: Path) -> List[float]:
+def parse_ozonekv_result(result_file: Path) -> List[float]:
     text = result_file.read_text(encoding="utf-8", errors="replace")
     values = [float(x) for x in THROUGHPUT_RE.findall(text)]
     if not values:
         raise ValueError(f"No throughput lines found in file: {result_file}")
+    return values
+
+
+def parse_hctree_result(result_file: Path) -> List[float]:
+    text = result_file.read_text(encoding="utf-8", errors="replace")
+    values = [float(x) for x in HCTREE_THROUGHPUT_RE.findall(text)]
+    if not values:
+        raise ValueError(f"No 'Run throughput(ops/sec)' lines found in file: {result_file}")
+    return values
+
+
+def parse_bcw2_result(result_file: Path) -> List[float]:
+    text = result_file.read_text(encoding="utf-8", errors="replace")
+    values = [float(x) for x in HCTREE_THROUGHPUT_RE.findall(text)]
+    if not values:
+        raise ValueError(f"No 'Run throughput(ops/sec)' lines found in file: {result_file}")
+    return values
+
+
+def parse_rocksdb_result(result_file: Path) -> List[float]:
+    text = result_file.read_text(encoding="utf-8", errors="replace")
+    values = [float(x) for x in HCTREE_THROUGHPUT_RE.findall(text)]
+    if not values:
+        raise ValueError(f"No 'Run throughput(ops/sec)' lines found in file: {result_file}")
     return values
 
 
@@ -91,7 +119,14 @@ def summarize_result_file(result_file: Path) -> Tuple[str, str, int, List[float]
     workload = extract_workload(stem)
     system = extract_system(stem)
     writers = extract_writer_count(stem)
-    runs = parse_throughput_runs(result_file)
+    if system == "hctree":
+        runs = parse_hctree_result(result_file)
+    elif system == "bcw2":
+        runs = parse_bcw2_result(result_file)
+    elif system == "rocksdb":
+        runs = parse_rocksdb_result(result_file)
+    else:
+        runs = parse_ozonekv_result(result_file)
 
     avg = mean(runs)
     std = stdev(runs) if len(runs) > 1 else 0.0
@@ -202,13 +237,26 @@ def make_plot(
         ax.set_yscale("log")
         ax.grid(True, axis="y", linestyle="--", alpha=0.35)
 
-        # Hide empty legend duplicates later by only showing where there is data.
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend()
+    # Collect handles/labels from the first populated subplot for the shared legend.
+    shared_handles, shared_labels = [], []
+    for ax in axes_flat:
+        h, l = ax.get_legend_handles_labels()
+        if h:
+            shared_handles, shared_labels = h, l
+            break
 
-    for idx in range(n_panels, len(axes_flat)):
-        axes_flat[idx].axis("off")
+    # Hide empty subplots, then place the shared legend inside the last empty one.
+    empty_axes = list(axes_flat[n_panels:])
+    for ax in empty_axes:
+        ax.axis("off")
+    if shared_handles and empty_axes:
+        empty_axes[-1].legend(
+            shared_handles,
+            shared_labels,
+            loc="center",
+            fontsize="large",
+            frameon=True,
+        )
 
     fig.suptitle(title)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
