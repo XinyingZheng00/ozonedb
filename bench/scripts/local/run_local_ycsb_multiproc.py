@@ -3,6 +3,7 @@ import os
 import argparse
 import yaml
 import time
+from datetime import datetime
 
 from load_local_ycsb import corfu_bridge_jar_path
 from load_local_ycsb_multiproc import (
@@ -62,6 +63,7 @@ def run_ycsb(
     corfu_settings=None,
     s3_settings=None,
     max_exec_time=None,
+    trial=1,
 ):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
@@ -69,6 +71,8 @@ def run_ycsb(
         raise ValueError("num_writers must be >= 1")
     if offset < 0:
         raise ValueError("offset must be >= 0")
+    if trial < 1:
+        raise ValueError("trial must be >= 1")
     if total_writers is None:
         total_writers = num_writers
     if total_writers < offset + num_writers:
@@ -80,7 +84,12 @@ def run_ycsb(
     record_cnt = str(record_cnt)
     total_records = int(record_cnt)
     ycsb_path = os.path.join(ozonedb_home, "ycsb")
-    result_path = os.path.join(ozonedb_home, "bench", "results/local")
+    run_tag = os.environ.get("OZONEDB_RUN_TAG") or datetime.now().strftime(
+        "%Y%m%d-%H%M%S"
+    )
+    result_path = os.path.join(ozonedb_home, "bench", "results/local", run_tag)
+    os.makedirs(result_path, exist_ok=True)
+    print(f"[results] writing to {result_path}")
     script_path = os.path.join(ozonedb_home, "bench", "scripts")
 
     os.chdir(ycsb_path)
@@ -125,6 +134,10 @@ def run_ycsb(
 
                     for _round in range(repeated):
                         for thread in thread_list:
+                            print(
+                                f"[trial {trial}] "
+                                f"workload={workload_name} db={db_name} thread={thread}"
+                            )
                             jobs = []
                             per_writer_files = []
                             for local_idx, (_, writer_ops) in enumerate(local_partitions):
@@ -225,7 +238,7 @@ def run_ycsb(
 
                                 result_file = os.path.join(
                                     result_path,
-                                    f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_w{writer_idx}of{total_writers}_t{thread}.result",
+                                    f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_w{writer_idx}of{total_writers}_t{thread}_trial{trial}.result",
                                 )
                                 jobs.append((cmd, result_file))
                                 per_writer_files.append(result_file)
@@ -247,7 +260,7 @@ def run_ycsb(
                                 )
                             agg_file = os.path.join(
                                 result_path,
-                                f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}{agg_tag}_t{thread}.result",
+                                f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}{agg_tag}_t{thread}_trial{trial}.result",
                             )
                             write_aggregate(
                                 agg_file, per_writer_files, wall_ms, num_writers
@@ -297,6 +310,12 @@ if __name__ == "__main__":
         default=None,
         help="Total writer count across all machines (overrides local.run.total_writers, default = num_writers).",
     )
+    parser.add_argument(
+        "--trial",
+        type=int,
+        default=None,
+        help="Trial index (>=1) to tag this run's result files as _trial{N}. Caller should drive the trial loop; this script runs one trial per invocation (overrides local.run.trial, default 1).",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -331,10 +350,15 @@ if __name__ == "__main__":
     corfu_settings = config.get("corfu")
     s3_settings = config.get("s3")
     max_exec_time = run_config.get("max_exec_time")
+    trial = (
+        args.trial
+        if args.trial is not None
+        else run_config.get("trial", 1)
+    )
 
     print(
         f"Launching {num_writers} parallel runner processes "
-        f"(offset={offset}, total_writers={total_writers})"
+        f"(offset={offset}, total_writers={total_writers}, trial={trial})"
     )
     run_ycsb(
         workload_names,
@@ -351,4 +375,5 @@ if __name__ == "__main__":
         corfu_settings=corfu_settings,
         s3_settings=s3_settings,
         max_exec_time=max_exec_time,
+        trial=trial,
     )

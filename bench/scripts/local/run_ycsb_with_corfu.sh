@@ -4,13 +4,18 @@ set -euo pipefail
 # Orchestrate a Corfu server on a remote node while sweeping YCSB workloads
 # and writer-process counts on this machine.
 #
+# Loop order: trials -> workloads -> writers. Corfu is restarted on every
+# (trial, workload, writers) iteration. All iterations share a single
+# OZONEDB_RUN_TAG so their result files land under one timestamped dir.
+#
 # Per iteration:
 #   1. start corfu on $REMOTE_HOST:
-#        cd $CORFU_DIR && rm -rf /data/run_batch/corfu \
-#          && cp -r /data/load_batch/corfu /data/run_batch \
+#        cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/corfu \
+#          && cp -r /mnt/corfu/load/corfu /mnt/corfu/run_batch \
 #          && JAVA_ARGS="-Xmx120g" ./bin/corfu_server \
-#                 -l /data/run_batch -s -a $REMOTE_HOST $CORFU_PORT
-#   2. run run_local_ycsb_multiproc.py with --workloads=<wl> --num_writers=<n>
+#                 -l /mnt/corfu/run_batch -s -a $REMOTE_HOST $CORFU_PORT
+#   2. run run_local_ycsb_multiproc.py with
+#      --workloads=<wl> --num_writers=<n> --trial=<k>
 #   3. stop corfu
 # After the full sweep, corfu is started one more time (so the node is left
 # ready for a subsequent manual run).
@@ -22,14 +27,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export OZONEDB_HOME
 
 CONFIG="${OZONEDB_HOME}/bench/scripts/config/ycsb.yaml"
-REMOTE_HOST="10.10.1.2"
+REMOTE_HOST="10.10.1.1"
 REMOTE_USER="${SSH_USER:-$USER}"
-SSH_KEY=""
+SSH_KEY="~/.ssh/cloudlab"
 CORFU_DIR="~/CorfuDB"
-CORFU_PORT=9000
+CORFU_PORT=9090
 CORFU_LOG="/tmp/corfu_server.log"
 WORKLOADS="a b c d f"
 WRITERS_LIST="1 2 4 8"
+TRIALS=1
 
 usage() {
   cat <<EOF
@@ -45,6 +51,8 @@ Usage: $(basename "$0") [options]
                         (default: "$WORKLOADS")
   --writers-list "1 2"  space-separated num_writers values to sweep
                         (default: "$WRITERS_LIST")
+  --trials N            number of trials per (workload, writers) iteration
+                        (default: $TRIALS)
   -h | --help
 EOF
 }
@@ -83,6 +91,10 @@ while [[ $# -gt 0 ]]; do
     WRITERS_LIST="$2"
     shift 2
     ;;
+  --trials)
+    TRIALS="$2"
+    shift 2
+    ;;
   -h | --help)
     usage
     exit 0
@@ -99,6 +111,10 @@ read -r -a WORKLOADS_ARR <<<"$WORKLOADS"
 read -r -a WRITERS_ARR <<<"$WRITERS_LIST"
 if [[ ${#WORKLOADS_ARR[@]} -eq 0 || ${#WRITERS_ARR[@]} -eq 0 ]]; then
   echo "workloads and writers-list must each contain at least one value" >&2
+  exit 1
+fi
+if ! [[ "$TRIALS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--trials must be a positive integer (got: $TRIALS)" >&2
   exit 1
 fi
 
@@ -121,7 +137,7 @@ start_corfu() {
   # whole chain in one subshell that then runs the chain sequentially --
   # the subshell would wait synchronously on corfu_server, holding ssh's
   # stdout/stderr pipes open, and ssh would hang forever.
-  remote_sh "cd $CORFU_DIR && rm -rf /data/run_batch/corfu && cp -r /data/load_batch/corfu /data/run_batch && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /data/run_batch -s -a $REMOTE_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
+  remote_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $REMOTE_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
   sleep 10
   remote_sh "pgrep -af 'org.corfudb.infrastructure.CorfuServer' | head -n1 || echo '[corfu] WARNING: no CorfuServer process found after start'"
 }
@@ -132,7 +148,7 @@ stop_corfu() {
   # cmdline is `java ... org.corfudb.infrastructure.CorfuServer ...` with
   # no "corfu_server" substring. Match on the java main class instead, plus
   # the port as a belt-and-braces second pattern. Go straight to SIGKILL --
-  # we reset /data/run_batch on every start so graceful shutdown buys us
+  # we reset /mnt/corfu/run_batch on every start so graceful shutdown buys us
   # nothing.
   remote_sh "pkill -KILL -f 'org.corfudb.infrastructure.CorfuServer' 2>/dev/null || true; pkill -KILL -f '\-a $REMOTE_HOST $CORFU_PORT' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
   for _ in $(seq 1 30); do
@@ -176,28 +192,34 @@ trap cleanup EXIT INT TERM
 BENCH_SCRIPT="$OZONEDB_HOME/bench/scripts/local/run_local_ycsb_multiproc.py"
 RESULTS=()
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers=(${WRITERS_ARR[*]}) ==="
+# Shared timestamped results directory across all (trial, workload, writers)
+# iterations of this sweep. Per-trial result files are differentiated by the
+# _trial{N} suffix that the python script appends.
+export OZONEDB_RUN_TAG="$(date +%Y%m%d-%H%M%S)"
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers=(${WRITERS_ARR[*]}) trials=$TRIALS run_tag=$OZONEDB_RUN_TAG ==="
 
-for WL in "${WORKLOADS_ARR[@]}"; do
-  for NW in "${WRITERS_ARR[@]}"; do
-    echo ""
-    echo "### iteration: workload=$WL writers=$NW ###"
+for ((TRIAL = 1; TRIAL <= TRIALS; TRIAL++)); do
+  for WL in "${WORKLOADS_ARR[@]}"; do
+    for NW in "${WRITERS_ARR[@]}"; do
+      echo ""
+      echo "### iteration: trial=$TRIAL/$TRIALS workload=$WL writers=$NW ###"
 
-    stop_corfu || true
-    start_corfu
-    wait_for_corfu
+      stop_corfu || true
+      start_corfu
+      wait_for_corfu
 
-    echo "[bench] python3 $BENCH_SCRIPT --config $CONFIG --workloads $WL --num_writers $NW"
-    set +e
-    python3 "$BENCH_SCRIPT" --config "$CONFIG" --workloads "$WL" --num_writers "$NW"
-    rc=$?
-    set -e
-    RESULTS+=("workload=$WL writers=$NW rc=$rc")
-    echo "[bench] workload=$WL writers=$NW rc=$rc"
+      echo "[bench] python3 $BENCH_SCRIPT --config $CONFIG --workloads $WL --num_writers $NW --trial $TRIAL"
+      set +e
+      python3 "$BENCH_SCRIPT" --config "$CONFIG" --workloads "$WL" --num_writers "$NW" --trial "$TRIAL"
+      rc=$?
+      set -e
+      RESULTS+=("trial=$TRIAL workload=$WL writers=$NW rc=$rc")
+      echo "[bench] trial=$TRIAL workload=$WL writers=$NW rc=$rc"
 
-    # Best-effort: next iteration's defensive stop_corfu will retry anyway,
-    # and we'd rather continue the sweep than abort on a flaky teardown.
-    stop_corfu || echo "[orchestrator] warning: stop_corfu failed; continuing sweep"
+      # Best-effort: next iteration's defensive stop_corfu will retry anyway,
+      # and we'd rather continue the sweep than abort on a flaky teardown.
+      stop_corfu || echo "[orchestrator] warning: stop_corfu failed; continuing sweep"
+    done
   done
 done
 
