@@ -141,9 +141,43 @@ Iterator* Table::blockReader(Table* table,
   return iter;
 }
 
+// Fig 1 investigation: counters for Table::get bloom-filter / block-read fates.
+namespace {
+std::atomic<uint64_t> kTblFileFilterReject{0};
+std::atomic<uint64_t> kTblBlockFilterReject{0};
+std::atomic<uint64_t> kTblIndexInvalid{0};      // index_iter not valid (key not in file)
+std::atomic<uint64_t> kTblNeedReadBlock{0};     // needed to actually read the data block
+std::atomic<uint64_t> kTblHitFromCache{0};      // block already cached, returned record
+std::atomic<uint64_t> kTblMissAfterRead{0};     // block read, key still not present
+std::atomic<uint64_t> kTblFound{0};             // returned kSuccess
+}  // namespace
+
+void Table::dumpProfileCounters() {
+  fprintf(stderr,
+          "[OZONEDB-TBL-PROFILE] file_filter_reject=%lu  block_filter_reject=%lu  "
+          "index_invalid=%lu  block_read_more=%lu  hit_from_cache=%lu  "
+          "miss_after_read=%lu  found=%lu\n",
+          (unsigned long)kTblFileFilterReject.load(),
+          (unsigned long)kTblBlockFilterReject.load(),
+          (unsigned long)kTblIndexInvalid.load(),
+          (unsigned long)kTblNeedReadBlock.load(),
+          (unsigned long)kTblHitFromCache.load(),
+          (unsigned long)kTblMissAfterRead.load(),
+          (unsigned long)kTblFound.load());
+  fflush(stderr);
+  kTblFileFilterReject.store(0);
+  kTblBlockFilterReject.store(0);
+  kTblIndexInvalid.store(0);
+  kTblNeedReadBlock.store(0);
+  kTblHitFromCache.store(0);
+  kTblMissAfterRead.store(0);
+  kTblFound.store(0);
+}
+
 Status Table::get(std::string const& key, Record*& record) {
   // check file filter first
   if (rep_->filter_block_for_file_reader != nullptr && !rep_->filter_block_for_file_reader->keyMayMatch(0, key)) {
+    kTblFileFilterReject.fetch_add(1, std::memory_order_relaxed);
     return Status::kNotFound;
   }
   Status s;
@@ -153,6 +187,7 @@ Status Table::get(std::string const& key, Record*& record) {
     BlockIdentifier identifier;
     bool s = identifier.ParseFromString(identifier_value);
     if (rep_->filter_block_reader != nullptr && !rep_->filter_block_reader->keyMayMatch(identifier.offset(), key)) {
+      kTblBlockFilterReject.fetch_add(1, std::memory_order_relaxed);
       return Status::kNotFound;
     }
     Status status;
@@ -160,13 +195,21 @@ Status Table::get(std::string const& key, Record*& record) {
       bool read_more = true;
       this->rep_->lru_cache->needReadBlock(rep_->fileName, read_more, identifier_value);
       if (read_more) {
+        kTblNeedReadBlock.fetch_add(1, std::memory_order_relaxed);
         this->rep_->lru_cache->readDataBlocks(rep_->fileName, identifier_value);
+      } else {
+        kTblHitFromCache.fetch_add(1, std::memory_order_relaxed);
       }
       this->rep_->lru_cache->get(rep_->fileName, key, record, identifier_value);
       if (record != nullptr) {
+        kTblFound.fetch_add(1, std::memory_order_relaxed);
         return Status::kSuccess;
+      } else {
+        kTblMissAfterRead.fetch_add(1, std::memory_order_relaxed);
       }
     }
+  } else {
+    kTblIndexInvalid.fetch_add(1, std::memory_order_relaxed);
   }
   return Status::kNotFound;
 }

@@ -98,7 +98,7 @@ JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get(JNIEnv* env, jobject obj, j
   env->ReleaseStringUTFChars(key, nativeKey);
 
   if (status != ozonedb::Status::kSuccess) {
-    std::cerr << "Failed to get value" << std::endl;
+    // std::cerr << "Failed to get value" << std::endl;
     return nullptr;
   }
   jbyteArray byteArray = env->NewByteArray(value->length());

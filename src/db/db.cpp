@@ -1,9 +1,25 @@
 #include "db.h"
 #include "helper.h"
 #include "thread_pool.h"
+#include "sstable/sstable_handler.h"
+#include "sstable/table_reader.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 namespace ozonedb {
+
+// ---------- read-path profile counters (Fig 1 investigation) -----------------
+// Atomic ns accumulators around the three suspect sections of DB::get.
+// Dumped to stderr in DB::~DB so the output shows up in YCSB-cpp logs.
+static std::atomic<uint64_t> kProfReads{0};
+static std::atomic<uint64_t> kProfTotalNs{0};
+static std::atomic<uint64_t> kProfViewNs{0};
+static std::atomic<uint64_t> kProfLogNs{0};
+static std::atomic<uint64_t> kProfSstNs{0};
+static std::atomic<uint64_t> kProfSstCalls{0};
+// -----------------------------------------------------------------------------
 DB::DB(std::string const& shared_config_path) {
   this->metadata = new Metadata(shared_config_path);
   if (this->metadata->mode == 0) {
@@ -18,7 +34,9 @@ DB::DB(std::string const& shared_config_path) {
     this->storage = new FileStorage(this->metadata->DBpath);
   }
   this->tail_cache = new TailCache();
-  this->lru_cache = new LRUCache(33554432, storage);
+  // Per-instance LRU cache budget aligned at 128 MB to match RocksDB and
+  // SQLite caches in the Fig 1 / Fig 2 multi-writer comparison.
+  this->lru_cache = new LRUCache(134217728, storage);
   this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log, this->storage, this->tail_cache);
   this->metadata_log->setLRUCache(this->lru_cache);
   this->metadata_log->setMetadata(this->metadata);
@@ -40,6 +58,34 @@ DB::DB(std::string const& shared_config_path) {
 };
 
 DB::~DB() {
+  // Dump per-DB read-path profile (Fig 1 investigation).
+  uint64_t reads     = kProfReads.load(std::memory_order_relaxed);
+  if (reads > 0) {
+    uint64_t total_ns  = kProfTotalNs.load(std::memory_order_relaxed);
+    uint64_t view_ns   = kProfViewNs.load(std::memory_order_relaxed);
+    uint64_t log_ns    = kProfLogNs.load(std::memory_order_relaxed);
+    uint64_t sst_ns    = kProfSstNs.load(std::memory_order_relaxed);
+    uint64_t sst_calls = kProfSstCalls.load(std::memory_order_relaxed);
+    auto pct = [&](uint64_t v) -> double { return total_ns ? 100.0 * v / total_ns : 0.0; };
+    fprintf(stderr,
+            "[OZONEDB-PROFILE] reads=%lu  avg_total=%.2fus  view=%.2fus(%.1f%%)  "
+            "log=%.2fus(%.1f%%)  sst=%.2fus_per_call x %lu_calls(%.1f%%_of_total)\n",
+            (unsigned long)reads,
+            total_ns / 1000.0 / reads,
+            view_ns / 1000.0 / reads, pct(view_ns),
+            log_ns / 1000.0 / reads, pct(log_ns),
+            sst_calls ? sst_ns / 1000.0 / sst_calls : 0.0,
+            (unsigned long)sst_calls, pct(sst_ns));
+    fflush(stderr);
+    // Reset for the next DB connection in this process.
+    kProfReads.store(0, std::memory_order_relaxed);
+    kProfTotalNs.store(0, std::memory_order_relaxed);
+    kProfViewNs.store(0, std::memory_order_relaxed);
+    kProfLogNs.store(0, std::memory_order_relaxed);
+    kProfSstNs.store(0, std::memory_order_relaxed);
+    kProfSstCalls.store(0, std::memory_order_relaxed);
+  }
+
   delete this->watcher;
   delete this->sstable_handler;
   delete this->log_handler;
@@ -67,6 +113,37 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
 }
 
 Status DB::closeDB(DB*& db) {
+  // Dump per-DB read-path profile (Fig 1 investigation) before stopping
+  // the compaction watcher / view-update thread, since DB::~DB is never
+  // called (the `delete db;` below is intentionally commented out).
+  uint64_t reads = kProfReads.load(std::memory_order_relaxed);
+  if (reads > 0) {
+    uint64_t total_ns  = kProfTotalNs.load(std::memory_order_relaxed);
+    uint64_t view_ns   = kProfViewNs.load(std::memory_order_relaxed);
+    uint64_t log_ns    = kProfLogNs.load(std::memory_order_relaxed);
+    uint64_t sst_ns    = kProfSstNs.load(std::memory_order_relaxed);
+    uint64_t sst_calls = kProfSstCalls.load(std::memory_order_relaxed);
+    auto pct = [&](uint64_t v) -> double { return total_ns ? 100.0 * v / total_ns : 0.0; };
+    fprintf(stderr,
+            "[OZONEDB-PROFILE] reads=%lu  avg_total=%.2fus  view=%.2fus(%.1f%%)  "
+            "log=%.2fus(%.1f%%)  sst=%.2fus_per_call x %lu_calls(%.1f%%_of_total)\n",
+            (unsigned long)reads,
+            total_ns / 1000.0 / reads,
+            view_ns / 1000.0 / reads, pct(view_ns),
+            log_ns / 1000.0 / reads, pct(log_ns),
+            sst_calls ? sst_ns / 1000.0 / sst_calls : 0.0,
+            (unsigned long)sst_calls, pct(sst_ns));
+    fflush(stderr);
+    SSTableHandler::dumpProfileCounters();
+    Table::dumpProfileCounters();
+    kProfReads.store(0, std::memory_order_relaxed);
+    kProfTotalNs.store(0, std::memory_order_relaxed);
+    kProfViewNs.store(0, std::memory_order_relaxed);
+    kProfLogNs.store(0, std::memory_order_relaxed);
+    kProfSstNs.store(0, std::memory_order_relaxed);
+    kProfSstCalls.store(0, std::memory_order_relaxed);
+  }
+
   db->active = false;
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     db->watcher->stopCompactionWatcher();
@@ -126,11 +203,18 @@ Status DB::remove(std::string const& key) {
 }
 
 Status DB::get(std::string const& key, std::string const*& value) {
+  using clk = std::chrono::steady_clock;
+  auto t_get_start = clk::now();
+
   // Step1: get the latest view and cache state from metadata log
+  auto t_view_start = clk::now();
   metadata_log->getLatestView(this->latest_view);
   this->log_handler->setLatestView(&this->latest_view);
   this->sstable_handler->setLatestView(&this->latest_view);
   this->lru_cache->setLatestView(&this->latest_view);
+  kProfViewNs.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t_view_start).count(),
+      std::memory_order_relaxed);
   std::pair<Record*, std::string> entry;
   bool hit = tail_cache->getLatestRecord(key, entry);
 
@@ -150,7 +234,11 @@ Status DB::get(std::string const& key, std::string const*& value) {
   // Read from log, from new to old.
   Record* log_record = nullptr;
   std::string latest_offset;
+  auto t_log_start = clk::now();
   log_handler->readRecord(key, log_record, offset, latest_offset);
+  kProfLogNs.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t_log_start).count(),
+      std::memory_order_relaxed);
   if (log_record) {
     latest_record = log_record;
     updated = true;
@@ -161,7 +249,12 @@ Status DB::get(std::string const& key, std::string const*& value) {
   Record* sstable_record = nullptr;
   std::string prefix = this->metadata->sstable_level_prefix;
   if ((cached_record == nullptr || offset.substr(0, prefix.size()) == prefix) && log_record == nullptr) {
+    auto t_sst_start = clk::now();
     sstable_handler->readRecordFromAllLevel(key, sstable_record, offset);
+    kProfSstNs.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t_sst_start).count(),
+        std::memory_order_relaxed);
+    kProfSstCalls.fetch_add(1, std::memory_order_relaxed);
     if (sstable_record) {
       updated = true;
       latest_record = sstable_record;
@@ -174,6 +267,11 @@ Status DB::get(std::string const& key, std::string const*& value) {
   //       tail_cache->updateCache(key, latest_record, latest_offset, offset);
   //   });
   // }
+
+  kProfTotalNs.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t_get_start).count(),
+      std::memory_order_relaxed);
+  kProfReads.fetch_add(1, std::memory_order_relaxed);
 
   if (latest_record) {
     if (latest_record->type() == kTypeDeletion) {

@@ -23,7 +23,7 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
         each_operation_cnt = str(each_operation_cnt)
         for each_key_size in key_size:
             for workload_name in workload_names:
-                subprocess.run(['python3', script_path +'/generate_workload.py', '--workload_name', workload_name,'--key_size', each_key_size, '--operation_cnt', '0', "--record_cnt", record_cnt]) #generate workload 
+                subprocess.run(['python3', script_path +'/generate_workload.py', '--workload_name', workload_name,'--key_size', each_key_size, '--operation_cnt', each_operation_cnt, "--record_cnt", record_cnt]) #generate workload 
                 workload_path = ycsb_path + "/workloads/generated_workloads/workload" + workload_name + "_" + each_key_size + "_" + each_operation_cnt + "_" + record_cnt
                 
                 for db_name in db_names:
@@ -48,7 +48,7 @@ def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, rep
                         config_path = os.path.join(ozonedb_home, "bench/scripts/config/sqlite.properties")
                         with open(config_path, 'w') as f:
                             f.write("db.driver=org.sqlite.JDBC\n")
-                            f.write(f"db.url=jdbc:sqlite:{db_file}\n")
+                            f.write(f"db.url=jdbc:sqlite:{db_file}?journal_mode=WAL&cache_size=-1048576&synchronous=FULL&mmap_size=1073741824&locking_mode=EXCLUSIVE&vfs=unix-excl\n")
                         command.append("-P")
                         command.append(config_path)
                         command.append("-cp")

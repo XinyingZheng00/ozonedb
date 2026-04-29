@@ -43,6 +43,9 @@ class SSTableHandler {
 
   Status readRecordFromAllLevel(std::string const& key, Record*& record, std::string const& offset);
 
+  // Fig 1 investigation: print + reset accumulated per-level counters.
+  static void dumpProfileCounters();
+
   // set thread pool
   void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }
 };

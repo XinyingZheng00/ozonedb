@@ -125,7 +125,7 @@ def load_ycsb(record_cnt, key_size, db_names, ycsb_data_path, threads, repeated)
                     db_file = os.path.join(cached_data_path, "mydb.db")
                     with open(config_path, 'w') as f:
                         f.write("db.driver=org.sqlite.JDBC\n")
-                        f.write(f"db.url=jdbc:sqlite:{db_file}?journal_mode=WAL&cache_size=-163840&synchronous=FULL\n")
+                        f.write(f"db.url=jdbc:sqlite:{db_file}?journal_mode=WAL&cache_size=-32768&synchronous=FULL&mmap_size=1073741824&locking_mode=EXCLUSIVE&vfs=unix-excl\n")
                     command.append("-P")
                     command.append(config_path)
                     command.append("-cp")

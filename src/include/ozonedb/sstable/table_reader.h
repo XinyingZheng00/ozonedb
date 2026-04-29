@@ -33,6 +33,8 @@ class Table {
                      std::string const& fileName,
                      Table*& table);
   Status get(std::string const& key, Record*& record);
+  // Fig 1 investigation: print + reset accumulated bloom-filter / block-read counters.
+  static void dumpProfileCounters();
   // Status getBlockPosition(std::string const& key, std::string& index_value);
   std::unordered_map<std::string, Record*> getAll();
 

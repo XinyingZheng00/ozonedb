@@ -44,6 +44,9 @@ public class OzoneDBClient extends DB {
   @Override
   public Status read(String table, String key, Set<String> fields, Map<String, ByteIterator> result) {
     byte[] values = db.get(key);
+    if (values == null) {
+      return Status.NOT_FOUND;
+    }
     deserializeValues(values, fields, result);
     int totalBytes = key.length() + values.length;
     reportThroughput(totalBytes); // Report throughput after each read
@@ -62,6 +65,9 @@ public class OzoneDBClient extends DB {
     // read current value
     final Map<String, ByteIterator> result = new HashMap<>();
     byte[] currentValue = db.get(key);
+    if (currentValue == null) {
+      return Status.NOT_FOUND;
+    }
     deserializeValues(currentValue, null, result);
 
     // update
