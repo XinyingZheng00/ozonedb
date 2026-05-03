@@ -1,0 +1,49 @@
+# CMD: /users/Xinying/ozonedb/ycsb/bin/ycsb run ozonedb -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_500000_500000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=500000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyW_n8_r0pct.json
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:ozonedb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb/ycsb/ozonedb/conf:/users/Xinying/ozonedb/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_500000_500000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=500000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyW_n8_r0pct.json -t
+Command line: -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_500000_500000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=500000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyW_n8_r0pct.json -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+2026-05-01 03:14:57:165 0 sec: 0 operations; est completion in 0 second 
+Starting compaction watcher
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-05-01 03:15:07:165 10 sec: 168507 operations; 16849.02 current ops/sec; est completion in 20 seconds [READ: Count=168541, Max=7503, Min=30, Avg=56.26, 90=64, 99=77, 99.9=100, 99.99=254] 
+2026-05-01 03:15:17:165 20 sec: 353657 operations; 18515 current ops/sec; est completion in 9 second [READ: Count=185134, Max=4351, Min=17, Avg=53.03, 90=63, 99=75, 99.9=96, 99.99=146] 
+[OZONEDB-PROFILE] reads=500000  avg_total=42.89us  view=2.72us(6.3%)  log=0.73us(1.7%)  sst=39.35us_per_call x 498512_calls(91.5%_of_total)
+[OZONEDB-SST-PROFILE] level | time_total_ms | enters | range_rejects | table_gets | hits
+[OZONEDB-SST-PROFILE] L1  |      1837.33 |  2956756 |         2828 |    2953928 |  13692
+[OZONEDB-SST-PROFILE] L2  |     17602.76 |  2643944 |          455 |    2643489 | 484820
+[OZONEDB-TBL-PROFILE] file_filter_reject=5052484  block_filter_reject=45912  index_invalid=0  block_read_more=300043  hit_from_cache=198978  miss_after_read=509  found=498512
+2026-05-01 03:15:20:460 23 sec: 500000 operations; 44413.66 current ops/sec; [READ: Count=146325, Max=1432, Min=3, Avg=21.23, 90=38, 99=48, 99.9=62, 99.99=91] [CLEANUP: Count=1, Max=63039, Min=63008, Avg=63024, 90=63039, 99=63039, 99.9=63039, 99.99=63039] 
+[OVERALL], RunTime(ms), 23296
+[OVERALL], Throughput(ops/sec), 21462.91208791209
+[TOTAL_GCS_PS_Scavenge], Count, 2
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 9
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.03863324175824176
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 2
+[TOTAL_GC_TIME], Time(ms), 9
+[TOTAL_GC_TIME_%], Time(%), 0.03863324175824176
+[READ], Operations, 500000
+[READ], AverageLatency(us), 44.811602
+[READ], MinLatency(us), 3
+[READ], MaxLatency(us), 7503
+[READ], 95thPercentileLatency(us), 65
+[READ], 99thPercentileLatency(us), 74
+[READ], Return=OK, 500000
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 63024.0
+[CLEANUP], MinLatency(us), 63008
+[CLEANUP], MaxLatency(us), 63039
+[CLEANUP], 95thPercentileLatency(us), 63039
+[CLEANUP], 99thPercentileLatency(us), 63039

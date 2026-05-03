@@ -1,0 +1,46 @@
+# CMD: /usr/bin/time -v /users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloada_hctree -P /users/Xinying/YCSB-cpp/sqlite/sqlite-bcw.properties -p sqlite.dbpath=/tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db -p threadcount=4 -p recordcount=1000000 -p maxexecutiontime=120
+# devices=['sda6'] sectors_before=1979469096 sectors_after=1979469096
+# elapsed_s=0.07 returncode=134
+
+=== STDOUT ===
+[Thread 139652914480704] SqliteDB::Init at 2026-04-28 03:50:20
+Opening database with URL: file:///tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db?vfs=unix-excl
+PRAGMA journal_mode: wal2
+PRAGMA mmap_size: 0
+PRAGMA page_size: 4096
+PRAGMA cache_size: -131072
+PRAGMA synchronous: 2
+[Thread 139652906088000] SqliteDB::Init at 2026-04-28 03:50:20
+Opening database with URL: file:///tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db?vfs=unix-excl
+[Thread 139652897695296] SqliteDB::Init at 2026-04-28 03:50:20
+Opening database with URL: file:///tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db?vfs=unix-excl
+
+=== STDERR ===
+Caught exception: Init exec cache_size: database is locked
+Caught exception: Init exec cache_size: database is locked
+terminate called after throwing an instance of 'ycsbc::utils::Exception'
+  what():  Init exec cache_size: database is locked
+Command terminated by signal 6
+	Command being timed: "/users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloada_hctree -P /users/Xinying/YCSB-cpp/sqlite/sqlite-bcw.properties -p sqlite.dbpath=/tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db -p threadcount=4 -p recordcount=1000000 -p maxexecutiontime=120"
+	User time (seconds): 0.00
+	System time (seconds): 0.01
+	Percent of CPU this job got: 25%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.06
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 15712
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 130
+	Minor (reclaiming a frame) page faults: 1204
+	Voluntary context switches: 131
+	Involuntary context switches: 6
+	Swaps: 0
+	File system inputs: 22232
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

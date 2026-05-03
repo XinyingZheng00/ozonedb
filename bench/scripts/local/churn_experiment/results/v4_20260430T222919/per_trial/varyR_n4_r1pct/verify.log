@@ -1,0 +1,53 @@
+# CMD: /users/Xinying/ozonedb/ycsb/bin/ycsb run ozonedb -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=1000000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyR_n4_r1pct.json
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:ozonedb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb/ycsb/ozonedb/conf:/users/Xinying/ozonedb/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=1000000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyR_n4_r1pct.json -t
+Command line: -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=1000000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyR_n4_r1pct.json -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+2026-05-01 04:30:33:495 0 sec: 0 operations; est completion in 0 second 
+Starting compaction watcher
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-05-01 04:30:43:495 10 sec: 75997 operations; 7598.94 current ops/sec; est completion in 2 minutes [READ: Count=76021, Max=7215, Min=46, Avg=74.87, 90=82, 99=102, 99.9=133, 99.99=490] 
+2026-05-01 04:30:53:495 20 sec: 205803 operations; 12980.6 current ops/sec; est completion in 1 minute [READ: Count=129789, Max=5395, Min=45, Avg=75.84, 90=83, 99=97, 99.9=120, 99.99=237] 
+2026-05-01 04:31:03:495 30 sec: 337442 operations; 13163.9 current ops/sec; est completion in 59 seconds [READ: Count=131638, Max=454, Min=47, Avg=75.02, 90=82, 99=95, 99.9=118, 99.99=176] 
+2026-05-01 04:31:13:495 40 sec: 469916 operations; 13247.4 current ops/sec; est completion in 46 seconds [READ: Count=132476, Max=3929, Min=47, Avg=74.53, 90=81, 99=96, 99.9=119, 99.99=172] 
+2026-05-01 04:31:23:495 50 sec: 602012 operations; 13209.6 current ops/sec; est completion in 34 seconds [READ: Count=132097, Max=4311, Min=45, Avg=74.74, 90=81, 99=95, 99.9=117, 99.99=172] 
+2026-05-01 04:31:33:495 60 sec: 789666 operations; 18765.4 current ops/sec; est completion in 16 seconds [READ: Count=187658, Max=7331, Min=25, Avg=52.32, 90=77, 99=86, 99.9=107, 99.99=188] 
+[OZONEDB-PROFILE] reads=1000000  avg_total=60.81us  view=2.61us(4.3%)  log=0.47us(0.8%)  sst=57.54us_per_call x 999709_calls(94.6%_of_total)
+[OZONEDB-SST-PROFILE] level | time_total_ms | enters | range_rejects | table_gets | hits
+[OZONEDB-SST-PROFILE] L1  |      4066.33 |  6958032 |        10302 |    6947730 |  13452
+[OZONEDB-SST-PROFILE] L2  |     53100.25 |  3505485 |          122 |    3505363 | 986257
+[OZONEDB-TBL-PROFILE] file_filter_reject=9361003  block_filter_reject=91391  index_invalid=0  block_read_more=767330  hit_from_cache=233369  miss_after_read=990  found=999709
+2026-05-01 04:31:41:240 67 sec: 1000000 operations; 27157.39 current ops/sec; [READ: Count=210321, Max=3805, Min=3, Avg=35.52, 90=55, 99=64, 99.9=77, 99.99=134] [CLEANUP: Count=1, Max=84543, Min=84480, Avg=84512, 90=84543, 99=84543, 99.9=84543, 99.99=84543] 
+[OVERALL], RunTime(ms), 67746
+[OVERALL], Throughput(ops/sec), 14761.019100758716
+[TOTAL_GCS_PS_Scavenge], Count, 5
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 19
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.028045936291441562
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 5
+[TOTAL_GC_TIME], Time(ms), 19
+[TOTAL_GC_TIME_%], Time(%), 0.028045936291441562
+[READ], Operations, 1000000
+[READ], AverageLatency(us), 62.444725
+[READ], MinLatency(us), 3
+[READ], MaxLatency(us), 7331
+[READ], 95thPercentileLatency(us), 83
+[READ], 99thPercentileLatency(us), 94
+[READ], Return=OK, 1000000
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 84512.0
+[CLEANUP], MinLatency(us), 84480
+[CLEANUP], MaxLatency(us), 84543
+[CLEANUP], 95thPercentileLatency(us), 84543
+[CLEANUP], 99thPercentileLatency(us), 84543

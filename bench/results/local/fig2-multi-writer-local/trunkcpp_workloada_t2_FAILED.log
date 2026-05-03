@@ -1,0 +1,43 @@
+# CMD: /usr/bin/time -v /users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloada_hctree -P /users/Xinying/YCSB-cpp/sqlite/sqlite-trunk.properties -p sqlite.dbpath=/tank/ycsb_data/trunkcpp_ycsb/trunkcpp_ycsb.db -p threadcount=2 -p recordcount=1000000 -p maxexecutiontime=120
+# devices=['sda6'] sectors_before=1714751608 sectors_after=1715967456
+# elapsed_s=13.69 returncode=134
+
+=== STDOUT ===
+[Thread 140007650199104] SqliteDB::Init at 2026-04-28 02:15:27
+Opening database with URL: file:///tank/ycsb_data/trunkcpp_ycsb/trunkcpp_ycsb.db?vfs=unix-excl
+PRAGMA journal_mode: wal
+PRAGMA mmap_size: 0
+PRAGMA page_size: 4096
+PRAGMA cache_size: -131072
+PRAGMA synchronous: 2
+[Thread 140007641806400] SqliteDB::Init at 2026-04-28 02:15:27
+Opening database with URL: file:///tank/ycsb_data/trunkcpp_ycsb/trunkcpp_ycsb.db?vfs=unix-excl
+
+=== STDERR ===
+Caught exception: Init exec cache_size: database is locked
+terminate called after throwing an instance of 'ycsbc::utils::Exception'
+  what():  Init exec cache_size: database is locked
+Command terminated by signal 6
+	Command being timed: "/users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloada_hctree -P /users/Xinying/YCSB-cpp/sqlite/sqlite-trunk.properties -p sqlite.dbpath=/tank/ycsb_data/trunkcpp_ycsb/trunkcpp_ycsb.db -p threadcount=2 -p recordcount=1000000 -p maxexecutiontime=120"
+	User time (seconds): 1.48
+	System time (seconds): 7.65
+	Percent of CPU this job got: 66%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.68
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 152168
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 130
+	Minor (reclaiming a frame) page faults: 35308
+	Voluntary context switches: 209545
+	Involuntary context switches: 19
+	Swaps: 0
+	File system inputs: 767912
+	File system outputs: 437017
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

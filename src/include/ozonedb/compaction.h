@@ -7,6 +7,7 @@
 #include "sstable/table_builder.h"
 #include "storage.h"
 #include "task_log_handler.h"
+#include <atomic>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -23,6 +24,11 @@ class Compaction {
   TaskRecord::TaskIdentifier* task_id = nullptr;
   TableBuilder* outputBuilder = nullptr;
   bool finished = false;
+  // Set by doCompactionWork when an experimental abort fires (controlled by
+  // OZONEDB_CHURN_ABORT_RATE). The heartbeat thread checks this flag and
+  // exits without writing TASK_COMPLETE, leaving the task abandoned exactly
+  // as if the writer had crashed mid-compaction.
+  std::atomic<bool> aborted{false};
   int compaction_version = -1; // this is only used for the last layer compaction
 };
 

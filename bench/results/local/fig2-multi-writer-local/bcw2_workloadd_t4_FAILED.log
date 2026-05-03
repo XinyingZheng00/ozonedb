@@ -1,0 +1,49 @@
+# CMD: /usr/bin/time -v /users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloadd -P /users/Xinying/YCSB-cpp/sqlite/sqlite-bcw.properties -p sqlite.dbpath=/tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db -p threadcount=4 -p recordcount=1000000 -p maxexecutiontime=120
+# devices=['sda6'] sectors_before=2159581760 sectors_after=2159581768
+# elapsed_s=0.14 returncode=134
+
+=== STDOUT ===
+[Thread 139884595992128] SqliteDB::Init at 2026-04-28 05:04:22
+Opening database with URL: file:///tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db?vfs=unix-excl
+PRAGMA journal_mode: wal2
+PRAGMA mmap_size: 0
+PRAGMA page_size: 4096
+PRAGMA cache_size: -131072
+PRAGMA synchronous: 2
+[Thread 139884587599424] SqliteDB::Init at 2026-04-28 05:04:22
+Opening database with URL: file:///tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db?vfs=unix-excl
+[Thread 139884579206720] SqliteDB::Init at 2026-04-28 05:04:22
+Opening database with URL: file:///tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db?vfs=unix-excl
+[Thread 139884570814016] SqliteDB::Init at 2026-04-28 05:04:22
+Opening database with URL: file:///tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db?vfs=unix-excl
+
+=== STDERR ===
+Caught exception: Init exec cache_size: database is locked
+Caught exception: Init exec cache_size: database is locked
+terminate called after throwing an instance of 'ycsbc::utils::Exception'
+Caught exception: Init exec cache_size: database is locked
+  what():  Init exec cache_size: database is locked
+Command terminated by signal 6
+	Command being timed: "/users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloadd -P /users/Xinying/YCSB-cpp/sqlite/sqlite-bcw.properties -p sqlite.dbpath=/tank/ycsb_data/bcw2_ycsb/bcw_ycsb.db -p threadcount=4 -p recordcount=1000000 -p maxexecutiontime=120"
+	User time (seconds): 0.02
+	System time (seconds): 0.00
+	Percent of CPU this job got: 26%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.13
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 15772
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 132
+	Minor (reclaiming a frame) page faults: 1213
+	Voluntary context switches: 130
+	Involuntary context switches: 3
+	Swaps: 0
+	File system inputs: 22544
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

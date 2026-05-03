@@ -93,7 +93,7 @@ void TaskLogHandler::rollForwardTaskLog() {
   std::unique_lock<std::shared_mutex> task_map_lock(task_map_mutex);
   for (auto it = task_map.begin(); it != task_map.end(); it++) {
     if (it->second.heartbeat >= task_heartbeat_threshold && it->second.status != TaskRecord::TASK_COMPLETE && it->second.status != TaskRecord::TASK_DEAD) {
-      // std::cout << getpid() << ":Task " << it->first.DebugString() << " is dead" << std::endl;
+      std::cout << getpid() << ":Task " << it->first.ShortDebugString() << " is dead (hb=" << it->second.heartbeat << ")" << std::endl;
       std::unique_lock<std::shared_mutex> lock(dead_tasks_mutex);
       dead_tasks[it->first] = it->second.owner_generation;
       lock.unlock();
@@ -132,13 +132,37 @@ std::pair<TaskRecord::TaskIdentifier, int> TaskLogHandler::getDeadTask() {
 
 // =======================================[heartbeats]=======================================
 void TaskLogHandler::updateHeartbeats() {
+  static bool churn_debug = std::getenv("OZONEDB_CHURN_DEBUG") != nullptr;
+  int debug_tick = 0;
   while (!stop_thread) {
     std::unique_lock<std::shared_mutex> task_map_lock(task_map_mutex);
     for (auto& task : task_map) {
       task.second.heartbeat++;
     }
+    int n = task_map.size();
+    int max_hb = 0;
+    int n_begin = 0;
+    int n_in_progress = 0;
+    int n_complete = 0;
+    int n_dead = 0;
+    if (churn_debug) {
+      for (auto& task : task_map) {
+        if (task.second.heartbeat > max_hb) max_hb = task.second.heartbeat;
+        switch (task.second.status) {
+          case TaskRecord::TASK_BEGIN: n_begin++; break;
+          case TaskRecord::TASK_IN_PROGRESS: n_in_progress++; break;
+          case TaskRecord::TASK_COMPLETE: n_complete++; break;
+          case TaskRecord::TASK_DEAD: n_dead++; break;
+          default: break;
+        }
+      }
+    }
     task_map_lock.unlock();
-
+    if (churn_debug && (++debug_tick % 10 == 0)) {  // every 1s
+      std::cout << getpid() << ":HB_TICK n=" << n << " max_hb=" << max_hb
+                << " begin=" << n_begin << " in_progress=" << n_in_progress
+                << " complete=" << n_complete << " dead=" << n_dead << std::endl;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 }

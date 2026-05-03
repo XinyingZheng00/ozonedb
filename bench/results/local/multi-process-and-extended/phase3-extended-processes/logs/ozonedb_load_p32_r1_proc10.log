@@ -1,0 +1,96 @@
+# CMD: /usr/bin/time -v /usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb/ycsb/ozonedb/conf:/users/Xinying/ozonedb/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloada_1KB_1000000_1000000 -p status.interval=1 -p recordcount=1000000 -p insertstart=312500 -p insertcount=31250 -p shared_config=/tmp/phase1_ozonedb_configs/shared_config_LOAD_p32_r1_proc10.json -load
+# work_path=/tank/ycsb_data/multi-proc-run/ozonedb_load_shared_p32
+Command line: -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloada_1KB_1000000_1000000 -p status.interval=1 -p recordcount=1000000 -p insertstart=312500 -p insertcount=31250 -p shared_config=/tmp/phase1_ozonedb_configs/shared_config_LOAD_p32_r1_proc10.json -load
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+2026-04-29 20:43:58:473 0 sec: 0 operations; est completion in 0 second 
+Directory already created.
+Starting compaction watcher
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-04-29 20:43:58:517 - NewTail completed: 
+2026-04-29 20:43:59:472 1 sec: 1042 operations; 1042 current ops/sec; est completion in 29 seconds [INSERT: Count=1042, Max=18015, Min=175, Avg=861.58, 90=1255, 99=3747, 99.9=11519, 99.99=18015] 
+2026-04-29 20:44:00:472 2 sec: 2175 operations; 1133 current ops/sec; est completion in 27 seconds [INSERT: Count=1133, Max=30799, Min=209, Avg=885.49, 90=1132, 99=2853, 99.9=21647, 99.99=30799] 
+2026-04-29 20:44:01:472 3 sec: 3367 operations; 1192 current ops/sec; est completion in 25 seconds [INSERT: Count=1192, Max=11255, Min=282, Avg=830.17, 90=1142, 99=1947, 99.9=8303, 99.99=11255] 
+2026-04-29 20:44:01:819 - Compaction started: 
+140193621235264:Compacting datalog/3 datalog/4 into:sstable1/080380f1-0148-46ff-981f-37fec9b7b6dc202604291443581777495442013729584.sst
+2026-04-29 20:44:02:472 4 sec: 4338 operations; 971 current ops/sec; est completion in 25 seconds [INSERT: Count=971, Max=26383, Min=303, Avg=1019.1, 90=1475, 99=2025, 99.9=26383, 99.99=26383] 
+2026-04-29 20:44:02:510 - Compaction completed: 
+2026-04-29 20:44:03:472 5 sec: 5560 operations; 1222 current ops/sec; est completion in 24 seconds [INSERT: Count=1222, Max=10871, Min=213, Avg=806.43, 90=1135, 99=2091, 99.9=9047, 99.99=10871] 
+2026-04-29 20:44:04:472 6 sec: 6740 operations; 1180 current ops/sec; est completion in 22 seconds [INSERT: Count=1180, Max=12343, Min=201, Avg=841.05, 90=1153, 99=3433, 99.9=10823, 99.99=12343] 
+2026-04-29 20:44:05:472 7 sec: 7982 operations; 1242 current ops/sec; est completion in 21 seconds [INSERT: Count=1243, Max=5355, Min=188, Avg=802.26, 90=1125, 99=1789, 99.9=2731, 99.99=5355] 
+2026-04-29 20:44:06:472 8 sec: 9231 operations; 1249 current ops/sec; est completion in 20 seconds [INSERT: Count=1249, Max=2799, Min=174, Avg=796.29, 90=1099, 99=1799, 99.9=2627, 99.99=2799] 
+2026-04-29 20:44:07:472 9 sec: 10258 operations; 1027 current ops/sec; est completion in 19 seconds [INSERT: Count=1026, Max=37471, Min=169, Avg=967.51, 90=1435, 99=2287, 99.9=7067, 99.99=37471] 
+2026-04-29 20:44:08:472 10 sec: 11099 operations; 841 current ops/sec; est completion in 19 seconds [INSERT: Count=842, Max=93695, Min=213, Avg=1183.9, 90=1545, 99=2153, 99.9=93695, 99.99=93695] 
+2026-04-29 20:44:09:472 11 sec: 12213 operations; 1114 current ops/sec; est completion in 18 seconds [INSERT: Count=1113, Max=90879, Min=163, Avg=891.79, 90=1091, 99=1799, 99.9=8639, 99.99=90879] 
+2026-04-29 20:44:10:472 12 sec: 13424 operations; 1211 current ops/sec; est completion in 16 seconds [INSERT: Count=1211, Max=17967, Min=198, Avg=821.07, 90=1094, 99=1884, 99.9=9887, 99.99=17967] 
+2026-04-29 20:44:11:472 13 sec: 14670 operations; 1246 current ops/sec; est completion in 15 seconds [INSERT: Count=1247, Max=11959, Min=197, Avg=798.17, 90=1092, 99=1879, 99.9=7855, 99.99=11959] 
+2026-04-29 20:44:12:472 14 sec: 15777 operations; 1107 current ops/sec; est completion in 14 seconds [INSERT: Count=1106, Max=39103, Min=198, Avg=898.11, 90=1286, 99=1852, 99.9=13383, 99.99=39103] 
+2026-04-29 20:44:13:472 15 sec: 16630 operations; 853 current ops/sec; est completion in 14 seconds [INSERT: Count=853, Max=11607, Min=389, Avg=1168.13, 90=1610, 99=2167, 99.9=11607, 99.99=11607] 
+2026-04-29 20:44:14:472 16 sec: 17605 operations; 975 current ops/sec; est completion in 13 seconds [INSERT: Count=975, Max=95615, Min=237, Avg=1020.31, 90=1397, 99=1993, 99.9=95615, 99.99=95615] 
+2026-04-29 20:44:15:472 17 sec: 18808 operations; 1203 current ops/sec; est completion in 12 seconds [INSERT: Count=1203, Max=8591, Min=256, Avg=826.79, 90=1087, 99=1677, 99.9=8303, 99.99=8591] 
+2026-04-29 20:44:16:472 18 sec: 20013 operations; 1205 current ops/sec; est completion in 11 seconds [INSERT: Count=1206, Max=8775, Min=225, Avg=825.04, 90=1123, 99=1785, 99.9=7427, 99.99=8775] 
+2026-04-29 20:44:17:472 19 sec: 21153 operations; 1140 current ops/sec; est completion in 10 seconds [INSERT: Count=1140, Max=37951, Min=235, Avg=871.83, 90=1185, 99=2131, 99.9=8383, 99.99=37951] 
+2026-04-29 20:44:18:472 20 sec: 22013 operations; 860 current ops/sec; est completion in 9 second [INSERT: Count=859, Max=8383, Min=359, Avg=1158.86, 90=1599, 99=2233, 99.9=8383, 99.99=8383] 
+2026-04-29 20:44:19:472 21 sec: 22915 operations; 902 current ops/sec; est completion in 8 second [INSERT: Count=903, Max=14943, Min=291, Avg=1102.25, 90=1867, 99=3657, 99.9=14943, 99.99=14943] 
+2026-04-29 20:44:20:472 22 sec: 24088 operations; 1173 current ops/sec; est completion in 7 second [INSERT: Count=1172, Max=85439, Min=197, Avg=840.64, 90=1064, 99=1811, 99.9=6907, 99.99=85439] 
+2026-04-29 20:44:21:472 23 sec: 25243 operations; 1155 current ops/sec; est completion in 6 second [INSERT: Count=1156, Max=85503, Min=187, Avg=868.84, 90=1073, 99=1825, 99.9=12471, 99.99=85503] 
+2026-04-29 20:44:22:472 24 sec: 26369 operations; 1126 current ops/sec; est completion in 5 second [INSERT: Count=1125, Max=39935, Min=224, Avg=882.9, 90=1165, 99=2231, 99.9=13407, 99.99=39935] 
+2026-04-29 20:44:23:472 25 sec: 27041 operations; 672 current ops/sec; est completion in 4 second [INSERT: Count=672, Max=69055, Min=384, Avg=1483.47, 90=1949, 99=6139, 99.9=69055, 99.99=69055] 
+2026-04-29 20:44:24:472 26 sec: 27734 operations; 693 current ops/sec; est completion in 4 second [INSERT: Count=694, Max=11383, Min=398, Avg=1435.75, 90=2309, 99=3439, 99.9=11383, 99.99=11383] 
+2026-04-29 20:44:25:473 27 sec: 28928 operations; 1194 current ops/sec; est completion in 3 second [INSERT: Count=1193, Max=15271, Min=237, Avg=833.3, 90=1128, 99=1899, 99.9=12175, 99.99=15271] 
+2026-04-29 20:44:26:472 28 sec: 30121 operations; 1193 current ops/sec; est completion in 2 second [INSERT: Count=1193, Max=15079, Min=229, Avg=832.87, 90=1103, 99=1974, 99.9=5699, 99.99=15079] 
+2026-04-29 20:44:27:320 28 sec: 31250 operations; 1331.37 current ops/sec; [CLEANUP: Count=1, Max=68351, Min=68288, Avg=68320, 90=68351, 99=68351, 99.9=68351, 99.99=68351] [INSERT: Count=1129, Max=11183, Min=195, Avg=686.37, 90=949, 99=1890, 99.9=9375, 99.99=11183] 
+[OVERALL], RunTime(ms), 28848
+[OVERALL], Throughput(ops/sec), 1083.2640044370494
+[TOTAL_GCS_PS_Scavenge], Count, 0
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.0
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 0
+[TOTAL_GC_TIME], Time(ms), 0
+[TOTAL_GC_TIME_%], Time(%), 0.0
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 68320.0
+[CLEANUP], MinLatency(us), 68288
+[CLEANUP], MaxLatency(us), 68351
+[CLEANUP], 95thPercentileLatency(us), 68351
+[CLEANUP], 99thPercentileLatency(us), 68351
+[INSERT], Operations, 31250
+[INSERT], AverageLatency(us), 912.61488
+[INSERT], MinLatency(us), 163
+[INSERT], MaxLatency(us), 95615
+[INSERT], 95thPercentileLatency(us), 1558
+[INSERT], 99thPercentileLatency(us), 2433
+[INSERT], Return=OK, 31250
+	Command being timed: "/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb/ycsb/ozonedb/conf:/users/Xinying/ozonedb/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloada_1KB_1000000_1000000 -p status.interval=1 -p recordcount=1000000 -p insertstart=312500 -p insertcount=31250 -p shared_config=/tmp/phase1_ozonedb_configs/shared_config_LOAD_p32_r1_proc10.json -load"
+	User time (seconds): 2.03
+	System time (seconds): 14.50
+	Percent of CPU this job got: 55%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:29.67
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 469160
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 273
+	Minor (reclaiming a frame) page faults: 129934
+	Voluntary context switches: 230821
+	Involuntary context switches: 2084
+	Swaps: 0
+	File system inputs: 143269
+	File system outputs: 218641
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

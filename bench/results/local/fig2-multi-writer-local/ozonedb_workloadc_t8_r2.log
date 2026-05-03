@@ -1,0 +1,201 @@
+# CMD: /usr/bin/time -v /users/Xinying/ozonedb/ycsb/bin/ycsb run ozonedb -threads 8 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=1 -p maxexecutiontime=120 -p operationcount=0 -p shared_config=/users/Xinying/ozonedb/src/config/local/shared_config_rocksdb.json
+# devices=['sda6'] sectors_before=1131623192 sectors_after=1131650072
+# elapsed_s=130.70 returncode=0
+
+=== STDOUT ===
+Starting compaction watcher
+Starting compaction watcher
+Starting compaction watcher
+Starting compaction watcher
+Starting compaction watcher
+Starting compaction watcher
+Starting compaction watcher
+Starting compaction watcher
+[OVERALL], RunTime(ms), 120097
+[OVERALL], Throughput(ops/sec), 110144.03357286194
+[TOTAL_GCS_PS_Scavenge], Count, 197
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 299
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.2489654196191412
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 197
+[TOTAL_GC_TIME], Time(ms), 299
+[TOTAL_GC_TIME_%], Time(%), 0.2489654196191412
+[READ], Operations, 13227968
+[READ], AverageLatency(us), 70.3204543585228
+[READ], MinLatency(us), 3
+[READ], MaxLatency(us), 260479
+[READ], 95thPercentileLatency(us), 111
+[READ], 99thPercentileLatency(us), 129
+[READ], Return=OK, 13227968
+[CLEANUP], Operations, 8
+[CLEANUP], AverageLatency(us), 44616.0
+[CLEANUP], MinLatency(us), 18160
+[CLEANUP], MaxLatency(us), 94911
+[CLEANUP], 95thPercentileLatency(us), 94911
+[CLEANUP], 99thPercentileLatency(us), 94911
+
+=== STDERR ===
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:ozonedb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb/ycsb/ozonedb/conf:/users/Xinying/ozonedb/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 8 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=1 -p maxexecutiontime=120 -p operationcount=0 -p shared_config=/users/Xinying/ozonedb/src/config/local/shared_config_rocksdb.json -t
+Command line: -db site.ycsb.db.OzoneDBClient -threads 8 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=1 -p maxexecutiontime=120 -p operationcount=0 -p shared_config=/users/Xinying/ozonedb/src/config/local/shared_config_rocksdb.json -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+Maximum execution time specified as: 120 secs
+2026-04-28 07:03:06:574 0 sec: 0 operations; 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-04-28 07:03:07:574 1 sec: 0 operations; 
+2026-04-28 07:03:08:574 2 sec: 101615 operations; 101615 current ops/sec; [READ: Count=101807, Max=260479, Min=3, Avg=93.72, 90=108, 99=149, 99.9=262, 99.99=550] 
+2026-04-28 07:03:09:573 3 sec: 210283 operations; 108668 current ops/sec; [READ: Count=108536, Max=5063, Min=3, Avg=71.45, 90=106, 99=131, 99.9=157, 99.99=343] 
+2026-04-28 07:03:10:573 4 sec: 323251 operations; 112968 current ops/sec; [READ: Count=112965, Max=411, Min=3, Avg=69.12, 90=103, 99=127, 99.9=151, 99.99=295] 
+2026-04-28 07:03:11:573 5 sec: 435026 operations; 111775 current ops/sec; [READ: Count=111775, Max=3725, Min=3, Avg=69.88, 90=104, 99=128, 99.9=147, 99.99=180] 
+2026-04-28 07:03:12:573 6 sec: 546754 operations; 111728 current ops/sec; [READ: Count=111716, Max=3399, Min=3, Avg=69.83, 90=104, 99=128, 99.9=153, 99.99=291] 
+2026-04-28 07:03:13:573 7 sec: 658619 operations; 111865 current ops/sec; [READ: Count=111863, Max=345, Min=3, Avg=69.69, 90=104, 99=128, 99.9=152, 99.99=261] 
+2026-04-28 07:03:14:573 8 sec: 770558 operations; 111939 current ops/sec; [READ: Count=111969, Max=3429, Min=3, Avg=69.61, 90=104, 99=128, 99.9=148, 99.99=299] 
+2026-04-28 07:03:15:573 9 sec: 882909 operations; 112351 current ops/sec; [READ: Count=112320, Max=302, Min=3, Avg=69.39, 90=104, 99=128, 99.9=149, 99.99=242] 
+2026-04-28 07:03:16:573 10 sec: 994922 operations; 112013 current ops/sec; [READ: Count=112042, Max=3735, Min=3, Avg=69.74, 90=104, 99=129, 99.9=158, 99.99=319] 
+2026-04-28 07:03:17:573 11 sec: 1106813 operations; 111891 current ops/sec; [READ: Count=111897, Max=3707, Min=3, Avg=69.75, 90=104, 99=128, 99.9=149, 99.99=297] 
+2026-04-28 07:03:18:573 12 sec: 1219814 operations; 113001 current ops/sec; [READ: Count=112981, Max=292, Min=3, Avg=69.14, 90=103, 99=127, 99.9=147, 99.99=180] 
+2026-04-28 07:03:19:573 13 sec: 1331823 operations; 112009 current ops/sec; [READ: Count=112020, Max=3917, Min=3, Avg=69.58, 90=104, 99=127, 99.9=149, 99.99=408] 
+2026-04-28 07:03:20:573 14 sec: 1443374 operations; 111551 current ops/sec; [READ: Count=111540, Max=1851, Min=3, Avg=69.83, 90=104, 99=128, 99.9=166, 99.99=433] 
+2026-04-28 07:03:21:573 15 sec: 1555394 operations; 112020 current ops/sec; [READ: Count=112017, Max=456, Min=3, Avg=69.63, 90=104, 99=128, 99.9=154, 99.99=377] 
+2026-04-28 07:03:22:573 16 sec: 1666707 operations; 111313 current ops/sec; [READ: Count=111299, Max=5279, Min=3, Avg=70.07, 90=104, 99=129, 99.9=175, 99.99=384] 
+2026-04-28 07:03:23:573 17 sec: 1778110 operations; 111403 current ops/sec; [READ: Count=111433, Max=2265, Min=3, Avg=70.04, 90=104, 99=130, 99.9=322, 99.99=994] 
+2026-04-28 07:03:24:573 18 sec: 1889959 operations; 111849 current ops/sec; [READ: Count=111845, Max=447, Min=3, Avg=69.74, 90=104, 99=128, 99.9=152, 99.99=345] 
+2026-04-28 07:03:25:573 19 sec: 2001730 operations; 111771 current ops/sec; [READ: Count=111786, Max=1836, Min=3, Avg=69.8, 90=104, 99=129, 99.9=155, 99.99=398] 
+2026-04-28 07:03:26:573 20 sec: 2113147 operations; 111417 current ops/sec; [READ: Count=111401, Max=1496, Min=3, Avg=70.03, 90=104, 99=129, 99.9=162, 99.99=405] 
+2026-04-28 07:03:27:573 21 sec: 2224304 operations; 111157 current ops/sec; [READ: Count=111159, Max=472, Min=3, Avg=70.19, 90=104, 99=129, 99.9=197, 99.99=384] 
+2026-04-28 07:03:28:573 22 sec: 2336000 operations; 111696 current ops/sec; [READ: Count=111687, Max=1748, Min=3, Avg=69.84, 90=104, 99=129, 99.9=158, 99.99=401] 
+2026-04-28 07:03:29:574 23 sec: 2447432 operations; 111432 current ops/sec; [READ: Count=111414, Max=2309, Min=3, Avg=70.02, 90=104, 99=129, 99.9=169, 99.99=388] 
+2026-04-28 07:03:30:573 24 sec: 2559229 operations; 111797 current ops/sec; [READ: Count=111798, Max=1652, Min=3, Avg=69.78, 90=104, 99=129, 99.9=176, 99.99=414] 
+2026-04-28 07:03:31:573 25 sec: 2670828 operations; 111599 current ops/sec; [READ: Count=111597, Max=419, Min=3, Avg=69.94, 90=104, 99=129, 99.9=184, 99.99=387] 
+2026-04-28 07:03:32:573 26 sec: 2782146 operations; 111318 current ops/sec; [READ: Count=111358, Max=1598, Min=3, Avg=70.1, 90=104, 99=129, 99.9=318, 99.99=409] 
+2026-04-28 07:03:33:573 27 sec: 2893598 operations; 111452 current ops/sec; [READ: Count=111490, Max=3721, Min=3, Avg=70, 90=104, 99=128, 99.9=153, 99.99=647] 
+2026-04-28 07:03:34:573 28 sec: 3005486 operations; 111888 current ops/sec; [READ: Count=111847, Max=1526, Min=3, Avg=69.74, 90=104, 99=128, 99.9=151, 99.99=346] 
+2026-04-28 07:03:35:573 29 sec: 3116788 operations; 111302 current ops/sec; [READ: Count=111292, Max=1751, Min=3, Avg=70.1, 90=104, 99=129, 99.9=173, 99.99=386] 
+2026-04-28 07:03:36:573 30 sec: 3228197 operations; 111409 current ops/sec; [READ: Count=111405, Max=474, Min=3, Avg=70.04, 90=104, 99=130, 99.9=233, 99.99=435] 
+2026-04-28 07:03:37:573 31 sec: 3339501 operations; 111304 current ops/sec; [READ: Count=111307, Max=1599, Min=3, Avg=70.1, 90=104, 99=129, 99.9=164, 99.99=473] 
+2026-04-28 07:03:38:573 32 sec: 3451023 operations; 111522 current ops/sec; [READ: Count=111559, Max=1606, Min=3, Avg=69.96, 90=104, 99=129, 99.9=174, 99.99=450] 
+2026-04-28 07:03:39:573 33 sec: 3562090 operations; 111067 current ops/sec; [READ: Count=111005, Max=1907, Min=3, Avg=70.26, 90=104, 99=129, 99.9=181, 99.99=454] 
+2026-04-28 07:03:40:573 34 sec: 3673557 operations; 111467 current ops/sec; [READ: Count=111465, Max=1748, Min=3, Avg=70.01, 90=104, 99=129, 99.9=157, 99.99=422] 
+2026-04-28 07:03:41:573 35 sec: 3784682 operations; 111125 current ops/sec; [READ: Count=111124, Max=1475, Min=3, Avg=70.21, 90=104, 99=130, 99.9=174, 99.99=422] 
+2026-04-28 07:03:42:573 36 sec: 3895862 operations; 111180 current ops/sec; [READ: Count=111184, Max=1694, Min=3, Avg=70.18, 90=104, 99=129, 99.9=167, 99.99=416] 
+2026-04-28 07:03:43:573 37 sec: 4006989 operations; 111127 current ops/sec; [READ: Count=111129, Max=1883, Min=3, Avg=70.22, 90=104, 99=129, 99.9=169, 99.99=442] 
+2026-04-28 07:03:44:573 38 sec: 4118048 operations; 111059 current ops/sec; [READ: Count=111046, Max=1289, Min=3, Avg=70.26, 90=104, 99=129, 99.9=184, 99.99=438] 
+2026-04-28 07:03:45:573 39 sec: 4229058 operations; 111010 current ops/sec; [READ: Count=111028, Max=3461, Min=3, Avg=70.27, 90=104, 99=129, 99.9=170, 99.99=433] 
+2026-04-28 07:03:46:573 40 sec: 4340556 operations; 111498 current ops/sec; [READ: Count=111483, Max=1597, Min=3, Avg=69.98, 90=104, 99=129, 99.9=152, 99.99=439] 
+2026-04-28 07:03:47:573 41 sec: 4451191 operations; 110635 current ops/sec; [READ: Count=110634, Max=3201, Min=3, Avg=70.5, 90=105, 99=130, 99.9=260, 99.99=451] 
+2026-04-28 07:03:48:573 42 sec: 4561743 operations; 110552 current ops/sec; [READ: Count=110543, Max=1805, Min=3, Avg=70.47, 90=105, 99=131, 99.9=357, 99.99=456] 
+2026-04-28 07:03:49:573 43 sec: 4672755 operations; 111012 current ops/sec; [READ: Count=111023, Max=1775, Min=3, Avg=70.3, 90=104, 99=130, 99.9=288, 99.99=432] 
+2026-04-28 07:03:50:573 44 sec: 4784246 operations; 111491 current ops/sec; [READ: Count=111500, Max=1614, Min=3, Avg=69.96, 90=104, 99=129, 99.9=206, 99.99=424] 
+2026-04-28 07:03:51:573 45 sec: 4896003 operations; 111757 current ops/sec; [READ: Count=111750, Max=1802, Min=3, Avg=69.82, 90=104, 99=129, 99.9=154, 99.99=429] 
+2026-04-28 07:03:52:573 46 sec: 5007090 operations; 111087 current ops/sec; [READ: Count=111087, Max=1654, Min=3, Avg=70.25, 90=104, 99=130, 99.9=261, 99.99=437] 
+2026-04-28 07:03:53:573 47 sec: 5118444 operations; 111354 current ops/sec; [READ: Count=111355, Max=1455, Min=3, Avg=70.08, 90=104, 99=128, 99.9=177, 99.99=433] 
+2026-04-28 07:03:54:573 48 sec: 5230086 operations; 111642 current ops/sec; [READ: Count=111642, Max=1746, Min=3, Avg=69.89, 90=104, 99=129, 99.9=198, 99.99=439] 
+2026-04-28 07:03:55:573 49 sec: 5341583 operations; 111497 current ops/sec; [READ: Count=111481, Max=1689, Min=3, Avg=69.98, 90=104, 99=129, 99.9=164, 99.99=401] 
+2026-04-28 07:03:56:573 50 sec: 5453266 operations; 111683 current ops/sec; [READ: Count=111700, Max=1577, Min=3, Avg=69.86, 90=104, 99=129, 99.9=158, 99.99=417] 
+2026-04-28 07:03:57:573 51 sec: 5564597 operations; 111331 current ops/sec; [READ: Count=111323, Max=2455, Min=3, Avg=70.05, 90=104, 99=128, 99.9=164, 99.99=1538] 
+2026-04-28 07:03:58:573 52 sec: 5676381 operations; 111784 current ops/sec; [READ: Count=111793, Max=3823, Min=3, Avg=69.79, 90=104, 99=129, 99.9=157, 99.99=422] 
+2026-04-28 07:03:59:573 53 sec: 5787757 operations; 111376 current ops/sec; [READ: Count=111382, Max=1433, Min=3, Avg=70.06, 90=104, 99=129, 99.9=223, 99.99=428] 
+2026-04-28 07:04:00:573 54 sec: 5899303 operations; 111546 current ops/sec; [READ: Count=111531, Max=1368, Min=3, Avg=69.95, 90=104, 99=129, 99.9=207, 99.99=403] 
+2026-04-28 07:04:01:573 55 sec: 6010270 operations; 110967 current ops/sec; [READ: Count=110986, Max=1999, Min=3, Avg=70.33, 90=104, 99=130, 99.9=330, 99.99=1472] 
+2026-04-28 07:04:02:573 56 sec: 6121791 operations; 111521 current ops/sec; [READ: Count=111504, Max=1750, Min=3, Avg=69.98, 90=104, 99=129, 99.9=152, 99.99=405] 
+2026-04-28 07:04:03:573 57 sec: 6233186 operations; 111395 current ops/sec; [READ: Count=111390, Max=1493, Min=3, Avg=70.05, 90=104, 99=129, 99.9=162, 99.99=414] 
+2026-04-28 07:04:04:573 58 sec: 6344027 operations; 110841 current ops/sec; [READ: Count=110846, Max=1687, Min=3, Avg=70.41, 90=104, 99=131, 99.9=261, 99.99=1364] 
+2026-04-28 07:04:05:573 59 sec: 6455478 operations; 111451 current ops/sec; [READ: Count=111441, Max=1765, Min=3, Avg=70, 90=104, 99=128, 99.9=155, 99.99=411] 
+2026-04-28 07:04:06:573 60 sec: 6566464 operations; 110986 current ops/sec; [READ: Count=110983, Max=2247, Min=3, Avg=70.2, 90=104, 99=129, 99.9=155, 99.99=1594] 
+2026-04-28 07:04:07:573 61 sec: 6677955 operations; 111491 current ops/sec; [READ: Count=111504, Max=1544, Min=3, Avg=69.99, 90=104, 99=129, 99.9=168, 99.99=405] 
+2026-04-28 07:04:08:573 62 sec: 6789267 operations; 111312 current ops/sec; [READ: Count=111298, Max=1804, Min=3, Avg=70.09, 90=104, 99=129, 99.9=158, 99.99=417] 
+2026-04-28 07:04:09:573 63 sec: 6900303 operations; 111036 current ops/sec; [READ: Count=111044, Max=1575, Min=3, Avg=70.28, 90=104, 99=129, 99.9=160, 99.99=1468] 
+2026-04-28 07:04:10:573 64 sec: 7011910 operations; 111607 current ops/sec; [READ: Count=111613, Max=1921, Min=3, Avg=69.9, 90=104, 99=128, 99.9=158, 99.99=1664] 
+2026-04-28 07:04:11:573 65 sec: 7122924 operations; 111014 current ops/sec; [READ: Count=111011, Max=1381, Min=3, Avg=70.29, 90=104, 99=129, 99.9=212, 99.99=422] 
+2026-04-28 07:04:12:573 66 sec: 7233841 operations; 110917 current ops/sec; [READ: Count=110915, Max=1609, Min=3, Avg=70.36, 90=105, 99=130, 99.9=221, 99.99=1365] 
+2026-04-28 07:04:13:573 67 sec: 7345116 operations; 111275 current ops/sec; [READ: Count=111272, Max=1479, Min=3, Avg=70.13, 90=104, 99=129, 99.9=264, 99.99=436] 
+2026-04-28 07:04:14:573 68 sec: 7456101 operations; 110985 current ops/sec; [READ: Count=110985, Max=2425, Min=3, Avg=70.28, 90=104, 99=129, 99.9=160, 99.99=1995] 
+2026-04-28 07:04:15:573 69 sec: 7567230 operations; 111129 current ops/sec; [READ: Count=111133, Max=1632, Min=3, Avg=70.22, 90=104, 99=129, 99.9=163, 99.99=1391] 
+2026-04-28 07:04:16:573 70 sec: 7678589 operations; 111359 current ops/sec; [READ: Count=111352, Max=1721, Min=3, Avg=70.09, 90=104, 99=129, 99.9=174, 99.99=408] 
+2026-04-28 07:04:17:573 71 sec: 7789676 operations; 111087 current ops/sec; [READ: Count=111091, Max=1994, Min=3, Avg=70.24, 90=105, 99=129, 99.9=158, 99.99=1504] 
+2026-04-28 07:04:18:573 72 sec: 7900469 operations; 110793 current ops/sec; [READ: Count=110792, Max=2805, Min=3, Avg=70.44, 90=104, 99=129, 99.9=168, 99.99=1336] 
+2026-04-28 07:04:19:573 73 sec: 8010991 operations; 110522 current ops/sec; [READ: Count=110523, Max=1699, Min=3, Avg=70.61, 90=104, 99=130, 99.9=294, 99.99=1558] 
+2026-04-28 07:04:20:573 74 sec: 8121686 operations; 110695 current ops/sec; [READ: Count=110698, Max=3097, Min=3, Avg=70.48, 90=104, 99=129, 99.9=228, 99.99=1470] 
+2026-04-28 07:04:21:573 75 sec: 8232989 operations; 111303 current ops/sec; [READ: Count=111297, Max=1484, Min=3, Avg=70.13, 90=104, 99=129, 99.9=185, 99.99=1379] 
+2026-04-28 07:04:22:573 76 sec: 8344302 operations; 111313 current ops/sec; [READ: Count=111316, Max=1589, Min=3, Avg=70.1, 90=104, 99=129, 99.9=185, 99.99=1286] 
+2026-04-28 07:04:23:573 77 sec: 8455594 operations; 111292 current ops/sec; [READ: Count=111294, Max=1596, Min=3, Avg=70.12, 90=104, 99=129, 99.9=173, 99.99=1502] 
+2026-04-28 07:04:24:573 78 sec: 8566848 operations; 111254 current ops/sec; [READ: Count=111258, Max=1566, Min=3, Avg=70.14, 90=104, 99=129, 99.9=164, 99.99=1413] 
+2026-04-28 07:04:25:573 79 sec: 8677583 operations; 110735 current ops/sec; [READ: Count=110731, Max=3623, Min=3, Avg=70.47, 90=104, 99=129, 99.9=195, 99.99=1785] 
+2026-04-28 07:04:26:573 80 sec: 8788483 operations; 110900 current ops/sec; [READ: Count=110901, Max=3435, Min=3, Avg=70.36, 90=104, 99=129, 99.9=204, 99.99=2129] 
+2026-04-28 07:04:27:573 81 sec: 8900008 operations; 111525 current ops/sec; [READ: Count=111521, Max=1612, Min=3, Avg=69.98, 90=104, 99=129, 99.9=188, 99.99=1411] 
+2026-04-28 07:04:28:573 82 sec: 9011266 operations; 111258 current ops/sec; [READ: Count=111261, Max=1828, Min=3, Avg=70.14, 90=104, 99=129, 99.9=186, 99.99=1546] 
+2026-04-28 07:04:29:573 83 sec: 9122692 operations; 111426 current ops/sec; [READ: Count=111423, Max=1458, Min=3, Avg=70.05, 90=104, 99=129, 99.9=161, 99.99=1323] 
+2026-04-28 07:04:30:573 84 sec: 9233866 operations; 111174 current ops/sec; [READ: Count=111177, Max=1895, Min=3, Avg=70.15, 90=104, 99=129, 99.9=172, 99.99=1614] 
+2026-04-28 07:04:31:573 85 sec: 9345276 operations; 111410 current ops/sec; [READ: Count=111417, Max=1622, Min=3, Avg=70.05, 90=104, 99=129, 99.9=161, 99.99=1503] 
+2026-04-28 07:04:32:573 86 sec: 9456374 operations; 111098 current ops/sec; [READ: Count=111100, Max=1580, Min=3, Avg=70.24, 90=104, 99=130, 99.9=205, 99.99=1460] 
+2026-04-28 07:04:33:573 87 sec: 9567236 operations; 110862 current ops/sec; [READ: Count=110849, Max=1915, Min=3, Avg=70.4, 90=104, 99=130, 99.9=273, 99.99=1528] 
+2026-04-28 07:04:34:573 88 sec: 9678669 operations; 111433 current ops/sec; [READ: Count=111429, Max=1398, Min=3, Avg=70.02, 90=104, 99=129, 99.9=170, 99.99=1211] 
+2026-04-28 07:04:35:573 89 sec: 9789808 operations; 111139 current ops/sec; [READ: Count=111142, Max=1891, Min=3, Avg=70.23, 90=104, 99=129, 99.9=208, 99.99=1625] 
+2026-04-28 07:04:36:573 90 sec: 9900862 operations; 111054 current ops/sec; [READ: Count=111057, Max=1586, Min=3, Avg=70.22, 90=105, 99=129, 99.9=160, 99.99=1429] 
+2026-04-28 07:04:37:573 91 sec: 10011665 operations; 110803 current ops/sec; [READ: Count=110802, Max=1797, Min=3, Avg=70.42, 90=105, 99=130, 99.9=175, 99.99=1578] 
+2026-04-28 07:04:38:573 92 sec: 10121084 operations; 109419 current ops/sec; [READ: Count=109421, Max=9423, Min=3, Avg=71.34, 90=105, 99=130, 99.9=164, 99.99=6659] 
+2026-04-28 07:04:39:573 93 sec: 10231985 operations; 110901 current ops/sec; [READ: Count=110897, Max=1622, Min=3, Avg=70.38, 90=104, 99=130, 99.9=293, 99.99=1439] 
+2026-04-28 07:04:40:573 94 sec: 10342977 operations; 110992 current ops/sec; [READ: Count=110992, Max=1530, Min=3, Avg=70.25, 90=104, 99=129, 99.9=164, 99.99=1318] 
+2026-04-28 07:04:41:573 95 sec: 10454051 operations; 111074 current ops/sec; [READ: Count=111076, Max=1508, Min=3, Avg=70.23, 90=104, 99=129, 99.9=171, 99.99=1354] 
+2026-04-28 07:04:42:573 96 sec: 10565223 operations; 111172 current ops/sec; [READ: Count=111176, Max=1656, Min=3, Avg=70.19, 90=104, 99=129, 99.9=168, 99.99=1465] 
+2026-04-28 07:04:43:573 97 sec: 10676246 operations; 111023 current ops/sec; [READ: Count=111017, Max=2217, Min=3, Avg=70.29, 90=104, 99=129, 99.9=157, 99.99=1471] 
+2026-04-28 07:04:44:574 98 sec: 10787412 operations; 111054.95 current ops/sec; [READ: Count=111163, Max=1656, Min=3, Avg=70.24, 90=104, 99=129, 99.9=171, 99.99=1472] 
+2026-04-28 07:04:45:573 99 sec: 10898535 operations; 111234.23 current ops/sec; [READ: Count=111130, Max=1614, Min=3, Avg=70.17, 90=104, 99=129, 99.9=156, 99.99=1357] 
+2026-04-28 07:04:46:573 100 sec: 11009349 operations; 110814 current ops/sec; [READ: Count=110813, Max=2313, Min=3, Avg=70.43, 90=104, 99=129, 99.9=180, 99.99=1471] 
+2026-04-28 07:04:47:573 101 sec: 11120232 operations; 110883 current ops/sec; [READ: Count=110886, Max=3397, Min=3, Avg=70.37, 90=104, 99=129, 99.9=152, 99.99=1448] 
+2026-04-28 07:04:48:573 102 sec: 11231139 operations; 110907 current ops/sec; [READ: Count=110895, Max=2443, Min=3, Avg=70.36, 90=105, 99=129, 99.9=155, 99.99=1494] 
+2026-04-28 07:04:49:573 103 sec: 11341903 operations; 110764 current ops/sec; [READ: Count=110773, Max=1855, Min=3, Avg=70.44, 90=104, 99=129, 99.9=254, 99.99=1687] 
+2026-04-28 07:04:50:573 104 sec: 11452840 operations; 110937 current ops/sec; [READ: Count=110941, Max=2361, Min=3, Avg=70.35, 90=104, 99=129, 99.9=198, 99.99=1626] 
+2026-04-28 07:04:51:573 105 sec: 11563943 operations; 111103 current ops/sec; [READ: Count=111097, Max=1698, Min=3, Avg=70.24, 90=104, 99=129, 99.9=245, 99.99=1577] 
+2026-04-28 07:04:52:573 106 sec: 11674824 operations; 110881 current ops/sec; [READ: Count=110887, Max=2845, Min=3, Avg=70.38, 90=104, 99=129, 99.9=182, 99.99=1630] 
+2026-04-28 07:04:53:573 107 sec: 11785973 operations; 111149 current ops/sec; [READ: Count=111143, Max=1551, Min=3, Avg=70.2, 90=104, 99=129, 99.9=187, 99.99=1325] 
+2026-04-28 07:04:54:573 108 sec: 11896911 operations; 110938 current ops/sec; [READ: Count=110932, Max=1847, Min=3, Avg=70.34, 90=104, 99=129, 99.9=172, 99.99=1480] 
+2026-04-28 07:04:55:573 109 sec: 12007865 operations; 110954 current ops/sec; [READ: Count=110960, Max=2441, Min=3, Avg=70.33, 90=104, 99=129, 99.9=167, 99.99=1712] 
+2026-04-28 07:04:56:573 110 sec: 12119034 operations; 111169 current ops/sec; [READ: Count=111167, Max=1903, Min=3, Avg=70.19, 90=104, 99=129, 99.9=158, 99.99=1666] 
+2026-04-28 07:04:57:573 111 sec: 12229984 operations; 110950 current ops/sec; [READ: Count=110952, Max=1925, Min=3, Avg=70.34, 90=104, 99=129, 99.9=184, 99.99=1821] 
+2026-04-28 07:04:58:573 112 sec: 12340614 operations; 110630 current ops/sec; [READ: Count=110633, Max=1879, Min=3, Avg=70.54, 90=104, 99=129, 99.9=175, 99.99=1683] 
+2026-04-28 07:04:59:573 113 sec: 12451723 operations; 111109 current ops/sec; [READ: Count=111100, Max=1575, Min=3, Avg=70.22, 90=104, 99=129, 99.9=157, 99.99=1327] 
+2026-04-28 07:05:00:573 114 sec: 12562710 operations; 110987 current ops/sec; [READ: Count=110989, Max=1747, Min=3, Avg=70.32, 90=104, 99=129, 99.9=161, 99.99=1601] 
+2026-04-28 07:05:01:573 115 sec: 12673847 operations; 111137 current ops/sec; [READ: Count=111141, Max=1824, Min=3, Avg=70.22, 90=104, 99=129, 99.9=166, 99.99=1599] 
+2026-04-28 07:05:02:573 116 sec: 12784939 operations; 111092 current ops/sec; [READ: Count=111093, Max=1694, Min=3, Avg=70.24, 90=104, 99=129, 99.9=167, 99.99=1560] 
+2026-04-28 07:05:03:573 117 sec: 12895735 operations; 110796 current ops/sec; [READ: Count=110789, Max=1705, Min=3, Avg=70.43, 90=104, 99=129, 99.9=160, 99.99=1585] 
+2026-04-28 07:05:04:573 118 sec: 13006335 operations; 110600 current ops/sec; [READ: Count=110609, Max=3463, Min=3, Avg=70.56, 90=104, 99=129, 99.9=195, 99.99=1720] 
+2026-04-28 07:05:05:573 119 sec: 13117357 operations; 111022 current ops/sec; [READ: Count=111019, Max=1677, Min=3, Avg=70.31, 90=104, 99=129, 99.9=171, 99.99=1552] 
+2026-04-28 07:05:06:573 120 sec: 13227851 operations; 110494 current ops/sec; [READ: Count=110496, Max=1732, Min=3, Avg=70.65, 90=104, 99=129, 99.9=160, 99.99=1630] 
+Maximum time elapsed. Requesting stop for the workload.
+Stop requested for workload. Now Joining!
+2026-04-28 07:05:06:670 120 sec: 13227968 operations; 1218.75 current ops/sec; [READ: Count=92, Max=129, Min=11, Avg=77.97, 90=106, 99=129, 99.9=129, 99.99=129] [CLEANUP: Count=8, Max=94911, Min=18160, Avg=44616, 90=94911, 99=94911, 99.9=94911, 99.99=94911] 
+	Command being timed: "/users/Xinying/ozonedb/ycsb/bin/ycsb run ozonedb -threads 8 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=1 -p maxexecutiontime=120 -p operationcount=0 -p shared_config=/users/Xinying/ozonedb/src/config/local/shared_config_rocksdb.json"
+	User time (seconds): 586.37
+	System time (seconds): 393.93
+	Percent of CPU this job got: 750%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:10.69
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 55012288
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 786
+	Minor (reclaiming a frame) page faults: 14029752
+	Voluntary context switches: 1691580
+	Involuntary context switches: 3031
+	Swaps: 0
+	File system inputs: 145591591
+	File system outputs: 11128
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

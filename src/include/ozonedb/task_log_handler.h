@@ -58,7 +58,12 @@ class TaskLogHandler {
   std::shared_mutex task_map_mutex;
 
   std::unordered_map<TaskRecord::TaskIdentifier, int, TaskIdentifierHash, TaskIdentifierEqual> dead_tasks;  // the value here is used to store the owner generation
-  int task_heartbeat_threshold = 10000000;
+  // Tick rate is 100 ms (TaskLogHandler::updateHeartbeats), so this constant is
+  // measured in 100-ms units. 30 -> 3 s. The committed value is small enough
+  // that abandoned compaction tasks are reclaimed within an experiment window;
+  // the original literal was 10000000 (~11.6 days) which left the dead-task
+  // path effectively unreachable.
+  int task_heartbeat_threshold = 30;
   std::shared_mutex dead_tasks_mutex;
   std::shared_mutex task_log_mutex;
 

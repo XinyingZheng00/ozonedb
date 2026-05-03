@@ -1,6 +1,8 @@
 #include "metadata_log_handler.h"
 #include "db.h"
 #include "helper.h"
+#include <algorithm>
+#include <climits>
 
 namespace ozonedb {
 
@@ -151,7 +153,9 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       return "buffered";
     }
     for (auto const& input_file : record->input_files()) {
-      // remove input file from latest_view
+      // The buffer rule above guarantees input[0] is at the front of L1, and
+      // the picker (initInputUnit) always took inputs as a consecutive run
+      // from the front, so each pop_front removes the next expected input.
       latest_view.storage_layout[input_prefix].pop_front();
       if (latest_view.key_range.find(input_file) != latest_view.key_range.end()) {
         latest_view.key_range.erase(input_file);
@@ -174,33 +178,56 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
     std::string const& input_file = record->input_files()[0];
     std::string input_prefix = getPrefix(input_file);
     std::deque<std::string>& level_layout = this->latest_view.storage_layout[input_prefix];
-    std::vector<std::string> keys;
-    auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
-    int index = std::distance(level_layout.begin(), it);
-    for (auto const& input_file : record->input_files()) {
-      // remove input file from latest_view
-      //find the index of the input file
-      auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
-      level_layout.erase(it);
 
-      if (latest_view.key_range.find(input_file) != latest_view.key_range.end()) {
-        latest_view.key_range.erase(input_file);
+    // Canonical-replay buffer for last-level COMPACT. The picker
+    // (initInputUnitInlastLayer) always picks the first run of `limit`
+    // same-version files starting from the front of the deque, so the OLDEST
+    // commit within a version has its first input at the front of that
+    // version's region. To make replay deterministic across writers, defer
+    // any commit whose first input isn't at the front of its version region —
+    // it'll drain back when the records before it (in canonical order) have
+    // applied. Without this, two writer processes at different replay offsets
+    // can apply records in different orders, produce non-canonical deque
+    // shapes, and pick divergent (overlapping) input sets in subsequent rounds.
+    int input_version = getNumberBeforeUnderscore(input_file);
+    size_t version_start = 0;
+    while (version_start < level_layout.size() &&
+           getNumberBeforeUnderscore(level_layout[version_start]) > input_version) {
+      ++version_start;
+    }
+    if (version_start >= level_layout.size() ||
+        level_layout[version_start] != input_file) {
+      auto it = std::find(level_layout.begin(), level_layout.end(), input_file);
+      int index = (it == level_layout.end())
+                      ? INT_MAX
+                      : static_cast<int>(std::distance(level_layout.begin(), it));
+      this->buffer[input_prefix].push({index, record});
+      return "buffered";
+    }
+
+    int index = static_cast<int>(version_start);
+    for (auto const& input_f : record->input_files()) {
+      // Inputs are at consecutive positions starting at `index`. After each
+      // erase, the next input shifts to position `index`. The canonical-replay
+      // invariant guarantees the file is present.
+      level_layout.erase(level_layout.begin() + index);
+      if (latest_view.key_range.find(input_f) != latest_view.key_range.end()) {
+        latest_view.key_range.erase(input_f);
       }
-      if (latest_view.file_size.find(input_file) != latest_view.file_size.end()) {
-        latest_view.file_size.erase(input_file);
+      if (latest_view.file_size.find(input_f) != latest_view.file_size.end()) {
+        latest_view.file_size.erase(input_f);
       }
-      this->tail_cache->addTailChange(input_file, record->output_file(0));
+      this->tail_cache->addTailChange(input_f, record->output_file(0));
     }
     for (int i = 0; i < record->output_file_size(); i++) {
       std::string const& output_file = record->output_file(i);
-      std::string output_prefix = getPrefix(output_file);
-      //place the output file in the last level in the index position
-      level_layout.insert(level_layout.begin() + index + i, output_file);
+      int insert_at = std::min(index + i, static_cast<int>(level_layout.size()));
+      level_layout.insert(level_layout.begin() + insert_at, output_file);
       latest_view.key_range[output_file] = std::make_pair(record->key_start(i), record->key_end(i));
       latest_view.file_size[output_file] = this->storage->size(output_file);
     }
     delete record;
-    return "";
+    return input_prefix;
   }
   return "";
 }
@@ -224,11 +251,7 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
     std::unique_lock<std::shared_mutex> lock(view_mutex);
     for (auto const& record : records) {
       std::string modified_layer = rollforwardSingleOperationRecord(record);
-      while (modified_layer != "buffered" && !this->buffer[modified_layer].empty()) {
-        OperationRecord* op_record = this->buffer[modified_layer].top().second;
-        this->buffer[modified_layer].pop();
-        modified_layer = rollforwardSingleOperationRecord(op_record);
-      }
+      if (modified_layer != "buffered") drainBuffer(modified_layer);
     }
     if (!this->latest_view.current_log_tail.empty()) {
       this->latest_view.tail_size = this->storage->size(this->latest_view.current_log_tail);
@@ -255,11 +278,7 @@ View MetadataLogHandler::rollForwardMetadataLog() {
   std::unique_lock<std::shared_mutex> lock(view_mutex);
   for (auto const& record : records) {
     std::string modified_layer = rollforwardSingleOperationRecord(record);
-    while (modified_layer != "buffered" && !this->buffer[modified_layer].empty()) {
-      OperationRecord* op_record = this->buffer[modified_layer].top().second;
-      this->buffer[modified_layer].pop();
-      modified_layer = rollforwardSingleOperationRecord(op_record);
-    }
+    if (modified_layer != "buffered") drainBuffer(modified_layer);
   }
   if (!this->latest_view.current_log_tail.empty()) {
     this->latest_view.tail_size = this->storage->size(this->latest_view.current_log_tail);
@@ -267,6 +286,25 @@ View MetadataLogHandler::rollForwardMetadataLog() {
   }
   return latest_view;
 }
+void MetadataLogHandler::drainBuffer(std::string const& layer) {
+  while (true) {
+    auto& buf = this->buffer[layer];
+    if (buf.empty()) return;
+    std::vector<OperationRecord*> attempts;
+    attempts.reserve(buf.size());
+    while (!buf.empty()) {
+      attempts.push_back(buf.top().second);
+      buf.pop();
+    }
+    bool any_applied = false;
+    for (auto* op : attempts) {
+      std::string r = rollforwardSingleOperationRecord(op);
+      if (r != "buffered") any_applied = true;
+    }
+    if (!any_applied) return;
+  }
+}
+
 void MetadataLogHandler::initSSTMetadata() {
   // this is invoked only when the database starts so no need to lock
   for (auto const& entry : this->latest_view.storage_layout) {

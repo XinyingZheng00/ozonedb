@@ -1,0 +1,53 @@
+# CMD: /users/Xinying/ozonedb/ycsb/bin/ycsb run ozonedb -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=1000000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyW_n2_r0pct.json
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:ozonedb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb/ycsb/ozonedb/conf:/users/Xinying/ozonedb/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=1000000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyW_n2_r0pct.json -t
+Command line: -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p requestdistribution=sequential -p operationcount=1000000 -p maxexecutiontime=0 -p shared_config=/tmp/churn_v4_configs/shared_config_varyW_n2_r0pct.json -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+2026-05-01 03:42:05:587 0 sec: 0 operations; est completion in 0 second 
+Starting compaction watcher
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-05-01 03:42:15:586 10 sec: 120155 operations; 12015.5 current ops/sec; est completion in 1 minute [READ: Count=120177, Max=6855, Min=48, Avg=77.68, 90=85, 99=103, 99.9=128, 99.99=434] 
+2026-05-01 03:42:25:586 20 sec: 249037 operations; 12888.2 current ops/sec; est completion in 1 minute [READ: Count=128864, Max=5319, Min=40, Avg=76.5, 90=84, 99=99, 99.9=123, 99.99=195] 
+2026-05-01 03:42:35:586 30 sec: 378939 operations; 12990.2 current ops/sec; est completion in 50 seconds [READ: Count=129904, Max=4139, Min=48, Avg=76.03, 90=83, 99=97, 99.9=118, 99.99=233] 
+2026-05-01 03:42:45:586 40 sec: 510295 operations; 13135.6 current ops/sec; est completion in 39 seconds [READ: Count=131355, Max=450, Min=47, Avg=75.17, 90=83, 99=97, 99.9=119, 99.99=172] 
+2026-05-01 03:42:55:586 50 sec: 641162 operations; 13086.7 current ops/sec; est completion in 28 seconds [READ: Count=130872, Max=4175, Min=26, Avg=75.44, 90=83, 99=98, 99.9=120, 99.99=302] 
+2026-05-01 03:43:05:586 60 sec: 849988 operations; 20882.6 current ops/sec; est completion in 11 seconds [READ: Count=208823, Max=7279, Min=25, Avg=46.93, 90=57, 99=68, 99.9=91, 99.99=155] 
+[OZONEDB-PROFILE] reads=1000000  avg_total=61.45us  view=2.83us(4.6%)  log=0.48us(0.8%)  sst=57.94us_per_call x 999709_calls(94.3%_of_total)
+[OZONEDB-SST-PROFILE] level | time_total_ms | enters | range_rejects | table_gets | hits
+[OZONEDB-SST-PROFILE] L1  |      4100.11 |  6958032 |        10302 |    6947730 |  13452
+[OZONEDB-SST-PROFILE] L2  |     53443.87 |  4464186 |          256 |    4463930 | 986257
+[OZONEDB-TBL-PROFILE] file_filter_reject=10313738  block_filter_reject=97118  index_invalid=0  block_read_more=761420  hit_from_cache=239384  miss_after_read=1095  found=999709
+2026-05-01 03:43:10:329 64 sec: 1000000 operations; 31628.08 current ops/sec; [READ: Count=150005, Max=3293, Min=3, Avg=30.26, 90=54, 99=64, 99.9=77, 99.99=131] [CLEANUP: Count=1, Max=70207, Min=70144, Avg=70176, 90=70207, 99=70207, 99.9=70207, 99.99=70207] 
+[OVERALL], RunTime(ms), 64743
+[OVERALL], Throughput(ops/sec), 15445.685247826019
+[TOTAL_GCS_PS_Scavenge], Count, 5
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 20
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.03089137049565204
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 5
+[TOTAL_GC_TIME], Time(ms), 20
+[TOTAL_GC_TIME_%], Time(%), 0.03089137049565204
+[READ], Operations, 1000000
+[READ], AverageLatency(us), 63.155514
+[READ], MinLatency(us), 3
+[READ], MaxLatency(us), 7279
+[READ], 95thPercentileLatency(us), 85
+[READ], 99thPercentileLatency(us), 97
+[READ], Return=OK, 1000000
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 70176.0
+[CLEANUP], MinLatency(us), 70144
+[CLEANUP], MaxLatency(us), 70207
+[CLEANUP], 95thPercentileLatency(us), 70207
+[CLEANUP], 99thPercentileLatency(us), 70207

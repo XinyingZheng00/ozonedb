@@ -1,0 +1,59 @@
+[WARN]  Running against a source checkout. In order to get our runtime dependencies we'll have to invoke Maven. Depending on the state of your system, this may take ~30-45 seconds
+[DEBUG]  Running 'mvn -pl site.ycsb:ozonedb-binding -am package -DskipTests dependency:build-classpath -DincludeScope=compile -Dmdep.outputFilterFile=true'
+/usr/lib/jvm/java-8-openjdk-amd64/bin/java -cp /users/Xinying/ozonedb/ycsb/ozonedb/conf:/users/Xinying/ozonedb/ycsb/ozonedb/target/ozonedb-binding-0.18.0-SNAPSHOT.jar:/users/Xinying/.m2/repository/org/apache/htrace/htrace-core4/4.1.0-incubating/htrace-core4-4.1.0-incubating.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-api/1.7.25/slf4j-api-1.7.25.jar:/users/Xinying/.m2/repository/org/hdrhistogram/HdrHistogram/2.1.12/HdrHistogram-2.1.12.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar:/users/Xinying/.m2/repository/ozonedbjnimaven/demoproc-jni/1.0/demoproc-jni-1.0.jar:/users/Xinying/.m2/repository/ch/qos/logback/logback-core/1.2.3/logback-core-1.2.3.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-mapper-asl/1.9.4/jackson-mapper-asl-1.9.4.jar:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar:/users/Xinying/.m2/repository/org/codehaus/jackson/jackson-core-asl/1.9.4/jackson-core-asl-1.9.4.jar:/users/Xinying/ozonedb/ycsb/core/target/core-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p maxexecutiontime=30 -p operationcount=0 -p shared_config=/users/Xinying/ozonedb/src/config/local/shared_config_rocksdb.json -t
+Command line: -db site.ycsb.db.OzoneDBClient -threads 1 -s -P /users/Xinying/ozonedb/ycsb/workloads/generated_workloads/workloadc_1KB_1000000_1000000 -p status.interval=10 -p maxexecutiontime=30 -p operationcount=0 -p shared_config=/users/Xinying/ozonedb/src/config/local/shared_config_rocksdb.json -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Class path contains multiple SLF4J bindings.
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/ch/qos/logback/logback-classic/1.2.3/logback-classic-1.2.3.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: Found binding in [jar:file:/users/Xinying/.m2/repository/org/slf4j/slf4j-simple/1.7.25/slf4j-simple-1.7.25.jar!/org/slf4j/impl/StaticLoggerBinder.class]
+SLF4J: See http://www.slf4j.org/codes.html#multiple_bindings for an explanation.
+SLF4J: Actual binding is of type [ch.qos.logback.classic.util.ContextSelectorStaticBinder]
+Maximum execution time specified as: 30 secs
+2026-04-28 22:26:57:298 0 sec: 0 operations; 
+Starting compaction watcher
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-04-28 22:26:58:008 - Compaction started: 
+139774929131072:Compacting datalog/33 datalog/34 into:sstable1/79b887bf-ed37-4490-90ed-64f7303d9e08202604281626571777415218192223750.sst
+2026-04-28 22:26:58:581 - Compaction completed: 
+2026-04-28 22:26:58:613 - Compaction started: 
+2026-04-28 22:27:07:298 10 sec: 69597 operations; 6959.7 current ops/sec; [READ: Count=69626, Max=2547711, Min=2, Avg=138.2, 90=97, 99=122, 99.9=317, 99.99=3405] 
+139774929131072:Compacting sstable4/e4b567d4-905e-4653-af87-b5313a942799202604281616181777414654241522157.sst sstable4/e4b567d4-905e-4653-af87-b5313a942799202604281616181777414723835095177.sst into:sstable5/79b887bf-ed37-4490-90ed-64f7303d9e08202604281626571777415225313002136.sst
+2026-04-28 22:27:12:467 - Compaction completed: 
+2026-04-28 22:27:17:298 20 sec: 208950 operations; 13935.3 current ops/sec; [READ: Count=139330, Max=146175, Min=2, Avg=70.44, 90=99, 99=126, 99.9=285, 99.99=591] 
+Maximum time elapsed. Requesting stop for the workload.
+Stop requested for workload. Now Joining!
+[OZONEDB-PROFILE] reads=350804  avg_total=81.11us  view=1.28us(1.6%)  log=1.16us(1.4%)  sst=79.86us_per_call x 344549_calls(96.7%_of_total)
+[OZONEDB-SST-PROFILE] level | time_total_ms | enters | range_rejects | table_gets | hits
+[OZONEDB-SST-PROFILE] L1  |      1576.08 |   333040 |            1 |     333039 |  21158
+[OZONEDB-SST-PROFILE] L4  |     12600.35 |   191281 |            0 |     191281 | 127782
+[OZONEDB-SST-PROFILE] L5  |     13118.40 |   195609 |            0 |     195609 | 195609
+[OZONEDB-TBL-PROFILE] file_filter_reject=372079  block_filter_reject=3266  index_invalid=0  block_read_more=204886  hit_from_cache=139698  miss_after_read=35  found=344549
+2026-04-28 22:27:27:298 30 sec: 350798 operations; 14184.8 current ops/sec; [READ: Count=141848, Max=4471, Min=2, Avg=69.38, 90=98, 99=119, 99.9=133, 99.99=162] 
+2026-04-28 22:27:27:372 30 sec: 350804 operations; 81.08 current ops/sec; [READ: Count=0, Max=0, Min=0, Avg=0, 90=0, 99=0, 99.9=0, 99.99=0] [CLEANUP: Count=1, Max=73215, Min=73152, Avg=73184, 90=73215, 99=73215, 99.9=73215, 99.99=73215] 
+[OVERALL], RunTime(ms), 30074
+[OVERALL], Throughput(ops/sec), 11664.69375540334
+[TOTAL_GCS_PS_Scavenge], Count, 2
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 8
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.02660105074150429
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 2
+[TOTAL_GC_TIME], Time(ms), 8
+[TOTAL_GC_TIME_%], Time(%), 0.02660105074150429
+[READ], Operations, 350804
+[READ], AverageLatency(us), 83.46191605568922
+[READ], MinLatency(us), 2
+[READ], MaxLatency(us), 2547711
+[READ], 95thPercentileLatency(us), 104
+[READ], 99thPercentileLatency(us), 122
+[READ], Return=OK, 350804
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 73184.0
+[CLEANUP], MinLatency(us), 73152
+[CLEANUP], MaxLatency(us), 73215
+[CLEANUP], 95thPercentileLatency(us), 73215
+[CLEANUP], 99thPercentileLatency(us), 73215

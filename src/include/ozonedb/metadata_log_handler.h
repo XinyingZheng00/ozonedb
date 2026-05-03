@@ -56,6 +56,12 @@ class MetadataLogHandler {
   // Deserialize OperationRecords from a file
   std::vector<OperationRecord*> readMetadataLog();
   std::string rollforwardSingleOperationRecord(OperationRecord* record);
+  // Drain all applicable buffered records for `layer` until quiescent.
+  // Each pass snapshots the layer's buffer, retries every record (any record
+  // that can't apply re-buffers itself), and repeats until a full pass yields
+  // no applications. Avoids head-of-line blocking when the lowest-priority
+  // record can't apply but other buffered records can.
+  void drainBuffer(std::string const& layer);
 
  public:
   EventListener* event_listener = nullptr;

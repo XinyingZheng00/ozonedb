@@ -73,9 +73,15 @@ Status CompactionWatcher::watchForCompaction(std::atomic<bool> const* active) {
 
 Status CompactionWatcher::taskHeartbeat(Compaction* compaction, TaskRecord* task_record) {
   task_record->set_status(TaskRecord::TASK_IN_PROGRESS);
-  while (!(compaction->finished)) {
+  while (!(compaction->finished) && !(compaction->aborted.load())) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     this->task_log_handler->appendToTaskLog(*task_record);
+  }
+  // If the compaction was experimentally aborted, do NOT write COMPLETE —
+  // leaving the task in BEGIN/IN_PROGRESS state so survivors detect it as
+  // dead via the heartbeat-timeout path (Section 4.4 of the paper).
+  if (compaction->aborted.load()) {
+    return Status::kSuccess;
   }
   task_record->set_status(TaskRecord::TASK_COMPLETE);
   this->task_log_handler->appendToTaskLog(*task_record);
@@ -84,6 +90,67 @@ Status CompactionWatcher::taskHeartbeat(Compaction* compaction, TaskRecord* task
 
 Status CompactionWatcher::pickCompaction(Compaction*& compaction, TaskRecord*& task_record, bool& has_worked_on_compaction) {
   this->metadata_handler->getLatestView(this->latest_view);
+  // Replay the task log on every pick so the heartbeat-timeout check in
+  // rollForwardTaskLog actually runs even when this writer is not currently
+  // attempting to claim any new task. As-shipped, rollForwardTaskLog was
+  // only invoked from shouldWorkOnTask (compaction.cpp:30) — meaning a
+  // quiescent writer (e.g. a drain process with no live work in its view)
+  // would never discover that other writers' tasks have gone dead.
+  this->task_log_handler->rollForwardTaskLog();
+
+  // Pick-trace instrumentation. With OZONEDB_PICK_TRACE=1 in the env, every
+  // pickCompaction call dumps the metadata view (every storage-layout layer's
+  // deque) at entry and emits a PICK_RESULT line for whatever TaskID it picks.
+  // PICK_TRACE/PICK_RESULT share `ts=` so they can be joined in post-processing.
+  static bool pick_trace = std::getenv("OZONEDB_PICK_TRACE") != nullptr;
+  long pick_ts = 0;
+  if (pick_trace) {
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    pick_ts = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    std::cout << "PICK_TRACE pid=" << getpid() << " ts=" << pick_ts;
+    for (auto const& entry : this->latest_view.storage_layout) {
+      std::cout << " " << entry.first << "=[";
+      bool first = true;
+      for (auto const& f : entry.second) {
+        if (!first) std::cout << ",";
+        auto slash = f.find('/');
+        std::cout << (slash == std::string::npos ? f : f.substr(slash + 1));
+        first = false;
+      }
+      std::cout << "]";
+    }
+    std::cout << std::endl;
+  }
+
+  // Step 0 (added for the churn-tolerance experiment): check the dead-task
+  // queue first. Without this, continuous workload keeps Steps 1-3 finding
+  // work, so abandoned tasks marked DEAD by the heartbeat-timeout path can
+  // sit unreclaimed indefinitely. The paper (Section 4.4) claims tasks "can
+  // continue making progress" once detected — interleaving the dead-task
+  // check ensures that in practice.
+  {
+    auto result = this->task_log_handler->getDeadTask();
+    auto dead_task = result.first;
+    int owner_generation = result.second;
+    while (dead_task.IsInitialized()) {
+      auto* dead_task_id = new TaskRecord::TaskIdentifier(dead_task);
+      std::cout << getpid() << ":Found dead task " << dead_task_id->ShortDebugString() << std::endl;
+      bool is_first_writer = shouldWorkOnTask(dead_task_id, task_record, owner_generation + 1);
+      if (is_first_writer) {
+        compaction = new Compaction();
+        compaction->task_id = dead_task_id;
+        if (pick_trace) std::cout << "PICK_RESULT pid=" << getpid() << " ts=" << pick_ts << " step=dead0 taskid=" << compaction->task_id->ShortDebugString() << std::endl;
+        has_worked_on_compaction = true;
+        return Status::kSuccess;
+      } else {
+        delete task_record;
+        task_record = nullptr;
+        result = this->task_log_handler->getDeadTask();
+        dead_task = result.first;
+        owner_generation = result.second;
+      }
+    }
+  }
 
   // First step: check if there is any log level compaction
   // log level compaction
@@ -106,7 +173,7 @@ Status CompactionWatcher::pickCompaction(Compaction*& compaction, TaskRecord*& t
     }
     bool is_first_writer = shouldWorkOnTask(compaction->task_id, task_record, 0);
     if (is_first_writer) {
-      // std::cout << getpid() << " is the first writer for task "<< compaction->task_id->ShortDebugString() << std::endl;
+      if (pick_trace) std::cout << "PICK_RESULT pid=" << getpid() << " ts=" << pick_ts << " step=log taskid=" << compaction->task_id->ShortDebugString() << std::endl;
       has_worked_on_compaction = true;
       return Status::kSuccess;
     }
@@ -132,7 +199,7 @@ Status CompactionWatcher::pickCompaction(Compaction*& compaction, TaskRecord*& t
       compaction->task_id->set_destinationlevel(level + 1);
       bool is_first_writer = shouldWorkOnTask(compaction->task_id, task_record, 0);
       if (is_first_writer) {
-        // std::cout << getpid() << " is the first writer for task " << compaction->task_id->ShortDebugString() << std::endl;
+        if (pick_trace) std::cout << "PICK_RESULT pid=" << getpid() << " ts=" << pick_ts << " step=sst-promote taskid=" << compaction->task_id->ShortDebugString() << std::endl;
         has_worked_on_compaction = true;
         return Status::kSuccess;
       }
@@ -152,13 +219,24 @@ Status CompactionWatcher::pickCompaction(Compaction*& compaction, TaskRecord*& t
   while (files.size() > metadata->last_file_number_limit) {
     compaction = new Compaction();
     compaction->task_id = new TaskRecord::TaskIdentifier();
-    initInputUnitInlastLayer(compaction, files, this->metadata->compaction_input_file_number);
+    Status init_status = initInputUnitInlastLayer(compaction, files, this->metadata->compaction_input_file_number);
+    // initInputUnitInlastLayer returns kFailure when no contiguous run of
+    // `limit` same-version files exists in the deque. In that case, no inputs
+    // were added to task_id; calling shouldWorkOnTask + doCompactionWork
+    // with an empty TaskID would dereference input_files(0) and segfault.
+    // Bail out cleanly — the next view-update tick will give us new state.
+    if (init_status != Status::kSuccess || compaction->task_id->input_files_size() < 2) {
+      delete compaction;
+      delete task_record;
+      compaction = nullptr;
+      task_record = nullptr;
+      break;
+    }
     compaction->task_id->set_compactintonextlevel(false);
     compaction->task_id->set_destinationlevel(this->metadata->max_level);
-    compaction->compaction_version = 0;
     bool is_first_writer = shouldWorkOnTask(compaction->task_id, task_record, 0);
     if (is_first_writer) {
-      // std::cout << getpid() << " is the first writer for task " << compaction->task_id->ShortDebugString() << std::endl;
+      if (pick_trace) std::cout << "PICK_RESULT pid=" << getpid() << " ts=" << pick_ts << " step=last taskid=" << compaction->task_id->ShortDebugString() << std::endl;
       has_worked_on_compaction = true;
       return Status::kSuccess;
     }
@@ -167,28 +245,28 @@ Status CompactionWatcher::pickCompaction(Compaction*& compaction, TaskRecord*& t
     compaction = nullptr;
     task_record = nullptr;
   };
-  // Fourth step: check if there is any dead task
-  auto result = this->task_log_handler->getDeadTask();
-  auto dead_task = result.first;
-  int owner_generation = result.second;
-  while (dead_task.IsInitialized()) {
-    auto* dead_task_id = new TaskRecord::TaskIdentifier(dead_task);
-    std::cout << getpid() << ":Found dead task " << dead_task_id->ShortDebugString() << std::endl;
-    bool is_first_writer = shouldWorkOnTask(dead_task_id, task_record, owner_generation + 1);
-    if (is_first_writer) {
-      // std::cout << getpid() << " is the first writer for dead task " << dead_task_id->ShortDebugString() << std::endl;
-      compaction = new Compaction();
-      compaction->task_id = dead_task_id;
-      has_worked_on_compaction = true;
-      return Status::kSuccess;
-    } else {
-      delete task_record;
-      task_record = nullptr;
-      result = this->task_log_handler->getDeadTask();
-      dead_task = result.first;
-      owner_generation = result.second;
-    }
-  }
+  // // Fourth step: check if there is any dead task
+  // auto result = this->task_log_handler->getDeadTask();
+  // auto dead_task = result.first;
+  // int owner_generation = result.second;
+  // while (dead_task.IsInitialized()) {
+  //   auto* dead_task_id = new TaskRecord::TaskIdentifier(dead_task);
+  //   std::cout << getpid() << ":Found dead task " << dead_task_id->ShortDebugString() << std::endl;
+  //   bool is_first_writer = shouldWorkOnTask(dead_task_id, task_record, owner_generation + 1);
+  //   if (is_first_writer) {
+  //     // std::cout << getpid() << " is the first writer for dead task " << dead_task_id->ShortDebugString() << std::endl;
+  //     compaction = new Compaction();
+  //     compaction->task_id = dead_task_id;
+  //     has_worked_on_compaction = true;
+  //     return Status::kSuccess;
+  //   } else {
+  //     delete task_record;
+  //     task_record = nullptr;
+  //     result = this->task_log_handler->getDeadTask();
+  //     dead_task = result.first;
+  //     owner_generation = result.second;
+  //   }
+  // }
   has_worked_on_compaction = false;
   return Status::kSuccess;
 }
@@ -256,6 +334,30 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   bool log_level_compaction = false;
   std::string log_string = "Compacting ";
   std::unordered_map<std::string, Record*> key_record;
+  // Emitted at the START of the compaction work — used by the churn-tolerance
+  // experiment to observe per-compaction events. The "Compacting ... into:..."
+  // message printed at the end of this function arrives too late.
+  std::cout << getpid() << ":COMPACT_START sstable="
+            << (compaction->task_id->input_files(0).find(this->metadata->log_prefix) == std::string::npos ? 1 : 0)
+            << " " << compaction->task_id->ShortDebugString() << std::endl;
+  // Experimental abort knob: with probability OZONEDB_CHURN_ABORT_RATE, mark
+  // the compaction aborted and bail without writing the metadata-log update
+  // or COMPLETE record. The heartbeat thread will see compaction->aborted and
+  // also exit without finalising. Survivors then detect the task as dead via
+  // the heartbeat-timeout path and reclaim it. Read once at static init.
+  static double abort_rate = []{
+    char const* s = std::getenv("OZONEDB_CHURN_ABORT_RATE");
+    if (!s) return 0.0;
+    try { return std::stod(s); } catch (...) { return 0.0; }
+  }();
+  if (abort_rate > 0.0) {
+    double r = rand() / (double)RAND_MAX;
+    if (r < abort_rate) {
+      compaction->aborted.store(true);
+      std::cout << getpid() << ":COMPACT_ABORT " << compaction->task_id->ShortDebugString() << std::endl;
+      return Status::kFailure;
+    }
+  }
   if (compaction->task_id->input_files(0).find(this->metadata->log_prefix) != std::string::npos) {
     log_level_compaction = true;
     if (this->event_listener != nullptr) {
@@ -347,8 +449,13 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     this->storage->createDirectory(dest_prefix);
   }
   for (int i = 0; i < records.size(); i++) {
+    // For last-level compactions we always emit a single output file —
+    // splitting on size_limit produced a non-terminating cascade with the
+    // version-incrementing fix (each (v=k, v=k) → 2 v=k+1 files keeps total
+    // file count constant; picker never converges to <= last_file_number_limit).
+    bool is_last_level = compaction->task_id->destinationlevel() == this->metadata->max_level;
     if (compaction->outputBuilder == nullptr ||
-        (compaction->task_id->destinationlevel() == this->metadata->max_level && compaction->outputBuilder->fileSize() > this->metadata->level_file_size_limit[compaction->task_id->destinationlevel() - 1])) {
+        (!is_last_level && compaction->outputBuilder->fileSize() > this->metadata->level_file_size_limit[compaction->task_id->destinationlevel() - 1])) {
       if (compaction->outputBuilder != nullptr) {
         compaction->outputBuilder->finish();
         key_range.second = records[i - 1]->key();

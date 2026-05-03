@@ -1,0 +1,47 @@
+# CMD: /usr/bin/time -v /users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloada_hctree -P /users/Xinying/YCSB-cpp/sqlite/hctree.properties -p sqlite.dbpath=/tank/ycsb_data/hctree_ycsb/hctree_ycsb.db -p threadcount=2 -p recordcount=1000000 -p maxexecutiontime=120
+# devices=['sda6'] sectors_before=2262650000 sectors_after=2308056688
+# elapsed_s=120.19 returncode=0
+
+=== STDOUT ===
+[Thread 140115458631232] SqliteDB::Init at 2026-04-28 05:32:59
+Opening database with URL: file:///tank/ycsb_data/hctree_ycsb/hctree_ycsb.db?hctree=1&vfs=unix-excl
+PRAGMA journal_mode: delete
+PRAGMA page_size: 4096
+PRAGMA cache_size: -131072
+PRAGMA synchronous: 2
+[Thread 140115450238528] SqliteDB::Init at 2026-04-28 05:32:59
+Opening database with URL: file:///tank/ycsb_data/hctree_ycsb/hctree_ycsb.db?hctree=1&vfs=unix-excl
+PRAGMA journal_mode: delete
+PRAGMA page_size: 4096
+PRAGMA cache_size: -131072
+PRAGMA synchronous: 2
+[HCTree] busy_snapshot aborts (discarded, not retried): 5015
+[Thread 140115458631232] SqliteDB::Cleanup (last) at 2026-04-28 05:34:59
+Run runtime(sec): 120.12
+Run operations(ops): 4399363
+Run throughput(ops/sec): 36583.1
+
+=== STDERR ===
+	Command being timed: "/users/Xinying/YCSB-cpp/ycsb -db sqlite -run -P /users/Xinying/YCSB-cpp/workloads/workloada_hctree -P /users/Xinying/YCSB-cpp/sqlite/hctree.properties -p sqlite.dbpath=/tank/ycsb_data/hctree_ycsb/hctree_ycsb.db -p threadcount=2 -p recordcount=1000000 -p maxexecutiontime=120"
+	User time (seconds): 51.55
+	System time (seconds): 111.59
+	Percent of CPU this job got: 135%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:00.19
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1408580
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 1560803
+	Minor (reclaiming a frame) page faults: 2086
+	Voluntary context switches: 2057788
+	Involuntary context switches: 289
+	Swaps: 0
+	File system inputs: 223624
+	File system outputs: 9929671
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
