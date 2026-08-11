@@ -36,6 +36,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(OZONEDB_ENABLE_CORFU "Build the CorfuDB storage backend (requires JDK + Maven)" OFF)
 option(OZONEDB_ENABLE_S3 "Build the S3/MinIO/R2 storage backend (requires aws-sdk-cpp)" ON)
 
+# libozonedb.so, the shim the YCSB binding's jni.OzoneDBJNI loads. Previously
+# built by a Maven module (ozonedb-jni-maven/native) via native-maven-plugin.
+option(OZONEDB_BUILD_JNI "Build libozonedb.so, the JNI shim the YCSB binding loads" ON)
+
 # Find Packages
 #
 # No link_directories() here: vcpkg's imported targets already carry their
@@ -52,9 +56,19 @@ find_package(GTest CONFIG REQUIRED)
 find_package(Boost 1.70 REQUIRED COMPONENTS uuid)
 find_package(OpenSSL CONFIG REQUIRED)
 
+# Corfu hosts an embedded JVM, so it hard-requires JNI. The shim only needs
+# jni.h, so it degrades to a skip rather than failing a build that never
+# wanted a JDK in the first place -- the base build did not require one
+# before this target existed.
 if (OZONEDB_ENABLE_CORFU)
     find_package(JNI REQUIRED)
     find_program(MAVEN_EXECUTABLE mvn REQUIRED)
+elseif (OZONEDB_BUILD_JNI)
+    find_package(JNI)
+    if (NOT JNI_FOUND)
+        message(STATUS "JNI not found; skipping the libozonedb.so shim. Pass -DOZONEDB_BUILD_JNI=OFF to silence this.")
+        set(OZONEDB_BUILD_JNI OFF)
+    endif()
 endif()
 
 if (OZONEDB_ENABLE_S3)
@@ -167,6 +181,32 @@ if (OZONEDB_ENABLE_CORFU)
     )
     add_custom_target(corfu-bridge ALL DEPENDS ${CORFU_BRIDGE_JAR})
     add_dependencies(OzoneDB corfu-bridge)
+endif()
+
+# JNI shim -> libozonedb.so
+#
+# Replaces the ozonedb-jni-maven/native Maven module, which built this with
+# native-maven-plugin 1.0-alpha-8 and a hand-maintained -I/-L list. Linking
+# OzoneDB here means include paths and link deps are inherited instead.
+#
+# The $ORIGIN rpath lets libozonedb.so find libOzoneDB.so sitting beside it in
+# the build directory, so neither has to be copied into /usr/lib. OUTPUT_NAME
+# differs from the OzoneDB target only by case, which is fine on the Linux
+# bench nodes this targets but would collide on a case-insensitive filesystem.
+if (OZONEDB_BUILD_JNI)
+    add_library(ozonedb_jni SHARED src/jni/jni_OzoneDBJNI.cpp)
+    set_target_properties(ozonedb_jni PROPERTIES
+        OUTPUT_NAME ozonedb
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN"
+    )
+    target_include_directories(ozonedb_jni PRIVATE
+        ${JNI_INCLUDE_DIRS}
+        ${PROJECT_SOURCE_DIR}/src/jni
+    )
+    # OzoneDB only -- the shim implements Java_jni_* entry points and uses the
+    # JNIEnv it is handed, so it must not link libjvm itself.
+    target_link_libraries(ozonedb_jni PRIVATE OzoneDB)
 endif()
 
 # Executable for Unit Tests

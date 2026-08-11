@@ -19,7 +19,7 @@ on macOS.
 First-time machine setup (must be *sourced*, it appends `OZONEDB_HOME`/`JAVA_HOME` to `~/.bashrc`):
 
 ```bash
-. bench/scripts/setup_node.sh          # submodules, apt deps, JDK 8, then update_jni.sh
+. bench/scripts/setup_node.sh          # submodules, apt deps, JDK 8, then build.sh
 bash bench/scripts/setup_corfu.sh      # clone + mvn install CorfuDB (separate node)
 ```
 
@@ -57,12 +57,13 @@ the Ubuntu 20.04 bench image ships 3.16 — hence the plain commands above as th
 **After any C++ change that a YCSB run must see, rebuild the whole chain:**
 
 ```bash
-bash bench/scripts/update_jni.sh
+bash bench/scripts/build.sh
 ```
 
-That builds `OzoneDB` + `corfu-bridge`, copies `libOzoneDB.so` into `ozonedb-jni-maven/native/`,
-runs `mvn package`, installs both `.so`s into `/usr/lib`, and installs the JNI jar into `~/.m2`.
-Skipping it means YCSB keeps running the previously installed library.
+That builds `OzoneDB`, `ozonedb_jni` and `corfu-bridge`, then the YCSB `ozonedb-binding`. Nothing
+is installed outside the repo — no `sudo`, no `/usr/lib`, no `~/.m2` — because `libozonedb.so` has
+an `$ORIGIN` rpath to reach `libOzoneDB.so` beside it in `build/`. Skipping it means YCSB keeps
+running the previously built library.
 
 ## Tests
 
@@ -179,10 +180,21 @@ constructor. Base configs live in `src/config/{local,cloud,corfu}/`.
 
 ### JNI / YCSB chain
 
-`libOzoneDB.so` → `ozonedb-jni-maven/native/src/main/cpp/jni_OzoneDBJNI.cpp` →
-`jni/src/main/java/jni/OzoneDBJNI.java` → `ycsb/ozonedb/.../OzoneDBClient.java`. YCSB selects the
-config with `-p shared_config=<path>`. Changing the JNI signature means touching all three layers
-plus `update_jni.sh`'s install steps.
+`libOzoneDB.so` → `src/jni/jni_OzoneDBJNI.cpp` (CMake target `ozonedb_jni` → `libozonedb.so`) →
+`ycsb/ozonedb/src/main/java/jni/OzoneDBJNI.java` → `ycsb/ozonedb/.../OzoneDBClient.java`. YCSB
+selects the config with `-p shared_config=<path>`. Changing the JNI signature means touching all
+three layers — and `jni_OzoneDBJNI.h` is javah-generated and checked in, so keep it in sync.
+
+- The Java class must stay in package `jni`: the exported symbols are `Java_jni_OzoneDBJNI_*`, so
+  renaming the package breaks the lookup at load time with no compile error.
+- `OzoneDBJNI` resolves the shim itself, in order: `-Dozonedb.native.lib`, then
+  `$OZONEDB_HOME/build/libozonedb.so`, then `System.loadLibrary`. Resolution lives in the class
+  rather than the runners because YCSB is launched several ways — the multiproc runners build
+  their own `java` command, while the single-process scripts and manual runs go through `bin/ycsb`,
+  which builds its own.
+- This used to be four Maven modules (`jni-demo` parent, `demoproc-native`, `demoproc-jni`,
+  `corfu-bridge`) plus `mvn install:install-file` and two `sudo cp` into `/usr/lib`. Only
+  `corfu-bridge` is left.
 
 ## Conventions
 

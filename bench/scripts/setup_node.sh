@@ -29,5 +29,5 @@ source ~/.profile
 java -version
 
 # compile ozonedb
-bash $OZONEDB_HOME/bench/scripts/update_jni.sh
+bash $OZONEDB_HOME/bench/scripts/build.sh
 

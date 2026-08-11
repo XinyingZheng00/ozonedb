@@ -17,7 +17,7 @@ it appends `OZONEDB_HOME` and `JAVA_HOME` to your shell profile:
 ```
 
 That pulls submodules, installs apt dependencies and a JDK, then builds the whole chain via
-`bench/scripts/update_jni.sh`.
+`bench/scripts/build.sh`.
 
 For the CorfuDB shared-log backend, on a separate node:
 
@@ -48,7 +48,7 @@ After any C++ change that a YCSB run must see, rebuild the whole chain — other
 running the previously installed library:
 
 ```bash
-bash bench/scripts/update_jni.sh
+bash bench/scripts/build.sh
 ```
 
 ## 3. Run benchmarks

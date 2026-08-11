@@ -18,13 +18,14 @@ LICENSE file.
 ## Quick Start
 
 ```
-sudo cp ${OZONEDB_HOME}/ozonedb-jni-maven/jni/target/classes/libozonedb.so /usr/lib/
-mvn install:install-file -Dfile=/users/Xinying/ozonedb/ozonedb-jni-maven/jni/target/demoproc-jni-1.0-jar-with-dependencies.jar -DgroupId=ozonedbjnimaven -DartifactId=demoproc-jni -Dversion=1.0 -Dpackaging=jar
-
-mvn -pl site.ycsb:ozonedb-binding -am clean package
+bash ${OZONEDB_HOME}/bench/scripts/build.sh
 ./bin/ycsb load ozonedb -s -P workloads/workloada (-p property)
-
 ```
+
+`build.sh` produces `libOzoneDB.so` and `libozonedb.so` in `${OZONEDB_HOME}/build` and packages
+this binding. There is nothing to install: `jni.OzoneDBJNI` (a source file in this module) loads
+the shim from `$OZONEDB_HOME/build`, and the shim's `$ORIGIN` rpath finds `libOzoneDB.so` beside
+it. Override the path with `-Dozonedb.native.lib=/abs/path/libozonedb.so` if you need to.
 
 ## Running YCSB against the CorfuDB backend
 
@@ -38,19 +39,16 @@ at a config file whose `"backend"` field is `"corfu"`, and (b) making sure
 
 1. Build OzoneDB with the Corfu backend enabled:
    ```
-   cmake -DOZONEDB_ENABLE_CORFU=ON -B build
-   cmake --build build --target OzoneDB corfu-bridge
+   cmake -B build -DOZONEDB_ENABLE_CORFU=ON
+   cmake --build build --target OzoneDB ozonedb_jni corfu-bridge
    ```
-   This produces both `libOzoneDB.so` and
+   This produces `libOzoneDB.so`, `libozonedb.so`, and
    `${OZONEDB_HOME}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-1.0-all.jar`.
-2. Install/refresh the JNI shared lib wherever the YCSB binding expects it
-   (e.g. `sudo cp .../libozonedb.so /usr/lib/`) — same step as the local
-   quick-start above.
-3. Start a Corfu server somewhere reachable, e.g.
+2. Start a Corfu server somewhere reachable, e.g.
    ```
    corfu_server -m -s 9000
    ```
-4. Make sure `JAVA_HOME` points at the same JDK that was used to build
+3. Make sure `JAVA_HOME` points at the same JDK that was used to build
    `corfu-bridge-1.0-all.jar` (currently JDK 25) and that
    `$JAVA_HOME/lib/server` is on `LD_LIBRARY_PATH` so YCSB can load libjvm.
 
