@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
+#
+# Compatibility shim for the CorfuDB node. The real work lives in setup.sh:
+#
+#   bash bench/scripts/setup.sh --role corfu-server
+#
+# Beyond what this script used to do (apt deps + clone + mvn install), the role
+# also creates $CORFU_DATA_DIR/{load,run_batch}, which run_ycsb_with_corfu.sh
+# has always assumed exists and which nothing previously created.
+#
+# CLONE_DIR is still honoured.
+
 set -euo pipefail
 
-REPO_URL="https://github.com/CorfuDB/CorfuDB.git"
-CLONE_DIR="${CLONE_DIR:-$HOME/CorfuDB}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-sudo apt-get update
-sudo apt-get install -y openjdk-25-jdk maven
+args=(--role corfu-server)
+[[ -n "${CLONE_DIR:-}" ]] && args+=(--corfu-dir "$CLONE_DIR")
 
-if [[ ! -d "$CLONE_DIR/.git" ]]; then
-  git clone "$REPO_URL" "$CLONE_DIR"
-fi
-
-cd "$CLONE_DIR"
-mvn clean install -DskipTests
-
-# Follow CorfuDB README.md for different setups for running corfu
+exec bash "$SCRIPT_DIR/setup.sh" "${args[@]}" "$@"

@@ -11,17 +11,35 @@ library (`libOzoneDB.so`), driven through a JNI binding from a YCSB benchmark cl
 
 ## Environment
 
-`OZONEDB_HOME` must be exported and point at the repo root. `CMakeLists.txt` resolves the vcpkg
-toolchain and `link_directories` from it, and every bench script reads it. The build targets Ubuntu
-bench nodes (apt packages, openjdk-8, a writable `/tank` data directory) — it is not set up to build
-on macOS.
+`OZONEDB_HOME` must be exported and point at the repo root — every bench script reads it, and
+`jni.OzoneDBJNI` uses it to locate `libozonedb.so`. CMake no longer needs it. The build targets
+Ubuntu bench nodes (apt packages, a writable `/tank`) — it is not set up to build on macOS.
 
-First-time machine setup (must be *sourced*, it appends `OZONEDB_HOME`/`JAVA_HOME` to `~/.bashrc`):
+Setup is one idempotent, role-based script. Re-running never duplicates shell config or
+reinstalls what is present:
 
 ```bash
-. bench/scripts/setup_node.sh          # submodules, apt deps, JDK 8, then build.sh
-bash bench/scripts/setup_corfu.sh      # clone + mvn install CorfuDB (separate node)
+bash bench/scripts/setup.sh --role client         # apt deps, JDK, python, /tank, submodules,
+                                                  # CorfuDB runtime into ~/.m2, then build.sh
+bash bench/scripts/setup.sh --role corfu-server   # CorfuDB + /mnt/corfu/{load,run_batch}
+bash bench/scripts/setup.sh --role minio          # minio + bucket (sstable_backend defaults to s3)
+bash bench/scripts/setup_zfs.sh --device /dev/sdXN
 ```
+
+- It writes `~/.ozonedb.env` and wires a marker-guarded include into `~/.profile` **and**
+  `~/.bashrc`, rewriting the block rather than appending. Sourcing the script is no longer needed.
+  Note `~/.bashrc` alone is not enough: Ubuntu's default returns early for non-interactive shells,
+  which is why `run_multinode_ycsb.py` uses `bash -lc`.
+- **JDK policy.** Three constraints conflict: YCSB compiles with `<source>1.8</source>`
+  (`ycsb/pom.xml`), `corfu-bridge` targets Java 11 so anything running it needs JDK ≥ 11, and
+  CorfuDB itself wants a much newer JDK. Hence `--jdk` (default 17, the node's persistent
+  `JAVA_HOME`) and `--corfu-jdk` (default 25, used only to build CorfuDB).
+- **`corfu-bridge` needs CorfuDB in the local `~/.m2`.** Its pom depends on
+  `org.corfudb:runtime:0.9.1.0-SNAPSHOT` and declares no `<repositories>`, so the artifact resolves
+  only from a local `mvn install`. That is why the *client* role installs CorfuDB too, not just the
+  corfu-server role. It is skipped when the artifact is already present.
+- `setup_node.sh` and `setup_corfu.sh` are thin wrappers kept for compatibility.
+- Python dependencies are declared in `bench/scripts/requirements.txt`.
 
 ## Build
 

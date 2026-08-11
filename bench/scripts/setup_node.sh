@@ -1,33 +1,30 @@
-# set up local host
-# in the directory of this ozonedb repo
-# must run with ". bench/scripts/setup_node.sh"
+#!/usr/bin/env bash
+#
+# Compatibility shim. The real work lives in setup.sh, which is idempotent and
+# role-based:
+#
+#   bash bench/scripts/setup.sh --role client
+#
+# This wrapper stays because older docs and muscle memory say `. setup_node.sh`.
+# Sourcing is no longer required -- setup.sh writes ~/.ozonedb.env and wires it
+# into ~/.profile and ~/.bashrc -- but sourcing still works and additionally
+# loads the environment into the current shell.
 
-git submodule update --init --recursive
-echo "export OZONEDB_HOME=$(pwd)" >>~/.bashrc
-echo "export OZONEDB_HOME=$(pwd)" >>~/.profile # for cloud use
-source ~/.bashrc
-source ~/.profile
-echo $OZONEDB_HOME
-sudo apt update
-sudo apt install -y cmake maven python3-pip zip pkg-config sqlite3 build-essential
-sudo apt install openjdk-8-jdk -y
-ARCH=$(dpkg --print-architecture)
-if [ "$ARCH" = "amd64" ]; then
-  echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >>~/.bashrc
-  echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >>~/.profile
-elif [ "$ARCH" = "arm64" ]; then
-  echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-arm64" >>~/.bashrc
-  echo "export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-arm64" >>~/.profile
-else
-  echo "Unsupported architecture: $ARCH"
-  echo $ARCH
-fi
-echo "export PATH=$JAVA_HOME/bin:$PATH" >>~/.bashrc
-echo "export PATH=$JAVA_HOME/bin:$PATH" >>~/.profile # for cloud use
-source ~/.bashrc
-source ~/.profile
-java -version
+_ozonedb_setup_node() {
+  local script_dir
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  else
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+  fi
 
-# compile ozonedb
-bash $OZONEDB_HOME/bench/scripts/build.sh
+  bash "$script_dir/setup.sh" --role client "$@" || return $?
 
+  # Convenience when sourced: make the new environment live immediately.
+  if [ -f "$HOME/.ozonedb.env" ]; then
+    # shellcheck disable=SC1090
+    . "$HOME/.ozonedb.env"
+  fi
+}
+
+_ozonedb_setup_node "$@"

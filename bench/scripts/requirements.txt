@@ -1,0 +1,16 @@
+# Python dependencies for the bench harness under bench/scripts/.
+# Installed by `bash bench/scripts/setup.sh --role client`.
+#
+# Previously undeclared: setup_node.sh installed python3-pip and then no
+# packages at all, so every runner's `import yaml` worked only because Ubuntu
+# images happen to ship python3-yaml.
+#
+# The Azure control-plane scripts under bench/scripts/cloud/ have their own
+# requirements.txt and are not needed for local or CloudLab runs.
+
+PyYAML>=5.4
+
+# Plotting only (bench/scripts/plot/). Harmless on a bench node, and needed
+# wherever you generate figures.
+matplotlib>=3.5
+numpy>=1.21

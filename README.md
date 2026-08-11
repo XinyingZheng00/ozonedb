@@ -9,27 +9,41 @@ The build targets Ubuntu bench nodes. It is not set up to build on macOS.
 
 ## 1. Set up the machine
 
-`OZONEDB_HOME` must point at the repo root, so this must be **sourced**, not executed —
-it appends `OZONEDB_HOME` and `JAVA_HOME` to your shell profile:
+One idempotent, role-based script provisions every kind of node. Re-running it is cheap and
+safe — it never duplicates shell config or reinstalls what is already there.
 
 ```bash
-. bench/scripts/setup_node.sh
+bash bench/scripts/setup.sh --role client         # the bench / YCSB machine
+bash bench/scripts/setup.sh --role corfu-server   # the shared-log node
+bash bench/scripts/setup.sh --role minio          # SSTable object store
 ```
 
-That pulls submodules, installs apt dependencies and a JDK, then builds the whole chain via
-`bench/scripts/build.sh`.
+No sourcing required. The script writes `~/.ozonedb.env` (with `OZONEDB_HOME`, `JAVA_HOME` and
+`PATH`) and wires a marker-guarded include into `~/.profile` and `~/.bashrc`. Open a new shell
+afterwards, or run `. ~/.ozonedb.env`.
 
-For the CorfuDB shared-log backend, on a separate node:
+The **client** role installs apt dependencies and a JDK, installs the Python requirements, creates
+`/tank`, updates submodules, installs the CorfuDB runtime into `~/.m2` (which `corfu-bridge` needs
+— it declares no `<repositories>`, so the dependency resolves only from a local install), then runs
+`bench/scripts/build.sh`. Pass `--no-build` or `--no-corfu-runtime` to skip either.
+
+For local experiments backed by ZFS, create the pool by naming the device — this no longer
+partitions anything for you:
 
 ```bash
-bash bench/scripts/setup_corfu.sh
+bash bench/scripts/setup_zfs.sh --list              # show candidate devices
+bash bench/scripts/setup_zfs.sh --device /dev/sda6
 ```
 
-For local experiments backed by ZFS:
+`setup_node.sh` and `setup_corfu.sh` remain as thin wrappers around `setup.sh`.
 
-```bash
-bash bench/scripts/setup_zfs.sh
-```
+### JDK versions
+
+Three constraints conflict, so there are two knobs. YCSB compiles with `<source>1.8</source>`;
+`corfu-bridge` targets Java 11, so anything running it needs JDK ≥ 11; CorfuDB itself wants a much
+newer JDK. `--jdk` (default 17) sets the node's persistent `JAVA_HOME`; `--corfu-jdk` (default 25)
+is used only to build CorfuDB. Both fall back through a candidate list when the exact apt package
+is unavailable on the release.
 
 ## 2. Build
 
