@@ -21,12 +21,40 @@ Status deserializeMessages(unsigned char* buffer,
                            size_t bufferSize,
                            std::vector<google::protobuf::Message*>& messages,
                            std::function<google::protobuf::Message*()> const& messageFactory) {
+  // Guard against callers that pass a null buffer with a positive size —
+  // happens when a multi-writer race REMOVE's a log file between
+  // checkReadMoreLog and the actual read, leaving `buffer == nullptr`
+  // while the caller still believes the file has bytes. Without this
+  // check the very first ReadVarint32 dereferences nullptr.
+  if (buffer == nullptr) {
+    return bufferSize == 0 ? Status::kSuccess : Status::kFailure;
+  }
   google::protobuf::io::ArrayInputStream array_input(buffer, bufferSize);
   google::protobuf::io::CodedInputStream coded_input(&array_input);
   // Deserialize all messages
-  while (coded_input.CurrentPosition() < bufferSize) {
-    uint32_t size;
-    coded_input.ReadVarint32(&size);
+  while (static_cast<size_t>(coded_input.CurrentPosition()) < bufferSize) {
+    uint32_t size = 0;
+    // Bail on a malformed varint instead of using uninitialized `size`
+    // (which would feed a garbage limit into the parser below).
+    if (!coded_input.ReadVarint32(&size)) {
+      std::cerr << getpid() << ":Failed to read varint prefix: bufferSize="
+                << bufferSize << " pos=" << coded_input.CurrentPosition()
+                << std::endl;
+      return Status::kFailure;
+    }
+    // A length-prefixed message must fit in what's left of the buffer.
+    // Without this, a corrupted prefix (e.g. from a partially-written
+    // log) makes PushLimit accept a giant size and MergeFromCodedStream
+    // can read past the buffer end before the parser notices.
+    size_t remaining =
+        bufferSize - static_cast<size_t>(coded_input.CurrentPosition());
+    if (size > remaining) {
+      std::cerr << getpid()
+                << ":Varint prefix exceeds remaining bytes: size=" << size
+                << " remaining=" << remaining << " bufferSize=" << bufferSize
+                << std::endl;
+      return Status::kFailure;
+    }
 
     google::protobuf::io::CodedInputStream::Limit limit = coded_input.PushLimit(size);
     google::protobuf::Message* message = messageFactory();

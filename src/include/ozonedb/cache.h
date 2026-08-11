@@ -73,8 +73,14 @@ class TailCache {
 class LRUCache {
  private:
   struct CacheEntry {
-    std::unordered_map<std::string, Record*> records;
-    std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records;  // index_value_for_block -> records
+    // Log + SSTable block records: shared_ptr ownership so concurrent
+    // readers (DB::get fast path, LogHandler::tryIndexLookup, the
+    // multi-file scan in readRecord, Table::get) keep the Record
+    // alive past invalidateLogFile, putLogRecordSingle overwrites,
+    // and LRU eviction. The cache holds the canonical reference; any
+    // borrower keeps an additional refcount until they release.
+    std::unordered_map<std::string, std::shared_ptr<Record>> records;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::shared_ptr<Record>>*> block_records;  // index_value_for_block -> records
     std::unordered_map<std::string, size_t> block_size;                                       // index_value_for_block -> tail
     std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> lru_itr;
 
@@ -85,8 +91,8 @@ class LRUCache {
     CacheEntry() {}
 
     // contructor for records
-    CacheEntry(std::unordered_map<std::string, Record*> records, size_t offset, bool sealed)
-        : records(records), table(nullptr), offset(offset), sealed(sealed) {}
+    CacheEntry(std::unordered_map<std::string, std::shared_ptr<Record>> records, size_t offset, bool sealed)
+        : records(std::move(records)), table(nullptr), offset(offset), sealed(sealed) {}
     // contructor for table
     CacheEntry(Table* table) : table(table), offset(), sealed(true) {}
   };
@@ -144,14 +150,9 @@ class LRUCache {
 
   ~LRUCache() {
     for (auto& entry : file_to_entry_map) {
-      for (auto& record : entry.second.records) {
-        delete record.second;
-      }
-      //std::unordered_map<std::string, std::unordered_map<std::string, Record*>*> block_records; 
+      // Log + block records are shared_ptr — destructors handle them.
+      // Each block_records entry is a heap-allocated map we still own.
       for (auto block : entry.second.block_records) {
-        for (auto record : *block.second) {
-          delete record.second;
-        }
         delete block.second;
       }
       if (entry.second.table != nullptr) {
@@ -175,26 +176,33 @@ class LRUCache {
   void needReadBlock(std::string const& file_name, bool& read_more, std::string const& index_value);
   void readDataBlocks(std::string const& file_name, std::string const& index_value);
 
-  void get(std::string const& file_name, std::string const& key, Record*& record, std::string const& index_value = "");
+  // SSTable variant — returns a shared_ptr so the Record stays alive
+  // past a concurrent evict(). Updates LRU order on hit.
+  void get(std::string const& file_name, std::string const& key, std::shared_ptr<Record>& record, std::string const& index_value = "");
+  // Log variant — returns a shared_ptr so the Record stays alive past
+  // a concurrent invalidateLogFile or a same-key overwrite from
+  // putLogRecordSingle. Used by LogHandler reads and the LogKeyIndex.
+  void getLog(std::string const& file_name, std::string const& key, std::shared_ptr<Record>& record);
   // Function to update the cache with a file_name, records, offset, and sealed status
-  void putLogRecords(std::string const& key, std::unordered_map<std::string, Record*> const& records, size_t offset, bool sealed);
+  void putLogRecords(std::string const& key, std::unordered_map<std::string, std::shared_ptr<Record>> records, size_t offset, bool sealed);
   // Insert or overwrite a single Record for a log file. Cache takes
-  // ownership of the Record*. If a prior Record* existed at the same
-  // key+file, it is deleted. Used by LogHandler to push freshly-written
-  // records into the cache so LogKeyIndex can safely borrow the pointer.
-  void putLogRecordSingle(std::string const& file_name, Record* record);
-  // Drop a log file's cache entry and free every Record* it owns.
-  // Called when a log file is compacted away. Caller MUST invalidate
-  // LogKeyIndex pointers for the same file before this runs, or a
-  // concurrent tryIndexLookup will dereference freed memory.
+  // shared ownership of the Record. If a prior Record existed at the
+  // same key+file, its shared_ptr is dropped (the Record only frees
+  // when the last borrower releases it). Used by LogHandler to push
+  // freshly-written records into the cache so LogKeyIndex can safely
+  // share the pointer.
+  void putLogRecordSingle(std::string const& file_name, std::shared_ptr<Record> record);
+  // Drop a log file's cache entry. Records are released via shared_ptr —
+  // they only deallocate once every borrower (readers, the LogKeyIndex)
+  // has released them. Called when a log file is compacted away.
   void invalidateLogFile(std::string const& file_name);
-  // Copy the per-file records map (pointers only) into `out`. Cache
-  // retains ownership of Record*. Used by LogKeyIndex::warm to seed
+  // Copy the per-file records map into `out`. Cache and `out` co-own
+  // each Record via shared_ptr. Used by LogKeyIndex::warm to seed
   // itself from already-cached log files on startup.
   void snapshotLogFileRecords(std::string const& file_name,
-                              std::unordered_map<std::string, Record*>& out);
+                              std::unordered_map<std::string, std::shared_ptr<Record>>& out);
   void putSSTableMeta(std::string const& key, Table* table);
-  void putSSTableRecords(std::string const& key, std::unordered_map<std::string, Record*>* records, std::string const& index_value, size_t size);
+  void putSSTableRecords(std::string const& key, std::unordered_map<std::string, std::shared_ptr<Record>>* records, std::string const& index_value, size_t size);
 
   // set latest view
   void setLatestView(View const* view) {

@@ -1,4 +1,5 @@
 #include <string>
+#include <vector>
 #ifndef OZONEDB_HELPER_H
 #define OZONEDB_HELPER_H
 
@@ -16,4 +17,12 @@ int getSSTLayerNumber(std::string const& filename);
 std::string generateFingerprint();
 
 int getNumberBeforeUnderscore(std::string const& filename);
+
+// Stable, cross-peer compaction task identifier. Two peers that observe the
+// same compaction (same input file set + same destination level + same
+// in-last-level flag) produce identical strings. Used by the
+// [COMPACTION_NEEDED] / [COMPACTION_COMMITTED] log lines so a benchmark
+// harness can join "needed" and "committed" events across writer processes.
+std::string formatTaskId(std::vector<std::string> const& input_files,
+                         int dest_level, bool in_last_level);
 #endif

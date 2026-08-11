@@ -74,7 +74,7 @@ class CorfuDBStorage : public Storage {
     if (cleared) drainDispatchQueue();
   }
   int commit_interval_ = 0;
-  bool sync_mode_ = false;
+  bool sync_mode_ = true;
 
  private:
   // JVM / JNI handles

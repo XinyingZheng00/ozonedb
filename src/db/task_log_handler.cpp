@@ -1,16 +1,40 @@
 #include "task_log_handler.h"
+#include "helper.h"
 #include "protobuf_serializer.h"
+#include <chrono>
+#include <iostream>
+#include <unistd.h>
 
 namespace ozonedb {
-#include <unistd.h>
 //========================================read and write=======================================
 void TaskLogHandler::appendToTaskLog(TaskRecord const& record) {
   int buffer_size;
   unsigned char* buffer = protobuf::serializeMessage(record, buffer_size);
-  std::unique_lock<std::shared_mutex> lock(task_log_mutex);
-  this->storage->append(this->active_unit, buffer, buffer_size);
+  {
+    std::unique_lock<std::shared_mutex> lock(task_log_mutex);
+    this->storage->append(this->active_unit, buffer, buffer_size);
+  }
   delete[] buffer;
   buffer = nullptr;
+  // [COMPACTION_NEEDED]: emitted only on the durable append of a brand-new
+  // task. Heartbeats use TASK_IN_PROGRESS, completions use TASK_COMPLETE,
+  // and dead-task takeovers use owner_generation > 0 — all excluded.
+  // Logged outside the task_log_mutex so std::cerr never extends the
+  // critical section that heartbeat threads contend on.
+  if (record.status() == TaskRecord::TASK_BEGIN &&
+      record.owner_generation() == 0) {
+    auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+    std::vector<std::string> inputs(record.task_id().input_files().begin(),
+                                    record.task_id().input_files().end());
+    std::cerr << "[COMPACTION_NEEDED] task_id="
+              << formatTaskId(inputs,
+                              record.task_id().destinationlevel(),
+                              !record.task_id().compactintonextlevel())
+              << " wall_ns=" << wall_ns << " writer_pid=" << getpid()
+              << std::endl;
+  }
 }
 
 Status TaskLogHandler::readTaskLog(std::vector<TaskRecord*>& result) {
@@ -25,12 +49,18 @@ Status TaskLogHandler::readTaskLog(std::vector<TaskRecord*>& result) {
   size_t size = file_size - this->offset;
   std::vector<google::protobuf::Message*> records;
   unsigned char* buffer = nullptr;
-  this->storage->read(this->active_unit, buffer, this->offset, size);
+  Status read_status =
+      this->storage->read(this->active_unit, buffer, this->offset, size);
   this->offset = file_size;
   lock.unlock();
+  if (read_status != Status::kSuccess || buffer == nullptr) {
+    delete[] buffer;
+    return Status::kFailure;
+  }
   if (protobuf::deserializeMessages(buffer, size, records, []() -> google::protobuf::Message* {
         return new TaskRecord();
       }) == Status::kFailure) {
+    delete[] buffer;
     return Status::kFailure;
   }
   delete[] buffer;

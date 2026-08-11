@@ -57,7 +57,8 @@ int main(int argc, char** argv) {
   for (int i = 0; i < num_keys; ++i) {
     std::string k = "key_" + std::to_string(i);
     std::string const* v = nullptr;
-    if (db->get(k, v) != Status::kSuccess || v == nullptr) {
+    std::shared_ptr<Record> guard;
+    if (db->get(k, v, guard) != Status::kSuccess || v == nullptr) {
       std::cerr << "[smoke] get failed for " << k << "\n";
       return 5;
     }

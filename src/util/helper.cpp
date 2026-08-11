@@ -1,5 +1,8 @@
 #include "helper.h"
+#include <algorithm>
+#include <functional>
 #include <regex>
+#include <sstream>
 
 // helper function : get prefix of a string, the filename string is always in the format of prefix/suffix
 std::string getPrefix(std::string const& filename) {
@@ -75,4 +78,23 @@ std::string generateFingerprint() {
   std::stringstream fingerprint;
   fingerprint << uuid << timestamp;
   return fingerprint.str();
+}
+
+std::string formatTaskId(std::vector<std::string> const& input_files,
+                         int dest_level, bool in_last_level) {
+  // Input file names are <fingerprint><nanoseconds>.sst — globally unique by
+  // construction. Sorting makes the joined string order-independent so peers
+  // that received input_files in different RepeatedField order still hash to
+  // the same value.
+  std::vector<std::string> sorted = input_files;
+  std::sort(sorted.begin(), sorted.end());
+  std::string joined;
+  for (auto const& f : sorted) {
+    joined += f;
+    joined.push_back(',');
+  }
+  std::ostringstream os;
+  os << std::hex << std::hash<std::string>{}(joined) << "_L" << dest_level
+     << (in_last_level ? "L" : "N");
+  return os.str();
 }

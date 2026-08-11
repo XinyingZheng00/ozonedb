@@ -316,6 +316,12 @@ if __name__ == "__main__":
         default=None,
         help="Trial index (>=1) to tag this run's result files as _trial{N}. Caller should drive the trial loop; this script runs one trial per invocation (overrides local.run.trial, default 1).",
     )
+    parser.add_argument(
+        "--max_exec_time",
+        type=int,
+        default=None,
+        help="Cap each YCSB run at this many seconds via maxexecutiontime (overrides local.run.max_exec_time).",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -349,7 +355,11 @@ if __name__ == "__main__":
     )
     corfu_settings = config.get("corfu")
     s3_settings = config.get("s3")
-    max_exec_time = run_config.get("max_exec_time")
+    max_exec_time = (
+        args.max_exec_time
+        if args.max_exec_time is not None
+        else run_config.get("max_exec_time")
+    )
     trial = (
         args.trial
         if args.trial is not None

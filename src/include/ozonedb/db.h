@@ -147,11 +147,17 @@ class DB {
   /**
    * @brief get the value of the key from the database
    *
+   * `value` aliases bytes inside `guard`'s Record. The caller MUST keep
+   * `guard` alive for as long as it dereferences `value`, otherwise a
+   * concurrent compaction or LRU eviction can free the bytes mid-read.
+   *
    * @param key
-   * @param value
+   * @param value  output: pointer to the value bytes
+   * @param guard  output: shared_ptr keeping the value alive
    * @return Status
    */
-  Status get(std::string const& key, std::string const*& value);
+  Status get(std::string const& key, std::string const*& value,
+             std::shared_ptr<Record>& guard);
 };
 }  // namespace ozonedb
 #endif  // DB_H

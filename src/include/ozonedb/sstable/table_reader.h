@@ -9,6 +9,7 @@
 #include "protobuf/sstable.pb.h"
 #include "sstable/iterator.h"
 #include "storage.h"
+#include <memory>
 #include <stdint.h>
 namespace ozonedb {
 class LRUCache;
@@ -32,9 +33,11 @@ class Table {
   static Status open(Storage* storage,
                      std::string const& fileName,
                      Table*& table);
-  Status get(std::string const& key, Record*& record);
+  Status get(std::string const& key, std::shared_ptr<Record>& record);
   // Status getBlockPosition(std::string const& key, std::string& index_value);
-  std::unordered_map<std::string, Record*> getAll();
+  // Returns freshly-allocated shared_ptr<Record>s for every key in the
+  // table. Caller (compaction) co-owns; cache is not involved.
+  std::unordered_map<std::string, std::shared_ptr<Record>> getAll();
 
   ~Table();
 

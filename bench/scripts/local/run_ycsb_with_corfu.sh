@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export OZONEDB_HOME
 
 CONFIG="${OZONEDB_HOME}/bench/scripts/config/ycsb.yaml"
-REMOTE_HOST="10.10.1.1"
+REMOTE_HOST="10.10.1.2"
 REMOTE_USER="${SSH_USER:-$USER}"
 SSH_KEY="~/.ssh/cloudlab"
 CORFU_DIR="~/CorfuDB"
@@ -36,6 +36,8 @@ CORFU_LOG="/tmp/corfu_server.log"
 WORKLOADS="a b c d f"
 WRITERS_LIST="1 2 4 8"
 TRIALS=1
+DURATION=""
+BENCH_SCRIPT_OVERRIDE=""
 
 usage() {
   cat <<EOF
@@ -53,6 +55,14 @@ Usage: $(basename "$0") [options]
                         (default: "$WRITERS_LIST")
   --trials N            number of trials per (workload, writers) iteration
                         (default: $TRIALS)
+  --duration SECONDS    cap each YCSB iteration at this many seconds via
+                        YCSB's maxexecutiontime property (default: from
+                        ycsb.yaml local.run.max_exec_time, else uncapped)
+  --script PATH         override the inner python bench script
+                        (default: \$OZONEDB_HOME/bench/scripts/local/run_local_ycsb_multiproc.py).
+                        The override must accept the same flags this script
+                        passes: --config --workloads --num_writers --trial
+                        [--max_exec_time].
   -h | --help
 EOF
 }
@@ -95,6 +105,14 @@ while [[ $# -gt 0 ]]; do
     TRIALS="$2"
     shift 2
     ;;
+  --duration)
+    DURATION="$2"
+    shift 2
+    ;;
+  --script)
+    BENCH_SCRIPT_OVERRIDE="$2"
+    shift 2
+    ;;
   -h | --help)
     usage
     exit 0
@@ -115,6 +133,10 @@ if [[ ${#WORKLOADS_ARR[@]} -eq 0 || ${#WRITERS_ARR[@]} -eq 0 ]]; then
 fi
 if ! [[ "$TRIALS" =~ ^[1-9][0-9]*$ ]]; then
   echo "--trials must be a positive integer (got: $TRIALS)" >&2
+  exit 1
+fi
+if [[ -n "$DURATION" ]] && ! [[ "$DURATION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--duration must be a positive integer (got: $DURATION)" >&2
   exit 1
 fi
 
@@ -189,7 +211,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-BENCH_SCRIPT="$OZONEDB_HOME/bench/scripts/local/run_local_ycsb_multiproc.py"
+if [[ -n "$BENCH_SCRIPT_OVERRIDE" ]]; then
+  BENCH_SCRIPT="$BENCH_SCRIPT_OVERRIDE"
+else
+  BENCH_SCRIPT="$OZONEDB_HOME/bench/scripts/local/run_local_ycsb_multiproc.py"
+fi
+if [[ ! -f "$BENCH_SCRIPT" ]]; then
+  echo "bench script not found: $BENCH_SCRIPT" >&2
+  exit 1
+fi
 RESULTS=()
 
 # Shared timestamped results directory across all (trial, workload, writers)
@@ -208,9 +238,11 @@ for ((TRIAL = 1; TRIAL <= TRIALS; TRIAL++)); do
       start_corfu
       wait_for_corfu
 
-      echo "[bench] python3 $BENCH_SCRIPT --config $CONFIG --workloads $WL --num_writers $NW --trial $TRIAL"
+      bench_args=(--config "$CONFIG" --workloads "$WL" --num_writers "$NW" --trial "$TRIAL")
+      [[ -n "$DURATION" ]] && bench_args+=(--max_exec_time "$DURATION")
+      echo "[bench] python3 $BENCH_SCRIPT ${bench_args[*]}"
       set +e
-      python3 "$BENCH_SCRIPT" --config "$CONFIG" --workloads "$WL" --num_writers "$NW" --trial "$TRIAL"
+      python3 "$BENCH_SCRIPT" "${bench_args[@]}"
       rc=$?
       set -e
       RESULTS+=("trial=$TRIAL workload=$WL writers=$NW rc=$rc")

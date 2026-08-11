@@ -215,7 +215,8 @@ Status DB::remove(std::string const& key) {
   return Status::kSuccess;
 }
 
-Status DB::get(std::string const& key, std::string const*& value) {
+Status DB::get(std::string const& key, std::string const*& value,
+               std::shared_ptr<Record>& guard) {
   // Fast path: probe the log key index before refreshing the view.
   // When trust_background_tail is enabled, the index is authoritative
   // for log reads — kept current by local addRecord and, on Corfu, by
@@ -223,10 +224,11 @@ Status DB::get(std::string const& key, std::string const*& value) {
   // View deep-copy at getLatestView, the tail_cache lock, and the
   // setLatestView calls below. Tombstones still terminate the read.
   if (this->metadata->trust_background_tail) {
-    Record* fast_hit = nullptr;
+    std::shared_ptr<Record> fast_hit;
     if (this->log_handler->tryIndexLookup(key, fast_hit)) {
       if (fast_hit->type() == kTypeDeletion) return Status::kFailure;
       value = &(fast_hit->value());
+      guard = std::move(fast_hit);
       return Status::kSuccess;
     }
   }
@@ -251,20 +253,19 @@ Status DB::get(std::string const& key, std::string const*& value) {
   // and readRecordFromAllLevel came from that dead cache and was
   // always empty, so drop both the call and the condition.
 
-  Record* latest_record = nullptr;
-  Record* log_record = nullptr;
+  std::shared_ptr<Record> log_record;
   std::string const empty_offset;
   std::string latest_offset;
   log_handler->readRecord(key, log_record, empty_offset, latest_offset);
-  if (log_record) {
-    latest_record = log_record;
-  }
 
-  if (log_record == nullptr) {
-    Record* sstable_record = nullptr;
+  std::shared_ptr<Record> latest_record;
+  if (log_record) {
+    latest_record = std::move(log_record);
+  } else {
+    std::shared_ptr<Record> sstable_record;
     sstable_handler->readRecordFromAllLevel(key, sstable_record, empty_offset);
     if (sstable_record) {
-      latest_record = sstable_record;
+      latest_record = std::move(sstable_record);
     }
   }
 
@@ -273,6 +274,7 @@ Status DB::get(std::string const& key, std::string const*& value) {
       return Status::kFailure;
     }
     value = &(latest_record->value());
+    guard = std::move(latest_record);
     return Status::kSuccess;
   }
   return Status::kFailure;

@@ -1,8 +1,32 @@
 #include "metadata_log_handler.h"
 #include "db.h"
 #include "helper.h"
+#include <chrono>
+#include <iostream>
+#include <unistd.h>
+#include <vector>
 
 namespace ozonedb {
+
+namespace {
+// Emit `[COMPACTION_COMMITTED]` when a COMPACT OperationRecord has been
+// applied to the local view. Every peer fires this independently from its
+// own rollforward thread, including the winner. The benchmark harness joins
+// these with `[COMPACTION_NEEDED]` from task_log_handler.cpp by task_id.
+inline void logCompactionCommitted(OperationRecord const* record) {
+  int dest_level = getNumberInTheEnd(getPrefix(record->output_file(0)));
+  std::vector<std::string> inputs(record->input_files().begin(),
+                                  record->input_files().end());
+  auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+  std::cerr << "[COMPACTION_COMMITTED] task_id="
+            << formatTaskId(inputs, dest_level,
+                            record->compact_in_last_level())
+            << " wall_ns=" << wall_ns << " writer_pid=" << getpid()
+            << std::endl;
+}
+}  // namespace
 
 // All accessors use find() so probing for a missing prefix/file
 // doesn't mutate the underlying maps. This is required now that
@@ -143,7 +167,12 @@ std::vector<OperationRecord*> MetadataLogHandler::readMetadataLog() {
   }
   std::vector<google::protobuf::Message*> records;
   unsigned char* buffer = nullptr;
-  this->storage->read(this->active_unit, buffer, local_offset, file_size - local_offset);
+  Status read_status = this->storage->read(this->active_unit, buffer,
+                                           local_offset, file_size - local_offset);
+  if (read_status != Status::kSuccess || buffer == nullptr) {
+    delete[] buffer;
+    return {};
+  }
   if (protobuf::deserializeMessages(buffer, file_size - local_offset, records, []() -> google::protobuf::Message* {
         return new OperationRecord();
       }) == Status::kFailure) {
@@ -231,6 +260,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       latest_view.file_size[output_file] =
           (i < record->output_bytes_size()) ? record->output_bytes(i) : 0;
     }
+    logCompactionCommitted(record);
     delete record;
     return input_prefix;
   } else if (record->op_type() == OperationRecord::COMPACT && record->compact_in_last_level()) {
@@ -263,6 +293,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       latest_view.file_size[output_file] =
           (i < record->output_bytes_size()) ? record->output_bytes(i) : 0;
     }
+    logCompactionCommitted(record);
     delete record;
     return "";
   }

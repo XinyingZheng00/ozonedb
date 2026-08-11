@@ -94,7 +94,11 @@ JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_put(JNIEnv* env, jobject obj, jstring
 JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get(JNIEnv* env, jobject obj, jstring key) {
   char const* nativeKey = env->GetStringUTFChars(key, 0);
   std::string const* value;
-  ozonedb::Status status = db_instance->get(std::string(nativeKey), value);
+  // `guard` keeps the underlying Record alive for the duration of the
+  // JNI byte-array copy below — without it, a concurrent compaction or
+  // LRU eviction could free the bytes mid-copy.
+  std::shared_ptr<Record> guard;
+  ozonedb::Status status = db_instance->get(std::string(nativeKey), value, guard);
   env->ReleaseStringUTFChars(key, nativeKey);
 
   if (status != ozonedb::Status::kSuccess) {

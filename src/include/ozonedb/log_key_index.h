@@ -4,30 +4,31 @@
 #include "protobuf/record.pb.h"
 #include <cstddef>
 #include <list>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
 namespace ozonedb {
 
-// Per-LogHandler in-memory key -> latest Record* index. Lets readRecord
+// Per-LogHandler in-memory key -> latest Record index. Lets readRecord
 // short-circuit the multi-file scan (and, on Corfu, the storage fence).
-// Record memory is owned by the LRUCache's per-file records map; the
-// index borrows pointers and never frees. Log files are invalidated on
-// compaction so stale pointers don't outlive the cache entry that owns
-// the Record.
+// Records are co-owned with the LRUCache via shared_ptr — the index
+// keeps a reference so a cache invalidate (compaction, REMOVE) cannot
+// free the Record out from under a reader that just lifted it out of
+// the index.
 class LogKeyIndex {
  public:
   explicit LogKeyIndex(size_t capacity) : capacity_(capacity) {}
 
-  Record* lookup(std::string const& key);
-  void upsert(std::string const& key, Record* rec, std::string const& source_file);
+  std::shared_ptr<Record> lookup(std::string const& key);
+  void upsert(std::string const& key, std::shared_ptr<Record> rec, std::string const& source_file);
   void invalidateFile(std::string const& file);
   size_t size() const;
 
  private:
   struct Entry {
-    Record* rec;
+    std::shared_ptr<Record> rec;
     std::string source_file;
     std::list<std::string>::iterator lru_it;
   };

@@ -96,34 +96,34 @@ Status LogHandler::addRecord(Record const& record) {
   buffer = nullptr;
 
   // Push the just-written record into the cache + index so subsequent
-  // readRecord calls short-circuit the fenced multi-file scan. The
-  // cache takes ownership of the clone; the index borrows the stored
-  // pointer. If the retry loop never succeeded, final_target is empty
-  // and we skip (the append failed upstream anyway).
+  // readRecord calls short-circuit the fenced multi-file scan. Cache
+  // and index co-own via shared_ptr — readers that lift the pointer
+  // out of the index keep their copy alive even if compaction or a
+  // peer REMOVE invalidates the cache entry concurrently.
   if (key_index_ && !final_target.empty()) {
-    auto* clone = new Record(record);
+    auto clone = std::make_shared<Record>(record);
     cache->putLogRecordSingle(final_target, clone);
-    key_index_->upsert(record.key(), clone, final_target);
+    key_index_->upsert(record.key(), std::move(clone), final_target);
   }
   return Status::kSuccess;
 }
 
-bool LogHandler::tryIndexLookup(std::string const& key, Record*& record) {
+bool LogHandler::tryIndexLookup(std::string const& key, std::shared_ptr<Record>& record) {
   if (!key_index_) return false;
-  Record* hit = key_index_->lookup(key);
-  if (hit == nullptr) return false;
-  record = hit;
+  auto hit = key_index_->lookup(key);
+  if (!hit) return false;
+  record = std::move(hit);
   return true;
 }
 
-Status LogHandler::readRecord(std::string const& key, Record*& record, std::string const& offset, std::string& latest_offset) {
+Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset, std::string& latest_offset) {
   // Fast path: check the in-memory key index first. This skips the
   // multi-file backward scan (and, on Corfu, the per-file fenced
   // storage->size() call in checkReadMoreLog). On miss, fall through
   // to the existing scan and backfill on success.
   if (key_index_) {
-    if (Record* hit = key_index_->lookup(key)) {
-      record = hit;
+    if (auto hit = key_index_->lookup(key)) {
+      record = std::move(hit);
       return Status::kSuccess;
     }
     // Trust-the-tailer mode: skip the synchronous multi-file log scan
@@ -164,12 +164,12 @@ Status LogHandler::readRecord(std::string const& key, Record*& record, std::stri
       thread_pool->enqueue([this, file_name, cached_offset, size, key, i,
                             &record_file, &record, &record_mutex, &cv, &cv_mutex, &finished_threads]() {
         this->cache->readDataLog(file_name, cached_offset, size);
-        Record* record_tmp = nullptr;
-        cache->get(file_name, key, record_tmp);
+        std::shared_ptr<Record> record_tmp;
+        cache->getLog(file_name, key, record_tmp);
         if (record_tmp) {
           std::unique_lock<std::shared_mutex> lock(record_mutex);
           if (i >= record_file) {
-            record = record_tmp;
+            record = std::move(record_tmp);
             record_file = i;
           }
         }
@@ -181,12 +181,12 @@ Status LogHandler::readRecord(std::string const& key, Record*& record, std::stri
       },
                            ThreadPool::Priority::High);
     } else {
-      Record* record_tmp = nullptr;
-      cache->get(file_name, key, record_tmp);
+      std::shared_ptr<Record> record_tmp;
+      cache->getLog(file_name, key, record_tmp);
       if (record_tmp) {
         std::unique_lock<std::shared_mutex> lock(record_mutex);
         if (i >= record_file) {
-          record = record_tmp;
+          record = std::move(record_tmp);
           record_file = i;
         }
         break;
@@ -209,7 +209,7 @@ Status LogHandler::readRecord(std::string const& key, Record*& record, std::stri
 
   if (record) {
     // Backfill the index from the slow-path hit so the next lookup
-    // for this key is O(1). `record` is already cache-owned.
+    // for this key is O(1). Cache and index co-own via shared_ptr.
     if (key_index_ && record_file >= 0 &&
         record_file < static_cast<int>(files.size())) {
       key_index_->upsert(key, record, files[record_file]);
@@ -230,7 +230,7 @@ Status LogHandler::warmKeyIndex() {
     if (read_more) {
       this->cache->readDataLog(file_name, cached_offset, size);
     }
-    std::unordered_map<std::string, Record*> snapshot;
+    std::unordered_map<std::string, std::shared_ptr<Record>> snapshot;
     this->cache->snapshotLogFileRecords(file_name, snapshot);
     // Iterating files oldest-to-newest means the last write wins, which
     // matches readRecord's backward-scan semantics (newest file first).
@@ -271,13 +271,12 @@ void LogHandler::onRemoteAppend(std::string const& file_name,
                                   return new Record();
                                 });
   for (auto* msg : messages) {
-    auto* rec = static_cast<Record*>(msg);
-    // Hand ownership to the cache so the index's borrowed pointer
-    // stays alive as long as the cache entry does. If the cache
-    // already holds this key for this file, the prior Record* is
-    // freed inside putLogRecordSingle.
+    // Wrap in shared_ptr immediately so we don't have to hand-roll
+    // cleanup if either the cache put or the index upsert throws.
+    std::shared_ptr<Record> rec(static_cast<Record*>(msg));
+    auto key = rec->key();
     cache->putLogRecordSingle(file_name, rec);
-    key_index_->upsert(rec->key(), rec, file_name);
+    key_index_->upsert(std::move(key), std::move(rec), file_name);
   }
 }
 }  // namespace ozonedb

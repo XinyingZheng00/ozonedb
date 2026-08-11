@@ -255,7 +255,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   // Step2: compact it
   bool log_level_compaction = false;
   std::string log_string = "Compacting ";
-  std::unordered_map<std::string, Record*> key_record;
+  std::unordered_map<std::string, std::shared_ptr<Record>> key_record;
   if (compaction->task_id->input_files(0).find(this->metadata->log_prefix) != std::string::npos) {
     log_level_compaction = true;
     if (this->event_listener != nullptr) {
@@ -266,22 +266,29 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       this->event_listener->onSSTableCompactionStart();
     }
   }
-  
+
   for (auto const& input : compaction->task_id->input_files()) {
     // read from log level
-    
+
     log_string += input + " ";
     if (input.find(this->metadata->log_prefix) != std::string::npos) {
-      
-      std::unordered_map<std::string, Record*> records_tmp;
+
       unsigned char* buffer = nullptr;
-      size_t file_size;
+      size_t file_size = 0;
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
       std::shared_lock file_lock(file_mutex);
 
-      this->storage->read(input, buffer, file_size);
-      
+      Status read_status = this->storage->read(input, buffer, file_size);
+
       file_lock.unlock();
+      // Same race as LRUCache::readDataLog: a peer's compaction can
+      // emit REMOVE for an input log between the metadata-log entry
+      // that scheduled this compaction and our read. Skip the input
+      // and continue — the rollforward will reconcile.
+      if (read_status != Status::kSuccess || buffer == nullptr) {
+        delete[] buffer;
+        continue;
+      }
       std::vector<google::protobuf::Message*> messages;
       protobuf::deserializeMessages(buffer, file_size, messages, []() -> google::protobuf::Message* {
         return new Record();
@@ -289,56 +296,52 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       delete[] buffer;
       buffer = nullptr;
       for (auto* msg : messages) {
-        auto* rec = static_cast<Record*>(msg);
-        if (key_record.find(rec->key()) != key_record.end()) {
-          delete key_record[rec->key()];
-        }
-        key_record[rec->key()] = rec;
+        // Take ownership of the freshly-parsed Record. Subsequent
+        // same-key writes overwrite the entry; the prior shared_ptr
+        // releases its refcount.
+        std::shared_ptr<Record> rec(static_cast<Record*>(msg));
+        auto key = rec->key();
+        key_record[std::move(key)] = std::move(rec);
       }
     } else {
-      
-
-      std::unordered_map<std::string, Record*> records_tmp;
       Table* table = nullptr;
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
       std::shared_lock file_lock(file_mutex);
 
       Table::open(this->sstable_storage, input, table);
-      records_tmp = table->getAll();
-      
+      auto records_tmp = table->getAll();
+
       file_lock.unlock();
       // print the range of records_tmp
       std::string key_start = records_tmp.begin()->first;
       std::string key_end = records_tmp.begin()->first;
-      for (auto const& record : records_tmp) {
+      for (auto& record : records_tmp) {
         if (record.first < key_start) {
           key_start = record.first;
         }
         if (record.first > key_end) {
           key_end = record.first;
         }
-        if (key_record.find(record.first) != key_record.end()) {
-          delete key_record[record.first];
-        }
-        key_record[record.first] = record.second;
+        key_record[record.first] = std::move(record.second);
       }
       delete table;
     }
   }
-  
-  std::vector<Record*> records;
+
+  std::vector<std::shared_ptr<Record>> records;
   records.reserve(key_record.size());
-  for (auto const& [key, record] : key_record) {
+  for (auto& [key, record] : key_record) {
     records.push_back(record);
   }
 
   // Step3: write to the destination file, cut the file by the max file size
   // sort based on the key
-  
+
   log_string += "into";
-  std::sort(records.begin(), records.end(), [](Record* a, Record* b) {
-    return a->key() < b->key();
-  });
+  std::sort(records.begin(), records.end(),
+            [](std::shared_ptr<Record> const& a, std::shared_ptr<Record> const& b) {
+              return a->key() < b->key();
+            });
   std::vector<std::string> output_files;
   std::vector<uint64_t> output_file_bytes;
   std::vector<std::pair<std::string, std::string>> key_ranges;
@@ -404,9 +407,10 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   }
   this->metadata_handler->appendToMetadataLog(operation_record);
 
-  // Invalidate the LogHandler's in-memory key index for compacted-away
-  // log files *before* the source Record*s are freed below, so no
-  // reader can lift a freed pointer out of the index.
+  // Drop LogKeyIndex entries and LRUCache log records for the inputs.
+  // Both layers hold shared_ptr<Record>, so a reader that already
+  // lifted a pointer out keeps its Record alive past this point — the
+  // refcount drops to zero only after the last borrower releases.
   if (log_level_compaction && this->log_handler != nullptr) {
     std::vector<std::string> log_inputs;
     log_inputs.reserve(compaction->task_id->input_files_size());
@@ -429,10 +433,10 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   }
   compaction->finished = true;
   std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
-  // delete the records
-  for (auto const& record : records) {
-    delete record;
-  }
+  // Records are shared_ptr-owned — they release as `records` and
+  // `key_record` go out of scope. Any concurrent reader that lifted
+  // a pointer out of LogKeyIndex / the cache keeps its Record alive
+  // independently until it releases its own refcount.
   if (log_level_compaction) {
     if (this->event_listener != nullptr) {
       int input_size = 0;

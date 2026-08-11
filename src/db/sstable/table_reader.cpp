@@ -141,7 +141,7 @@ Iterator* Table::blockReader(Table* table,
   return iter;
 }
 
-Status Table::get(std::string const& key, Record*& record) {
+Status Table::get(std::string const& key, std::shared_ptr<Record>& record) {
   // check file filter first
   if (rep_->filter_block_for_file_reader != nullptr && !rep_->filter_block_for_file_reader->keyMayMatch(0, key)) {
     return Status::kNotFound;
@@ -163,7 +163,7 @@ Status Table::get(std::string const& key, Record*& record) {
         this->rep_->lru_cache->readDataBlocks(rep_->fileName, identifier_value);
       }
       this->rep_->lru_cache->get(rep_->fileName, key, record, identifier_value);
-      if (record != nullptr) {
+      if (record) {
         return Status::kSuccess;
       }
     }
@@ -191,8 +191,8 @@ Status Table::getBlockPosition(std::string const& key, std::string& index_value)
 }
 */
 
-std::unordered_map<std::string, Record*> Table::getAll() {
-  std::unordered_map<std::string, Record*> result;
+std::unordered_map<std::string, std::shared_ptr<Record>> Table::getAll() {
+  std::unordered_map<std::string, std::shared_ptr<Record>> result;
   assert(this->rep_ != nullptr);
   assert(this->rep_->index_iter != nullptr);
   this->rep_->index_iter->seekToFirst();
@@ -202,9 +202,9 @@ std::unordered_map<std::string, Record*> Table::getAll() {
     block_iter->seekToFirst();
     while (block_iter->valid()) {
       std::string const& value = block_iter->value();
-      auto* record = new Record();
-      (*record).ParseFromString(value);
-      result[block_iter->key()] = record;
+      auto record = std::make_shared<Record>();
+      record->ParseFromString(value);
+      result[block_iter->key()] = std::move(record);
       block_iter->next();
     }
     this->rep_->index_iter->next();

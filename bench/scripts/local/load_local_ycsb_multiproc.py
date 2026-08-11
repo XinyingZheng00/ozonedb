@@ -133,6 +133,18 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
             data["corfu_stream_name"] = corfu_settings["stream_name"]
         if "jvm_opts" in corfu_settings:
             data["corfu_jvm_opts"] = corfu_settings["jvm_opts"]
+        # Compaction-tuning passthrough — used by the compaction-contention
+        # experiment script to override shared_config_base.json's defaults.
+        # Names match shared_config_base.json keys 1:1.
+        for k in (
+            "log_file_size_limit",
+            "base_file_number_limit",
+            "level_size",
+            "level_file_size_limit",
+            "max_level",
+        ):
+            if k in corfu_settings:
+                data[k] = corfu_settings[k]
     if s3_settings:
         data["sstable_backend"] = "s3"
         if "endpoint" in s3_settings:

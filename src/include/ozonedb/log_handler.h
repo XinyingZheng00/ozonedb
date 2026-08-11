@@ -102,7 +102,7 @@ class LogHandler {
    * @param value
    * @return Status
    */
-  Status readRecord(std::string const& key, Record*& record, std::string const& offset, std::string& latest_offset);
+  Status readRecord(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset, std::string& latest_offset);
 
   // View-independent fast path: probe the in-memory key index without
   // touching latest_view or any storage backend. Returns true and sets
@@ -112,7 +112,7 @@ class LogHandler {
   // circuit the View deep-copy and the tail_cache lookup when this
   // hits. Only safe to trust as authoritative when the Metadata
   // `trust_background_tail` flag is enabled.
-  bool tryIndexLookup(std::string const& key, Record*& record);
+  bool tryIndexLookup(std::string const& key, std::shared_ptr<Record>& record);
 
   // Populate key_index_ from log files already materialized in the
   // cache. Called once at openDB after metadata rollforward so the

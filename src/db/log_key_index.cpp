@@ -4,25 +4,27 @@
 
 namespace ozonedb {
 
-Record* LogKeyIndex::lookup(std::string const& key) {
+std::shared_ptr<Record> LogKeyIndex::lookup(std::string const& key) {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   auto it = map_.find(key);
   if (it == map_.end()) return nullptr;
+  // Return a copy so the caller's reference stays alive past any
+  // concurrent invalidateFile / overwrite under unique_lock.
   return it->second.rec;
 }
 
-void LogKeyIndex::upsert(std::string const& key, Record* rec,
+void LogKeyIndex::upsert(std::string const& key, std::shared_ptr<Record> rec,
                          std::string const& source_file) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = map_.find(key);
   if (it != map_.end()) {
-    it->second.rec = rec;
+    it->second.rec = std::move(rec);
     it->second.source_file = source_file;
     lru_.splice(lru_.begin(), lru_, it->second.lru_it);
     return;
   }
   lru_.push_front(key);
-  map_[key] = Entry{rec, source_file, lru_.begin()};
+  map_[key] = Entry{std::move(rec), source_file, lru_.begin()};
   while (capacity_ > 0 && map_.size() > capacity_) {
     evictOneLocked();
   }

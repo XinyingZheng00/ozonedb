@@ -4,7 +4,7 @@
 
 namespace ozonedb {
 
-Status SSTableHandler::readRecordFromAllLevel(std::string const& key, Record*& record, std::string const& offset) {
+Status SSTableHandler::readRecordFromAllLevel(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset) {
   // sstable prefix is level prefix + number
 
   for (int i = 1; i <= max_level; i++) {

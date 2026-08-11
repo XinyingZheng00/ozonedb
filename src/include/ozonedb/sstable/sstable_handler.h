@@ -41,7 +41,7 @@ class SSTableHandler {
   void setMaxLevel(int max_level) { this->max_level = max_level; }
   ~SSTableHandler(){};
 
-  Status readRecordFromAllLevel(std::string const& key, Record*& record, std::string const& offset);
+  Status readRecordFromAllLevel(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset);
 
   // set thread pool
   void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }

@@ -152,13 +152,13 @@ void TableBuilder::flush() {
   if (r->lru_cache != nullptr && !r->pending_records.empty() && ok() &&
       r->pending_index_identifier != nullptr) {
     std::string id_bytes = r->pending_index_identifier->SerializeAsString();
-    auto* records_map = new std::unordered_map<std::string, Record*>();
+    auto* records_map = new std::unordered_map<std::string, std::shared_ptr<Record>>();
     size_t size = 0;
     records_map->reserve(r->pending_records.size());
     for (auto& kv : r->pending_records) {
-      auto* rec = new Record(kv.second);
+      auto rec = std::make_shared<Record>(kv.second);
       size += rec->ByteSizeLong();
-      (*records_map)[kv.first] = rec;
+      (*records_map)[kv.first] = std::move(rec);
     }
     r->lru_cache->putSSTableRecords(r->fileName, records_map, id_bytes, size);
   }
