@@ -1,7 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Toolchain and Prefix Path
-set(CMAKE_TOOLCHAIN_FILE "$ENV{OZONEDB_HOME}/vcpkg/scripts/buildsystems/vcpkg.cmake")
+# vcpkg toolchain. Resolved from CMAKE_CURRENT_SOURCE_DIR rather than
+# $ENV{OZONEDB_HOME} so the build works from any checkout with nothing
+# exported first. Precedence: an explicitly supplied CMAKE_TOOLCHAIN_FILE
+# (preset or -D) > $VCPKG_ROOT > the in-repo vcpkg submodule.
+if (NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    if (DEFINED ENV{VCPKG_ROOT})
+        set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "vcpkg toolchain")
+    elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake")
+        set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "vcpkg toolchain")
+    endif()
+endif()
 
 # Project Configuration
 project(OzoneDB VERSION 1.0)
@@ -28,16 +37,20 @@ option(OZONEDB_ENABLE_CORFU "Build the CorfuDB storage backend (requires JDK + M
 option(OZONEDB_ENABLE_S3 "Build the S3/MinIO/R2 storage backend (requires aws-sdk-cpp)" ON)
 
 # Find Packages
-link_directories("$ENV{OZONEDB_HOME}/build/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+#
+# No link_directories() here: vcpkg's imported targets already carry their
+# own link information, and the old call hardcoded a `build/` directory name.
+#
+# sqlite3, fmt and log4cxx were previously REQUIRED but are not referenced
+# anywhere under src/ or tests/ -- they only made a fresh machine fail
+# earlier. sqlite3 served the commented-out runBench target; log4cxx served
+# one BasicConfigurator::configure() call in the JNI shim, now removed.
 find_package(azure-identity-cpp CONFIG REQUIRED)
 find_package(azure-storage-blobs-cpp CONFIG REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
-find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(Boost 1.70 REQUIRED COMPONENTS uuid)
 find_package(OpenSSL CONFIG REQUIRED)
-find_package(fmt CONFIG REQUIRED)
-find_package(log4cxx CONFIG REQUIRED)
 
 if (OZONEDB_ENABLE_CORFU)
     find_package(JNI REQUIRED)
@@ -49,21 +62,26 @@ if (OZONEDB_ENABLE_S3)
 endif()
 
 # Protobuf Compilation
-file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/include/ozonedb/protobuf)
-protobuf_generate_cpp(
-    PROTO_SRCS PROTO_HDRS 
-    ${PROJECT_SOURCE_DIR}/src/include/ozonedb/record.proto 
-    ${PROJECT_SOURCE_DIR}/src/include/ozonedb/sstable.proto 
-    PROTOC_OUT_DIR ${PROJECT_SOURCE_DIR}/src/include/ozonedb/protobuf
-)
+#
+# Generated into the build tree, not src/include/ozonedb/protobuf/. Sources
+# include these as "protobuf/record.pb.h", so PROTO_GEN_ROOT (not the
+# protobuf/ subdir itself) is what goes on the include path.
+set(PROTO_GEN_ROOT ${CMAKE_CURRENT_BINARY_DIR}/generated)
+file(MAKE_DIRECTORY ${PROTO_GEN_ROOT}/protobuf)
 
-# Include Directories
-include_directories(
-    ${GTEST_INCLUDE_DIRS}
-    ${SQLITE3_INCLUDE_DIRS}
-    ${Boost_INCLUDE_DIRS}
-    ${PROJECT_SOURCE_DIR}/src/include/ozonedb 
-    ${PROJECT_SOURCE_DIR}/src/util/
+# Remove the pre-move generation directory. It was CMake-generated output
+# (gitignored, protoc-written), and because src/include/ozonedb comes ahead
+# of PROTO_GEN_ROOT for other headers, a leftover copy there would silently
+# shadow the freshly generated one on any machine that has built before.
+if (EXISTS ${PROJECT_SOURCE_DIR}/src/include/ozonedb/protobuf)
+    message(STATUS "Removing stale in-tree protobuf output: src/include/ozonedb/protobuf")
+    file(REMOVE_RECURSE ${PROJECT_SOURCE_DIR}/src/include/ozonedb/protobuf)
+endif()
+protobuf_generate_cpp(
+    PROTO_SRCS PROTO_HDRS
+    ${PROJECT_SOURCE_DIR}/src/include/ozonedb/record.proto
+    ${PROJECT_SOURCE_DIR}/src/include/ozonedb/sstable.proto
+    PROTOC_OUT_DIR ${PROTO_GEN_ROOT}/protobuf
 )
 
 # Library Target
@@ -101,6 +119,18 @@ endif()
 
 add_library(OzoneDB SHARED ${OZONEDB_SOURCES})
 
+# PUBLIC so every consumer -- runUnitTests, the corfu smoke binaries, and the
+# JNI shim -- inherits these instead of restating them. Public headers such as
+# db.h include "protobuf/record.pb.h", so PROTO_GEN_ROOT must be public too.
+# PROTO_GEN_ROOT deliberately comes first: it must win over any stale
+# src/include/ozonedb/protobuf/ left by a pre-move build.
+target_include_directories(OzoneDB PUBLIC
+    ${PROTO_GEN_ROOT}
+    ${PROJECT_SOURCE_DIR}/src/include/ozonedb
+    ${PROJECT_SOURCE_DIR}/src/util
+    ${Boost_INCLUDE_DIRS}
+)
+
 target_link_libraries(OzoneDB
     protobuf::libprotoc protobuf::libprotobuf protobuf::libprotobuf-lite
     ${Boost_LIBRARIES}
@@ -119,7 +149,14 @@ if (OZONEDB_ENABLE_CORFU)
     target_link_libraries(OzoneDB ${JNI_LIBRARIES})
 
     set(CORFU_BRIDGE_POM "${PROJECT_SOURCE_DIR}/ozonedb-jni-maven/corfu-bridge/pom.xml")
-    set(CORFU_BRIDGE_JAR "${PROJECT_SOURCE_DIR}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-all.jar")
+    # maven-shade-plugin names the *attached* shaded artifact
+    # ${artifactId}-${version}-${classifier}.jar and ignores <finalName>, so
+    # this is corfu-bridge-1.0-all.jar. Naming it corfu-bridge-all.jar meant
+    # the OUTPUT never appeared, so `mvn package` re-ran on every build and
+    # every incremental C++ build blocked on Maven. Keep in sync with the
+    # <version> in corfu-bridge/pom.xml.
+    set(CORFU_BRIDGE_VERSION "1.0")
+    set(CORFU_BRIDGE_JAR "${PROJECT_SOURCE_DIR}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-${CORFU_BRIDGE_VERSION}-all.jar")
     add_custom_command(
         OUTPUT ${CORFU_BRIDGE_JAR}
         COMMAND ${MAVEN_EXECUTABLE} -f ${CORFU_BRIDGE_POM} package -DskipTests
@@ -133,14 +170,15 @@ if (OZONEDB_ENABLE_CORFU)
 endif()
 
 # Executable for Unit Tests
+#
+# test_log.cpp and test_compaction.cpp are omitted: both are entirely
+# commented out, so they contributed nothing but compile time.
 set(OZONEDB_TEST_SOURCES
     tests/test_db.cpp
-    tests/test_log.cpp
     tests/test_storage.cpp
     tests/test_all.cpp
     tests/test_protobuf.cpp
     tests/test_sstable.cpp
-    tests/test_compaction.cpp
     tests/test_filter_block.cpp
 )
 if (OZONEDB_ENABLE_CORFU)
@@ -173,9 +211,13 @@ target_link_libraries(runUnitTests
 # target_link_libraries(runBench OzoneDB unofficial::sqlite3::sqlite3 rocksdb log4cxx)
 
 # Custom Clean Targets
+#
+# clean-all used to `rm -rf /tank/db/`, wiping every database under /tank --
+# including other users' and other backends'. It now scopes to the same
+# ozonedb directory clean-db uses.
 add_custom_target(clean-all
     COMMAND ${CMAKE_BUILD_TOOL} clean
-    COMMAND rm -rf /tank/db/
+    COMMAND rm -rf /tank/db/ozonedb
 )
 add_custom_target(clean-db
     COMMAND rm -rf /tank/db/ozonedb

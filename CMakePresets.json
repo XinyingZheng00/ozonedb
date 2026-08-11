@@ -1,12 +1,29 @@
 {
-  "version": 2,
+  "version": 3,
   "configurePresets": [
     {
-      "name": "vcpkg",
+      "name": "default",
+      "displayName": "Local FS + Azure + S3",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "/users/Xinying/ozonedb/vcpkg/scripts/buildsystems/vcpkg.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+      }
+    },
+    {
+      "name": "corfu",
+      "displayName": "Adds the CorfuDB shared-log backend + JNI",
+      "inherits": "default",
+      "cacheVariables": {
+        "OZONEDB_ENABLE_CORFU": "ON"
+      }
+    },
+    {
+      "name": "profiling",
+      "displayName": "Corfu build with frame pointers for perf/flamegraph",
+      "inherits": "corfu",
+      "cacheVariables": {
+        "OZONEDB_PROFILING": "ON"
       }
     }
   ]

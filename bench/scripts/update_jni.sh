@@ -1,5 +1,5 @@
-# cd $OZONEDB_HOME/src/include/ozonedb/protobuf && rm -rf *
-mkdir -p $OZONEDB_HOME/src/include/ozonedb/protobuf
+# Protobuf headers are generated into build/generated/ by CMake now, so there
+# is no in-tree protobuf directory to create or clear here.
 mkdir -p $OZONEDB_HOME/build
 cd $OZONEDB_HOME/build
 cmake -DOZONEDB_ENABLE_CORFU=ON .. && make -j20 OzoneDB corfu-bridge

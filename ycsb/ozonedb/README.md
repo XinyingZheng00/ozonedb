@@ -31,7 +31,7 @@ mvn -pl site.ycsb:ozonedb-binding -am clean package
 OzoneDB's CorfuDB backend reuses this same binding — the Java side is
 unchanged. Switching backends is purely a matter of (a) pointing `shared_config`
 at a config file whose `"backend"` field is `"corfu"`, and (b) making sure
-`corfu-bridge-all.jar` is on the YCSB JVM's classpath so the native
+`corfu-bridge-1.0-all.jar` is on the YCSB JVM's classpath so the native
 `CorfuDBStorage` can `FindClass("site/ycsb/db/corfu/CorfuBridge")`.
 
 ### Prerequisites
@@ -42,7 +42,7 @@ at a config file whose `"backend"` field is `"corfu"`, and (b) making sure
    cmake --build build --target OzoneDB corfu-bridge
    ```
    This produces both `libOzoneDB.so` and
-   `${OZONEDB_HOME}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-all.jar`.
+   `${OZONEDB_HOME}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-1.0-all.jar`.
 2. Install/refresh the JNI shared lib wherever the YCSB binding expects it
    (e.g. `sudo cp .../libozonedb.so /usr/lib/`) — same step as the local
    quick-start above.
@@ -51,7 +51,7 @@ at a config file whose `"backend"` field is `"corfu"`, and (b) making sure
    corfu_server -m -s 9000
    ```
 4. Make sure `JAVA_HOME` points at the same JDK that was used to build
-   `corfu-bridge-all.jar` (currently JDK 25) and that
+   `corfu-bridge-1.0-all.jar` (currently JDK 25) and that
    `$JAVA_HOME/lib/server` is on `LD_LIBRARY_PATH` so YCSB can load libjvm.
 
 ### Via the bench scripts (recommended)
@@ -86,7 +86,7 @@ python3 bench/scripts/local/run_local_ycsb.py
 
 The generator writes `src/config/corfu/shared_config_rocksdb.json` from
 `shared_config_rocksdb_base.json`, filling in the per-run `db_path` and the
-absolute path to `corfu-bridge-all.jar`.
+absolute path to `corfu-bridge-1.0-all.jar`.
 
 ### Manual invocation
 
@@ -96,7 +96,7 @@ If you want to bypass the wrapper scripts:
 cd ${OZONEDB_HOME}/ycsb
 ./bin/ycsb load ozonedb -s -P workloads/workloada \
     -p shared_config=${OZONEDB_HOME}/src/config/corfu/shared_config_rocksdb.json \
-    -cp ${OZONEDB_HOME}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-all.jar
+    -cp ${OZONEDB_HOME}/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-1.0-all.jar
 ```
 
 Edit the config JSON beforehand so `corfu_jar_path`, `corfu_endpoint`, and

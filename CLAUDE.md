@@ -26,19 +26,33 @@ bash bench/scripts/setup_corfu.sh      # clone + mvn install CorfuDB (separate n
 ## Build
 
 ```bash
-mkdir -p build && cd build
-cmake ..                          && make -j$(nproc)          # local FS + Azure + S3
-cmake -DOZONEDB_ENABLE_CORFU=ON .. && make -j$(nproc)         # adds JNI + CorfuDB backend
+cmake -B build                           && cmake --build build -j$(nproc)  # local FS + Azure + S3
+cmake -B build -DOZONEDB_ENABLE_CORFU=ON && cmake --build build -j$(nproc)  # adds JNI + CorfuDB
 ```
+
+CMake no longer reads `OZONEDB_HOME` — only the bench scripts do. The vcpkg toolchain resolves
+from an explicit `CMAKE_TOOLCHAIN_FILE`, else `$VCPKG_ROOT`, else the in-repo `vcpkg/` submodule.
+
+`CMakePresets.json` defines `default` / `corfu` / `profiling`, but presets need CMake ≥ 3.21 and
+the Ubuntu 20.04 bench image ships 3.16 — hence the plain commands above as the primary path.
+`CMakeUserPresets.json` is per-user and gitignored.
 
 - `OZONEDB_ENABLE_S3` defaults **ON** (needs `aws-sdk-cpp` from vcpkg); `OZONEDB_ENABLE_CORFU`
   defaults **OFF**. Both set a `-D` compile definition that guards the corresponding
   `src/db/*_storage.cpp` and its header — new backend code must be inside those guards.
 - `-DOZONEDB_PROFILING=ON` keeps `-O3` but adds frame pointers + line tables for perf/flamegraph.
-- Enabling Corfu makes CMake shell out to Maven to build `corfu-bridge-all.jar` (the Java shim the
-  embedded JVM loads), so the C++ build depends on a working `mvn` and JDK.
-- Protobuf headers are generated into `src/include/ozonedb/protobuf/` (gitignored) at configure time
-  from `record.proto` / `sstable.proto`.
+- Enabling Corfu makes CMake shell out to Maven to build `corfu-bridge-1.0-all.jar` (the Java shim the
+  embedded JVM loads), so the C++ build depends on a working `mvn` and JDK. That filename is what
+  maven-shade actually emits (`artifactId-version-classifier`); it ignores the pom's `<finalName>`.
+  If `CORFU_BRIDGE_JAR` ever stops matching, Maven silently re-runs on **every** build.
+- Protobuf headers are generated into `build/generated/protobuf/` at configure time from
+  `record.proto` / `sstable.proto`. Sources include them as `"protobuf/record.pb.h"`, and
+  `build/generated` is deliberately **first** on the include path so a stale in-tree copy from a
+  pre-move build can't shadow them (configure also deletes that directory if it finds it).
+- Header/link deps come from `target_include_directories(OzoneDB PUBLIC …)`, so anything linking
+  `OzoneDB` inherits them. Don't reintroduce global `include_directories()` or `link_directories()`.
+- `vcpkg.json` carries only what is actually linked. `sqlite3`, `fmt`, `log4cxx` (+ `apr`,
+  `apr-util`, `expat`) and `abseil` were removed — nothing under `src/` or `tests/` referenced them.
 
 **After any C++ change that a YCSB run must see, rebuild the whole chain:**
 
@@ -62,9 +76,10 @@ cd build && ./runUnitTests                               # all
 - `/tank` must exist and be writable: `sudo mkdir -p /tank && sudo chmod 777 /tank`.
 - `CorfuStorageTest.*` self-skip unless both `CORFU_TEST_ENDPOINT` and `CORFU_BRIDGE_JAR` are set.
 - `CloudStorageTest.*` talk to real Azure Blob Storage and fail without network/credentials.
-- `tests/test_log.cpp` and `tests/test_compaction.cpp` are entirely commented out; `DBTest`
-  references `src/config/cloud/shared_config_rocksdb_base.json`, which is **not** in the tree — the
-  DB suite does not currently pass out of the box.
+- `tests/test_log.cpp` and `tests/test_compaction.cpp` are entirely commented out and are no longer
+  in `OZONEDB_TEST_SOURCES` — re-add them there if they ever come back. `DBTest` references
+  `src/config/cloud/shared_config_rocksdb_base.json`, which is **not** in the tree, so the DB suite
+  does not currently pass out of the box.
 - Corfu end-to-end smoke binaries (only built with `OZONEDB_ENABLE_CORFU=ON`) are the practical way
   to exercise the shared-log path:
   ```bash
