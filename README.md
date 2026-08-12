@@ -84,6 +84,21 @@ python3 bench/scripts/local/run_multinode_ycsb.py
 
 Results land in `bench/results/local` (gitignored). Plotting scripts are in `bench/scripts/plot/`.
 
+### Pushing code to the nodes
+
+`bench/ansible/sync.yml` rsyncs the working tree to every host in
+`cloudlab.hosts` concurrently, and optionally rebuilds — the fast inner loop once
+the nodes are provisioned. Hosts come from `ycsb.yaml`, so there is no second
+list to maintain.
+
+```bash
+cd bench/ansible
+ansible-playbook sync.yml                  # push to every host
+ansible-playbook sync.yml -e build=true    # push, then build.sh on each host
+```
+
+See `bench/ansible/README.md`.
+
 ## Tests
 
 ```bash

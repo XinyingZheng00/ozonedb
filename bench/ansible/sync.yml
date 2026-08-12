@@ -1,0 +1,149 @@
+---
+# Push the local working tree to every CloudLab client host at once.
+#
+# Replaces running ../../../sync-ozonedb.sh once per node: the hosts sync
+# concurrently (forks in ansible.cfg), share one ControlPersist'd SSH
+# connection each, and can rebuild in the same pass.
+#
+#   cd $OZONEDB_HOME/bench/ansible
+#   ansible-playbook sync.yml                        # sync ozonedb everywhere
+#   ansible-playbook sync.yml -e build=true          # sync, then build.sh on each host
+#   ansible-playbook sync.yml -e delete=true         # mirror: prune remote-only files
+#   ansible-playbook sync.yml --limit amd172.utah.cloudlab.us
+#   ansible-playbook sync.yml --check --diff         # dry run (rsync -n)
+#
+# Sibling repos (slatedb, rocksdb, ...) ride along via extra_repos:
+#   ansible-playbook sync.yml \
+#     -e '{"extra_repos":[{"src":"../../../slatedb/","dest":"slatedb"}]}'
+# Relative src is resolved against this directory; relative dest against the
+# remote user's home.
+#
+# NOTE: this syncs a working tree, it does not bootstrap a node. .git/ and
+# vcpkg/ are excluded, so the destination must already be a clone with its
+# submodules initialised -- i.e. run `setup.sh --role client` there first.
+
+- name: Sync the OzoneDB working tree to the CloudLab clients
+  hosts: cloudlab
+  gather_facts: false
+  # free: a slow host doesn't hold up the others at each task boundary.
+  strategy: free
+
+  vars:
+    repo_src: "{{ playbook_dir }}/../../"
+    # Fallback destination name, used only when the remote has no OZONEDB_HOME.
+    repo_dest_name: ozonedb
+    # Set to force a destination and skip the OZONEDB_HOME probe entirely.
+    remote_repo_path: ""
+    extra_repos: []
+    build: false
+    delete: false
+
+    # Mirrors the exclude list in ../../../sync-ozonedb.sh. Everything here is
+    # either machine-local (build output, results), huge and independently
+    # provisioned (vcpkg, .git), or editor/agent scratch.
+    rsync_excludes:
+      - --exclude=.git/
+      - --exclude=.claude/
+      - --exclude=build/
+      - --exclude=**/build/
+      - --exclude=vcpkg/
+      - --exclude=target/
+      - --exclude=**/target/
+      - --exclude=**/__pycache__/
+      - --exclude=ozonedb-jni-maven/native/src/main/cpp/lib/
+      - --exclude=ycsb/workloads/
+      - --exclude=bench/results/
+      - --exclude=src/include/ozonedb/protobuf/
+      - --exclude=.DS_Store
+      - --exclude=.idea/
+      - --exclude=.vscode/
+      - --exclude=.env
+      - --exclude=tmp/
+      - --exclude=*.pyc
+      - --exclude=*.so
+      - --exclude=*.o
+      - --exclude=*.a
+      - --exclude=CLAUDE.md
+
+  tasks:
+    - name: Probe the remote for OZONEDB_HOME
+      ansible.builtin.shell: bash -lc 'echo "OZONEDB_HOME=$OZONEDB_HOME"; echo "REMOTE_HOME=$HOME"'
+      register: home_probe
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [sync, build]
+
+    - name: Resolve the destination path
+      ansible.builtin.set_fact:
+        # bash -lc output can carry ~/.profile noise, so match on the sentinel
+        # rather than trusting a line position.
+        repo_dest: >-
+          {{ remote_repo_path if (remote_repo_path | length > 0)
+             else ((_ozonedb_home | last) if (_ozonedb_home | length > 0)
+                   else ((_remote_home | last) ~ '/' ~ repo_dest_name)) }}
+      vars:
+        _ozonedb_home: "{{ home_probe.stdout | regex_findall('OZONEDB_HOME=(\\S+)') }}"
+        _remote_home: "{{ home_probe.stdout | regex_findall('REMOTE_HOME=(\\S+)') }}"
+      failed_when: false
+      tags: [sync, build]
+
+    - name: Fail loudly when neither OZONEDB_HOME nor HOME could be read
+      ansible.builtin.fail:
+        msg: >-
+          Could not determine a destination on {{ inventory_hostname }}
+          (rc={{ home_probe.rc | default('n/a') }},
+          stderr={{ home_probe.stderr | default('') | trim }}).
+          Pass -e remote_repo_path=/abs/path to override.
+      when: repo_dest is not defined or (repo_dest | trim | length == 0) or repo_dest.startswith('/ozonedb')
+      tags: [sync, build]
+
+    - name: Ensure the destination directory exists
+      ansible.builtin.file:
+        path: "{{ repo_dest }}"
+        state: directory
+        mode: "0755"
+      tags: [sync]
+
+    - name: Sync ozonedb
+      ansible.posix.synchronize:
+        src: "{{ repo_src }}"
+        dest: "{{ repo_dest }}/"
+        # archive implies -o/-g, which a non-root rsync cannot honour and which
+        # produce spurious "changed" churn. Everything else in -a is wanted.
+        owner: false
+        group: false
+        compress: true
+        delete: "{{ delete | bool }}"
+        # Reuse the ControlPersist connection from ansible.cfg.
+        use_ssh_args: true
+        rsync_opts: "{{ rsync_excludes }}"
+      tags: [sync]
+
+    - name: Sync extra repos
+      ansible.posix.synchronize:
+        src: "{{ (item.src if item.src.startswith('/') else playbook_dir ~ '/' ~ item.src) }}"
+        dest: "{{ item.dest }}/"
+        owner: false
+        group: false
+        compress: true
+        delete: "{{ item.delete | default(delete) | bool }}"
+        use_ssh_args: true
+        rsync_opts: "{{ item.rsync_opts | default(rsync_excludes) }}"
+      loop: "{{ extra_repos }}"
+      loop_control:
+        label: "{{ item.src }} -> {{ item.dest }}"
+      tags: [sync]
+
+    - name: Rebuild OzoneDB + JNI shim + YCSB binding
+      ansible.builtin.shell: bash -lc 'cd {{ repo_dest | quote }} && bash bench/scripts/build.sh'
+      register: build_result
+      changed_when: true
+      when: build | bool
+      tags: [build]
+
+    - name: Show the tail of each build
+      ansible.builtin.debug:
+        msg: "{{ build_result.stdout_lines[-15:] | default([]) }}"
+      when: build | bool
+      tags: [build]

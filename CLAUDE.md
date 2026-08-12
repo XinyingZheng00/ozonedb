@@ -125,6 +125,11 @@ python3 bench/scripts/local/run_corfu_compaction_contention.py
   `_make_corfu_config_per_writer` template `src/config/{local,corfu}/shared_config_base.json` into
   `shared_config_w{i}.json`. Never point multiple writers at a single `shared_config.json`.
 - Results go to `bench/results/local` (gitignored); plotting scripts live in `bench/scripts/plot/`.
+- `bench/ansible/sync.yml` pushes the working tree to every `cloudlab.hosts` entry in parallel
+  (`-e build=true` also rebuilds). `bench/ansible/inventory.py` is a dynamic inventory that reads
+  `cloudlab.{hosts,ssh_user,ssh_private_key_path}` straight out of `ycsb.yaml`, so the host list is
+  never duplicated. It excludes `.git/` and `vcpkg/`, so it updates a provisioned node — it does not
+  create one. The result pull stays on `scp` inside `run_multinode_ycsb.py`.
 
 ## Architecture
 
