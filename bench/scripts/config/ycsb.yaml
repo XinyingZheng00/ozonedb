@@ -1,45 +1,135 @@
+# ===========================================================================
+# OzoneDB benchmark configuration
+#
+# Consumed by bench/scripts/local/*, bench/ansible/* and (bottom section only)
+# bench/scripts/cloud/*. There is no schema and no validation: every value is
+# used exactly as written, so SHAPES MATTER. Where a scalar and a list are not
+# interchangeable it is called out inline.
+#
+# Everything above the AZURE banner is the CloudLab / shared-log workflow.
+# Everything below it is only read by the Azure provisioning scripts.
+# ===========================================================================
+
+# --------------------------------------------------------------- defaults --
+# Merged into local.load and local.run below via YAML merge keys (`<<:`), which
+# yaml.safe_load expands before any script sees them -- so this is a pure-config
+# change with no code behind it. These five keys used to be written out twice
+# and had to be kept in sync by hand. Override any of them for one phase by
+# re-stating the key inside that phase.
+defaults: &defaults
+  key_size: ["1KB"]
+  db_name: ["ozonedb-corfu"]
+  threads: [1] # sweep with e.g. [1, 4, 8, 16, 32, 64]
+  repeated: 1
+  ycsb_data_path: "/tmp/ycsb_data"
+
 local:
   load:
-    record_cnt:
-      - 1000000
-    key_size:
-      - "1KB"
-    db_name:
-      - "ozonedb-corfu"
-    repeated: 1
-    ycsb_data_path: "/tmp/ycsb_data"
-    threads:
-      - 1
-      # - 4
-      # - 8
-      # - 16
-      # - 32
-      # - 64
+    <<: *defaults
+    # LIST. load_local_ycsb*.py iterates this ("for each_record_cnt in ...").
+    record_cnt: [1000000]
+    # Parallel writer processes. Was absent and silently defaulted to 2.
+    num_writers: 2
+
   run:
-    workload_name:
-      - "c"
-      # - "b"
-      # - "c"
-      # - "d"
-      # - "f"
-    operation_cnt:
-      - 999999999
-    # Optional: cap each YCSB run at this many seconds (maps to
-    # YCSB -p maxexecutiontime=<seconds>). If unset or 0, runs are
-    # bounded only by operation_cnt.
-    max_exec_time: 300
+    <<: *defaults
+    # SCALAR. run_local_ycsb_multiproc.py does int(record_cnt) on it directly.
+    # Wrapping this in a list -- to match load.record_cnt above -- breaks the run
+    # phase. The two phases genuinely differ; that is not a typo.
     record_cnt: 1000000
-    key_size:
-      - "1KB"
-    db_name:
-      - "ozonedb-corfu"
-    threads:
-      - 1
-    repeated: 1
-    ycsb_data_path: "/tmp/ycsb_data"
+    workload_name: ["c"] # a b c d f
+    operation_cnt: [999999999]
+    # Cap each YCSB run at this many seconds (YCSB -p maxexecutiontime).
+    # Unset or 0 means runs are bounded only by operation_cnt.
+    max_exec_time: 300
+
+    # Writer-process counts. All three were absent before, which meant the
+    # single-node and multi-node runners disagreed about the default: a missing
+    # num_writers gave run_local_ycsb_multiproc.py 2, while
+    # run_multinode_ycsb.py resolves writers_per_host -> num_writers -> 1 and so
+    # got 1. Stated explicitly here at the values that were previously in
+    # effect. Note run_multinode_ycsb_with_corfu.sh passes --writers_per_host on
+    # every iteration of its sweep, so this is only the fallback.
+    num_writers: 2 # single-node runner
+    writers_per_host: 1 # multi-node runner, per host
+    trial: 1
+
+# ------------------------------------------------------------------ corfu --
+# Only consumed when db_name includes "ozonedb-corfu". The bridge jar path is
+# derived from $OZONEDB_HOME/ozonedb-jni-maven/corfu-bridge/target/ and is not
+# configured here.
+#
+# endpoint must be the address the CLIENT nodes can reach, i.e. the CloudLab
+# internal LAN address of the log node -- it is baked into every generated
+# per-writer config. run_multinode_ycsb_with_corfu.sh separately passes the same
+# address to corfu_server as -a, so it is also the server's bind address.
+corfu:
+  endpoint: "10.10.1.3:9090"
+  stream_name: "ozonedb-ycsb"
+  jvm_opts: "-Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 --add-opens=java.base/java.util=ALL-UNNAMED"
+
+# --------------------------------------------------------------------- s3 --
+# S3-compatible store for SSTables (paper §3.5 split). Any S3 API works: AWS,
+# MinIO, R2, Wasabi, SeaweedFS, B2. `bash bench/scripts/setup.sh --role minio`
+# provisions this on a node and creates the bucket named below.
+#
+# access_key/secret_key are MinIO's throwaway defaults, not credentials worth
+# protecting. Point endpoint at a real S3 and they become real -- move them to
+# the environment at that point rather than committing them.
+s3:
+  endpoint: "http://10.10.1.2:9000"
+  region: "us-east-1"
+  bucket: "ozonedb-ycsb"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  use_path_style: true
+  sstable_dir: "sstables"
+
+# ---------------------------------------------------------------- hosts ----
+# The YCSB client nodes. Single source of truth for run_multinode_ycsb.py,
+# run_multinode_ycsb_with_corfu.sh AND bench/ansible/inventory.py -- update here
+# after a CloudLab swap and nothing else needs touching.
+#
+# Do NOT list the corfu/minio node here; those are addressed by corfu.endpoint
+# and s3.endpoint above.
+cloudlab:
+  ssh_user: "oliverr3"
+  ssh_private_key_path: "~/.ssh/cloudlab"
+  # Entries may be "host" or "user@host"; a per-entry user overrides ssh_user.
+  hosts: ["ms0917.utah.cloudlab.us", "ms0943.utah.cloudlab.us"]
+
+# ------------------------------------------- compaction-contention overrides
+# Read only by run_corfu_compaction_contention.py, which merges these INTO the
+# corfu settings before _make_corfu_config_per_writer writes the per-writer
+# JSON. The regular run_local_ycsb_multiproc.py path ignores this block.
+#
+# Tunes ozonedb to fire many small compactions per writer (target 20-50 per
+# trial), which is what makes the contention measurement meaningful. The
+# shared_config_base.json defaults (32 MB log files, 256 MB L1, 64 MB output)
+# would produce only a handful across a 1M-record run.
+#
+# level_size and level_file_size_limit are STRINGS: shared_config_base.json is
+# parsed by Metadata, which splits "[a, b, ...]" into a vector at load time.
+corfu_compaction_experiment:
+  log_file_size_limit: 2097152 # 2 MiB
+  base_file_number_limit: 2
+  level_size: "[8388608, 33554432, 134217728]" # 8 MiB / 32 MiB / 128 MiB
+  level_file_size_limit: "[2097152, 4194304, 8388608]" # 2 MiB / 4 MiB / 8 MiB
+  max_level: 3
+
+# ===========================================================================
+# AZURE  --  everything below is read only by bench/scripts/cloud/*.
+# Irrelevant to the CloudLab / shared-log workflow above.
+#
+# Removed as unreferenced by any script: github_username, ozonedb_branch,
+# postgres, mysql, azure_sql.
+# Moved to the environment (were committed secrets):
+#   github_token   -> $GITHUB_TOKEN        (bench/scripts/cloud/create/setup_vms.py)
+#   azure.password -> $AZURE_VM_PASSWORD   (create_azure_vms.py, load_cosmosdb.py)
+# ===========================================================================
 
 # azure: discover VMs via Azure Resource Manager (needs AZURE_SUBSCRIPTION_ID).
-# cloudlab: SSH targets from cloudlab.hosts below (no Azure VM APIs).
+# cloudlab: SSH targets from cloudlab.hosts above (no Azure VM APIs).
 cloud:
   vmprovider: cloudlab
   load:
@@ -62,102 +152,23 @@ cloud:
     repeated: 1
     ycsb_data_path: "ycsb-data"
 
-# Corfu backend settings (only consumed when db_name includes "ozonedb-corfu").
-# The jar path is derived from $OZONEDB_HOME/ozonedb-jni-maven/corfu-bridge/target/corfu-bridge-1.0-all.jar
-# and does not need to be listed here.
-corfu:
-  endpoint: "10.10.1.2:9090"
-  stream_name: "ozonedb-ycsb"
-  jvm_opts: "-Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 --add-opens=java.base/java.util=ALL-UNNAMED"
-
-# Compaction-contention experiment overrides. Read by
-# run_corfu_compaction_contention.py and merged INTO corfu_settings before
-# _make_corfu_config_per_writer writes the per-writer JSON. Not consumed by
-# the regular run_local_ycsb_multiproc.py path.
-#
-# Tunes ozonedb to fire many small compactions per writer (target 20-50 per
-# trial), which is what makes the contention measurement meaningful. Defaults
-# from shared_config_base.json (32 MB log files, 256 MB L1, 64 MB output)
-# would only produce a handful of compactions across a 1M-record run.
-#
-# level_size and level_file_size_limit are strings to match the format
-# shared_config_base.json expects (the JSON parser splits the "[a, b, ...]"
-# string into a vector at config-load time).
-corfu_compaction_experiment:
-  log_file_size_limit: 2097152 # 2 MiB
-  base_file_number_limit: 2
-  level_size: "[8388608, 33554432, 134217728]" # 8 MiB / 32 MiB / 128 MiB
-  level_file_size_limit: "[2097152, 4194304, 8388608]" # 2 MiB / 4 MiB / 8 MiB
-  max_level: 3
-
-# S3-compatible storage for SSTables (paper §3.5 split). When set, SSTables
-# are written to this object store instead of the main backend. Works with
-# any service that speaks the S3 API: real AWS S3, MinIO, R2, Wasabi,
-# SeaweedFS, B2. For MinIO local dev:
-#   docker run --rm -p 9000:9000 -p 9001:9001 \
-#     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-#     minio/minio server /data --console-address ":9001"
-#   mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-#   mc mb local/ozonedb-sstables
-s3:
-  endpoint: "http://10.10.1.2:9000"
-  region: "us-east-1"
-  bucket: "ozonedb-ycsb"
-  access_key: "minioadmin"
-  secret_key: "minioadmin"
-  use_path_style: true
-  sstable_dir: "sstables"
-
-github_username: "XinyingZheng00"
-github_token: "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"
-ozonedb_branch: "main"
 id: "testrun"
 
 azure:
   location: "eastus2"
   username: "Xinying"
-  password: "Zxy102246!"
+  # password: now $AZURE_VM_PASSWORD
 
 storage:
   account_name: "ozonedbstorage"
-  # Optional secret string (not a file path): for cloudlab or when not using Azure CLI
-  # to list storage keys. Or export AZURE_STORAGE_KEY instead.
+  # Optional secret string (not a file path): for cloudlab or when not using the
+  # Azure CLI to list storage keys. Or export AZURE_STORAGE_KEY instead.
   # account_key: ""
-
-# Used when cloud.vmprovider is cloudlab: list each node (hostname or IP from CloudLab).
-cloudlab:
-  ssh_user: "oliverr3"
-  ssh_private_key_path: "~/.ssh/cloudlab"
-  # Example: [ "Xinying@hp111.utah.cloudlab.us"]
-  hosts: ["amd172.utah.cloudlab.us", "amd180.utah.cloudlab.us"]
-
-postgres:
-  server_name: "ozonedb-postgresql-server"
-  port: 5432
-  sku_name: "Standard_B2ms"
-  sku_tier: "Burstable"
-  storage_size: 64
-  subnet_name: "ozonedb-postgresql-subnet"
-  subnet_address_prefix: "10.0.1.0/24"
 
 cosmosdb:
   account_name: "ozonedb-cosmosdb-account"
   consistency_level: "Eventual"
   mode: "serverless"
-
-mysql:
-  server_name: "ozonedb-mysql-server1234"
-  port: 3306
-  sku_name: "Standard_B2ms"
-  sku_tier: "Burstable"
-  storage_size: 64
-  subnet_name: "ozonedb-mysql-subnet"
-  subnet_address_prefix: "10.0.2.0/24"
-
-azure_sql:
-  server_name: "ozonedb-azuresql-server"
-  sku_name: "GP_S_Gen5_4"
-  sku_tier: "GeneralPurpose"
 
 resource_group:
   name: "ozonedb_test"
@@ -174,9 +185,9 @@ network:
 vm:
   num: 1
   name: "test-vm"
-  # Path to the SSH *public* key file (.pub) for Azure VM provisioning / authorized_keys.
+  # Path to the SSH *public* key file (.pub) for VM provisioning / authorized_keys.
   ssh_public_key_path: "~/.ssh/id_rsa.pub"
-  # Path to the matching *private* key for ssh/scp -i when vmprovider is azure (default ~/.ssh/id_rsa if unset).
+  # Matching *private* key for ssh/scp -i when vmprovider is azure.
   ssh_private_key_path: "~/.ssh/id_rsa"
   vm_size: "Standard_D4s_v3"
   image_reference:

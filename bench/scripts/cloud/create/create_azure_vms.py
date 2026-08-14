@@ -146,7 +146,10 @@ if __name__ == "__main__":
     num_vms = config["vm"]["num"]
     base_vm_name = config["vm"]["name"]
     username = config["azure"]["username"]
-    password = config["azure"]["password"]
+    # Was config["azure"]["password"] -- committed to a tracked file.
+    password = os.environ.get("AZURE_VM_PASSWORD")
+    if not password:
+        raise EnvironmentError("AZURE_VM_PASSWORD is not set (was ycsb.yaml azure.password).")
     vm_size = config["vm"]["vm_size"]
     image_reference = config["vm"]["image_reference"]
     ssh_public_key_path = config["vm"].get("ssh_public_key_path") or config["vm"].get("ssh_key")

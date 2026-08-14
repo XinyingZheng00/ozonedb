@@ -47,9 +47,7 @@ def build_inventory():
     config = load_config()
     cloudlab = config.get("cloudlab") or {}
 
-    default_user = cloudlab.get("ssh_user") or (config.get("azure") or {}).get(
-        "username"
-    )
+    default_user = cloudlab.get("ssh_user")
     key = (
         cloudlab.get("ssh_private_key_path")
         or cloudlab.get("ssh_private_key")

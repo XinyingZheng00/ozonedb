@@ -34,7 +34,10 @@ def common_init(node, cfg):
     # git clone ozonedb
     server_exec(node, "tmux new -s setup -d")
     server_exec(node, 'ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts',  tmux_session="setup")
-    access_token = config["github_token"]
+    # Was config["github_token"] -- a PAT committed to a tracked file.
+    access_token = os.environ.get("GITHUB_TOKEN")
+    if not access_token:
+        raise EnvironmentError("GITHUB_TOKEN is not set (was ycsb.yaml github_token).")
     server_exec(node, f'curl -H "Authorization: token {access_token}" --data "{{\\"title\\":\\"key:$(hostname)\\",\\"key\\":\\"$(cat ~/.ssh/id_rsa.pub)\\"}}" https://api.github.com/user/keys', tmux_session="setup")
     server_exec(node, f'[ -d "ozonedb-tmp" ] || git clone git@github.com:XinyingZheng00/ozonedb-tmp.git',  tmux_session="setup") # to be changed 
     server_exec(node, "cd ozonedb-tmp", tmux_session="setup") # to be changed 

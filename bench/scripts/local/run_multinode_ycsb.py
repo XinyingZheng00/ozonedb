@@ -61,7 +61,7 @@ def resolve_ssh_user(config, ssh_user_arg):
     if ssh_user_arg:
         return ssh_user_arg
     cloudlab = config.get("cloudlab") or {}
-    user = cloudlab.get("ssh_user") or (config.get("azure") or {}).get("username")
+    user = cloudlab.get("ssh_user")
     if not user:
         raise ValueError(
             "No ssh user. Set cloudlab.ssh_user in ycsb.yaml or pass --ssh_user."

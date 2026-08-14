@@ -128,7 +128,10 @@ if __name__ == "__main__":
     resource_group = config["resource_group"]["name"]
     storage_account_name = config["storage"]["account_name"]
     username = config["azure"]["username"]
-    password = config["azure"]["password"]
+    # Was config["azure"]["password"] -- committed to a tracked file.
+    password = os.environ.get("AZURE_VM_PASSWORD")
+    if not password:
+        raise EnvironmentError("AZURE_VM_PASSWORD is not set (was ycsb.yaml azure.password).")
     account_name = config["cosmosdb"]["account_name"]
 
     cosmos_mgmt_client = CosmosDBManagementClient(credential, subscription_id)
