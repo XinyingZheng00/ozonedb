@@ -144,6 +144,13 @@ python3 bench/scripts/local/run_corfu_compaction_contention.py
   `bench/ansible/group_vars/all.yml`; `inventory.py` is a dynamic inventory reading
   `cloudlab.{hosts,ssh_user,ssh_private_key_path}` straight out of `ycsb.yaml`, so the host list is
   never duplicated. The result pull stays on `scp` inside `run_multinode_ycsb.py`.
+- **The Azure benchmark path is gone.** `bench/scripts/cloud/` (Azure VM/CosmosDB provisioning,
+  `azureozonedb`/`cosmosdb` load+run drivers), the `cloud`/`azure`/`storage`/`cosmosdb`/
+  `resource_group`/`network`/`vm`/`id` config blocks and the `postgres`/`azuresql` YCSB properties
+  were all deleted — those experiments are retired. `ycsb.yaml` is now only the CloudLab shared-log
+  workflow. The **C++ `AzureBlobStorage` backend is deliberately still here**
+  (`src/db/azure_blob_storage.cpp`, `CloudStorageTest.*`, the two `azure-*-cpp` vcpkg ports, which
+  are `find_package(... REQUIRED)`); it is a `Storage` implementation, not an experiment driver.
 
 ## Architecture
 

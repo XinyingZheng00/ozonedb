@@ -1,13 +1,12 @@
 # ===========================================================================
 # OzoneDB benchmark configuration
 #
-# Consumed by bench/scripts/local/*, bench/ansible/* and (bottom section only)
-# bench/scripts/cloud/*. There is no schema and no validation: every value is
-# used exactly as written, so SHAPES MATTER. Where a scalar and a list are not
-# interchangeable it is called out inline.
+# Consumed by bench/scripts/local/* and bench/ansible/*, always through
+# bench/scripts/ycsb_config.py rather than yaml.safe_load directly.
 #
-# Everything above the AZURE banner is the CloudLab / shared-log workflow.
-# Everything below it is only read by the Azure provisioning scripts.
+# There is no schema and no validation: every value is used exactly as written,
+# so SHAPES MATTER. Where a scalar and a list are not interchangeable it is
+# called out inline.
 # ===========================================================================
 
 # --------------------------------------------------------------- defaults --
@@ -143,82 +142,3 @@ corfu_compaction_experiment:
   level_size: "[8388608, 33554432, 134217728]" # 8 MiB / 32 MiB / 128 MiB
   level_file_size_limit: "[2097152, 4194304, 8388608]" # 2 MiB / 4 MiB / 8 MiB
   max_level: 3
-
-# ===========================================================================
-# AZURE  --  everything below is read only by bench/scripts/cloud/*.
-# Irrelevant to the CloudLab / shared-log workflow above.
-#
-# Removed as unreferenced by any script: github_username, ozonedb_branch,
-# postgres, mysql, azure_sql.
-# Moved to the environment (were committed secrets):
-#   github_token   -> $GITHUB_TOKEN        (bench/scripts/cloud/create/setup_vms.py)
-#   azure.password -> $AZURE_VM_PASSWORD   (create_azure_vms.py, load_cosmosdb.py)
-# ===========================================================================
-
-# azure: discover VMs via Azure Resource Manager (needs AZURE_SUBSCRIPTION_ID).
-# cloudlab: SSH targets from cloudlab.hosts above (no Azure VM APIs).
-cloud:
-  vmprovider: cloudlab
-  load:
-    record_cnt:
-      - 10000
-    key_size:
-      - "1KB"
-    repeated: 1
-    ycsb_data_path: "ycsb-data"
-    threads: 1
-  run:
-    workload_name:
-      - "a"
-    operation_cnt:
-      - 1000
-    record_cnt: 10000
-    key_size:
-      - "1KB"
-    threads: 1
-    repeated: 1
-    ycsb_data_path: "ycsb-data"
-
-id: "testrun"
-
-azure:
-  location: "eastus2"
-  username: "Xinying"
-  # password: now $AZURE_VM_PASSWORD
-
-storage:
-  account_name: "ozonedbstorage"
-  # Optional secret string (not a file path): for cloudlab or when not using the
-  # Azure CLI to list storage keys. Or export AZURE_STORAGE_KEY instead.
-  # account_key: ""
-
-cosmosdb:
-  account_name: "ozonedb-cosmosdb-account"
-  consistency_level: "Eventual"
-  mode: "serverless"
-
-resource_group:
-  name: "ozonedb_test"
-
-network:
-  vnet_name: "ozonedb-test-vnet"
-  vnet_address_prefix: "10.0.0.0/16"
-  subnet_name: "default"
-  subnet_address_prefix: "10.0.0.0/24"
-  ip_name: "ozonedb-test-ip"
-  ip_config_name: "ozonedb-test-ip-config"
-  nic_name: "ozonedb-test-nic"
-
-vm:
-  num: 1
-  name: "test-vm"
-  # Path to the SSH *public* key file (.pub) for VM provisioning / authorized_keys.
-  ssh_public_key_path: "~/.ssh/id_rsa.pub"
-  # Matching *private* key for ssh/scp -i when vmprovider is azure.
-  ssh_private_key_path: "~/.ssh/id_rsa"
-  vm_size: "Standard_D4s_v3"
-  image_reference:
-    publisher: "Canonical"
-    offer: "0001-com-ubuntu-server-focal"
-    sku: "20_04-lts-gen2"
-    version: "latest"
