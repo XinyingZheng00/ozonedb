@@ -1,0 +1,56 @@
+---
+# Shared by sync.yml and bootstrap.yml. These are playbook group_vars, so a
+# play's own `vars:` and anything passed with -e both override them.
+
+# Where the tree lands. Empty means "probe the remote for OZONEDB_HOME and fall
+# back to $HOME/<repo_dest_name>".
+remote_repo_path: ""
+repo_dest_name: ozonedb
+
+# --------------------------------------------------------------- exclusions
+#
+# Never useful on a bench node, in any mode: build output, results, editor and
+# agent scratch, and compiled objects that must be produced on the target.
+rsync_excludes_base:
+  - --exclude=build/
+  - --exclude=**/build/
+  - --exclude=target/
+  - --exclude=**/target/
+  - --exclude=**/__pycache__/
+  - --exclude=ozonedb-jni-maven/native/src/main/cpp/lib/
+  - --exclude=ycsb/workloads/
+  - --exclude=bench/results/
+  - --exclude=src/include/ozonedb/protobuf/
+  - --exclude=.claude/
+  - --exclude=.DS_Store
+  - --exclude=.idea/
+  - --exclude=.vscode/
+  - --exclude=.env
+  - --exclude=tmp/
+  - --exclude=*.pyc
+  - --exclude=*.so
+  - --exclude=*.o
+  - --exclude=*.a
+  - --exclude=CLAUDE.md
+
+# vcpkg is *vendored*, not a submodule -- `git ls-tree HEAD vcpkg` is a plain
+# tree of ~11.7k committed files and `git submodule status` is empty. So the
+# ports tree has to ride along on a bootstrap (nothing on the node will fetch
+# it), while these four directories must NOT:
+#   vcpkg/vcpkg        the bootstrapped CLI -- a Mach-O binary on this machine
+#   vcpkg/downloads    ~63 MB of source tarballs the node can re-fetch
+#   installed/packages/buildtrees   per-platform build output
+rsync_excludes_vcpkg_local:
+  - --exclude=vcpkg/vcpkg
+  - --exclude=vcpkg/vcpkg.exe
+  - --exclude=vcpkg/downloads/
+  - --exclude=vcpkg/installed/
+  - --exclude=vcpkg/packages/
+  - --exclude=vcpkg/buildtrees/
+
+# Incremental (sync.yml): the node already has vcpkg and .git from the
+# bootstrap, and re-sending 11.7k unchanged port files every push is waste.
+rsync_excludes_incremental: "{{ rsync_excludes_base + ['--exclude=.git/', '--exclude=vcpkg/'] }}"
+
+# Bootstrap (bootstrap.yml): everything the build needs, nothing platform-local.
+rsync_excludes_bootstrap: "{{ rsync_excludes_base + rsync_excludes_vcpkg_local }}"

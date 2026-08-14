@@ -1,0 +1,38 @@
+---
+# Sets `repo_dest`. Shared by sync.yml and bootstrap.yml.
+#
+# Uses the same login-shell probe run_multinode_ycsb.py does, so Ansible and the
+# benchmark orchestrator always agree about where the tree lives. A node that
+# has not been through setup.sh yet has no OZONEDB_HOME, which is the normal
+# case during bootstrap -- fall back to $HOME/<repo_dest_name>.
+
+- name: Probe the remote for OZONEDB_HOME
+  ansible.builtin.raw: bash -lc 'echo "OZONEDB_HOME=$OZONEDB_HOME"; echo "REMOTE_HOME=$HOME"'
+  register: home_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Resolve the destination path
+  ansible.builtin.set_fact:
+    # bash -lc output can carry ~/.profile noise, so match on the sentinel
+    # rather than trusting a line position.
+    repo_dest: >-
+      {{ remote_repo_path if (remote_repo_path | length > 0)
+         else ((_ozonedb_home | last) if (_ozonedb_home | length > 0)
+               else ((_remote_home | last) ~ '/' ~ repo_dest_name)) }}
+  vars:
+    _ozonedb_home: "{{ home_probe.stdout | default('') | regex_findall('OZONEDB_HOME=(\\S+)') }}"
+    _remote_home: "{{ home_probe.stdout | default('') | regex_findall('REMOTE_HOME=(\\S+)') }}"
+  failed_when: false
+
+- name: Fail loudly when no destination could be determined
+  ansible.builtin.fail:
+    msg: >-
+      Could not determine a destination on {{ inventory_hostname }}
+      (rc={{ home_probe.rc | default('n/a') }}).
+      Pass -e remote_repo_path=/abs/path to override.
+  when: >-
+    repo_dest is not defined
+    or (repo_dest | trim | length == 0)
+    or repo_dest.startswith('/' ~ repo_dest_name)

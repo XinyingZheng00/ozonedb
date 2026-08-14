@@ -23,7 +23,7 @@ No sourcing required. The script writes `~/.ozonedb.env` (with `OZONEDB_HOME`, `
 afterwards, or run `. ~/.ozonedb.env`.
 
 The **client** role installs apt dependencies and a JDK, installs the Python requirements, creates
-`/tank`, updates submodules, installs the CorfuDB runtime into `~/.m2` (which `corfu-bridge` needs
+`/tank`, installs the CorfuDB runtime into `~/.m2` (which `corfu-bridge` needs
 — it declares no `<repositories>`, so the dependency resolves only from a local install), then runs
 `bench/scripts/build.sh`. Pass `--no-build` or `--no-corfu-runtime` to skip either.
 
@@ -53,7 +53,8 @@ cmake -B build -DOZONEDB_ENABLE_CORFU=ON && cmake --build build -j$(nproc) # add
 ```
 
 No environment needs to be exported first: the vcpkg toolchain resolves from an explicit
-`CMAKE_TOOLCHAIN_FILE`, else `$VCPKG_ROOT`, else the in-repo `vcpkg/` submodule.
+`CMAKE_TOOLCHAIN_FILE`, else `$VCPKG_ROOT`, else the in-repo `vcpkg/` tree (which is vendored
+— ~11.7k committed files — not a submodule, so a clone or rsync already has it).
 
 With CMake 3.21 or newer you can use the presets instead — `cmake --preset default`,
 `--preset corfu`, or `--preset profiling`.
@@ -86,18 +87,18 @@ Results land in `bench/results/local` (gitignored). Plotting scripts are in `ben
 
 ### Pushing code to the nodes
 
-`bench/ansible/sync.yml` rsyncs the working tree to every host in
-`cloudlab.hosts` concurrently, and optionally rebuilds — the fast inner loop once
-the nodes are provisioned. Hosts come from `ycsb.yaml`, so there is no second
-list to maintain.
+Two Ansible playbooks, both fanning out to every host in `cloudlab.hosts`
+concurrently. Hosts come from `ycsb.yaml`, so there is no second list to maintain.
 
 ```bash
 cd bench/ansible
-ansible-playbook sync.yml                  # push to every host
-ansible-playbook sync.yml -e build=true    # push, then build.sh on each host
+ansible-playbook bootstrap.yml             # fresh node: push tree (incl. vcpkg) + run setup.sh
+ansible-playbook sync.yml -e build=true    # thereafter: push changes + rebuild
 ```
 
-See `bench/ansible/README.md`.
+`bootstrap.yml` needs no `git clone` and no credentials on the node — `vcpkg` is
+vendored rather than a submodule, so an rsync of the working tree is everything
+the build needs. See `bench/ansible/README.md`.
 
 ## Tests
 

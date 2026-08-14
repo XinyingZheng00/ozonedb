@@ -1,0 +1,93 @@
+---
+# Stand up a freshly provisioned CloudLab node straight from this working tree.
+# No git clone on the node, no GitHub credentials, no PAT leaving your laptop.
+#
+#   cd $OZONEDB_HOME/bench/ansible
+#   ansible-playbook bootstrap.yml                          # push + setup.sh --role client
+#   ansible-playbook bootstrap.yml --limit amd171.utah.cloudlab.us \
+#     -e '{"setup_roles":["corfu-server","minio"]}'         # the log/store node
+#   ansible-playbook bootstrap.yml -e run_setup=false       # push only
+#   ansible-playbook bootstrap.yml -e include_git=false     # skip .git (~40 MB)
+#
+# This works because vcpkg is *vendored*, not a submodule: `git ls-tree HEAD
+# vcpkg` is a plain tree of ~11.7k committed files, so rsyncing the working tree
+# gives the node everything the build needs. Excluded are the things that are
+# local to this machine and would be wrong on Linux -- the Mach-O vcpkg binary,
+# vcpkg/downloads, and the per-platform installed/packages/buildtrees dirs.
+#
+# Measured payload (rsync -avn --stats against this tree):
+#   bootstrap, no .git   14867 files    19 MB
+#   bootstrap, with .git 15616 files    59 MB   (.git is the whole 40 MB)
+#   sync.yml incremental   442 files   2.2 MB
+# Use sync.yml for every push after this one.
+#
+# setup.sh takes a long time on first run (it builds CorfuDB into ~/.m2), so it
+# runs detached via async rather than holding an SSH channel open for the whole
+# build.
+
+- name: Bootstrap CloudLab nodes from the local working tree
+  hosts: cloudlab
+  gather_facts: false
+  strategy: free
+
+  vars:
+    repo_src: "{{ playbook_dir }}/../../"
+    setup_roles: [client]
+    setup_extra_args: ""
+    run_setup: true
+    include_git: true
+    delete: false
+    # setup.sh's CorfuDB build dominates; 2h is a ceiling, not an expectation.
+    setup_timeout: 7200
+
+  tasks:
+    - name: Resolve the destination path
+      ansible.builtin.include_tasks: tasks/resolve_dest.yml
+
+    - name: Ensure the destination directory exists
+      ansible.builtin.file:
+        path: "{{ repo_dest }}"
+        state: directory
+        mode: "0755"
+
+    - name: Push the working tree (vcpkg included)
+      ansible.posix.synchronize:
+        src: "{{ repo_src }}"
+        dest: "{{ repo_dest }}/"
+        owner: false
+        group: false
+        compress: true
+        delete: "{{ delete | bool }}"
+        use_ssh_args: true
+        rsync_opts: >-
+          {{ rsync_excludes_bootstrap
+             + ([] if (include_git | bool) else ['--exclude=.git/']) }}
+
+    - name: Report what landed
+      ansible.builtin.raw: >-
+        bash -lc 'cd {{ repo_dest | quote }} &&
+        echo "vcpkg ports: $(ls vcpkg/ports 2>/dev/null | wc -l)" &&
+        echo "git repo: $([ -d .git ] && echo yes || echo no)"'
+      register: landed
+      changed_when: false
+
+    - name: Show it
+      ansible.builtin.debug:
+        msg: "{{ landed.stdout_lines | default([]) | select('search', ':') | list }}"
+
+    - name: Run setup.sh
+      ansible.builtin.shell: >-
+        bash -lc 'cd {{ repo_dest | quote }} &&
+        bash bench/scripts/setup.sh --role {{ setup_roles | join(' --role ') }} {{ setup_extra_args }}'
+      register: setup_result
+      changed_when: true
+      when: run_setup | bool
+      # Detached: a laptop's SSH session should not have to survive a CorfuDB
+      # build for the provisioning to succeed.
+      async: "{{ setup_timeout }}"
+      poll: 30
+
+    - name: Show the tail of each setup run
+      ansible.builtin.debug:
+        msg: "{{ setup_result.stdout_lines[-25:] | default([]) }}"
+      when: run_setup | bool

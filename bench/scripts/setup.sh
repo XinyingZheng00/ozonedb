@@ -349,8 +349,25 @@ role_client() {
   sudo mkdir -p "$TANK_DIR"
   sudo chmod 777 "$TANK_DIR"
 
-  log "updating git submodules"
-  (cd "$REPO_ROOT" && git submodule update --init --recursive)
+  # vcpkg is vendored, not a submodule -- `git ls-tree HEAD vcpkg` is a plain
+  # tree of ~11.7k committed files and `git submodule status` is empty -- so
+  # this fetches nothing today. It is kept for the day something is actually
+  # added as a submodule, and skipped when the tree arrived by rsync
+  # (bench/ansible/bootstrap.yml -e include_git=false) rather than by clone,
+  # where it would otherwise abort the run under `set -e`.
+  if [[ -e "$REPO_ROOT/.git" ]]; then
+    log "updating git submodules"
+    (cd "$REPO_ROOT" && git submodule update --init --recursive)
+  else
+    log "no .git in $REPO_ROOT (rsync'd tree) -- skipping submodule update"
+  fi
+
+  if [[ ! -d "$REPO_ROOT/vcpkg/ports" ]]; then
+    die "$REPO_ROOT/vcpkg/ports is missing -- the build cannot resolve dependencies.
+    vcpkg is vendored in this repo, so a clone or a full rsync should have brought it.
+    If you pushed with bench/ansible/sync.yml, that excludes vcpkg/ by design: use
+    bootstrap.yml for the first push to a node."
+  fi
 
   if [[ $DO_CORFU_RUNTIME -eq 1 ]]; then
     install_corfu_runtime

@@ -19,7 +19,7 @@ Setup is one idempotent, role-based script. Re-running never duplicates shell co
 reinstalls what is present:
 
 ```bash
-bash bench/scripts/setup.sh --role client         # apt deps, JDK, python, /tank, submodules,
+bash bench/scripts/setup.sh --role client         # apt deps, JDK, python, /tank,
                                                   # CorfuDB runtime into ~/.m2, then build.sh
 bash bench/scripts/setup.sh --role corfu-server   # CorfuDB + /mnt/corfu/{load,run_batch}
 bash bench/scripts/setup.sh --role minio          # minio + bucket (sstable_backend defaults to s3)
@@ -49,7 +49,10 @@ cmake -B build -DOZONEDB_ENABLE_CORFU=ON && cmake --build build -j$(nproc)  # ad
 ```
 
 CMake no longer reads `OZONEDB_HOME` — only the bench scripts do. The vcpkg toolchain resolves
-from an explicit `CMAKE_TOOLCHAIN_FILE`, else `$VCPKG_ROOT`, else the in-repo `vcpkg/` submodule.
+from an explicit `CMAKE_TOOLCHAIN_FILE`, else `$VCPKG_ROOT`, else the in-repo `vcpkg/` tree.
+**`vcpkg` is vendored, not a submodule**: `git ls-tree HEAD vcpkg` is a plain `040000 tree` of
+~11.7k committed files and `git submodule status` is empty, so `.gitmodules` is vestigial and
+`git submodule update` fetches nothing. A clone *or* an rsync of the working tree is sufficient.
 
 `CMakePresets.json` defines `default` / `corfu` / `profiling`, but presets need CMake ≥ 3.21 and
 the Ubuntu 20.04 bench image ships 3.16 — hence the plain commands above as the primary path.
@@ -125,11 +128,15 @@ python3 bench/scripts/local/run_corfu_compaction_contention.py
   `_make_corfu_config_per_writer` template `src/config/{local,corfu}/shared_config_base.json` into
   `shared_config_w{i}.json`. Never point multiple writers at a single `shared_config.json`.
 - Results go to `bench/results/local` (gitignored); plotting scripts live in `bench/scripts/plot/`.
-- `bench/ansible/sync.yml` pushes the working tree to every `cloudlab.hosts` entry in parallel
-  (`-e build=true` also rebuilds). `bench/ansible/inventory.py` is a dynamic inventory that reads
+- `bench/ansible/` fans out to every `cloudlab.hosts` entry in parallel. `bootstrap.yml` pushes the
+  full tree (vcpkg included, minus the Mach-O `vcpkg/vcpkg` and `vcpkg/downloads/`) and then runs
+  `setup.sh` — no `git clone` and no GitHub credentials on the node, because vcpkg is vendored.
+  `sync.yml` is the incremental follow-up (442 files / 2.2 MB vs 14.9k / 19 MB) and excludes `.git/`
+  and `vcpkg/`, so it **cannot** bootstrap a node; `setup.sh` hard-fails early if `vcpkg/ports` is
+  absent, which is what that mistake looks like. Exclude lists are shared in
+  `bench/ansible/group_vars/all.yml`; `inventory.py` is a dynamic inventory reading
   `cloudlab.{hosts,ssh_user,ssh_private_key_path}` straight out of `ycsb.yaml`, so the host list is
-  never duplicated. It excludes `.git/` and `vcpkg/`, so it updates a provisioned node — it does not
-  create one. The result pull stays on `scp` inside `run_multinode_ycsb.py`.
+  never duplicated. The result pull stays on `scp` inside `run_multinode_ycsb.py`.
 
 ## Architecture
 
