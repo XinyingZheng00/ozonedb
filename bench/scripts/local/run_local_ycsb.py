@@ -1,3 +1,4 @@
+import sys
 import subprocess
 import os
 import argparse
@@ -7,6 +8,12 @@ from load_local_ycsb import (
     generate_config_for_ozonedb_corfu,
     corfu_bridge_jar_path,
 )
+
+# bench/scripts is one level up. ycsb_config.derive() resolves the `nodes:`
+# block into the cloudlab.hosts / corfu.endpoint / s3.endpoint keys read below,
+# so those are computed in exactly one place.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ycsb_config import derive as _derive_addresses
 ozonedb_home = os.environ.get("OZONEDB_HOME")
 
 def run_ycsb(workload_names, record_cnt, operation_cnts, key_size, db_names, repeated, ycsb_data_path, threads, corfu_settings=None, s3_settings=None, max_exec_time=None):
@@ -102,7 +109,7 @@ if __name__ == "__main__":
     json_path = args.config
     
     with open(json_path, 'r') as f:
-        config = yaml.safe_load(f)
+        config = _derive_addresses(yaml.safe_load(f))
         
         load_config = config["local"]["run"]
         workload_names = load_config["workload_name"]

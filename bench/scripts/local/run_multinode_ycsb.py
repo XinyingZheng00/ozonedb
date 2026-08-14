@@ -1,3 +1,4 @@
+import sys
 import argparse
 import os
 import re
@@ -10,6 +11,12 @@ from datetime import datetime
 import yaml
 
 from load_local_ycsb_multiproc import write_aggregate
+
+# bench/scripts is one level up. ycsb_config.derive() resolves the `nodes:`
+# block into the cloudlab.hosts / corfu.endpoint / s3.endpoint keys read below,
+# so those are computed in exactly one place.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ycsb_config import derive as _derive_addresses
 
 """
 Multi-node YCSB orchestrator. SSHes to each host and invokes
@@ -321,7 +328,7 @@ def main():
             "OZONEDB_HOME is not set on the orchestrator host."
         )
     with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
+        config = _derive_addresses(yaml.safe_load(f))
 
     hosts = resolve_hosts(config, args.hosts)
     ssh_user = resolve_ssh_user(config, args.ssh_user)

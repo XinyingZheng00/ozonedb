@@ -8,7 +8,7 @@ set -euo pipefail
 # Same shape as run_ycsb_with_corfu.sh, except:
 #   - YCSB does not run on this machine. It runs on $CLIENT_HOSTS (each host
 #     spawns writers_per_host processes via run_local_ycsb_multiproc.py).
-#   - Corfu still runs on a single dedicated $CORFU_HOST. All YCSB writers
+#   - Corfu still runs on a single dedicated $CORFU_BIND_HOST. All YCSB writers
 #     across all client hosts share that one Corfu instance and stream.
 #
 # Loop order: trials -> workloads -> writers_per_host. Corfu is restarted on
@@ -16,9 +16,9 @@ set -euo pipefail
 # one OZONEDB_RUN_TAG so result files land in one tagged dir.
 #
 # Per iteration:
-#   1. stop corfu on $CORFU_HOST (best-effort)
-#   2. start corfu on $CORFU_HOST (clean /mnt/corfu/run_batch from /mnt/corfu/load)
-#   3. wait until $CORFU_HOST:$CORFU_PORT is reachable
+#   1. stop corfu on $CORFU_BIND_HOST (best-effort)
+#   2. start corfu on $CORFU_BIND_HOST (clean /mnt/corfu/run_batch from /mnt/corfu/load)
+#   3. wait until $CORFU_BIND_HOST:$CORFU_PORT is reachable
 #   4. run run_multinode_ycsb.py with
 #        --workloads=<wl> --writers_per_host=<n> --trial=<k>
 #      (this SSHes to every client host and launches its writer slice)
@@ -28,7 +28,7 @@ set -euo pipefail
 #
 # PRECONDITIONS
 #   - Each client host's ycsb.yaml has corfu.endpoint set to
-#     $CORFU_HOST:$CORFU_PORT (so its writer processes connect to the same
+#     $CORFU_BIND_HOST:$CORFU_PORT (so its writer processes connect to the same
 #     instance this script restarts).
 #   - cloudlab.hosts in ycsb.yaml lists the client hosts (or pass
 #     --client-hosts).
@@ -44,11 +44,14 @@ export OZONEDB_HOME
 
 CONFIG="${OZONEDB_HOME}/bench/scripts/config/ycsb.yaml"
 
-CORFU_HOST="10.10.1.2"
-CORFU_USER="${SSH_USER:-$USER}"
-CORFU_SSH_KEY="~/.ssh/cloudlab"
+# All empty: resolved from ycsb.yaml after argument parsing, so there is no
+# second copy of the cluster's addressing left to drift.
+CORFU_BIND_HOST=""
+CORFU_SSH_HOST=""
+CORFU_USER="${SSH_USER:-}"
+CORFU_SSH_KEY=""
 CORFU_DIR="~/CorfuDB"
-CORFU_PORT=9090
+CORFU_PORT=""
 CORFU_LOG="/tmp/corfu_server.log"
 
 CLIENT_HOSTS=""
@@ -66,11 +69,15 @@ Usage: $(basename "$0") [options]
   --config PATH             ycsb.yaml (default: $CONFIG)
 
   Corfu server (one node):
-  --corfu-host HOST         (default: $CORFU_HOST)
-  --corfu-user USER         (default: $CORFU_USER)
-  --corfu-ssh-key PATH      (default: $CORFU_SSH_KEY)
+  --corfu-host HOST         sets both addresses below at once
+  --corfu-bind-host ADDR    corfu_server -a, and what clients dial
+                            (default: nodes.log.lan from ycsb.yaml)
+  --corfu-ssh-host HOST     how this script reaches the node
+                            (default: nodes.log.ssh, else nodes.log.lan)
+  --corfu-user USER         (default: nodes.ssh_user from ycsb.yaml)
+  --corfu-ssh-key PATH      (default: nodes.ssh_private_key_path)
   --corfu-dir PATH          corfu repo on remote (default: $CORFU_DIR)
-  --corfu-port PORT         (default: $CORFU_PORT)
+  --corfu-port PORT         (default: corfu.port from ycsb.yaml)
 
   YCSB client nodes (orchestrated via run_multinode_ycsb.py):
   --client-hosts "h1,h2"    comma-separated. Default: read cloudlab.hosts
@@ -94,7 +101,9 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
   --config)         CONFIG="$2"; shift 2 ;;
-  --corfu-host)     CORFU_HOST="$2"; shift 2 ;;
+  --corfu-host)      CORFU_BIND_HOST="$2"; CORFU_SSH_HOST="$2"; shift 2 ;;
+  --corfu-bind-host) CORFU_BIND_HOST="$2"; shift 2 ;;
+  --corfu-ssh-host)  CORFU_SSH_HOST="$2"; shift 2 ;;
   --corfu-user)     CORFU_USER="$2"; shift 2 ;;
   --corfu-ssh-key)  CORFU_SSH_KEY="$2"; shift 2 ;;
   --corfu-dir)      CORFU_DIR="$2"; shift 2 ;;
@@ -125,23 +134,45 @@ if ! [[ "$TRIALS" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Resolve the corfu node from ycsb.yaml's `nodes:` block instead of a hardcoded
+# constant. This default used to say 10.10.1.2 while corfu.endpoint said
+# 10.10.1.3 -- which would start the server on the MinIO node, bound to an
+# address no client was configured to dial.
+#
+# The two addresses are deliberately separate:
+#   BIND  nodes.log.lan -- what corfu_server -a binds, and what clients dial
+#   SSH   nodes.log.ssh -- how THIS script reaches the box (falls back to lan)
+# Overrides still win; --corfu-host sets both, as it always did.
+# ---------------------------------------------------------------------------
+cfg() { python3 "$OZONEDB_HOME/bench/scripts/ycsb_config.py" --config "$CONFIG" "$@"; }
+[[ -n "$CORFU_BIND_HOST" ]] || CORFU_BIND_HOST="$(cfg --node log --field lan)" || exit 1
+[[ -n "$CORFU_SSH_HOST"  ]] || CORFU_SSH_HOST="$(cfg --node log --field ssh)"  || exit 1
+[[ -n "$CORFU_USER"      ]] || CORFU_USER="$(cfg --get nodes.ssh_user)"        || exit 1
+[[ -n "$CORFU_SSH_KEY"   ]] || CORFU_SSH_KEY="$(cfg --get nodes.ssh_private_key_path)" || exit 1
+[[ -n "$CORFU_PORT"      ]] || CORFU_PORT="$(cfg --get corfu.port)"            || exit 1
+echo "[corfu] node: ssh=$CORFU_SSH_HOST bind=$CORFU_BIND_HOST port=$CORFU_PORT (from $CONFIG)"
+
 CORFU_SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new)
 [[ -n "$CORFU_SSH_KEY" ]] && CORFU_SSH_OPTS+=(-i "$CORFU_SSH_KEY")
-CORFU_TARGET="${CORFU_USER}@${CORFU_HOST}"
+CORFU_TARGET="${CORFU_USER}@${CORFU_SSH_HOST}"
 
 corfu_sh() {
   ssh "${CORFU_SSH_OPTS[@]}" "$CORFU_TARGET" "$1"
 }
 
+# Probed ON the corfu node against its own bind address. A local /dev/tcp check
+# cannot succeed when the bind address is a CloudLab-internal 10.10.1.x and the
+# sweep is driven from off-cluster.
 port_open() {
-  (exec 3<>/dev/tcp/"$1"/"$2") >/dev/null 2>&1
+  corfu_sh "bash -c '(exec 3<>/dev/tcp/$1/$2) >/dev/null 2>&1'" >/dev/null 2>&1
 }
 
 start_corfu() {
-  echo "[corfu] starting on $CORFU_TARGET ($CORFU_HOST:$CORFU_PORT)"
+  echo "[corfu] starting on $CORFU_TARGET ($CORFU_BIND_HOST:$CORFU_PORT)"
   # Trailing & must apply only to nohup, not to the whole chain — otherwise
   # ssh holds stdout open on a foregrounded subshell and hangs.
-  corfu_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $CORFU_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
+  corfu_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $CORFU_BIND_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
   sleep 10
   corfu_sh "pgrep -af 'org.corfudb.infrastructure.CorfuServer' | head -n1 || echo '[corfu] WARNING: no CorfuServer process found after start'"
 }
@@ -151,30 +182,30 @@ stop_corfu() {
   # bin/corfu_server execs java, so the live cmdline matches the main class,
   # not the wrapper name. SIGKILL directly — we wipe /mnt/corfu/run_batch
   # next start, so graceful shutdown buys nothing.
-  corfu_sh "pkill -KILL -f 'org.corfudb.infrastructure.CorfuServer' 2>/dev/null || true; pkill -KILL -f '\-a $CORFU_HOST $CORFU_PORT' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
+  corfu_sh "pkill -KILL -f 'org.corfudb.infrastructure.CorfuServer' 2>/dev/null || true; pkill -KILL -f '\-a $CORFU_BIND_HOST $CORFU_PORT' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
   for _ in $(seq 1 30); do
-    if ! port_open "$CORFU_HOST" "$CORFU_PORT"; then
+    if ! port_open "$CORFU_BIND_HOST" "$CORFU_PORT"; then
       echo "[corfu] down"
       return 0
     fi
     sleep 1
   done
-  echo "[corfu] ERROR: $CORFU_HOST:$CORFU_PORT still reachable after SIGKILL" >&2
+  echo "[corfu] ERROR: $CORFU_BIND_HOST:$CORFU_PORT still reachable after SIGKILL" >&2
   corfu_sh "pgrep -af CorfuServer 2>/dev/null || true; ss -ltnp 2>/dev/null | grep :${CORFU_PORT} || netstat -ltnp 2>/dev/null | grep :${CORFU_PORT} || true"
   return 1
 }
 
 wait_for_corfu() {
-  echo "[corfu] waiting for $CORFU_HOST:$CORFU_PORT"
+  echo "[corfu] waiting for $CORFU_BIND_HOST:$CORFU_PORT"
   for _ in $(seq 1 120); do
-    if port_open "$CORFU_HOST" "$CORFU_PORT"; then
+    if port_open "$CORFU_BIND_HOST" "$CORFU_PORT"; then
       echo "[corfu] up"
       sleep 10
       return 0
     fi
     sleep 1
   done
-  echo "[corfu] ERROR: never became reachable (tail $CORFU_LOG on $CORFU_HOST)" >&2
+  echo "[corfu] ERROR: never became reachable (tail $CORFU_LOG on $CORFU_BIND_HOST)" >&2
   return 1
 }
 
@@ -239,7 +270,7 @@ for ((TRIAL = 1; TRIAL <= TRIALS; TRIAL++)); do
 done
 
 echo ""
-echo "=== final restart: corfu on $CORFU_HOST:$CORFU_PORT ==="
+echo "=== final restart: corfu on $CORFU_BIND_HOST:$CORFU_PORT ==="
 start_corfu
 wait_for_corfu
 FINAL_STATE_LEFT_RUNNING=1

@@ -54,17 +54,54 @@ local:
     writers_per_host: 1 # multi-node runner, per host
     trial: 1
 
+# ----------------------------------------------------------------- nodes --
+# THE source of truth for every address in the cluster. Each machine is named
+# once, and everything else is derived by bench/scripts/ycsb_config.py:
+#
+#   cloudlab.hosts  <- clients[].ssh      corfu.endpoint <- log.lan   : corfu.port
+#   cloudlab.*      <- ssh_user, key      s3.endpoint    <- store.lan : s3.port
+#
+# Two addresses per node, because they are not interchangeable:
+#   ssh   how YOU reach it        -- public CloudLab name, routable from a laptop
+#   lan   how OTHER NODES reach it -- internal 10.10.1.x
+# `corfu_server -a <addr>` binds the address it is handed, so it must be the LAN
+# one or no client can connect; the sweep script must SSH to the same box, which
+# from off-cluster needs the public one. Previously only one of the two was ever
+# recorded, and the corfu host was additionally hardcoded in both sweep wrappers
+# -- where it had already drifted to 10.10.1.2, the MinIO node.
+#
+# `ssh:` may be omitted, in which case `lan:` is used for SSH too. That is the
+# old behaviour and works when you orchestrate from inside CloudLab. Add the
+# public names to drive a sweep from your laptop.
+nodes:
+  ssh_user: "oliverr3"
+  ssh_private_key_path: "~/.ssh/cloudlab"
+
+  # Shared log. Also the -a bind address for corfu_server.
+  log:
+    lan: "10.10.1.3"
+    # ssh: "<public name of the log node>"
+
+  # SSTable object store (MinIO).
+  store:
+    lan: "10.10.1.2"
+    # ssh: "<public name of the store node>"
+
+  # YCSB writer nodes. `ssh` is required; `lan` is documentation for now.
+  # A bare string is shorthand for {ssh: ...}.
+  clients:
+    - ssh: "ms0917.utah.cloudlab.us"
+    - ssh: "ms0943.utah.cloudlab.us"
+
 # ------------------------------------------------------------------ corfu --
 # Only consumed when db_name includes "ozonedb-corfu". The bridge jar path is
 # derived from $OZONEDB_HOME/ozonedb-jni-maven/corfu-bridge/target/ and is not
 # configured here.
 #
-# endpoint must be the address the CLIENT nodes can reach, i.e. the CloudLab
-# internal LAN address of the log node -- it is baked into every generated
-# per-writer config. run_multinode_ycsb_with_corfu.sh separately passes the same
-# address to corfu_server as -a, so it is also the server's bind address.
+# `endpoint` is NOT set here -- it is derived as nodes.log.lan:port. Setting it
+# by hand is rejected at load time rather than silently shadowing nodes:.
 corfu:
-  endpoint: "10.10.1.3:9090"
+  port: 9090
   stream_name: "ozonedb-ycsb"
   jvm_opts: "-Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 --add-opens=java.base/java.util=ALL-UNNAMED"
 
@@ -76,27 +113,17 @@ corfu:
 # access_key/secret_key are MinIO's throwaway defaults, not credentials worth
 # protecting. Point endpoint at a real S3 and they become real -- move them to
 # the environment at that point rather than committing them.
+#
+# `endpoint` is NOT set here -- it is derived as scheme://nodes.store.lan:port.
 s3:
-  endpoint: "http://10.10.1.2:9000"
+  scheme: "http"
+  port: 9000
   region: "us-east-1"
   bucket: "ozonedb-ycsb"
   access_key: "minioadmin"
   secret_key: "minioadmin"
   use_path_style: true
   sstable_dir: "sstables"
-
-# ---------------------------------------------------------------- hosts ----
-# The YCSB client nodes. Single source of truth for run_multinode_ycsb.py,
-# run_multinode_ycsb_with_corfu.sh AND bench/ansible/inventory.py -- update here
-# after a CloudLab swap and nothing else needs touching.
-#
-# Do NOT list the corfu/minio node here; those are addressed by corfu.endpoint
-# and s3.endpoint above.
-cloudlab:
-  ssh_user: "oliverr3"
-  ssh_private_key_path: "~/.ssh/cloudlab"
-  # Entries may be "host" or "user@host"; a per-entry user overrides ssh_user.
-  hosts: ["ms0917.utah.cloudlab.us", "ms0943.utah.cloudlab.us"]
 
 # ------------------------------------------- compaction-contention overrides
 # Read only by run_corfu_compaction_contention.py, which merges these INTO the

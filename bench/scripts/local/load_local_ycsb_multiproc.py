@@ -1,3 +1,4 @@
+import sys
 import subprocess
 import os
 import argparse
@@ -9,6 +10,12 @@ import time
 from datetime import datetime
 
 from load_local_ycsb import corfu_bridge_jar_path
+
+# bench/scripts is one level up. ycsb_config.derive() resolves the `nodes:`
+# block into the cloudlab.hosts / corfu.endpoint / s3.endpoint keys read below,
+# so those are computed in exactly one place.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ycsb_config import derive as _derive_addresses
 
 """
 Multi-process YCSB loader that emulates multiple distributed writers by
@@ -577,7 +584,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
+        config = _derive_addresses(yaml.safe_load(f))
 
     load_config = config["local"]["load"]
     record_cnts = load_config["record_cnt"]

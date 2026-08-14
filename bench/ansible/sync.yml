@@ -21,7 +21,7 @@
 # For a node that has never been set up, use bootstrap.yml instead.
 
 - name: Sync the OzoneDB working tree to the CloudLab clients
-  hosts: cloudlab
+  hosts: "{{ target | default('clients') }}"
   gather_facts: false
   # free: a slow host doesn't hold up the others at each task boundary.
   strategy: free

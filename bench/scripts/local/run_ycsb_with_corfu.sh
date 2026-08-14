@@ -13,7 +13,7 @@ set -euo pipefail
 #        cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/corfu \
 #          && cp -r /mnt/corfu/load/corfu /mnt/corfu/run_batch \
 #          && JAVA_ARGS="-Xmx120g" ./bin/corfu_server \
-#                 -l /mnt/corfu/run_batch -s -a $REMOTE_HOST $CORFU_PORT
+#                 -l /mnt/corfu/run_batch -s -a $BIND_HOST $CORFU_PORT
 #   2. run run_local_ycsb_multiproc.py with
 #      --workloads=<wl> --num_writers=<n> --trial=<k>
 #   3. stop corfu
@@ -27,11 +27,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export OZONEDB_HOME
 
 CONFIG="${OZONEDB_HOME}/bench/scripts/config/ycsb.yaml"
-REMOTE_HOST="10.10.1.2"
-REMOTE_USER="${SSH_USER:-$USER}"
-SSH_KEY="~/.ssh/cloudlab"
+# Empty: resolved from ycsb.yaml after argument parsing.
+REMOTE_HOST=""
+BIND_HOST=""
+REMOTE_USER="${SSH_USER:-}"
+SSH_KEY=""
 CORFU_DIR="~/CorfuDB"
-CORFU_PORT=9090
+CORFU_PORT=""
 CORFU_LOG="/tmp/corfu_server.log"
 WORKLOADS="a b c d f"
 WRITERS_LIST="1 2 4 8"
@@ -44,11 +46,11 @@ usage() {
 Usage: $(basename "$0") [options]
 
   --config PATH         ycsb.yaml (default: $CONFIG)
-  --remote HOST         corfu host (default: $REMOTE_HOST)
-  --user USER           ssh user on remote (default: $REMOTE_USER)
+  --remote HOST         corfu host (default: nodes.log.ssh from ycsb.yaml)
+  --user USER           ssh user on remote (default: nodes.ssh_user from ycsb.yaml)
   --ssh-key PATH        ssh private key (optional)
   --corfu-dir PATH      corfu repo on remote (default: $CORFU_DIR)
-  --corfu-port PORT     corfu port (default: $CORFU_PORT)
+  --corfu-port PORT     corfu port (default: corfu.port from ycsb.yaml)
   --workloads "a b c"   space-separated workload letters to sweep
                         (default: "$WORKLOADS")
   --writers-list "1 2"  space-separated num_writers values to sweep
@@ -140,6 +142,20 @@ if [[ -n "$DURATION" ]] && ! [[ "$DURATION" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Corfu node resolved from ycsb.yaml's `nodes:` block, not a hardcoded constant.
+# BIND (nodes.log.lan) is what corfu_server -a binds and what clients dial;
+# SSH (nodes.log.ssh, falling back to lan) is how this script reaches the box.
+# --host sets both, as it did before.
+# ---------------------------------------------------------------------------
+cfg() { python3 "$OZONEDB_HOME/bench/scripts/ycsb_config.py" --config "$CONFIG" "$@"; }
+[[ -n "$BIND_HOST"   ]] || BIND_HOST="$(cfg --node log --field lan)"  || exit 1
+[[ -n "$REMOTE_HOST" ]] || REMOTE_HOST="$(cfg --node log --field ssh)" || exit 1
+[[ -n "$REMOTE_USER" ]] || REMOTE_USER="$(cfg --get nodes.ssh_user)"   || exit 1
+[[ -n "$SSH_KEY"     ]] || SSH_KEY="$(cfg --get nodes.ssh_private_key_path)" || exit 1
+[[ -n "$CORFU_PORT"  ]] || CORFU_PORT="$(cfg --get corfu.port)"        || exit 1
+echo "[corfu] node: ssh=$REMOTE_HOST bind=$BIND_HOST port=$CORFU_PORT (from $CONFIG)"
+
 SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new)
 [[ -n "$SSH_KEY" ]] && SSH_OPTS+=(-i "$SSH_KEY")
 SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
@@ -148,8 +164,9 @@ remote_sh() {
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$1"
 }
 
+# Probed ON the node against its own bind address -- see the multi-node wrapper.
 port_open() {
-  (exec 3<>/dev/tcp/"$1"/"$2") >/dev/null 2>&1
+  remote_sh "bash -c '(exec 3<>/dev/tcp/$1/$2) >/dev/null 2>&1'" >/dev/null 2>&1
 }
 
 start_corfu() {
@@ -159,7 +176,7 @@ start_corfu() {
   # whole chain in one subshell that then runs the chain sequentially --
   # the subshell would wait synchronously on corfu_server, holding ssh's
   # stdout/stderr pipes open, and ssh would hang forever.
-  remote_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $REMOTE_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
+  remote_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $BIND_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
   sleep 10
   remote_sh "pgrep -af 'org.corfudb.infrastructure.CorfuServer' | head -n1 || echo '[corfu] WARNING: no CorfuServer process found after start'"
 }
@@ -172,9 +189,9 @@ stop_corfu() {
   # the port as a belt-and-braces second pattern. Go straight to SIGKILL --
   # we reset /mnt/corfu/run_batch on every start so graceful shutdown buys us
   # nothing.
-  remote_sh "pkill -KILL -f 'org.corfudb.infrastructure.CorfuServer' 2>/dev/null || true; pkill -KILL -f '\-a $REMOTE_HOST $CORFU_PORT' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
+  remote_sh "pkill -KILL -f 'org.corfudb.infrastructure.CorfuServer' 2>/dev/null || true; pkill -KILL -f '\-a $BIND_HOST $CORFU_PORT' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
   for _ in $(seq 1 30); do
-    if ! port_open "$REMOTE_HOST" "$CORFU_PORT"; then
+    if ! port_open "$BIND_HOST" "$CORFU_PORT"; then
       echo "[corfu] down"
       return 0
     fi
@@ -188,7 +205,7 @@ stop_corfu() {
 wait_for_corfu() {
   echo "[corfu] waiting for $REMOTE_HOST:$CORFU_PORT"
   for _ in $(seq 1 120); do
-    if port_open "$REMOTE_HOST" "$CORFU_PORT"; then
+    if port_open "$BIND_HOST" "$CORFU_PORT"; then
       echo "[corfu] up"
       sleep 10
       return 0

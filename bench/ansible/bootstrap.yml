@@ -26,13 +26,16 @@
 # build.
 
 - name: Bootstrap CloudLab nodes from the local working tree
-  hosts: cloudlab
+  hosts: "{{ target | default('clients') }}"
   gather_facts: false
   strategy: free
 
   vars:
     repo_src: "{{ playbook_dir }}/../../"
-    setup_roles: [client]
+    # Defaults to the role the inventory assigns from `nodes:` -- client for
+    # nodes.clients, corfu-server for nodes.log, minio for nodes.store. So
+    # `-e target=nodes` provisions the whole cluster correctly in one pass.
+    setup_roles: ["{{ ozonedb_role | default('client') }}"]
     setup_extra_args: ""
     run_setup: true
     include_git: true

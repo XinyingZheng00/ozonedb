@@ -111,8 +111,15 @@ cd build && ./runUnitTests                               # all
 
 ## Benchmarks
 
-Everything is driven by `bench/scripts/config/ycsb.yaml` (record counts, workloads, thread/writer
-counts, Corfu endpoint, S3/MinIO settings, CloudLab hosts).
+Everything is driven by `bench/scripts/config/ycsb.yaml`, loaded through
+`bench/scripts/ycsb_config.py` — never `yaml.safe_load` directly. The `nodes:` block names each
+machine once with **two non-interchangeable addresses**: `ssh` (public, how the orchestrator
+reaches it) and `lan` (internal 10.10.1.x, how other nodes reach it). `corfu_server -a` binds the
+*lan* one, so clients can only connect if that is what `corfu.endpoint` resolves to. The loader
+derives `corfu.endpoint`, `s3.endpoint` and `cloudlab.{hosts,ssh_user,ssh_private_key_path}` from
+`nodes:` and materialises them under the keys consumers already read, and **rejects** any of those
+set by hand. `python3 bench/scripts/ycsb_config.py --check` prints the resolved plan; the shell
+wrappers read the corfu node through its `--node`/`--get` CLI rather than a hardcoded constant.
 
 ```bash
 python3 bench/scripts/local/load_local_ycsb_multiproc.py   # load phase, N parallel writer procs

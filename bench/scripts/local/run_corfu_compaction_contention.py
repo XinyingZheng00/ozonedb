@@ -41,6 +41,12 @@ import yaml
 
 from run_local_ycsb_multiproc import run_ycsb
 
+# bench/scripts is one level up. ycsb_config.derive() resolves the `nodes:`
+# block into the cloudlab.hosts / corfu.endpoint / s3.endpoint keys read below,
+# so those are computed in exactly one place.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ycsb_config import derive as _derive_addresses
+
 ozonedb_home = os.environ.get("OZONEDB_HOME")
 
 NEEDED_RE = re.compile(
@@ -126,7 +132,7 @@ def main():
         )
 
     with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
+        config = _derive_addresses(yaml.safe_load(f))
 
     run_cfg = config["local"]["run"]
 

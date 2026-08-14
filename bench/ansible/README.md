@@ -13,28 +13,31 @@ pip install ansible                                    # bundles ansible.posix
 
 ## After a CloudLab swap
 
-Update `cloudlab.hosts` in `bench/scripts/config/ycsb.yaml`, then:
+Update the `nodes:` block in `bench/scripts/config/ycsb.yaml` — every address in
+the cluster lives there and nowhere else. Confirm it resolves, then go:
 
 ```bash
+python3 ../scripts/ycsb_config.py --check   # print the resolved plan first
+
 cd $OZONEDB_HOME/bench/ansible
-ansible -m ping cloudlab             # reachable?
+ansible -m ping nodes                       # everything reachable?
 
-# client nodes: push the tree, then provision
-ansible-playbook bootstrap.yml
-
-# the log/store node
-ansible-playbook bootstrap.yml --limit amd171.utah.cloudlab.us \
-  -e '{"setup_roles":["corfu-server","minio"]}'
+ansible-playbook bootstrap.yml -e target=nodes   # provision the whole cluster
+ansible-playbook bootstrap.yml                   # clients only (the default)
 ```
 
+Each host's `setup.sh --role` comes from the group it landed in, so the one
+`-e target=nodes` pass gives clients `--role client`, the log node
+`--role corfu-server` and the store node `--role minio`.
+
 `bootstrap.yml` pushes the working tree **including `vcpkg/`** and then runs
-`bench/scripts/setup.sh --role client` on each host (detached via `async`, since
+`bench/scripts/setup.sh` with that host's role on each host (detached via `async`, since
 the first run builds CorfuDB into `~/.m2`). Useful flags:
 
 ```bash
 -e run_setup=false                   # push only, don't provision
 -e include_git=false                 # skip .git/ (40 of the 59 MB)
--e '{"setup_roles":["client"]}'      # roles to pass to setup.sh
+-e '{"setup_roles":["client"]}'      # override the role from the inventory
 -e setup_extra_args="--jdk 17"       # anything else setup.sh takes
 ```
 
@@ -76,16 +79,31 @@ remote user's home (or absolute).
 
 ## Where the hosts come from
 
-`inventory.py` reads `bench/scripts/config/ycsb.yaml` —
-`cloudlab.{hosts,ssh_user,ssh_private_key_path}` — so Ansible and
-`run_multinode_ycsb.py` can never disagree about which nodes are in the
-experiment. After a CloudLab re-swap, edit `ycsb.yaml` and nothing else.
+`inventory.py` goes through `bench/scripts/ycsb_config.py`, the same loader the
+benchmark runners use, so Ansible and `run_multinode_ycsb.py` cannot disagree
+about which machines are in the experiment. After a CloudLab re-swap, edit
+`nodes:` in `ycsb.yaml` and nothing else.
 
 ```bash
 ./inventory.py --list       # what Ansible sees
 ```
 
-Groups: `cloudlab`, and `clients` as an alias for it.
+Groups: `clients`, `log`, `store`, `nodes` (all of them), and `cloudlab` as an
+alias for `clients`. Playbooks default to `clients`; pass `-e target=<group>`
+to aim elsewhere:
+
+```bash
+ansible-playbook bootstrap.yml -e target=nodes   # provision the whole cluster
+ansible-playbook bootstrap.yml -e target=log     # just the CorfuDB node
+```
+
+`bootstrap.yml` picks each host's `setup.sh --role` from the group it is in, so
+`-e target=nodes` gives clients `--role client`, the log node `--role
+corfu-server` and the store node `--role minio` in one pass.
+
+Every host also carries `lan_address` — the internal address other nodes use.
+That is **not** the connection address; Ansible reaches hosts via
+`ansible_host`. Use it when configuring what a service binds or dials.
 
 ## What gets excluded
 
