@@ -152,6 +152,16 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         ):
             if k in corfu_settings:
                 data[k] = corfu_settings[k]
+        # Read-consistency knobs. Metadata parses every config value as a
+        # string, so normalize YAML booleans to "true"/"false" rather than
+        # letting json.dump emit a bare true/false literal.
+        for k in ("trust_background_tail", "linearizable_reads"):
+            if k in corfu_settings:
+                data[k] = (
+                    "true"
+                    if corfu_settings[k] in (True, "true", "1", 1)
+                    else "false"
+                )
     if s3_settings:
         data["sstable_backend"] = "s3"
         if "endpoint" in s3_settings:

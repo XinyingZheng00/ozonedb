@@ -102,6 +102,22 @@ void MetadataLogHandler::publishSnapshotLocked() {
                     std::shared_ptr<View const>(std::move(snap)));
 }
 
+void MetadataLogHandler::markAppliedLocked(size_t start, size_t end) {
+  if (end <= start) return;
+  if (start <= applied_offset_) {
+    if (end > applied_offset_) applied_offset_ = end;
+  } else {
+    // Applied ahead of the watermark — park until the hole below fills.
+    size_t& parked_end = applied_gaps_[start];
+    if (end > parked_end) parked_end = end;
+  }
+  for (auto it = applied_gaps_.begin();
+       it != applied_gaps_.end() && it->first <= applied_offset_;) {
+    if (it->second > applied_offset_) applied_offset_ = it->second;
+    it = applied_gaps_.erase(it);
+  }
+}
+
 void MetadataLogHandler::getLatestScore(double& score) {
   // For sst levels, the score is total size of the level divided by the target
   // size. for log level, the score is the total number of files, divided by the
@@ -152,16 +168,20 @@ void MetadataLogHandler::getLatestScore(double& score) {
 // the new offset — and only if nobody else advanced it in the meantime.
 // Loser of a race discards its records and the caller catches up on
 // the next tick.
-std::vector<OperationRecord*> MetadataLogHandler::readMetadataLog() {
+std::vector<OperationRecord*> MetadataLogHandler::readMetadataLog(size_t* observed_size,
+                                                                  size_t* batch_start) {
+  if (observed_size != nullptr) *observed_size = 0;
   size_t local_offset;
   {
     std::unique_lock<std::shared_mutex> lock(read_mutex);
     local_offset = this->offset;
   }
+  if (batch_start != nullptr) *batch_start = local_offset;
   if (!this->storage->exist(this->active_unit)) {
     return {};
   }
   size_t file_size = this->storage->size(this->active_unit);
+  if (observed_size != nullptr) *observed_size = file_size;
   if (file_size == local_offset) {
     return {};
   }
@@ -310,7 +330,9 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
 // brief unique_lock — but only if the tail hasn't rotated in the meantime.
 void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> const* active) {
   while (*active) {
-    std::vector<OperationRecord*> records = readMetadataLog();
+    size_t observed = 0;
+    size_t batch_start = 0;
+    std::vector<OperationRecord*> records = readMetadataLog(&observed, &batch_start);
     if (records.empty()) {
       refreshTailSizeUnlocked();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -326,6 +348,7 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
           modified_layer = rollforwardSingleOperationRecord(op_record);
         }
       }
+      markAppliedLocked(batch_start, observed);
       publishSnapshotLocked();
     }
     refreshTailSizeUnlocked();
@@ -356,27 +379,72 @@ void MetadataLogHandler::refreshTailSizeUnlocked() {
   }
 }
 
-// Roll forward the metadata log to get the latest view. Called from
-// foreground log-roll / put paths. Same invariant as the periodic
-// variant: keep storage->size() out of unique_lock<view_mutex>.
-View MetadataLogHandler::rollForwardMetadataLog() {
-  std::vector<OperationRecord*> records = readMetadataLog();
-  {
-    std::unique_lock<std::shared_mutex> lock(view_mutex);
-    for (auto const& record : records) {
-      std::string modified_layer = rollforwardSingleOperationRecord(record);
-      while (modified_layer != "buffered" && !this->buffer[modified_layer].empty()) {
-        OperationRecord* op_record = this->buffer[modified_layer].top().second;
-        this->buffer[modified_layer].pop();
-        modified_layer = rollforwardSingleOperationRecord(op_record);
-      }
+// Fence + synchronous rollforward, no View copy. Same invariant as the
+// periodic variant: keep storage->size() out of unique_lock<view_mutex>.
+// See the header comment for the linearizable_reads role.
+size_t MetadataLogHandler::syncView() {
+  // `target` is the metadata-log length observed by the first
+  // readMetadataLog — on Corfu that size() fences on the global
+  // sequencer tail, so it covers every operation sequenced before this
+  // call. The loop guards against the offset-CAS race: a loser's batch
+  // is discarded by readMetadataLog while the winner may have committed
+  // less than our target, and returning then would publish a view short
+  // of our fence. Iteration count is bounded in practice (offset is
+  // monotone and every loser observes the winner's advance next pass);
+  // the cap is a livelock backstop for a persistently failing read.
+  size_t target = 0;
+  bool have_target = false;
+  constexpr int kMaxPasses = 100;
+  for (int pass = 0; pass < kMaxPasses; ++pass) {
+    size_t observed = 0;
+    size_t batch_start = 0;
+    std::vector<OperationRecord*> records = readMetadataLog(&observed, &batch_start);
+    if (!have_target) {
+      target = observed;
+      have_target = true;
     }
-    // Publish unconditionally: even on an empty-records call during
-    // openDB, readers need a non-null snapshot to load. The cost is
-    // one shared_ptr construction, amortized against per-read
-    // latestViewSnapshot() calls.
-    publishSnapshotLocked();
+    {
+      std::unique_lock<std::shared_mutex> lock(view_mutex);
+      for (auto const& record : records) {
+        std::string modified_layer = rollforwardSingleOperationRecord(record);
+        while (modified_layer != "buffered" && !this->buffer[modified_layer].empty()) {
+          OperationRecord* op_record = this->buffer[modified_layer].top().second;
+          this->buffer[modified_layer].pop();
+          modified_layer = rollforwardSingleOperationRecord(op_record);
+        }
+      }
+      if (!records.empty()) {
+        markAppliedLocked(batch_start, observed);
+      }
+      // Publish only when the view changed, or when no snapshot exists
+      // yet (openDB's first rollforward needs a non-null snapshot even
+      // with zero records). Publishing deep-copies the View, and strict
+      // mode runs syncView once per get — an unconditional publish
+      // would reintroduce the per-get O(files) copy.
+      if (!records.empty() || std::atomic_load(&latest_snapshot_) == nullptr) {
+        publishSnapshotLocked();
+      }
+      // Gate on applied_offset_, not `offset`: readMetadataLog commits
+      // the offset before its caller applies the batch, and in that
+      // window the view lags the offset. A racing winner applies within
+      // microseconds; the loop just re-checks until it has.
+      if (applied_offset_ >= target) return applied_offset_;
+    }
   }
+  {
+    std::shared_lock<std::shared_mutex> lock(view_mutex);
+    std::cerr << "[metadata_log] syncView: view never reached fence target "
+              << target << " (applied " << applied_offset_ << ") after "
+              << kMaxPasses << " passes\n";
+    return applied_offset_;
+  }
+}
+
+// Roll forward the metadata log to get the latest view. Called from
+// foreground log-roll / put paths, which want the copy and the tail
+// refresh; per-get strict reads use syncView() directly to skip both.
+View MetadataLogHandler::rollForwardMetadataLog() {
+  syncView();
   refreshTailSizeUnlocked();
   std::shared_lock<std::shared_mutex> lock(view_mutex);
   return latest_view;

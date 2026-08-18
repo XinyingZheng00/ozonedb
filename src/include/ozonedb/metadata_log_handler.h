@@ -7,6 +7,7 @@
 #include "protobuf_serializer.h"
 #include "storage.h"
 #include <atomic>
+#include <map>
 #include <memory>
 #include <queue>
 #include <string>
@@ -63,13 +64,34 @@ class MetadataLogHandler {
   // std::shared_ptr are used; C++20's atomic<shared_ptr> isn't
   // required.
   std::shared_ptr<View const> latest_snapshot_;
+  // Contiguous metadata-log prefix whose records have been APPLIED into
+  // latest_view; guarded by view_mutex. Distinct from `offset` (guarded
+  // by read_mutex), which readMetadataLog commits BEFORE its caller
+  // applies the batch — in that window the view lags the offset, so
+  // syncView must gate on this, not on `offset`, to guarantee the
+  // published snapshot covers its fence target. Batches can apply out
+  // of order (reader A commits [0,L1), is preempted, reader B applies
+  // [L1,L2) first); applied_gaps_ parks such ranges until the watermark
+  // reaches them, so the watermark never overclaims an unapplied hole.
+  size_t applied_offset_ = 0;
+  std::map<size_t, size_t> applied_gaps_;
+  // Record that [start, end) has been applied into latest_view and
+  // advance applied_offset_ over any now-contiguous parked ranges.
+  // Caller must hold view_mutex as a unique_lock.
+  void markAppliedLocked(size_t start, size_t end);
   Metadata* metadata = nullptr;
   std::shared_mutex view_mutex;
   std::shared_mutex read_mutex;
   std::unordered_map<std::string, std::priority_queue<std::pair<int, OperationRecord*>, std::vector<std::pair<int, OperationRecord*>>, std::greater<>>> buffer;
 
-  // Deserialize OperationRecords from a file
-  std::vector<OperationRecord*> readMetadataLog();
+  // Deserialize OperationRecords from a file. When `observed_size` /
+  // `batch_start` are non-null they receive the metadata-log length
+  // this call saw (0 when the log does not exist yet) and the offset
+  // the returned batch begins at — i.e. the batch spans
+  // [batch_start, observed_size). On Corfu that size() is fenced on the
+  // global tail, so the first observation doubles as syncView's fence.
+  std::vector<OperationRecord*> readMetadataLog(size_t* observed_size = nullptr,
+                                                size_t* batch_start = nullptr);
   std::string rollforwardSingleOperationRecord(OperationRecord* record);
   // Refresh latest_view.tail_size without holding view_mutex across
   // storage->size() — keeps the Corfu fence out of the critical section.
@@ -104,6 +126,27 @@ class MetadataLogHandler {
 
   // used by compaction module and put module
   View rollForwardMetadataLog();
+
+  // Fence + synchronous rollforward with no View copy. On the Corfu
+  // backend, readMetadataLog's first storage call samples the global
+  // sequencer tail and waits for the tailer to catch up, so one call
+  // both linearizes against the shared log and ingests every
+  // LOGCREATE/COMPACT sequenced before it — closing the ~100ms window
+  // of the background view thread. This is the per-get hook for
+  // Metadata::linearizable_reads; unlike rollForwardMetadataLog it
+  // avoids the O(files) return-by-value copy (a known hot-path
+  // regression) and skips the tail-size refresh (the strict read path
+  // re-fences the tail itself in checkReadMoreLog).
+  //
+  // Loops until the committed offset covers the log length sampled at
+  // entry: readMetadataLog's offset-CAS means a racing caller can lose
+  // its batch to a concurrent winner and come back empty-handed while
+  // the view is still short of this caller's fence — tolerable for the
+  // background thread, not for a linearizable get. Returns the
+  // committed offset the published view reflects; DB::get compares it
+  // against a post-scan fenced log length to detect a compaction that
+  // landed mid-scan.
+  size_t syncView();
 
   void initSSTMetadata();
 

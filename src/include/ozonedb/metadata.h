@@ -89,6 +89,18 @@ class Metadata {
   // => log miss; the DB layer still consults SSTables as usual.
   bool trust_background_tail = false;
 
+  // When true, every DB::get linearizes against the shared log: it
+  // synchronously fences on the log's global tail and rolls the
+  // metadata-log view forward before scanning, and the unfenced
+  // key-index probe in LogHandler::readRecord is bypassed. This makes
+  // reads strict (a get observes every put acked before it started, on
+  // any writer process) at the cost of two extra fenced storage calls
+  // per get. Mutually exclusive with trust_background_tail — the
+  // constructor rejects configs that set both. The end-to-end guarantee
+  // also assumes the write side keeps its sync defaults (every put is
+  // sequenced in the log before it acks; see CorfuDBStorage::sync_mode_).
+  bool linearizable_reads = false;
+
   /**
    * @brief Local Metadata, read from local config file
    *
@@ -198,6 +210,17 @@ class Metadata {
     auto tbt_it = result.find("trust_background_tail");
     if (tbt_it != result.end()) {
       trust_background_tail = (tbt_it->second == "true" || tbt_it->second == "1");
+    }
+
+    auto lin_it = result.find("linearizable_reads");
+    if (lin_it != result.end()) {
+      linearizable_reads = (lin_it->second == "true" || lin_it->second == "1");
+    }
+    if (linearizable_reads && trust_background_tail) {
+      throw std::runtime_error(
+          "config error: linearizable_reads and trust_background_tail are "
+          "mutually exclusive (one demands a fence per get, the other skips "
+          "it)");
     }
 
     // std::cout<<shared_config_path<<std::endl;

@@ -195,6 +195,14 @@ compaction task themselves and dispatch it to the thread pool.
 3. `LogHandler::readRecord` across log files;
 4. `SSTableHandler::readRecordFromAllLevel`.
 
+`linearizable_reads` (mutually exclusive with `trust_background_tail` — `Metadata` throws on both)
+makes every get strict: `MetadataLogHandler::syncView()` fences on the global log tail and rolls the
+view forward before the snapshot, the unfenced key-index probe in `readRecord` is bypassed, and a
+post-scan fenced size check on `metadata.log` retries the get if a LOGCREATE/COMPACT was sequenced
+mid-scan (otherwise a peer compaction's REMOVE can make a key transiently invisible). Costs ~2 extra
+fenced storage calls per get; the end-to-end guarantee assumes the sync write defaults
+(`commit_interval_ = 0`, `sync_mode_ = true`).
+
 The returned `value` **aliases bytes inside the `guard` `shared_ptr<Record>`** — callers must keep
 the guard alive while dereferencing.
 

@@ -52,9 +52,10 @@ class LogHandler {
   LogHandler(uint64_t file_size_limit, std::string log_prefix, Storage* storage,
              LRUCache* global_cache, MetadataLogHandler* metadata_log = nullptr,
              bool enable_key_index = false, size_t key_index_capacity = 1000000,
-             bool trust_background_tail = false)
+             bool trust_background_tail = false, bool linearizable_reads = false)
       : file_size_limit(file_size_limit), prefix(std::move(log_prefix)), storage(storage),
-        trust_background_tail_(trust_background_tail) {
+        trust_background_tail_(trust_background_tail),
+        linearizable_reads_(linearizable_reads) {
     storage->createDirectory(prefix);
     cache = global_cache;
     this->metadata_log = metadata_log;
@@ -140,6 +141,13 @@ class LogHandler {
  private:
   std::unique_ptr<LogKeyIndex> key_index_;
   bool trust_background_tail_ = false;
+  // Strict mode (Metadata::linearizable_reads): readRecord must not
+  // serve an index hit without a fence. The index is fed for remote
+  // writes by the tailer's dispatch thread, which lags
+  // last_applied_addr_ — a hit can predate a peer's acked put that the
+  // fenced file scan downstream would observe. The index still gets
+  // written (addRecord, backfill, onRemoteAppend) so it stays warm.
+  bool linearizable_reads_ = false;
 };
 }  // namespace ozonedb
 #endif  // LOG_H

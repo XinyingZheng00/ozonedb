@@ -120,8 +120,9 @@ Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& r
   // Fast path: check the in-memory key index first. This skips the
   // multi-file backward scan (and, on Corfu, the per-file fenced
   // storage->size() call in checkReadMoreLog). On miss, fall through
-  // to the existing scan and backfill on success.
-  if (key_index_) {
+  // to the existing scan and backfill on success. Bypassed entirely in
+  // linearizable mode — see the linearizable_reads_ member comment.
+  if (key_index_ && !linearizable_reads_) {
     if (auto hit = key_index_->lookup(key)) {
       record = std::move(hit);
       return Status::kSuccess;

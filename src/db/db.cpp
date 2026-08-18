@@ -91,7 +91,8 @@ DB::DB(std::string const& shared_config_path) {
       this->metadata->log_file_size_limit, this->metadata->log_prefix,
       this->log_storage, lru_cache, metadata_log, /*enable_key_index=*/true,
       /*key_index_capacity=*/1000000,
-      /*trust_background_tail=*/this->metadata->trust_background_tail);
+      /*trust_background_tail=*/this->metadata->trust_background_tail,
+      /*linearizable_reads=*/this->metadata->linearizable_reads);
   this->sstable_handler = new SSTableHandler(this->sstable_storage, metadata_log, this->metadata->sstable_level_prefix, lru_cache);
   this->sstable_handler->setMaxLevel(this->metadata->max_level);
   this->thread_pool = new ThreadPool(std::thread::hardware_concurrency());
@@ -233,50 +234,85 @@ Status DB::get(std::string const& key, std::string const*& value,
     }
   }
 
-  // Atomic snapshot of the metadata-log view — no deep copy, no lock.
-  // Held locally so children's raw latest_view pointers stay valid
-  // until this frame returns. Refresh publishes happen only on log
-  // rollforward / tail-size refresh, not per get.
-  this->latest_view_snapshot = metadata_log->latestViewSnapshot();
-  View const* view_ptr = this->latest_view_snapshot.get();
-  if (view_ptr == nullptr) {
-    return Status::kFailure;
-  }
-  this->log_handler->setLatestView(view_ptr);
-  this->sstable_handler->setLatestView(view_ptr);
-  this->lru_cache->setLatestView(view_ptr);
-
-  // tail_cache path removed — TailCache::getLatestRecord was dead
-  // code: the write side that populated it (db.cpp:~190 in put)
-  // was commented out, so every call was a shared-lock + empty
-  // hashmap lookup. The `offset` we used to feed into readRecord
-  // and readRecordFromAllLevel came from that dead cache and was
-  // always empty, so drop both the call and the condition.
-
-  std::shared_ptr<Record> log_record;
-  std::string const empty_offset;
-  std::string latest_offset;
-  log_handler->readRecord(key, log_record, empty_offset, latest_offset);
-
-  std::shared_ptr<Record> latest_record;
-  if (log_record) {
-    latest_record = std::move(log_record);
-  } else {
-    std::shared_ptr<Record> sstable_record;
-    sstable_handler->readRecordFromAllLevel(key, sstable_record, empty_offset);
-    if (sstable_record) {
-      latest_record = std::move(sstable_record);
+  // Strict mode (linearizable_reads): each attempt fences + rolls the
+  // metadata log forward before taking the snapshot, then validates
+  // after the scan that no metadata operation was sequenced meanwhile.
+  // syncView's first storage call samples the global log tail and waits
+  // for the tailer, so the snapshot reflects every LOGCREATE/COMPACT —
+  // and the file scan every data-log byte — sequenced before this get
+  // began. Without it the view lags by the background thread's ~100ms
+  // cycle, which both hides a peer's freshly rolled tail file and,
+  // during a peer compaction, opens a window where a key is temporarily
+  // in neither the (removed) input log file nor the (not-yet-visible)
+  // output SSTable.
+  //
+  // The post-scan check closes that compaction window against ops
+  // sequenced *after* our fence: the tailer applies entries in address
+  // order, so if it removed a log file under our scan, the COMPACT that
+  // precedes the REMOVE has already grown the local metadata log past
+  // view_offset — the fenced size() below sees it and we retry against
+  // the fresh view. Equal sizes mean no metadata op overlapped the scan
+  // and the result is valid. Metadata ops are rare (log rolls and
+  // compactions), so retries are too; the cap only guards against a
+  // pathological storm, serving the last result instead of spinning.
+  bool const strict = this->metadata->linearizable_reads;
+  constexpr int kStrictMaxAttempts = 5;
+  for (int attempt = 0;; ++attempt) {
+    size_t view_offset = 0;
+    if (strict) {
+      view_offset = metadata_log->syncView();
     }
-  }
 
-  if (latest_record) {
-    if (latest_record->type() == kTypeDeletion) {
+    // Atomic snapshot of the metadata-log view — no deep copy, no lock.
+    // Held locally so children's raw latest_view pointers stay valid
+    // until this frame returns. Refresh publishes happen only on log
+    // rollforward / tail-size refresh, not per get.
+    this->latest_view_snapshot = metadata_log->latestViewSnapshot();
+    View const* view_ptr = this->latest_view_snapshot.get();
+    if (view_ptr == nullptr) {
       return Status::kFailure;
     }
-    value = &(latest_record->value());
-    guard = std::move(latest_record);
-    return Status::kSuccess;
+    this->log_handler->setLatestView(view_ptr);
+    this->sstable_handler->setLatestView(view_ptr);
+    this->lru_cache->setLatestView(view_ptr);
+
+    // tail_cache path removed — TailCache::getLatestRecord was dead
+    // code: the write side that populated it (db.cpp:~190 in put)
+    // was commented out, so every call was a shared-lock + empty
+    // hashmap lookup. The `offset` we used to feed into readRecord
+    // and readRecordFromAllLevel came from that dead cache and was
+    // always empty, so drop both the call and the condition.
+
+    std::shared_ptr<Record> log_record;
+    std::string const empty_offset;
+    std::string latest_offset;
+    log_handler->readRecord(key, log_record, empty_offset, latest_offset);
+
+    std::shared_ptr<Record> latest_record;
+    if (log_record) {
+      latest_record = std::move(log_record);
+    } else {
+      std::shared_ptr<Record> sstable_record;
+      sstable_handler->readRecordFromAllLevel(key, sstable_record, empty_offset);
+      if (sstable_record) {
+        latest_record = std::move(sstable_record);
+      }
+    }
+
+    if (strict && attempt + 1 < kStrictMaxAttempts &&
+        log_storage->size(this->metadata->metadata_log) != view_offset) {
+      continue;
+    }
+
+    if (latest_record) {
+      if (latest_record->type() == kTypeDeletion) {
+        return Status::kFailure;
+      }
+      value = &(latest_record->value());
+      guard = std::move(latest_record);
+      return Status::kSuccess;
+    }
+    return Status::kFailure;
   }
-  return Status::kFailure;
 }
 }  // namespace ozonedb
