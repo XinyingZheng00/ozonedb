@@ -40,6 +40,7 @@ from load_local_ycsb_multiproc import (
     _resolve_ycsb_classpath,
     partition_records,
 )
+from visibility_analysis import analyze as _analyze_visibility
 from ycsb_config import derive as _derive_addresses
 
 OZONEDB_HOME = os.environ.get("OZONEDB_HOME")
@@ -335,10 +336,6 @@ def cmd_probe_staleness(cfg, args):
 
 # ================================================================= visibility
 
-# PBS-curve age buckets (ms): P[stale at age a] = P[visibility latency > a],
-# the complementary CDF of B1's latency, so one run yields the whole curve.
-PBS_AGES_MS = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
-
 
 def cmd_check_visibility(cfg, args):
     """Two benchmarks from one run over YCSB-keyspace inserts (PBS-style,
@@ -385,66 +382,70 @@ def cmd_check_visibility(cfg, args):
     finally:
         _reap(procs)
 
-    rows = []
-    with open(os.path.join(out, "visibility.csv")) as f:
-        next(f)
-        for line in f:
-            rows.append([int(x) for x in line.strip().split(",")])
-    checked = len(rows)
-    misses = sum(1 for r in rows if r[4] == 0)
-    timeouts = sum(1 for r in rows if r[5] < 0)
-    vis_ms = [(r[5] - r[1]) / 1e6 for r in rows if r[5] >= 0]
-    first_age_ms = [(r[3] - r[1]) / 1e6 for r in rows if r[3] >= 0]
-    notify_lag_ms = [(r[2] - r[1]) / 1e6 for r in rows]
-    # Timeouts count as "still stale at every age" so they push the curve
-    # up instead of silently vanishing from it.
-    pbs = [
-        {
-            "age_ms_le": a,
-            "p_stale": ((sum(1 for v in vis_ms if v > a) + timeouts) / checked)
-            if checked else 0.0,
-        }
-        for a in PBS_AGES_MS
-    ]
-
-    summary = {
-        "engine": ENGINE + ("-linearizable" if args.linearizable else ""),
-        "linearizable_reads": args.linearizable,
-        "inserts": checked,
-        "checked": checked,
-        "misses_first_read": misses,
-        "miss_first_read_fraction": (misses / checked) if checked else 0.0,
-        "timeouts": timeouts,
-        "visibility_ms_p50": round(_pct(vis_ms, 50), 3),
-        "visibility_ms_p90": round(_pct(vis_ms, 90), 3),
-        "visibility_ms_p95": round(_pct(vis_ms, 95), 3),
-        "visibility_ms_p99": round(_pct(vis_ms, 99), 3),
-        "visibility_ms_max": round(max(vis_ms), 3) if vis_ms else 0.0,
-        "first_check_age_ms_p50": round(_pct(first_age_ms, 50), 3),
-        "first_check_age_ms_p99": round(_pct(first_age_ms, 99), 3),
-        "notify_lag_ms_p50": round(_pct(notify_lag_ms, 50), 4),
-        "pbs": pbs,
-        "sync_interval_ms": 0,
+    _analyze_visibility(out, ENGINE, args.linearizable, cross_node=False, params={
         "rate_per_s": args.rate,
         "duration_s": args.duration,
         "value_size": args.value_size,
         "poll_ms": args.poll_ms,
         "stream": stream,
-    }
-    with open(os.path.join(out, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-    print(json.dumps(summary, indent=2))
-    if args.linearizable and misses == 0 and timeouts == 0:
-        verdict = ("0 first-read misses -- every key was visible on the first "
-                   "get issued after its ack (read-latest holds)")
-    elif args.linearizable:
-        verdict = (f"{misses} first-read misses / {timeouts} timeouts UNDER "
-                   "linearizable_reads -- should be impossible; check logs")
-    else:
-        verdict = (f"{misses} of {checked} first reads missed "
-                   f"({summary['miss_first_read_fraction']:.1%}); "
-                   f"visibility p50 {summary['visibility_ms_p50']} ms")
-    print(f"\n=> {verdict}. Results in {out}")
+    })
+
+
+def cmd_visibility_reader(cfg, args):
+    """Reader half of the cross-node visibility experiment: listen for the
+    writer's TCP ack notifications and poll every notified key. Started on
+    clients[1] by run_visibility_cross_node.sh; the writer's connect only
+    succeeds once this probe is listening (i.e. after its openDB), so the
+    socket handshake is the start barrier. Leaves visibility.csv in
+    --out-dir for the laptop to pull -- home dirs are NOT shared between
+    nodes."""
+    out = os.path.join(OZONEDB_HOME, args.out_dir)
+    os.makedirs(out, exist_ok=True)
+    _kill_stale_probes()
+    cfgs = _make_configs(cfg, args.stream, 1,
+                         f"visx-reader-{os.path.basename(out)}",
+                         idx_base=990, linearizable=args.linearizable)
+    cp = _classpath(args.rebuild)
+    cmd = _probe_cmd(cp, "visibility-probe", {
+        "config": cfgs[0], "out-dir": out, "notify-listen": args.port,
+        "poll-ms": args.poll_ms, "key-timeout-s": args.key_timeout_s,
+        "run-timeout-s": args.run_timeout_s,
+    })
+    proc = _spawn(cmd, os.path.join(out, "reader.log"))
+    try:
+        rc = proc["proc"].wait()
+    finally:
+        _reap([proc])
+    if rc != 0:
+        raise RuntimeError(f"visibility-probe rc={rc}, see {proc['log_path']}")
+    print(f"reader done, visibility.csv in {out}")
+
+
+def cmd_visibility_writer(cfg, args):
+    """Writer half of the cross-node visibility experiment: insert new keys
+    and ack each over TCP to the reader at --connect (reader's LAN
+    address). Blocks until the insert phase ends; closing the socket is the
+    done signal the reader drains against."""
+    out = os.path.join(OZONEDB_HOME, args.out_dir)
+    os.makedirs(out, exist_ok=True)
+    _kill_stale_probes()
+    cfgs = _make_configs(cfg, args.stream, 1,
+                         f"visx-writer-{os.path.basename(out)}",
+                         idx_base=991, linearizable=args.linearizable)
+    cp = _classpath(args.rebuild)
+    cmd = _probe_cmd(cp, "insert-probe", {
+        "config": cfgs[0], "out-dir": out, "notify-connect": args.connect,
+        "rate": args.rate, "duration-s": args.duration,
+        "value-size": args.value_size,
+    })
+    proc = _spawn(cmd, os.path.join(out, "writer.log"))
+    try:
+        rc = proc["proc"].wait()
+    finally:
+        _reap([proc])
+    if rc != 0:
+        raise RuntimeError(f"insert-probe rc={rc}, see {proc['log_path']}")
+    print(f"writer done, inserts.csv in {out}")
 
 
 # =============================================================== lost updates
@@ -649,6 +650,25 @@ def main():
                     help="give up on a key after this long (>> sync interval)")
     sp.add_argument("--stream", default=None)
 
+    sp = sub.add_parser("visibility-reader",
+                        help="cross-node reader role (driven by run_visibility_cross_node.sh)")
+    sp.add_argument("--out-dir", required=True,
+                    help="run dir relative to OZONEDB_HOME")
+    sp.add_argument("--stream", required=True)
+    sp.add_argument("--port", type=int, default=7911)
+    sp.add_argument("--poll-ms", type=int, default=1)
+    sp.add_argument("--key-timeout-s", type=int, default=30)
+    sp.add_argument("--run-timeout-s", type=int, default=600)
+
+    sp = sub.add_parser("visibility-writer",
+                        help="cross-node writer role (driven by run_visibility_cross_node.sh)")
+    sp.add_argument("--out-dir", required=True)
+    sp.add_argument("--stream", required=True)
+    sp.add_argument("--connect", required=True, help="reader LAN host:port")
+    sp.add_argument("--rate", type=float, default=20.0)
+    sp.add_argument("--duration", type=int, default=15)
+    sp.add_argument("--value-size", type=int, default=1000)
+
     sp = sub.add_parser("check-convergence",
                         help="hash a key sample on N fresh instances of one stream")
     sp.add_argument("--record-count", type=int, default=None,
@@ -668,6 +688,10 @@ def main():
         cmd_check_lost_updates(cfg, args)
     elif args.cmd == "check-visibility":
         cmd_check_visibility(cfg, args)
+    elif args.cmd == "visibility-reader":
+        cmd_visibility_reader(cfg, args)
+    elif args.cmd == "visibility-writer":
+        cmd_visibility_writer(cfg, args)
     elif args.cmd == "check-convergence":
         cmd_check_convergence(cfg, args)
 

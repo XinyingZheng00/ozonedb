@@ -7,7 +7,12 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -18,6 +23,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Standalone driver for the consistency experiments, mirroring the
@@ -47,12 +54,18 @@ import java.util.Random;
  *       --notify-file (flushed per line) and record it in inserts.csv.
  *       Touches --done-file when finished. New keys make "not found" an
  *       unambiguous staleness signal: there is no older value to serve.
+ *       Cross-node: --notify-connect host:port replaces --notify-file --
+ *       acks flow over TCP to the reader (retrying the connect until the
+ *       reader listens), and closing the socket is the done signal.
  *   <li>visibility-probe: tail --notify-file; each notified key joins a
  *       pending set that is polled every --poll-ms until found (or
  *       --key-timeout-s). The first get per key necessarily starts after
  *       the writer's ack (ack -&gt; notify -&gt; get), so a first-get miss is
  *       a read-latest violation with no clock comparison involved. Emits
  *       visibility.csv with per-key ack/notify/first/found timestamps.
+ *       Cross-node: --notify-listen port accepts the writer's TCP stream;
+ *       t_notify (this host's clock) is then the latency reference, since
+ *       t_ack lives in the writer's clock domain.
  *   <li>put-long / get-long: seed or read one 8-byte counter value.
  *   <li>hash: md5 over (key,value) for every --sample-every'th key of the
  *       YCSB keyspace (user + FNV hash, the workloads' insertorder=hashed
@@ -266,10 +279,33 @@ public final class ConsistencyProbe {
     long durationS = Long.parseLong(req(flags, "duration-s"));
     int valueSize = Integer.parseInt(flags.getOrDefault("value-size", "1000"));
     String outDir = req(flags, "out-dir");
-    String notifyPath = req(flags, "notify-file");
-    String donePath = req(flags, "done-file");
+    String notifyPath = flags.get("notify-file");
+    String connect = flags.get("notify-connect");
+    String donePath = flags.get("done-file");
+    if ((notifyPath == null) == (connect == null)) {
+      throw new IllegalArgumentException(
+          "pass exactly one of --notify-file / --notify-connect");
+    }
 
     OzoneDBJNI db = open(flags);
+    // TCP mode: the reader only listens after ITS openDB returned, so a
+    // successful connect doubles as the cross-node start barrier -- no
+    // ready/go files needed. The connect retries while the reader is
+    // still opening.
+    Socket sock = null;
+    PrintWriter notify;
+    if (connect != null) {
+      sock = connectWithRetry(connect,
+          Long.parseLong(flags.getOrDefault("connect-timeout-s", "240")));
+      notify = new PrintWriter(
+          new OutputStreamWriter(sock.getOutputStream(), StandardCharsets.UTF_8), true);
+    } else {
+      // Autoflush PrintWriter: each println pushes the full line (with its
+      // newline) through in one flush, so the tailing reader never sees a
+      // torn line under normal conditions (it also guards against partial
+      // lines itself).
+      notify = new PrintWriter(new FileWriter(notifyPath), true);
+    }
     barrier(flags);
 
     Random rnd = new Random(42);
@@ -278,22 +314,22 @@ public final class ConsistencyProbe {
     long deadline = System.nanoTime() + durationS * 1_000_000_000L;
     List<long[]> inserts = new ArrayList<>();
     long i = 0;
-    // Autoflush PrintWriter: each println pushes the full line (with its
-    // newline) through to the file in one flush, so the tailing reader
-    // never sees a torn line under normal conditions (it also guards
-    // against partial lines itself).
-    try (PrintWriter notify = new PrintWriter(new FileWriter(notifyPath), true)) {
-      while (System.nanoTime() < deadline) {
-        String key = CoreWorkload.buildKeyName(i, 1, false);
-        rnd.nextBytes(value);
-        ByteBuffer.wrap(value).putLong(i);
-        db.put(key, value);
-        long tAck = System.nanoTime();
-        inserts.add(new long[]{i, tAck});
-        notify.println(i + "," + tAck);
-        i++;
-        sleepNs(periodNs);
-      }
+    while (System.nanoTime() < deadline) {
+      String key = CoreWorkload.buildKeyName(i, 1, false);
+      rnd.nextBytes(value);
+      ByteBuffer.wrap(value).putLong(i);
+      db.put(key, value);
+      long tAck = System.nanoTime();
+      inserts.add(new long[]{i, tAck});
+      notify.println(i + "," + tAck);
+      i++;
+      sleepNs(periodNs);
+    }
+    // Closing the channel is the done signal in TCP mode (EOF at the
+    // reader); the done-file covers the same-host file channel.
+    notify.close();
+    if (sock != null) {
+      sock.close();
     }
     try (PrintWriter w = new PrintWriter(new File(outDir, "inserts.csv"), "UTF-8")) {
       w.println("idx,t_ack_ns");
@@ -301,9 +337,59 @@ public final class ConsistencyProbe {
         w.println(ins[0] + "," + ins[1]);
       }
     }
-    new File(donePath).createNewFile();
+    if (donePath != null) {
+      new File(donePath).createNewFile();
+    }
     db.closeDB();
     System.out.println("{\"inserts\": " + i + "}");
+  }
+
+  private static Socket connectWithRetry(String hostPort, long timeoutS) throws Exception {
+    int colon = hostPort.lastIndexOf(':');
+    String host = hostPort.substring(0, colon);
+    int port = Integer.parseInt(hostPort.substring(colon + 1));
+    long deadline = System.nanoTime() + timeoutS * 1_000_000_000L;
+    while (true) {
+      Socket s = new Socket();
+      try {
+        s.connect(new InetSocketAddress(host, port), 2000);
+        s.setTcpNoDelay(true);
+        return s;
+      } catch (Exception e) {
+        s.close();
+        if (System.nanoTime() > deadline) {
+          throw new IllegalStateException("could not connect to " + hostPort, e);
+        }
+        Thread.sleep(200);
+      }
+    }
+  }
+
+  // Socket-side notify drain: runs on its own thread so a blocking
+  // readLine never stalls the polling loop. t_notify is stamped HERE, at
+  // receipt -- the reader-clock anchor of the ack -> notify -> get
+  // happens-before chain. EOF (writer closed the socket) sets done.
+  private static void drainNotifySocket(BufferedReader in,
+                                        ConcurrentLinkedQueue<long[]> queue,
+                                        AtomicBoolean done) {
+    try {
+      while (true) {
+        String line = in.readLine();
+        if (line == null) {
+          break;
+        }
+        int comma = line.indexOf(',');
+        if (comma <= 0) {
+          continue;
+        }
+        long idx = Long.parseLong(line.substring(0, comma));
+        long tAck = Long.parseLong(line.substring(comma + 1).trim());
+        queue.add(new long[]{idx, tAck, System.nanoTime()});
+      }
+    } catch (Exception e) {
+      System.err.println("notify socket closed: " + e);
+    }
+    done.set(true);
   }
 
   // Column slots of a visibility-probe per-key record.
@@ -317,18 +403,50 @@ public final class ConsistencyProbe {
 
   private static void visibilityProbe(Map<String, String> flags) throws Exception {
     String outDir = req(flags, "out-dir");
-    String notifyPath = req(flags, "notify-file");
-    String donePath = req(flags, "done-file");
+    String notifyPath = flags.get("notify-file");
+    String listen = flags.get("notify-listen");
+    String donePath = flags.get("done-file");
+    if ((notifyPath == null) == (listen == null)) {
+      throw new IllegalArgumentException(
+          "pass exactly one of --notify-file / --notify-listen");
+    }
+    if (notifyPath != null && donePath == null) {
+      throw new IllegalArgumentException("--notify-file needs --done-file");
+    }
     long pollMs = Long.parseLong(flags.getOrDefault("poll-ms", "1"));
     long keyTimeoutNs = Long.parseLong(flags.getOrDefault("key-timeout-s", "30"))
         * 1_000_000_000L;
     long runTimeoutS = Long.parseLong(flags.getOrDefault("run-timeout-s", "600"));
 
     OzoneDBJNI db = open(flags);
+
+    // TCP mode: bind only after openDB so a successful writer connect
+    // implies this reader is fully up -- the handshake is the barrier.
+    // EOF on the socket is the writer's done signal.
+    ServerSocket server = null;
+    Socket sock = null;
+    ConcurrentLinkedQueue<long[]> arrivals = null;
+    AtomicBoolean socketDone = null;
+    if (listen != null) {
+      server = new ServerSocket(Integer.parseInt(listen));
+      server.setSoTimeout(1000 * Integer.parseInt(
+          flags.getOrDefault("accept-timeout-s", "300")));
+      sock = server.accept();
+      sock.setTcpNoDelay(true);
+      BufferedReader in = new BufferedReader(
+          new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8));
+      arrivals = new ConcurrentLinkedQueue<>();
+      socketDone = new AtomicBoolean(false);
+      ConcurrentLinkedQueue<long[]> q = arrivals;
+      AtomicBoolean flag = socketDone;
+      Thread drainer = new Thread(() -> drainNotifySocket(in, q, flag));
+      drainer.setDaemon(true);
+      drainer.start();
+    }
     barrier(flags);
 
-    File notifyFile = new File(notifyPath);
-    File doneFile = new File(donePath);
+    File notifyFile = notifyPath != null ? new File(notifyPath) : null;
+    File doneFile = donePath != null ? new File(donePath) : null;
     BufferedReader notify = null;
     StringBuilder partial = new StringBuilder();
     // Insertion-ordered so per-tick checks walk keys oldest-first.
@@ -337,7 +455,16 @@ public final class ConsistencyProbe {
     long runDeadline = System.nanoTime() + runTimeoutS * 1_000_000_000L;
 
     while (true) {
-      if (notify == null && notifyFile.exists()) {
+      if (arrivals != null) {
+        while (!arrivals.isEmpty()) {
+          long[] a = arrivals.poll();
+          if (a == null) {
+            break;
+          }
+          pending.put(a[0], new long[]{a[0], a[1], a[2], -1, 0, -1, 0});
+        }
+      }
+      if (notifyFile != null && notify == null && notifyFile.exists()) {
         notify = new BufferedReader(new FileReader(notifyFile));
       }
       // Drain complete notify lines. Char-by-char with a persistent
@@ -385,8 +512,14 @@ public final class ConsistencyProbe {
         }
       }
 
-      boolean drained = notify != null && !notify.ready() && partial.length() == 0;
-      if (doneFile.exists() && drained && pending.isEmpty()) {
+      boolean done;
+      if (arrivals != null) {
+        done = socketDone.get() && arrivals.isEmpty();
+      } else {
+        done = doneFile.exists() && notify != null && !notify.ready()
+            && partial.length() == 0;
+      }
+      if (done && pending.isEmpty()) {
         break;
       }
       if (System.nanoTime() > runDeadline) {
@@ -400,8 +533,18 @@ public final class ConsistencyProbe {
     if (notify != null) {
       notify.close();
     }
+    if (sock != null) {
+      sock.close();
+    }
+    if (server != null) {
+      server.close();
+    }
     db.closeDB();
+    writeVisibilityResults(outDir, results);
+  }
 
+  private static void writeVisibilityResults(String outDir, List<long[]> results)
+      throws Exception {
     long missesFirst = 0;
     long timeouts = 0;
     for (long[] r : results) {
