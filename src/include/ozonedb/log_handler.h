@@ -97,6 +97,18 @@ class LogHandler {
   Status addRecord(Record const& record);
 
   /**
+   * @brief conditional variant of addRecord for compare-and-put
+   *
+   * Appends exactly one record via Storage::appendConditional and
+   * blocks until the shared log's apply order decides the outcome. No
+   * cache/index upsert here: the writer never self-applies conditional
+   * entries, so an accepted one arrives through the storage's
+   * remote-append listener like a peer write.
+   */
+  Status addRecordConditional(Record const& record, int64_t expected_version,
+                              int64_t& new_version);
+
+  /**
    * @brief read record from this level, end to the offset
    *
    * @param key

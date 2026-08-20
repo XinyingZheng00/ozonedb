@@ -47,6 +47,22 @@ JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get
 JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove
   (JNIEnv *, jobject, jstring);
 
+/*
+ * Class:     jni_OzoneDBJNI
+ * Method:    getVersioned
+ * Signature: (Ljava/lang/String;)[B
+ */
+JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_getVersioned
+  (JNIEnv *, jobject, jstring);
+
+/*
+ * Class:     jni_OzoneDBJNI
+ * Method:    casPut
+ * Signature: (Ljava/lang/String;[BJ)J
+ */
+JNIEXPORT jlong JNICALL Java_jni_OzoneDBJNI_casPut
+  (JNIEnv *, jobject, jstring, jbyteArray, jlong);
+
 #ifdef __cplusplus
 }
 #endif

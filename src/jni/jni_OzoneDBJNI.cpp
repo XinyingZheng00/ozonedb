@@ -114,3 +114,52 @@ JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove(JNIEnv* env, jobject obj, jstr
     std::cerr << "Failed to remove key" << std::endl;
   }
 }
+
+// Returns null when the key is absent; otherwise an 8-byte big-endian
+// version (the key's global log address; -1 encodes "unwritten")
+// followed by the value bytes. One array keeps the (value, version)
+// pair atomic across the JNI boundary.
+JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_getVersioned(JNIEnv* env, jobject obj, jstring key) {
+  char const* nativeKey = env->GetStringUTFChars(key, 0);
+  std::string value;
+  int64_t version = -1;
+  ozonedb::Status status = db_instance->getVersioned(std::string(nativeKey), value, version);
+  env->ReleaseStringUTFChars(key, nativeKey);
+
+  if (status != ozonedb::Status::kSuccess) {
+    return nullptr;
+  }
+  jbyteArray byteArray = env->NewByteArray(8 + value.length());
+  jbyte header[8];
+  for (int i = 0; i < 8; i++) {
+    header[i] = static_cast<jbyte>((static_cast<uint64_t>(version) >> (8 * (7 - i))) & 0xff);
+  }
+  env->SetByteArrayRegion(byteArray, 0, 8, header);
+  env->SetByteArrayRegion(byteArray, 8, value.length(), reinterpret_cast<const jbyte*>(value.data()));
+  return byteArray;
+}
+
+// Returns the key's new version (>= 0) when the conditional put is
+// accepted, -2 when it loses the version check (caller should re-read
+// and retry), -1 on any other failure.
+JNIEXPORT jlong JNICALL Java_jni_OzoneDBJNI_casPut(JNIEnv* env, jobject obj, jstring key,
+                                                   jbyteArray value, jlong expectedVersion) {
+  char const* nativeKey = env->GetStringUTFChars(key, 0);
+  jsize length = env->GetArrayLength(value);
+  jbyte* byteArrayPtr = env->GetByteArrayElements(value, nullptr);
+  std::string str(reinterpret_cast<char*>(byteArrayPtr), length);
+  int64_t newVersion = -1;
+  ozonedb::Status status = db_instance->compareAndPut(
+      std::string(nativeKey), static_cast<int64_t>(expectedVersion), str, newVersion);
+  env->ReleaseStringUTFChars(key, nativeKey);
+  env->ReleaseByteArrayElements(value, byteArrayPtr, 0);
+
+  if (status == ozonedb::Status::kSuccess) {
+    return static_cast<jlong>(newVersion);
+  }
+  if (status == ozonedb::Status::kCasConflict) {
+    return -2;
+  }
+  std::cerr << "casPut failed" << std::endl;
+  return -1;
+}

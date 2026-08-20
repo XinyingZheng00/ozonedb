@@ -342,7 +342,10 @@ def cmd_check_lost_updates(cfg, args):
     -- milliseconds -- where cr-sqlite's is its sync interval, and unlike
     cr-sqlite no acknowledged put is ever discarded (appends are totally
     ordered; put returns only after the record is sequenced). --rate paces
-    each worker to sweep the conflict window."""
+    each worker to sweep the conflict window. --cas switches the workers to
+    the conditional-append RMW (getVersioned + casPut retry loop): the
+    version check runs deterministically in every replica's apply order, so
+    the window closes entirely and the expected lost count is exactly 0."""
     out = _outdir("lost-updates")
     tag = os.path.basename(out).split("-", 2)[2]
     stream = args.stream or f"{cfg['corfu']['stream_name']}-lostupd-{tag}"
@@ -370,6 +373,7 @@ def cmd_check_lost_updates(cfg, args):
             "config": cfgs[i], "key": "__counter__", "increments": cnt,
             "rate": args.rate, "worker": i, "out-dir": out,
             "ready-file": ready, "go-file": go,
+            "cas": "true" if args.cas else "false",
         })
         procs.append(_spawn(cmd, os.path.join(out, f"worker-{i}.log")))
 
@@ -397,10 +401,19 @@ def cmd_check_lost_updates(cfg, args):
     f_val = _last_json_line(final_log)["value"]
 
     k = args.increments
+    conflicts = sum(w.get("conflicts", 0) for w in workers)
+    engine = ENGINE
+    if args.cas:
+        engine += "-cas"
+    elif args.linearizable:
+        engine += "-linearizable"
     summary = {
-        "engine": ENGINE + ("-linearizable" if args.linearizable else ""),
+        "engine": engine,
         "linearizable_reads": args.linearizable,
-        "mode": "ozonedb writers (shared Corfu log)",
+        "cas": args.cas,
+        "cas_conflicts": conflicts,
+        "mode": ("ozonedb writers, conditional appends (CAS)" if args.cas
+                 else "ozonedb writers (shared Corfu log)"),
         "replicas": n,
         "workers": n,
         "increments_issued": k,
@@ -419,13 +432,19 @@ def cmd_check_lost_updates(cfg, args):
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(json.dumps(summary, indent=2))
-    verdict = (
-        "no updates lost"
-        if k == f_val
-        else f"{k - f_val} of {k} increments lost ({(k - f_val) / k:.1%}) -- "
-        "get+put RMW races within the ~ms apply window; no acknowledged put "
-        "was discarded by the log itself"
-    )
+    if k == f_val:
+        verdict = "no updates lost"
+        if args.cas:
+            verdict += f" ({conflicts} CAS conflicts retried)"
+    elif args.cas:
+        verdict = (f"{k - f_val} of {k} increments lost DESPITE CAS -- this "
+                   "should be impossible; check worker logs")
+    else:
+        verdict = (
+            f"{k - f_val} of {k} increments lost ({(k - f_val) / k:.1%}) -- "
+            "get+put RMW races within the ~ms apply window; no acknowledged "
+            "put was discarded by the log itself"
+        )
     print(f"\n=> final counter {f_val} after {k} increments: {verdict}. Results in {out}")
 
 
@@ -516,6 +535,8 @@ def main():
                         help="concurrent RMW increments across writer processes")
     sp.add_argument("--workers", type=int, default=2)
     sp.add_argument("--increments", type=int, default=2000, help="total across workers")
+    sp.add_argument("--cas", action="store_true",
+                    help="atomic RMW via conditional appends (getVersioned + casPut)")
     sp.add_argument("--rate", type=float, default=0.0,
                     help="increments/s per worker (0 = as fast as possible)")
     sp.add_argument("--settle", type=float, default=3.0,

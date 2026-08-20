@@ -1,6 +1,7 @@
 #ifdef OZONEDB_ENABLE_CORFU
 #include "corfu_storage.h"
 #include "protobuf/record.pb.h"
+#include "protobuf_serializer.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -34,8 +35,9 @@ CorfuDBStorage::CorfuDBStorage(std::string const& endpoint,
                                std::string const& jar_path,
                                std::string const& jvm_opts,
                                std::string const& stream_name,
-                               std::string const& db_path)
-    : Storage(db_path) {
+                               std::string const& db_path,
+                               std::string const& log_prefix)
+    : Storage(db_path), log_prefix_(log_prefix) {
   {
     std::random_device rd;
     std::mt19937_64 rng(rd());
@@ -203,13 +205,18 @@ void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& 
 }
 
 long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
-                                    unsigned char const* data, int length) {
+                                    unsigned char const* data, int length,
+                                    bool conditional, long expected_version) {
   ::CorfuEntry entry;
   entry.set_file_name(file_name);
   entry.set_op(static_cast<::CorfuEntry_Op>(op));
   entry.set_client_id(client_id_);
   if (data != nullptr && length > 0) {
     entry.set_payload(data, length);
+  }
+  if (conditional) {
+    entry.set_conditional(true);
+    entry.set_expected_version(expected_version);
   }
   std::string serialized;
   entry.SerializeToString(&serialized);
@@ -259,17 +266,25 @@ bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
     std::string const& fn = entry.file_name();
     switch (entry.op()) {
       case ::CorfuEntry_Op_APPEND: {
-        // Skip locally-originated APPENDs: the writer thread already copied
-        // (or will copy) the bytes into file_buffers_ itself as part of the
-        // post-JNI reconcile step. Applying them here would double-count
-        // the bytes until the writer's own reconcile erases the placeholder.
-        if (entry.has_client_id() && entry.client_id() == client_id_) {
-          break;
-        }
-        auto& buf = file_buffers_[fn];
+        // Unconditional own APPENDs are skipped for bytes-apply: the
+        // writer thread already copied (or will copy) the bytes into
+        // file_buffers_ itself as part of the post-JNI reconcile step.
+        // Applying them here would double-count the bytes until the
+        // writer's own reconcile erases the placeholder. Conditional
+        // (CAS) entries are the exception — the writer never
+        // self-applies those, so accepted ones are applied here for own
+        // and peer entries alike. applyVersionedLocked also keeps the
+        // log-ordered key-version map current for every data-log entry.
+        bool own = entry.has_client_id() && entry.client_id() == client_id_;
+        bool should_apply = true;
+        bool should_notify = true;
+        applyVersionedLocked(entry, addr, own, should_apply, should_notify);
         auto const& payload = entry.payload();
-        buf.insert(buf.end(), payload.begin(), payload.end());
-        if (remote_listener_) {
+        if (should_apply) {
+          auto& buf = file_buffers_[fn];
+          buf.insert(buf.end(), payload.begin(), payload.end());
+        }
+        if (should_notify && remote_listener_) {
           notify = true;
           notify_op = RemoteOp::kAppend;
           notify_file = fn;
@@ -601,6 +616,136 @@ void CorfuDBStorage::reconcilePendingFrontLocked(std::string const& fileName) {
     lst.pop_front();
   }
   if (lst.empty()) pending_.erase(pit);
+}
+
+// Version effects of one APPEND entry, run with mtx_ held at the
+// entry's position in the apply loop. Every replica executes this for
+// every entry in address order (own entries included — the tailer
+// parses them even when their bytes-apply was handled by the writer's
+// reconcile), so key_versions_ is identical everywhere and a
+// conditional entry's accept/reject is deterministic.
+bool CorfuDBStorage::applyVersionedLocked(::CorfuEntry const& entry, long addr,
+                                          bool own, bool& should_apply_bytes,
+                                          bool& should_notify) {
+  std::string const& fn = entry.file_name();
+  bool tracked = isVersionTracked(fn);
+
+  if (!entry.conditional()) {
+    // Unconditional APPEND keeps today's apply semantics: the writer
+    // self-applied its own bytes, peers apply here. A blind write also
+    // resets has_value — its value is not tracked in the map, so a
+    // reader of this key goes back to the file-scan path.
+    should_apply_bytes = !own;
+    should_notify = !own;
+    if (tracked && entry.has_payload() && !entry.payload().empty()) {
+      std::vector<google::protobuf::Message*> messages;
+      protobuf::deserializeMessages(
+          reinterpret_cast<unsigned char*>(
+              const_cast<char*>(entry.payload().data())),
+          entry.payload().size(), messages,
+          []() -> google::protobuf::Message* { return new Record(); });
+      for (auto* msg : messages) {
+        Record* rec = static_cast<Record*>(msg);
+        KeyVersion& kv = key_versions_[rec->key()];
+        kv.addr = addr;
+        kv.has_value = false;
+        kv.deleted = rec->type() == kTypeDeletion;
+        kv.value.clear();
+        delete rec;
+      }
+    }
+    return true;
+  }
+
+  // Conditional (CAS) APPEND: payload is exactly one Record. A parse
+  // failure or malformed entry rejects — deterministically, since every
+  // replica sees the same bytes. Accepted entries keep the record's
+  // value inline in the map so readers get an atomic (value, version)
+  // pair independent of file visibility.
+  bool accepted = false;
+  should_apply_bytes = false;
+  should_notify = false;
+  if (tracked && entry.has_payload() && !entry.payload().empty()) {
+    std::vector<google::protobuf::Message*> messages;
+    protobuf::deserializeMessages(
+        reinterpret_cast<unsigned char*>(
+            const_cast<char*>(entry.payload().data())),
+        entry.payload().size(), messages,
+        []() -> google::protobuf::Message* { return new Record(); });
+    if (messages.size() == 1) {
+      Record* rec = static_cast<Record*>(messages[0]);
+      long expected = entry.has_expected_version()
+                          ? static_cast<long>(entry.expected_version())
+                          : -1;
+      auto it = key_versions_.find(rec->key());
+      long current = it == key_versions_.end() ? -1 : it->second.addr;
+      if (current == expected) {
+        accepted = true;
+        KeyVersion& kv = key_versions_[rec->key()];
+        kv.addr = addr;
+        kv.has_value = true;
+        kv.deleted = rec->type() == kTypeDeletion;
+        kv.value = rec->has_value() ? rec->value() : std::string();
+        should_apply_bytes = true;
+        should_notify = true;
+      }
+    }
+    for (auto* msg : messages) delete msg;
+  }
+  if (own) {
+    cas_outcomes_[addr] = accepted;
+  }
+  return accepted;
+}
+
+Status CorfuDBStorage::appendConditional(std::string const& fileName,
+                                         unsigned char const* data, int length,
+                                         int64_t expected_version,
+                                         int64_t& result_version) {
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (sealed_files_.count(fileName)) return Status::kSealed;
+  }
+
+  // No pending_ placeholder and no self-apply: the entry's effect is
+  // decided at its log position by the apply loop, ours included. The
+  // bytes become locally readable only if the tailer accepts them.
+  JNIEnv* env = attachThread();
+  if (!env) return Status::kFailure;
+  long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND, data,
+                             length, /*conditional=*/true,
+                             static_cast<long>(expected_version));
+  if (addr < 0) return Status::kFailure;
+  long prev = last_written_addr_.load(std::memory_order_acquire);
+  while (addr > prev &&
+         !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+  }
+
+  std::unique_lock<std::mutex> lock(mtx_);
+  waitForTailerLocked(lock, addr);
+  auto it = cas_outcomes_.find(addr);
+  if (it == cas_outcomes_.end()) {
+    // Only reachable when waitForTailerLocked bailed on shutdown
+    // (running_ false) before the tailer applied our entry.
+    return Status::kFailure;
+  }
+  bool accepted = it->second;
+  cas_outcomes_.erase(it);
+  result_version = static_cast<int64_t>(addr);
+  return accepted ? Status::kSuccess : Status::kCasConflict;
+}
+
+bool CorfuDBStorage::versionedLookup(std::string const& key, int64_t& version,
+                                     std::string& value, bool& has_value,
+                                     bool& deleted) {
+  std::lock_guard<std::mutex> lk(mtx_);
+  auto it = key_versions_.find(key);
+  if (it == key_versions_.end()) return false;
+  version = static_cast<int64_t>(it->second.addr);
+  has_value = it->second.has_value;
+  deleted = it->second.deleted;
+  if (has_value) value = it->second.value;
+  return true;
 }
 
 Status CorfuDBStorage::append(std::string const& fileName, unsigned char* const& data, int length) {

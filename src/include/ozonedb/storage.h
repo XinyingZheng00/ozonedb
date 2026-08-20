@@ -20,7 +20,10 @@ namespace ozonedb {
 enum class Status { kSuccess,
                     kFailure,
                     kSealed,
-                    kNotFound };
+                    kNotFound,
+                    // Conditional append lost: the key's version at the
+                    // entry's log position differed from expected_version.
+                    kCasConflict };
 
 // Signalled by shared-log backends (e.g. Corfu) when a *remote* writer
 // appends/removes a file entry. Lets the LogHandler maintain a key
@@ -121,6 +124,39 @@ class Storage {
    * override. Should be called once before reads begin.
    */
   virtual void setRemoteAppendListener(RemoteAppendListener /*listener*/) {}
+
+  /**
+   * @brief Conditionally append one serialized Record to a data-log file.
+   *
+   * The append takes effect only if the record's key still has version
+   * `expected_version` (the global log address of its last accepted
+   * write; -1 = key must be unwritten) at the point the entry lands in
+   * the shared log. Blocks until the outcome is decided. On kSuccess,
+   * result_version is the key's new version. Only shared-log backends
+   * can order the check; the default is unsupported.
+   */
+  virtual Status appendConditional(std::string const& /*fileName*/,
+                                   unsigned char const* /*data*/, int /*length*/,
+                                   int64_t /*expected_version*/,
+                                   int64_t& /*result_version*/) {
+    return Status::kFailure;
+  }
+
+  /**
+   * @brief Look up a key in the log-ordered version map.
+   *
+   * Returns false when the backend doesn't track versions or the key has
+   * never been written. On true: version is the log address of the last
+   * accepted write; when has_value is set the map also carries the
+   * record's value (kept for keys written via appendConditional) and
+   * value/deleted describe that record — an atomic (value, version) pair
+   * for read-modify-write callers.
+   */
+  virtual bool versionedLookup(std::string const& /*key*/, int64_t& /*version*/,
+                               std::string& /*value*/, bool& /*has_value*/,
+                               bool& /*deleted*/) {
+    return false;
+  }
 
 #include <unistd.h>  // For fsync()
   int GetFileDescriptor(std::filebuf& filebuf) {

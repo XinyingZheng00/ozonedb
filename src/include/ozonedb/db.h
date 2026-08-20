@@ -158,6 +158,45 @@ class DB {
    */
   Status get(std::string const& key, std::string const*& value,
              std::shared_ptr<Record>& guard);
+
+  /**
+   * @brief read the value and version of a key for read-modify-write
+   *
+   * The version is the global log address of the key's last accepted
+   * write, suitable as compareAndPut's expected_version. Fences on the
+   * shared log tail before reading, so the pair reflects every write
+   * acked before the call. version is -1 when the key has never been
+   * written (or the backend doesn't track versions).
+   *
+   * @param key
+   * @param value    output: copy of the value bytes
+   * @param version  output: the key's version, -1 if unwritten
+   * @return Status  kNotFound when the key is absent or deleted
+   */
+  Status getVersioned(std::string const& key, std::string& value,
+                      int64_t& version);
+
+  /**
+   * @brief conditionally put: succeeds only if the key's version is
+   * still expected_version at the write's position in the shared log
+   *
+   * The condition is evaluated deterministically by every replica's
+   * apply loop, so a successful compareAndPut is totally ordered
+   * against all concurrent writes to the key — a get/compareAndPut
+   * retry loop is an atomic read-modify-write. Requires a shared-log
+   * backend (Corfu); other backends return kFailure. Concurrent blind
+   * put()s to the same key are not ordered by the check (a put always
+   * wins); keys managed via CAS should be written only via CAS after
+   * the initial seed.
+   *
+   * @param key
+   * @param expected_version  version from getVersioned, -1 = key unwritten
+   * @param value
+   * @param new_version  output: the key's version after a successful put
+   * @return Status kSuccess | kCasConflict | kFailure
+   */
+  Status compareAndPut(std::string const& key, int64_t expected_version,
+                       std::string const& value, int64_t& new_version);
 };
 }  // namespace ozonedb
 #endif  // DB_H

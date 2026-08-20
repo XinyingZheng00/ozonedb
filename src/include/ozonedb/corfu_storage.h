@@ -41,7 +41,8 @@ class CorfuDBStorage : public Storage {
                  std::string const& jar_path,
                  std::string const& jvm_opts,
                  std::string const& stream_name,
-                 std::string const& db_path);
+                 std::string const& db_path,
+                 std::string const& log_prefix = "datalog");
   ~CorfuDBStorage();
 
   void createDirectory(std::string name) override;
@@ -56,6 +57,13 @@ class CorfuDBStorage : public Storage {
   bool isSealed(std::string fileName) override;
   void remove(std::string fileName) override;
   bool exist(std::string fileName) override;
+  Status appendConditional(std::string const& fileName,
+                           unsigned char const* data, int length,
+                           int64_t expected_version,
+                           int64_t& result_version) override;
+  bool versionedLookup(std::string const& key, int64_t& version,
+                       std::string& value, bool& has_value,
+                       bool& deleted) override;
 
   void setSyncMode(bool sync) { sync_mode_ = sync; }
   void setRemoteAppendListener(RemoteAppendListener listener) override {
@@ -93,6 +101,33 @@ class CorfuDBStorage : public Storage {
   std::unordered_map<std::string, std::vector<unsigned char>> file_buffers_;
   std::unordered_set<std::string> sealed_files_;
   std::unordered_set<std::string> removed_files_;
+
+  // Data-log file prefix ("datalog") — the apply loop parses APPEND
+  // payloads under this prefix as Records to maintain key_versions_.
+  std::string log_prefix_;
+
+  // Log-ordered per-key version map, guarded by mtx_. addr is the global
+  // log address of the key's last *accepted* write — every replica's
+  // apply loop computes the identical map because entries are evaluated
+  // in address order, own entries included (they are parsed for version
+  // tracking even when their byte-apply is skipped). For keys last
+  // written by an accepted conditional entry the record's value rides
+  // along (has_value), giving readers an atomic (value, version) pair
+  // that never depends on file visibility. Rebuilt from the stream on
+  // every open by drainInitialEntries, so it is complete, not a cache.
+  struct KeyVersion {
+    long addr = -1;
+    bool has_value = false;
+    bool deleted = false;
+    std::string value;
+  };
+  std::unordered_map<std::string, KeyVersion> key_versions_;
+
+  // Outcome of this process's own conditional appends, keyed by log
+  // address; recorded by the apply loop, consumed (erased) by
+  // appendConditional after its waitForTailerLocked returns. Guarded by
+  // mtx_. Bounded: one in-flight entry per concurrent CAS caller.
+  std::unordered_map<long, bool> cas_outcomes_;
 
   // Pending batched writes (same role as AzureBlobStorage::cached_file)
   std::unordered_map<std::string, std::vector<unsigned char>> cached_file_;
@@ -172,7 +207,19 @@ class CorfuDBStorage : public Storage {
   void detachThread();
   void loadBridge(std::string const& endpoint, std::string const& stream_name);
   long jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
-                      unsigned char const* data, int length);
+                      unsigned char const* data, int length,
+                      bool conditional = false, long expected_version = -1);
+  // True for files whose APPEND payloads are parsed for version
+  // tracking (data-log files: "<log_prefix_>/N").
+  bool isVersionTracked(std::string const& file_name) const {
+    return file_name.compare(0, log_prefix_.size(), log_prefix_) == 0;
+  }
+  // Parse + evaluate + (maybe) apply one entry's version effects.
+  // Called by applyEntryBytes with mtx_ held. Returns whether a
+  // conditional entry was accepted (true for unconditional).
+  bool applyVersionedLocked(::CorfuEntry const& entry, long addr,
+                            bool own, bool& should_apply_bytes,
+                            bool& should_notify);
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
   // Core apply logic, takes already-JNI-extracted bytes. Shared by
   // applyEntryFromJava (single-entry path, kept for drainInitialEntries)

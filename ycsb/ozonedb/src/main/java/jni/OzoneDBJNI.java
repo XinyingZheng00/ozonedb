@@ -65,4 +65,20 @@ public class OzoneDBJNI {
   public native void put(String key, byte[] value);
   public native byte[] get(String key);
   public native void remove(String key);
+
+  /**
+   * Versioned read for read-modify-write: null when the key is absent, else an
+   * 8-byte big-endian version (the key's global log address, -1 = unwritten)
+   * followed by the value bytes. The pair comes from one fenced lookup, so the
+   * version is safe to feed straight into {@link #casPut}.
+   */
+  public native byte[] getVersioned(String key);
+
+  /**
+   * Conditional put: takes effect only if the key's version at the write's
+   * position in the shared log still equals expectedVersion. Returns the new
+   * version (&gt;= 0) on success, -2 on a version conflict (re-read and
+   * retry), -1 on failure. Corfu backend only.
+   */
+  public native long casPut(String key, byte[] value, long expectedVersion);
 }

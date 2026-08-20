@@ -36,6 +36,10 @@ import java.util.Map;
  *       skipped, matching the cr-sqlite probe.
  *   <li>counter-worker: --increments read-modify-write increments of --key
  *       (get, +1, put), optionally paced at --rate; emit worker-N.json.
+ *       With --cas true the RMW is atomic: getVersioned pairs the value
+ *       with its log-address version and casPut is accepted only if the
+ *       key is still at that version, so lost increments are impossible
+ *       and conflicts are retried (and counted).
  *   <li>put-long / get-long: seed or read one 8-byte counter value.
  *   <li>hash: md5 over (key,value) for every --sample-every'th key of the
  *       YCSB keyspace (user + FNV hash, the workloads' insertorder=hashed
@@ -109,6 +113,13 @@ public final class ConsistencyProbe {
       return -1L;
     }
     return ByteBuffer.wrap(v, 0, 8).getLong();
+  }
+
+  private static long decodeLongAt(byte[] v, int offset) {
+    if (v == null || v.length < offset + 8) {
+      return -1L;
+    }
+    return ByteBuffer.wrap(v, offset, 8).getLong();
   }
 
   /**
@@ -216,20 +227,47 @@ public final class ConsistencyProbe {
     int workerIdx = Integer.parseInt(req(flags, "worker"));
     String outDir = req(flags, "out-dir");
 
+    boolean cas = Boolean.parseBoolean(flags.getOrDefault("cas", "false"));
+
     OzoneDBJNI db = open(flags);
     barrier(flags);
 
     long periodNs = rate > 0 ? (long) (1e9 / rate) : 0;
     long t0 = System.nanoTime();
     long acked = 0;
+    long conflicts = 0;
     long lastWritten = -1;
     for (long i = 0; i < increments; i++) {
-      long seen = decodeLong(db.get(key));
-      if (seen < 0) {
-        seen = 0;
+      if (cas) {
+        // Atomic RMW: retry until this increment's conditional put wins.
+        // -2 means another worker advanced the version between our read
+        // and our write's log position — re-read and try again. Nothing
+        // is ever silently overwritten.
+        while (true) {
+          byte[] vv = db.getVersioned(key);
+          long version = decodeLong(vv);
+          long seen = decodeLongAt(vv, 8);
+          if (seen < 0) {
+            seen = 0;
+          }
+          long r = db.casPut(key, encodeLong(seen + 1), version);
+          if (r >= 0) {
+            lastWritten = seen + 1;
+            break;
+          }
+          if (r != -2) {
+            throw new IllegalStateException("casPut backend failure at increment " + i);
+          }
+          conflicts++;
+        }
+      } else {
+        long seen = decodeLong(db.get(key));
+        if (seen < 0) {
+          seen = 0;
+        }
+        lastWritten = seen + 1;
+        db.put(key, encodeLong(lastWritten));
       }
-      lastWritten = seen + 1;
-      db.put(key, encodeLong(lastWritten));
       acked++;
       sleepNs(periodNs);
     }
@@ -239,9 +277,11 @@ public final class ConsistencyProbe {
     try (PrintWriter w = new PrintWriter(new File(outDir, "worker-" + workerIdx + ".json"), "UTF-8")) {
       w.println("{\"worker\": " + workerIdx + ", \"acked\": " + acked
           + ", \"last_written\": " + lastWritten
+          + ", \"cas\": " + cas + ", \"conflicts\": " + conflicts
           + ", \"elapsed_s\": " + String.format("%.3f", elapsedS) + "}");
     }
-    System.out.println("{\"worker\": " + workerIdx + ", \"acked\": " + acked + "}");
+    System.out.println("{\"worker\": " + workerIdx + ", \"acked\": " + acked
+        + ", \"conflicts\": " + conflicts + "}");
   }
 
   private static void putLong(Map<String, String> flags) {

@@ -31,7 +31,7 @@ Storage* makeStorage(BackendKind kind, Metadata const& md, bool for_sstables) {
 #ifdef OZONEDB_ENABLE_CORFU
       return new CorfuDBStorage(md.corfu_endpoint, md.corfu_jar_path,
                                 md.corfu_jvm_opts, md.corfu_stream_name,
-                                md.DBpath);
+                                md.DBpath, md.log_prefix);
 #else
       throw std::runtime_error(
           "OzoneDB was built without CorfuDB support (rebuild with "
@@ -213,6 +213,51 @@ Status DB::remove(std::string const& key) {
   record.set_key(key);
   record.set_type(kTypeDeletion);
   this->log_handler->addRecord(record);
+  return Status::kSuccess;
+}
+
+Status DB::compareAndPut(std::string const& key, int64_t expected_version,
+                         std::string const& value, int64_t& new_version) {
+  Record record;
+  record.set_key(key);
+  record.set_value(value);
+  record.set_type(kTypeValue);
+  return log_handler->addRecordConditional(record, expected_version, new_version);
+}
+
+Status DB::getVersioned(std::string const& key, std::string& value,
+                        int64_t& version) {
+  // Fence first: syncView blocks until the local tailer has applied at
+  // least up to the global log tail sampled now, so the version map
+  // reflects every write acked before this call — including our own
+  // (globalFenceTarget takes max with last_written_addr_). Runs
+  // regardless of the linearizable_reads config; CAS callers need this
+  // freshness unconditionally.
+  metadata_log->syncView();
+
+  version = -1;
+  bool has_value = false;
+  bool deleted = false;
+  if (log_storage->versionedLookup(key, version, value, has_value, deleted)) {
+    if (has_value) {
+      // Key last written by an accepted CAS: the map carries value and
+      // version from the same log entry — an atomic pair.
+      return deleted ? Status::kNotFound : Status::kSuccess;
+    }
+  }
+
+  // Key last written by a blind put (or unknown to the backend): the
+  // value comes from the normal read path. The version was read first,
+  // so the value can only be same-or-newer than the version — a stale
+  // pairing makes a subsequent compareAndPut fail (never wrongly
+  // succeed), and the caller retries with a fresh read.
+  std::string const* vptr = nullptr;
+  std::shared_ptr<Record> guard;
+  Status s = get(key, vptr, guard);
+  if (s != Status::kSuccess) {
+    return version >= 0 ? Status::kNotFound : s;
+  }
+  value = *vptr;
   return Status::kSuccess;
 }
 

@@ -108,6 +108,36 @@ Status LogHandler::addRecord(Record const& record) {
   return Status::kSuccess;
 }
 
+Status LogHandler::addRecordConditional(Record const& record,
+                                        int64_t expected_version,
+                                        int64_t& new_version) {
+  int buffer_size;
+  unsigned char* buffer = protobuf::serializeMessage(record, buffer_size);
+  if (this->active_unit.empty()) {
+    newTail();
+  }
+
+  // Only kSealed retries here — no post-append tail check like
+  // addRecord's. That check re-issues a record whose bytes landed past
+  // a LOGCREATE-frozen file size and became invisible to scans;
+  // re-issuing a CAS that was already accepted would double-apply it.
+  // An accepted conditional record doesn't need file visibility anyway:
+  // reads of CAS-written keys are served from the storage's key-version
+  // map, which tracks the acceptance itself.
+  Status s = Status::kFailure;
+  constexpr int kMaxSealRetries = 8;
+  for (int attempt = 0; attempt <= kMaxSealRetries; ++attempt) {
+    s = this->storage->appendConditional(this->active_unit, buffer,
+                                         buffer_size, expected_version,
+                                         new_version);
+    if (s != Status::kSealed) break;
+    newTail();
+  }
+
+  delete[] buffer;
+  return s;
+}
+
 bool LogHandler::tryIndexLookup(std::string const& key, std::shared_ptr<Record>& record) {
   if (!key_index_) return false;
   auto hit = key_index_->lookup(key);

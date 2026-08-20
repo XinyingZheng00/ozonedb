@@ -52,6 +52,18 @@ message CorfuEntry {
   // so entries written before this field existed still parse; those
   // entries just fall through to the unconditional-apply branch.
   optional uint64 client_id = 4;
+  // Conditional append (compare-and-swap). The payload must be exactly
+  // one serialized Record; the entry takes effect only if the key's
+  // version at this entry's log position equals expected_version. The
+  // check runs in every replica's tailer against the log-ordered
+  // key-version map, so all replicas accept or reject identically. A
+  // conditional entry is never self-applied by its writer — the writer
+  // learns the outcome from its own tailer (CorfuDBStorage::
+  // appendConditional).
+  optional bool conditional = 5;
+  // Expected version for a conditional entry: the global log address of
+  // the entry that last wrote the key, or -1 if the key must be unwritten.
+  optional sint64 expected_version = 6;
 }
 
 message TaskRecord {
