@@ -22,7 +22,10 @@ JOBS="$(nproc 2>/dev/null || echo 4)"
 sudo mkdir -p /tank && sudo chmod 777 /tank
 
 cmake -B "$OZONEDB_HOME/build" -S "$OZONEDB_HOME" -DOZONEDB_ENABLE_CORFU=ON
-cmake --build "$OZONEDB_HOME/build" -j"$JOBS"
+# Only the targets a YCSB run loads. The default `all` also builds
+# runUnitTests, whose sources have drifted from the current Table::get
+# signature and fail to compile -- that must not block a bench deploy.
+cmake --build "$OZONEDB_HOME/build" -j"$JOBS" --target OzoneDB --target ozonedb_jni
 
 cd "$OZONEDB_HOME/ycsb"
 mvn -pl site.ycsb:ozonedb-binding -am package -DskipTests

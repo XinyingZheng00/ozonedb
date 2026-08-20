@@ -18,7 +18,14 @@ rsync_excludes_base:
   - --exclude=**/target/
   - --exclude=**/__pycache__/
   - --exclude=ozonedb-jni-maven/native/src/main/cpp/lib/
-  - --exclude=ycsb/workloads/
+  # Anchored, and only the node-generated files. The old unanchored
+  # "ycsb/workloads/" also matched the *Java package directory*
+  # ycsb/core/src/main/java/site/ycsb/workloads/ -- rsync matches
+  # inner-slash patterns against the END of the path -- which silently
+  # dropped CoreWorkload et al. and broke the core build on freshly
+  # bootstrapped nodes. The workload template files are needed on nodes
+  # by generate_workload.py, so only generated_workloads/ stays local.
+  - --exclude=/ycsb/workloads/generated_workloads/
   - --exclude=bench/results/
   - --exclude=src/include/ozonedb/protobuf/
   - --exclude=.claude/

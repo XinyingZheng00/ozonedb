@@ -3,18 +3,10 @@
 #
 # Consumed by bench/scripts/local/* and bench/ansible/*, always through
 # bench/scripts/ycsb_config.py rather than yaml.safe_load directly.
-#
-# There is no schema and no validation: every value is used exactly as written,
-# so SHAPES MATTER. Where a scalar and a list are not interchangeable it is
-# called out inline.
 # ===========================================================================
 
 # --------------------------------------------------------------- defaults --
-# Merged into local.load and local.run below via YAML merge keys (`<<:`), which
-# yaml.safe_load expands before any script sees them -- so this is a pure-config
-# change with no code behind it. These five keys used to be written out twice
-# and had to be kept in sync by hand. Override any of them for one phase by
-# re-stating the key inside that phase.
+# Merged into local.load and local.run below via YAML merge keys (`<<:`),
 defaults: &defaults
   key_size: ["1KB"]
   db_name: ["ozonedb-corfu"]
@@ -42,13 +34,7 @@ local:
     # Unset or 0 means runs are bounded only by operation_cnt.
     max_exec_time: 300
 
-    # Writer-process counts. All three were absent before, which meant the
-    # single-node and multi-node runners disagreed about the default: a missing
-    # num_writers gave run_local_ycsb_multiproc.py 2, while
-    # run_multinode_ycsb.py resolves writers_per_host -> num_writers -> 1 and so
-    # got 1. Stated explicitly here at the values that were previously in
-    # effect. Note run_multinode_ycsb_with_corfu.sh passes --writers_per_host on
-    # every iteration of its sweep, so this is only the fallback.
+    # Writer-process counts.
     num_writers: 2 # single-node runner
     writers_per_host: 1 # multi-node runner, per host
     trial: 1
@@ -74,46 +60,34 @@ local:
 # public names to drive a sweep from your laptop.
 nodes:
   ssh_user: "oliverr3"
-  ssh_private_key_path: "~/.ssh/cloudlab"
+  ssh_private_key_path: "~/.ssh/id_ed25519"
 
-  # Shared log. Also the -a bind address for corfu_server.
+  # CorfuDB
   log:
+    ssh: "amd110.utah.cloudlab.us"
     lan: "10.10.1.3"
-    # ssh: "<public name of the log node>"
 
-  # SSTable object store (MinIO).
+  # Object Store
   store:
-    lan: "10.10.1.2"
-    # ssh: "<public name of the store node>"
+    ssh: "amd110.utah.cloudlab.us"
+    lan: "10.10.1.3"
 
-  # YCSB writer nodes. `ssh` is required; `lan` is documentation for now.
-  # A bare string is shorthand for {ssh: ...}.
   clients:
-    - ssh: "ms0917.utah.cloudlab.us"
-    - ssh: "ms0943.utah.cloudlab.us"
+    - ssh: "amd233.utah.cloudlab.us"
+      lan: "10.10.1.1"
+    - ssh: "amd236.utah.cloudlab.us"
+      lan: "10.10.1.2"
 
 # ------------------------------------------------------------------ corfu --
-# Only consumed when db_name includes "ozonedb-corfu". The bridge jar path is
-# derived from $OZONEDB_HOME/ozonedb-jni-maven/corfu-bridge/target/ and is not
-# configured here.
-#
-# `endpoint` is NOT set here -- it is derived as nodes.log.lan:port. Setting it
-# by hand is rejected at load time rather than silently shadowing nodes:.
 corfu:
   port: 9090
   stream_name: "ozonedb-ycsb"
   jvm_opts: "-Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 --add-opens=java.base/java.util=ALL-UNNAMED"
 
 # --------------------------------------------------------------------- s3 --
-# S3-compatible store for SSTables (paper §3.5 split). Any S3 API works: AWS,
-# MinIO, R2, Wasabi, SeaweedFS, B2. `bash bench/scripts/setup.sh --role minio`
+# S3-compatible store for SSTables
+# `bash bench/scripts/setup.sh --role minio`
 # provisions this on a node and creates the bucket named below.
-#
-# access_key/secret_key are MinIO's throwaway defaults, not credentials worth
-# protecting. Point endpoint at a real S3 and they become real -- move them to
-# the environment at that point rather than committing them.
-#
-# `endpoint` is NOT set here -- it is derived as scheme://nodes.store.lan:port.
 s3:
   scheme: "http"
   port: 9000

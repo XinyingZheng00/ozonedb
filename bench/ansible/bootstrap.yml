@@ -40,7 +40,6 @@
     run_setup: true
     include_git: true
     delete: false
-    # setup.sh's CorfuDB build dominates; 2h is a ceiling, not an expectation.
     setup_timeout: 7200
 
   tasks:
@@ -85,8 +84,6 @@
       register: setup_result
       changed_when: true
       when: run_setup | bool
-      # Detached: a laptop's SSH session should not have to survive a CorfuDB
-      # build for the provisioning to succeed.
       async: "{{ setup_timeout }}"
       poll: 30
 

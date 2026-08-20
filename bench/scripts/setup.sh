@@ -18,9 +18,10 @@
 #     source 8 is deprecated and being removed in newer JDKs.
 #   * corfu-bridge targets Java 11, so anything running it needs JDK >= 11.
 #   * CorfuDB itself is built with a much newer JDK (setup_corfu.sh used 25).
-# So --jdk (default 17) is the node's persistent JAVA_HOME, and --corfu-jdk
-# (default 25) is used only for the CorfuDB build. Both fall back through a
-# candidate list if the exact apt package is unavailable.
+# So --jdk (default 25) is the node's persistent JAVA_HOME, and --corfu-jdk
+# (default 25) is used only for the CorfuDB build. Since the pinned CorfuDB
+# emits Java 25 bytecode, every JVM that touches its jars needs 25+; javac 25
+# still accepts YCSB's -source 8 with warnings.
 
 set -euo pipefail
 
@@ -28,14 +29,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 ROLES=()
-JDK_VERSION=""
-CORFU_JDK_VERSION=""
-JDK_FALLBACKS=(17 21 11 25)
+# CorfuDB at the pinned commit below compiles with -target 25, so every JVM
+# that loads its jars -- the YCSB client, the ConsistencyProbe, the embedded
+# JVM in libozonedb, and corfu_server itself -- must be JDK 25+. That makes
+# 25 the default for BOTH knobs; javac 25 still accepts YCSB's -source 8
+# (with warnings). Override with --jdk / --corfu-jdk if CorfuDB moves.
+JDK_VERSION="25"
+CORFU_JDK_VERSION="25"
+JDK_FALLBACKS=(25 21 17 11)
 CORFU_JDK_FALLBACKS=(25 21 17)
 DO_BUILD=1
 DO_CORFU_RUNTIME=1
 CORFU_REPO="https://github.com/CorfuDB/CorfuDB.git"
 CORFU_CLONE_DIR="${CLONE_DIR:-$HOME/CorfuDB}"
+# The commit install_corfu_runtime checks out: the last 0.9.1.0-SNAPSHOT
+# commit (2026-05-28), matching corfu-bridge's <corfu.version> pin. HEAD has
+# moved to 0.9.2.0-SNAPSHOT, which the bridge's pom cannot resolve.
+CORFU_COMMIT="8f144d4c92535dfe5fad8e1a5c9ddaba5b7ad8d5"
+CORFU_MVN_VERSION="0.9.1.0-SNAPSHOT"
 CORFU_DATA_DIR="/mnt/corfu"
 TANK_DIR="/tank"
 MINIO_DATA_DIR="/tank/minio"
@@ -221,11 +232,15 @@ ensure_jdk() {
     fi
   done
 
-  apt_update_once
+  # This function's stdout IS its return value (callers use "$(ensure_jdk ...)"),
+  # so everything chatty must go to stderr. Letting apt print to stdout here
+  # corrupted the captured version string and killed the script silently via
+  # set -e on fresh nodes -- the "dies right after installing a JDK" bug.
+  apt_update_once >&2
   for v in "${candidates[@]}"; do
     if apt_available "openjdk-${v}-jdk"; then
-      log "installing openjdk-${v}-jdk"
-      sudo apt-get install -y "openjdk-${v}-jdk"
+      log "installing openjdk-${v}-jdk" >&2
+      sudo apt-get install -y "openjdk-${v}-jdk" >&2
       java_home_for "$v" >/dev/null && {
         echo "$v"
         return 0
@@ -298,7 +313,10 @@ EOF
 # CMake builds it under -DOZONEDB_ENABLE_CORFU=ON -- needs CorfuDB installed
 # locally first.
 corfu_runtime_present() {
-  compgen -G "$HOME/.m2/repository/org/corfudb/runtime/*/runtime-*.jar" >/dev/null 2>&1
+  # Version-aware: an ~/.m2 populated by a different CorfuDB commit (e.g. an
+  # unpinned HEAD build) must not satisfy this check, or the bridge build
+  # fails resolving its pinned <corfu.version>.
+  [[ -f "$HOME/.m2/repository/org/corfudb/runtime/$CORFU_MVN_VERSION/runtime-$CORFU_MVN_VERSION.jar" ]]
 }
 
 install_corfu_runtime() {
@@ -318,10 +336,21 @@ install_corfu_runtime() {
   else
     log "reusing existing CorfuDB checkout at $CORFU_CLONE_DIR"
   fi
+  log "pinning CorfuDB to $CORFU_COMMIT ($CORFU_MVN_VERSION)"
+  (cd "$CORFU_CLONE_DIR" &&
+    { git cat-file -e "$CORFU_COMMIT^{commit}" 2>/dev/null || git fetch origin; } &&
+    git checkout -q "$CORFU_COMMIT")
 
-  # Phase 4 pins this to a commit SHA; today it tracks whatever HEAD was
-  # cloned, which is the main remaining reproducibility gap in this script.
-  (cd "$CORFU_CLONE_DIR" && JAVA_HOME="$corfu_java_home" mvn -q clean install -DskipTests)
+  # The tail of the reactor (integration-test modules like `it`) does not
+  # always compile at HEAD; everything we consume -- org.corfudb:runtime in
+  # ~/.m2 and the shaded infrastructure jar bin/corfu_server runs -- builds
+  # earlier, so a late reactor failure is survivable as long as the runtime
+  # actually landed.
+  if ! (cd "$CORFU_CLONE_DIR" && JAVA_HOME="$corfu_java_home" mvn -q clean install -DskipTests); then
+    corfu_runtime_present ||
+      die "CorfuDB build failed before installing org.corfudb:runtime into ~/.m2"
+    warn "CorfuDB reactor failed after the runtime was installed (flaky integration-test modules at HEAD) -- continuing"
+  fi
   log "CorfuDB runtime installed into ~/.m2"
 }
 
@@ -342,8 +371,12 @@ role_client() {
 
   wire_env "$java_home"
 
-  log "installing python requirements"
-  python3 -m pip install --quiet --user -r "$SCRIPT_DIR/requirements.txt"
+  # Ubuntu 24.04 marks the system python externally-managed (PEP 668), so
+  # `pip install --user` refuses to run. The bench needs are small enough to
+  # come from apt instead; requirements.txt stays as documentation and for
+  # anyone running the harness inside a venv.
+  log "installing python requirements (via apt; PEP 668 blocks pip --user)"
+  apt_install python3-yaml python3-matplotlib python3-numpy
 
   log "ensuring $TANK_DIR exists and is writable"
   sudo mkdir -p "$TANK_DIR"
@@ -391,16 +424,10 @@ role_corfu_server() {
 
   apt_install maven git
 
-  local corfu_jdk corfu_java_home
-  corfu_jdk="$(ensure_jdk "$CORFU_JDK_VERSION" "${CORFU_JDK_FALLBACKS[@]}")"
-  corfu_java_home="$(java_home_for "$corfu_jdk")"
-  log "CorfuDB JDK $corfu_jdk ($corfu_java_home)"
-
-  if [[ ! -d "$CORFU_CLONE_DIR/.git" ]]; then
-    log "cloning CorfuDB into $CORFU_CLONE_DIR"
-    git clone "$CORFU_REPO" "$CORFU_CLONE_DIR"
-  fi
-  (cd "$CORFU_CLONE_DIR" && JAVA_HOME="$corfu_java_home" mvn -q clean install -DskipTests)
+  # Same present-check + clone + build (with the late-reactor-failure guard)
+  # the client role uses; the server additionally needs the shaded
+  # infrastructure jar, which builds before the runtime lands in ~/.m2.
+  install_corfu_runtime
 
   # run_ycsb_with_corfu.sh resets run_batch from load on every server start:
   #   rm -rf $CORFU_DATA_DIR/run_batch && cp -r $CORFU_DATA_DIR/load $CORFU_DATA_DIR/run_batch
