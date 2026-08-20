@@ -7,8 +7,15 @@ p50 35.2 ms, P[stale] = 0 past 100 ms. ozonedb (amd121/105/123 cluster,
 at rate 100, visibility p50 ≈ 2–2.7 ms; `linearizable_reads` **0/280 and
 0/1257 missed** at ~0.2–0.8 ms/get premium (p50 3.5 / 2.1 ms), 0 timeouts
 everywhere. Figure: crsqlite repo `plot/out/visibility_rate20.pdf`.
-Remaining: matrix row 3 sweeps (cr-sqlite interval sweep, more rates) and
-phase 2 (cross-node reader).
+
+**Phase 2 (cross-node) validated 2026-08-20:** writer amd121, reader
+amd105, TCP notify. Default engine 1/281 missed (0.4%), visibility p50
+2.6 ms (referenced to reader-side notify receipt — writer/reader
+CLOCK_MONOTONIC domains are incomparable, and the miss count needs no
+clocks at all); `linearizable_reads` **0/279 missed**, p50 3.0 ms, 0
+timeouts. Cross-node adds no artifacts vs same-host. Driver:
+`bash run_visibility_cross_node.sh [--linearizable] --rate 20 --duration 15`.
+Remaining: matrix row 3 sweeps (cr-sqlite interval sweep, more rates).
 
 ## Context and goal
 
