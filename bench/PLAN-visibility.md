@@ -15,7 +15,15 @@ CLOCK_MONOTONIC domains are incomparable, and the miss count needs no
 clocks at all); `linearizable_reads` **0/279 missed**, p50 3.0 ms, 0
 timeouts. Cross-node adds no artifacts vs same-host. Driver:
 `bash run_visibility_cross_node.sh [--linearizable] --rate 20 --duration 15`.
-Remaining: matrix row 3 sweeps (cr-sqlite interval sweep, more rates).
+**Sweeps validated 2026-08-20 (matrix rows 3-4 done — plan complete):**
+ozonedb rates 5/20/100/300 (achieved tops out ≈211/s: rate = 1/(period +
+put latency)): `linearizable_reads` **0 misses at every rate** (0/73,
+0/280, 0/1257, 0/3188) — the zero is load-invariant; default 1.4%/0.4%/
+0.2%/0.2%. cr-sqlite sync-interval sweep 10/50/200 ms at rate 20:
+visibility p50 7.7/25.8/104 ms ≈ interval/2 (log-log linear), miss rate
+~100% throughout — staleness is structural, set by the config knob.
+Figure: crsqlite repo `plot/out/visibility_sweep.pdf`
+(`plot_consistency.py visibility-sweep <dirs...>`).
 
 ## Context and goal
 
