@@ -3,15 +3,21 @@ package site.ycsb.db;
 import jni.OzoneDBJNI;
 import site.ycsb.workloads.CoreWorkload;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 
 /**
  * Standalone driver for the consistency experiments, mirroring the
@@ -36,6 +42,17 @@ import java.util.Map;
  *       skipped, matching the cr-sqlite probe.
  *   <li>counter-worker: --increments read-modify-write increments of --key
  *       (get, +1, put), optionally paced at --rate; emit worker-N.json.
+ *   <li>insert-probe: insert brand-new YCSB-keyspace keys at --rate for
+ *       --duration-s; after each put() returns, append "i,t_ack_ns" to
+ *       --notify-file (flushed per line) and record it in inserts.csv.
+ *       Touches --done-file when finished. New keys make "not found" an
+ *       unambiguous staleness signal: there is no older value to serve.
+ *   <li>visibility-probe: tail --notify-file; each notified key joins a
+ *       pending set that is polled every --poll-ms until found (or
+ *       --key-timeout-s). The first get per key necessarily starts after
+ *       the writer's ack (ack -&gt; notify -&gt; get), so a first-get miss is
+ *       a read-latest violation with no clock comparison involved. Emits
+ *       visibility.csv with per-key ack/notify/first/found timestamps.
  *   <li>put-long / get-long: seed or read one 8-byte counter value.
  *   <li>hash: md5 over (key,value) for every --sample-every'th key of the
  *       YCSB keyspace (user + FNV hash, the workloads' insertorder=hashed
@@ -244,6 +261,170 @@ public final class ConsistencyProbe {
     System.out.println("{\"worker\": " + workerIdx + ", \"acked\": " + acked + "}");
   }
 
+  private static void insertProbe(Map<String, String> flags) throws Exception {
+    double rate = Double.parseDouble(flags.getOrDefault("rate", "20"));
+    long durationS = Long.parseLong(req(flags, "duration-s"));
+    int valueSize = Integer.parseInt(flags.getOrDefault("value-size", "1000"));
+    String outDir = req(flags, "out-dir");
+    String notifyPath = req(flags, "notify-file");
+    String donePath = req(flags, "done-file");
+
+    OzoneDBJNI db = open(flags);
+    barrier(flags);
+
+    Random rnd = new Random(42);
+    byte[] value = new byte[Math.max(8, valueSize)];
+    long periodNs = (long) (1e9 / rate);
+    long deadline = System.nanoTime() + durationS * 1_000_000_000L;
+    List<long[]> inserts = new ArrayList<>();
+    long i = 0;
+    // Autoflush PrintWriter: each println pushes the full line (with its
+    // newline) through to the file in one flush, so the tailing reader
+    // never sees a torn line under normal conditions (it also guards
+    // against partial lines itself).
+    try (PrintWriter notify = new PrintWriter(new FileWriter(notifyPath), true)) {
+      while (System.nanoTime() < deadline) {
+        String key = CoreWorkload.buildKeyName(i, 1, false);
+        rnd.nextBytes(value);
+        ByteBuffer.wrap(value).putLong(i);
+        db.put(key, value);
+        long tAck = System.nanoTime();
+        inserts.add(new long[]{i, tAck});
+        notify.println(i + "," + tAck);
+        i++;
+        sleepNs(periodNs);
+      }
+    }
+    try (PrintWriter w = new PrintWriter(new File(outDir, "inserts.csv"), "UTF-8")) {
+      w.println("idx,t_ack_ns");
+      for (long[] ins : inserts) {
+        w.println(ins[0] + "," + ins[1]);
+      }
+    }
+    new File(donePath).createNewFile();
+    db.closeDB();
+    System.out.println("{\"inserts\": " + i + "}");
+  }
+
+  // Column slots of a visibility-probe per-key record.
+  private static final int VIS_IDX = 0;
+  private static final int VIS_T_ACK = 1;
+  private static final int VIS_T_NOTIFY = 2;
+  private static final int VIS_T_FIRST = 3;
+  private static final int VIS_FOUND_FIRST = 4;
+  private static final int VIS_T_FOUND = 5;
+  private static final int VIS_ATTEMPTS = 6;
+
+  private static void visibilityProbe(Map<String, String> flags) throws Exception {
+    String outDir = req(flags, "out-dir");
+    String notifyPath = req(flags, "notify-file");
+    String donePath = req(flags, "done-file");
+    long pollMs = Long.parseLong(flags.getOrDefault("poll-ms", "1"));
+    long keyTimeoutNs = Long.parseLong(flags.getOrDefault("key-timeout-s", "30"))
+        * 1_000_000_000L;
+    long runTimeoutS = Long.parseLong(flags.getOrDefault("run-timeout-s", "600"));
+
+    OzoneDBJNI db = open(flags);
+    barrier(flags);
+
+    File notifyFile = new File(notifyPath);
+    File doneFile = new File(donePath);
+    BufferedReader notify = null;
+    StringBuilder partial = new StringBuilder();
+    // Insertion-ordered so per-tick checks walk keys oldest-first.
+    LinkedHashMap<Long, long[]> pending = new LinkedHashMap<>();
+    List<long[]> results = new ArrayList<>();
+    long runDeadline = System.nanoTime() + runTimeoutS * 1_000_000_000L;
+
+    while (true) {
+      if (notify == null && notifyFile.exists()) {
+        notify = new BufferedReader(new FileReader(notifyFile));
+      }
+      // Drain complete notify lines. Char-by-char with a persistent
+      // remainder: readLine() would hand us a torn line at EOF and lose
+      // its tail when the writer's flush completes.
+      if (notify != null) {
+        while (notify.ready()) {
+          int ch = notify.read();
+          if (ch == -1) {
+            break;
+          }
+          if (ch != '\n') {
+            partial.append((char) ch);
+            continue;
+          }
+          String line = partial.toString();
+          partial.setLength(0);
+          int comma = line.indexOf(',');
+          if (comma <= 0) {
+            continue;
+          }
+          long idx = Long.parseLong(line.substring(0, comma));
+          long tAck = Long.parseLong(line.substring(comma + 1).trim());
+          pending.put(idx, new long[]{idx, tAck, System.nanoTime(), -1, 0, -1, 0});
+        }
+      }
+
+      Iterator<Map.Entry<Long, long[]>> it = pending.entrySet().iterator();
+      while (it.hasNext()) {
+        long[] r = it.next().getValue();
+        long tStart = System.nanoTime();
+        byte[] v = db.get(CoreWorkload.buildKeyName(r[VIS_IDX], 1, false));
+        r[VIS_ATTEMPTS]++;
+        if (r[VIS_T_FIRST] < 0) {
+          r[VIS_T_FIRST] = tStart;
+          r[VIS_FOUND_FIRST] = v != null ? 1 : 0;
+        }
+        if (v != null) {
+          r[VIS_T_FOUND] = System.nanoTime();
+          results.add(r);
+          it.remove();
+        } else if (tStart - r[VIS_T_NOTIFY] > keyTimeoutNs) {
+          results.add(r);
+          it.remove();
+        }
+      }
+
+      boolean drained = notify != null && !notify.ready() && partial.length() == 0;
+      if (doneFile.exists() && drained && pending.isEmpty()) {
+        break;
+      }
+      if (System.nanoTime() > runDeadline) {
+        System.err.println("visibility-probe run timeout with "
+            + pending.size() + " keys still pending");
+        results.addAll(pending.values());
+        break;
+      }
+      sleepNs(pollMs * 1_000_000L);
+    }
+    if (notify != null) {
+      notify.close();
+    }
+    db.closeDB();
+
+    long missesFirst = 0;
+    long timeouts = 0;
+    for (long[] r : results) {
+      if (r[VIS_FOUND_FIRST] == 0) {
+        missesFirst++;
+      }
+      if (r[VIS_T_FOUND] < 0) {
+        timeouts++;
+      }
+    }
+    try (PrintWriter w = new PrintWriter(new File(outDir, "visibility.csv"), "UTF-8")) {
+      w.println("idx,t_ack_ns,t_notify_ns,t_first_ns,found_first,t_found_ns,attempts");
+      for (long[] r : results) {
+        w.println(r[VIS_IDX] + "," + r[VIS_T_ACK] + "," + r[VIS_T_NOTIFY] + ","
+            + r[VIS_T_FIRST] + "," + r[VIS_FOUND_FIRST] + "," + r[VIS_T_FOUND]
+            + "," + r[VIS_ATTEMPTS]);
+      }
+    }
+    System.out.println("{\"checked\": " + results.size()
+        + ", \"misses_first\": " + missesFirst
+        + ", \"timeouts\": " + timeouts + "}");
+  }
+
   private static void putLong(Map<String, String> flags) {
     OzoneDBJNI db = open(flags);
     db.put(req(flags, "key"), encodeLong(Long.parseLong(req(flags, "value"))));
@@ -333,7 +514,8 @@ public final class ConsistencyProbe {
   public static void main(String[] args) throws Exception {
     if (args.length == 0) {
       System.err.println("usage: ConsistencyProbe <write-probe|read-probe|counter-worker"
-          + "|put-long|get-long|hash> --config <shared_config.json> [--flag value ...]");
+          + "|insert-probe|visibility-probe|put-long|get-long|hash>"
+          + " --config <shared_config.json> [--flag value ...]");
       System.exit(2);
     }
     Map<String, String> flags = parseFlags(args, 1);
@@ -346,6 +528,12 @@ public final class ConsistencyProbe {
       break;
     case "counter-worker":
       counterWorker(flags);
+      break;
+    case "insert-probe":
+      insertProbe(flags);
+      break;
+    case "visibility-probe":
+      visibilityProbe(flags);
       break;
     case "put-long":
       putLong(flags);

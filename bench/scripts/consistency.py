@@ -19,6 +19,7 @@ so it neither disturbs nor replays the benchmark stream.
 
   python3 consistency.py probe-staleness --write-rate 20 --duration 30
   python3 consistency.py check-lost-updates --workers 2 --increments 2000
+  python3 consistency.py check-visibility --rate 20 --duration 15
   python3 consistency.py check-convergence --record-count 1000000 --sample 1000
 """
 
@@ -332,6 +333,120 @@ def cmd_probe_staleness(cfg, args):
     )
 
 
+# ================================================================= visibility
+
+# PBS-curve age buckets (ms): P[stale at age a] = P[visibility latency > a],
+# the complementary CDF of B1's latency, so one run yields the whole curve.
+PBS_AGES_MS = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+
+
+def cmd_check_visibility(cfg, args):
+    """Two benchmarks from one run over YCSB-keyspace inserts (PBS-style,
+    see bench/PLAN-visibility.md). A writer inserts brand-new keys and acks
+    each into a notify file; a reader polls every acked key until it
+    appears. B2 (miss rate): did the reader's FIRST get -- which starts
+    after the ack by construction, no clocks involved -- find the key?
+    B1 (t-visibility): how long after the ack until some get found it?
+    New keys make "not found" unambiguous staleness: no older value can
+    masquerade as success."""
+    out = _outdir("visibility")
+    tag = os.path.basename(out).split("-", 1)[1]
+    stream = args.stream or f"{cfg['corfu']['stream_name']}-vis-{tag}"
+    _kill_stale_probes()
+    cfgs = _make_configs(cfg, stream, 2, f"visibility-{tag}",
+                         linearizable=args.linearizable)
+    cp = _classpath(args.rebuild)
+
+    ready_w = os.path.join(out, "ready-writer")
+    ready_r = os.path.join(out, "ready-reader")
+    go = os.path.join(out, "go")
+    notify = os.path.join(out, "notify.csv")
+    done = os.path.join(out, "done")
+    writer_cmd = _probe_cmd(cp, "insert-probe", {
+        "config": cfgs[0], "ready-file": ready_w, "go-file": go,
+        "out-dir": out, "notify-file": notify, "done-file": done,
+        "rate": args.rate, "duration-s": args.duration,
+        "value-size": args.value_size,
+    })
+    reader_cmd = _probe_cmd(cp, "visibility-probe", {
+        "config": cfgs[1], "ready-file": ready_r, "go-file": go,
+        "out-dir": out, "notify-file": notify, "done-file": done,
+        "poll-ms": args.poll_ms, "key-timeout-s": args.key_timeout_s,
+        "run-timeout-s": args.duration + args.key_timeout_s + 120,
+    })
+
+    procs = [
+        _spawn(writer_cmd, os.path.join(out, "writer.log")),
+        _spawn(reader_cmd, os.path.join(out, "reader.log")),
+    ]
+    try:
+        _wait_ready_then_go(out, [ready_w, ready_r], procs)
+        _wait_all(procs)
+    finally:
+        _reap(procs)
+
+    rows = []
+    with open(os.path.join(out, "visibility.csv")) as f:
+        next(f)
+        for line in f:
+            rows.append([int(x) for x in line.strip().split(",")])
+    checked = len(rows)
+    misses = sum(1 for r in rows if r[4] == 0)
+    timeouts = sum(1 for r in rows if r[5] < 0)
+    vis_ms = [(r[5] - r[1]) / 1e6 for r in rows if r[5] >= 0]
+    first_age_ms = [(r[3] - r[1]) / 1e6 for r in rows if r[3] >= 0]
+    notify_lag_ms = [(r[2] - r[1]) / 1e6 for r in rows]
+    # Timeouts count as "still stale at every age" so they push the curve
+    # up instead of silently vanishing from it.
+    pbs = [
+        {
+            "age_ms_le": a,
+            "p_stale": ((sum(1 for v in vis_ms if v > a) + timeouts) / checked)
+            if checked else 0.0,
+        }
+        for a in PBS_AGES_MS
+    ]
+
+    summary = {
+        "engine": ENGINE + ("-linearizable" if args.linearizable else ""),
+        "linearizable_reads": args.linearizable,
+        "inserts": checked,
+        "checked": checked,
+        "misses_first_read": misses,
+        "miss_first_read_fraction": (misses / checked) if checked else 0.0,
+        "timeouts": timeouts,
+        "visibility_ms_p50": round(_pct(vis_ms, 50), 3),
+        "visibility_ms_p90": round(_pct(vis_ms, 90), 3),
+        "visibility_ms_p95": round(_pct(vis_ms, 95), 3),
+        "visibility_ms_p99": round(_pct(vis_ms, 99), 3),
+        "visibility_ms_max": round(max(vis_ms), 3) if vis_ms else 0.0,
+        "first_check_age_ms_p50": round(_pct(first_age_ms, 50), 3),
+        "first_check_age_ms_p99": round(_pct(first_age_ms, 99), 3),
+        "notify_lag_ms_p50": round(_pct(notify_lag_ms, 50), 4),
+        "pbs": pbs,
+        "sync_interval_ms": 0,
+        "rate_per_s": args.rate,
+        "duration_s": args.duration,
+        "value_size": args.value_size,
+        "poll_ms": args.poll_ms,
+        "stream": stream,
+    }
+    with open(os.path.join(out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(json.dumps(summary, indent=2))
+    if args.linearizable and misses == 0 and timeouts == 0:
+        verdict = ("0 first-read misses -- every key was visible on the first "
+                   "get issued after its ack (read-latest holds)")
+    elif args.linearizable:
+        verdict = (f"{misses} first-read misses / {timeouts} timeouts UNDER "
+                   "linearizable_reads -- should be impossible; check logs")
+    else:
+        verdict = (f"{misses} of {checked} first reads missed "
+                   f"({summary['miss_first_read_fraction']:.1%}); "
+                   f"visibility p50 {summary['visibility_ms_p50']} ms")
+    print(f"\n=> {verdict}. Results in {out}")
+
+
 # =============================================================== lost updates
 
 
@@ -522,6 +637,18 @@ def main():
                     help="seconds to wait before the final read")
     sp.add_argument("--stream", default=None)
 
+    sp = sub.add_parser("check-visibility",
+                        help="insert visibility: retry-until-found latency "
+                             "+ first-read miss rate (PBS-style)")
+    sp.add_argument("--rate", type=float, default=20.0, help="inserts/s")
+    sp.add_argument("--duration", type=int, default=15, help="insert phase seconds")
+    sp.add_argument("--value-size", type=int, default=1000, help="value bytes")
+    sp.add_argument("--poll-ms", type=int, default=1,
+                    help="reader poll interval (bounds B1 resolution)")
+    sp.add_argument("--key-timeout-s", type=int, default=30,
+                    help="give up on a key after this long (>> sync interval)")
+    sp.add_argument("--stream", default=None)
+
     sp = sub.add_parser("check-convergence",
                         help="hash a key sample on N fresh instances of one stream")
     sp.add_argument("--record-count", type=int, default=None,
@@ -539,6 +666,8 @@ def main():
         cmd_probe_staleness(cfg, args)
     elif args.cmd == "check-lost-updates":
         cmd_check_lost_updates(cfg, args)
+    elif args.cmd == "check-visibility":
+        cmd_check_visibility(cfg, args)
     elif args.cmd == "check-convergence":
         cmd_check_convergence(cfg, args)
 

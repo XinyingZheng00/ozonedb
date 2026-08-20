@@ -1,5 +1,13 @@
 # Plan: YCSB-shaped visibility benchmarks (branch `visibility`)
 
+**Status (2026-08-20):** phase 1 implemented — probe modes, `check-visibility`
+in consistency.py, cr-sqlite mirror + `visibility` plot in the crsqlite repo.
+The cr-sqlite side ran end-to-end locally (50 ms sync: 94/94 first reads
+missed, visibility p50 35.2 ms, P[stale] = 0 past 100 ms — exactly the
+predicted interval-bound behavior). The ozonedb side compiles (mvn +
+checkstyle clean) and awaits cluster re-provisioning for rows 1–2 and 4–5 of
+the validation matrix. Phase 2 (cross-node reader) not started.
+
 ## Context and goal
 
 VLDB reviews ask for an empirical OzoneKV vs cr-sqlite comparison (R3-D3),
