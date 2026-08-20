@@ -1,12 +1,14 @@
 # Plan: YCSB-shaped visibility benchmarks (branch `visibility`)
 
-**Status (2026-08-20):** phase 1 implemented — probe modes, `check-visibility`
-in consistency.py, cr-sqlite mirror + `visibility` plot in the crsqlite repo.
-The cr-sqlite side ran end-to-end locally (50 ms sync: 94/94 first reads
-missed, visibility p50 35.2 ms, P[stale] = 0 past 100 ms — exactly the
-predicted interval-bound behavior). The ozonedb side compiles (mvn +
-checkstyle clean) and awaits cluster re-provisioning for rows 1–2 and 4–5 of
-the validation matrix. Phase 2 (cross-node reader) not started.
+**Status (2026-08-20):** phase 1 implemented and validated. cr-sqlite
+(laptop, 50 ms sync, rate 20): 94/94 first reads missed (100%), visibility
+p50 35.2 ms, P[stale] = 0 past 100 ms. ozonedb (amd121/105/123 cluster,
+15 s runs): default engine 1/282 missed (0.4%) at rate 20 and 2/1269 (0.2%)
+at rate 100, visibility p50 ≈ 2–2.7 ms; `linearizable_reads` **0/280 and
+0/1257 missed** at ~0.2–0.8 ms/get premium (p50 3.5 / 2.1 ms), 0 timeouts
+everywhere. Figure: crsqlite repo `plot/out/visibility_rate20.pdf`.
+Remaining: matrix row 3 sweeps (cr-sqlite interval sweep, more rates) and
+phase 2 (cross-node reader).
 
 ## Context and goal
 
