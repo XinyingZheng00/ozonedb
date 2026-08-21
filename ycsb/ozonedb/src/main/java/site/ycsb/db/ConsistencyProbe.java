@@ -480,6 +480,7 @@ public final class ConsistencyProbe {
     long keyTimeoutNs = Long.parseLong(flags.getOrDefault("key-timeout-s", "30"))
         * 1_000_000_000L;
     long runTimeoutS = Long.parseLong(flags.getOrDefault("run-timeout-s", "600"));
+    boolean tickFence = Boolean.parseBoolean(flags.getOrDefault("tick-fence", "false"));
 
     OzoneDBJNI db = open(flags);
 
@@ -545,6 +546,13 @@ public final class ConsistencyProbe {
         drainNotifyFiles(notifyFiles, notifies, partials, pending);
       }
 
+      // Per-tick batch fence (--tick-fence, strict runs): one fence
+      // covers every pending get below, the cr-sqlite /barrier analog.
+      // ack -> notify -> fence -> get, so miss counting is unchanged.
+      boolean fenced = tickFence && !pending.isEmpty();
+      if (fenced) {
+        db.sync();
+      }
       Iterator<Map.Entry<Long, long[]>> it = pending.entrySet().iterator();
       while (it.hasNext()) {
         long[] r = it.next().getValue();
@@ -563,6 +571,9 @@ public final class ConsistencyProbe {
           results.add(r);
           it.remove();
         }
+      }
+      if (fenced) {
+        db.clearSync();
       }
 
       boolean done;

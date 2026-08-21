@@ -47,6 +47,22 @@ JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get
 JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove
   (JNIEnv *, jobject, jstring);
 
+/*
+ * Class:     jni_OzoneDBJNI
+ * Method:    sync
+ * Signature: ()V
+ */
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_sync
+  (JNIEnv *, jobject);
+
+/*
+ * Class:     jni_OzoneDBJNI
+ * Method:    clearSync
+ * Signature: ()V
+ */
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_clearSync
+  (JNIEnv *, jobject);
+
 #ifdef __cplusplus
 }
 #endif

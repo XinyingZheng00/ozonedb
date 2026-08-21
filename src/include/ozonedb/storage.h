@@ -139,6 +139,11 @@ class Storage {
    */
   virtual void sync() {}
   virtual void clearSync() {}
+  // True when the CALLING THREAD holds a live sync() token for this
+  // storage. Lets DB::get reuse a caller-established fence (batch
+  // strict reads: one fence amortized over many gets, each linearized
+  // at the caller's sync() point) instead of stacking its own.
+  virtual bool hasSyncToken() const { return false; }
 
   // RAII for the sync() token: clears it on scope exit so early
   // returns and exceptions in the caller can't leak the fence.

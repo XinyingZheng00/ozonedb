@@ -378,6 +378,12 @@ def cmd_check_visibility(cfg, args):
         "config": cfgs[n], "ready-file": ready_r, "go-file": go,
         "out-dir": out, "notify-file": ",".join(notify_files),
         "done-file": done,
+        # Strict runs fence once per tick and share it across the whole
+        # pending batch (DB::sync) -- the cr-sqlite /barrier analog.
+        # Without it each get fences individually and the reader's ~ms
+        # service time queues at high writer counts, inflating the tail
+        # with probe-side waiting (misses are unaffected either way).
+        "tick-fence": "true" if args.linearizable else "false",
         "poll-ms": args.poll_ms, "key-timeout-s": args.key_timeout_s,
         "run-timeout-s": args.duration + args.key_timeout_s + 120,
     }), os.path.join(out, "reader.log"))
@@ -399,6 +405,7 @@ def cmd_check_visibility(cfg, args):
         "rate_per_s": args.rate,
         "writers": n,
         "aggregate_rate_per_s": n * args.rate,
+        "tick_fence": bool(args.linearizable),
         "duration_s": args.duration,
         "value_size": args.value_size,
         "poll_ms": args.poll_ms,

@@ -29,9 +29,19 @@ Figure: crsqlite repo `plot/out/visibility_sweep.pdf`
 W ∈ {2,4,8,16} writers at 20/s each, 15 s, disjoint key ranges, one reader.
 ozonedb `linearizable_reads` (one-fence): **0 misses at every W** (0/567,
 0/1128, 0/2260, 0/4456), visibility p50 flat 2.3/4.3/3.5/5.6 ms — writers
-share one log, so the reader's fence cost is writer-count-independent
-(p99 grows to 390 ms at W=16: single reader polling 320 keys/s, tail is
-reader-side). cr-sqlite-syncread (fenced, 50 ms interval, the other
+share one log, so the reader's fence cost is writer-count-independent.
+The first cut's W=16 tail (p99 390 ms) was probe-side queueing: every
+key was found on its FIRST get (max attempts 1 across all 8k+ keys), and
+p99 of (first-get-issued − notify) was 247 ms — the single-threaded
+reader fencing per get (~1.5 ms each) saturated at 320 keys/s. Fixed
+with the per-tick batch fence (`DB::sync`/`clearSync` + JNI, probe
+`--tick-fence`, on for `--linearizable` runs): one fence per tick shared
+by the whole pending batch — the exact mirror of cr-sqlite-syncread's
+per-tick `/barrier`, so the comparison is also methodologically
+symmetric now. Rerun (tick_fence=true in the summaries): still 0 misses
+and first-get-finds everywhere; W=16 p90/p99/max 14.1/84.4/140 ms (was
+30/390/—), residual tail is local scan work + 17 JVMs sharing the box,
+not sequencer round-trips. cr-sqlite-syncread (fenced, 50 ms interval, the other
 0-miss config): p50 4.5/5.1/11.4/**82 ms**, p99 1.29 **s** at W=16 — the
 /barrier pull round contacts all W peers, so fenced reads degrade with
 the mesh. cr-sqlite async 10/50/200 ms: ~100% first-read misses at every

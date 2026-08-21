@@ -71,6 +71,7 @@ class CorfuDBStorage : public Storage {
   // against a token from one CorfuDBStorage leaking into another.
   void sync() override;
   void clearSync() override;
+  bool hasSyncToken() const override { return fence_token_.instance == this; }
 
   void setRemoteAppendListener(RemoteAppendListener listener) override {
     bool cleared;

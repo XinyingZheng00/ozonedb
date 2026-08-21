@@ -204,7 +204,10 @@ unfenced key-index probe in `readRecord` is bypassed, the log scan runs inline o
 (the token is thread-local, and post-fence reads are local-memory splices), and a post-scan size
 check on `metadata.log` retries the get if a LOGCREATE/COMPACT was applied mid-scan (otherwise a
 peer compaction's REMOVE can make a key transiently invisible; retries reuse the original fence).
-The end-to-end guarantee assumes the sync write defaults (`commit_interval_ = 0`,
+`DB::sync()`/`clearSync()` (JNI: `OzoneDBJNI.sync`/`clearSync`) expose the fence as a batch API:
+one fence on the calling thread, reused by every get until cleared — each read then linearizes at
+the sync() point (`DB::get` skips its own fence when the thread already holds a token). The
+end-to-end guarantee assumes the sync write defaults (`commit_interval_ = 0`,
 `sync_mode_ = true`).
 
 The returned `value` **aliases bytes inside the `guard` `shared_ptr<Record>`** — callers must keep

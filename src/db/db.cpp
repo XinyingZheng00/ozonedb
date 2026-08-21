@@ -209,6 +209,16 @@ Status DB::put(std::string const& key, std::string const& value) {
   return Status::kSuccess;
 }
 
+Status DB::sync() {
+  log_storage->sync();
+  return Status::kSuccess;
+}
+
+Status DB::clearSync() {
+  log_storage->clearSync();
+  return Status::kSuccess;
+}
+
 Status DB::remove(std::string const& key) {
   Record record;
   record.set_key(key);
@@ -263,9 +273,13 @@ Status DB::get(std::string const& key, std::string const*& value,
   // Metadata ops are rare (log rolls and compactions), so retries are
   // too; the cap only guards against a pathological storm, serving the
   // last result instead of spinning.
+  // A caller-established batch fence (DB::sync) takes precedence: when
+  // this thread already holds a token, the get linearizes at the
+  // caller's fence point instead of taking its own — one sequencer
+  // round-trip amortized over the caller's whole read batch.
   bool const strict = this->metadata->linearizable_reads;
   std::optional<Storage::SyncScope> fence;
-  if (strict) {
+  if (strict && !log_storage->hasSyncToken()) {
     fence.emplace(*log_storage);
   }
   constexpr int kStrictMaxAttempts = 5;
