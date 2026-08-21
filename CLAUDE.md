@@ -196,12 +196,16 @@ compaction task themselves and dispatch it to the thread pool.
 4. `SSTableHandler::readRecordFromAllLevel`.
 
 `linearizable_reads` (mutually exclusive with `trust_background_tail` — `Metadata` throws on both)
-makes every get strict: `MetadataLogHandler::syncView()` fences on the global log tail and rolls the
-view forward before the snapshot, the unfenced key-index probe in `readRecord` is bypassed, and a
-post-scan fenced size check on `metadata.log` retries the get if a LOGCREATE/COMPACT was sequenced
-mid-scan (otherwise a peer compaction's REMOVE can make a key transiently invisible). Costs ~2 extra
-fenced storage calls per get; the end-to-end guarantee assumes the sync write defaults
-(`commit_interval_ = 0`, `sync_mode_ = true`).
+makes every get strict, at the cost of exactly **one fence per get**: `DB::get` opens a
+`Storage::SyncScope` (one sequencer round-trip + tailer wait — the linearization point), which
+records a thread-local fence token that every later storage call in the get reuses instead of
+re-fencing; `MetadataLogHandler::syncView()` then rolls the view forward from local state, the
+unfenced key-index probe in `readRecord` is bypassed, the log scan runs inline on the caller thread
+(the token is thread-local, and post-fence reads are local-memory splices), and a post-scan size
+check on `metadata.log` retries the get if a LOGCREATE/COMPACT was applied mid-scan (otherwise a
+peer compaction's REMOVE can make a key transiently invisible; retries reuse the original fence).
+The end-to-end guarantee assumes the sync write defaults (`commit_interval_ = 0`,
+`sync_mode_ = true`).
 
 The returned `value` **aliases bytes inside the `guard` `shared_ptr<Record>`** — callers must keep
 the guard alive while dereferencing.

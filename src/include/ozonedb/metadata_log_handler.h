@@ -127,12 +127,15 @@ class MetadataLogHandler {
   // used by compaction module and put module
   View rollForwardMetadataLog();
 
-  // Fence + synchronous rollforward with no View copy. On the Corfu
-  // backend, readMetadataLog's first storage call samples the global
-  // sequencer tail and waits for the tailer to catch up, so one call
-  // both linearizes against the shared log and ingests every
-  // LOGCREATE/COMPACT sequenced before it — closing the ~100ms window
-  // of the background view thread. This is the per-get hook for
+  // Synchronous rollforward with no View copy: ingests every
+  // LOGCREATE/COMPACT the storage layer can currently see, closing the
+  // ~100ms window of the background view thread. Fencing is the
+  // storage layer's business: with no fence token on the calling
+  // thread, readMetadataLog's storage calls each fence on the global
+  // sequencer tail; under a Storage::SyncScope (the strict DB::get
+  // path) they reuse the caller's single fence and read local state.
+  // Either way the resulting view covers everything sequenced before
+  // the caller's fence point. This is the per-get hook for
   // Metadata::linearizable_reads; unlike rollForwardMetadataLog it
   // avoids the O(files) return-by-value copy (a known hot-path
   // regression) and skips the tail-size refresh (the strict read path

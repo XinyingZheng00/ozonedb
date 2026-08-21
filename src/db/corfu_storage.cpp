@@ -581,6 +581,32 @@ void CorfuDBStorage::waitForTailerLocked(std::unique_lock<std::mutex>& lock, lon
   });
 }
 
+thread_local CorfuDBStorage::FenceToken CorfuDBStorage::fence_token_;
+
+long CorfuDBStorage::fenceTargetForCaller() {
+  if (fence_token_.instance == this) return fence_token_.target;
+  return globalFenceTarget();
+}
+
+// The one fence of a strict get (see Storage::sync). Sequencer query +
+// tailer wait happen here once; subsequent fenced ops on this thread
+// reuse the recorded target, so their waitForTailerLocked is satisfied
+// immediately — everything sequenced before the fence is already in
+// the local buffers, and linearizability doesn't require observing
+// anything sequenced after it.
+void CorfuDBStorage::sync() {
+  long target = globalFenceTarget();
+  {
+    std::unique_lock<std::mutex> lock(mtx_);
+    waitForTailerLocked(lock, target);
+  }
+  fence_token_ = {this, target};
+}
+
+void CorfuDBStorage::clearSync() {
+  fence_token_ = {nullptr, -1};
+}
+
 void CorfuDBStorage::createDirectory(std::string /*name*/) {
   // No-op: Corfu has no directory concept.
 }
@@ -799,7 +825,7 @@ struct Segment {
 }  // namespace
 
 Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, size_t& size) {
-  long target = globalFenceTarget();
+  long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
   if (removed_files_.count(fileName)) return Status::kNotFound;
@@ -839,7 +865,7 @@ Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, s
 }
 
 Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) {
-  long target = globalFenceTarget();
+  long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
   if (removed_files_.count(fileName)) return Status::kNotFound;
@@ -890,7 +916,7 @@ Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, s
 }
 
 size_t CorfuDBStorage::size(std::string fileName) {
-  long target = globalFenceTarget();
+  long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
   if (removed_files_.count(fileName)) return 0;
@@ -967,7 +993,7 @@ void CorfuDBStorage::seal(std::string fileName) {
 }
 
 bool CorfuDBStorage::isSealed(std::string fileName) {
-  long target = globalFenceTarget();
+  long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
   return sealed_files_.count(fileName) > 0;
@@ -989,7 +1015,7 @@ void CorfuDBStorage::remove(std::string fileName) {
 }
 
 bool CorfuDBStorage::exist(std::string fileName) {
-  long target = globalFenceTarget();
+  long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
   if (removed_files_.count(fileName)) return false;

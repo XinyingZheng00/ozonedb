@@ -94,8 +94,11 @@ class Metadata {
   // metadata-log view forward before scanning, and the unfenced
   // key-index probe in LogHandler::readRecord is bypassed. This makes
   // reads strict (a get observes every put acked before it started, on
-  // any writer process) at the cost of two extra fenced storage calls
-  // per get. Mutually exclusive with trust_background_tail — the
+  // any writer process) at the cost of ONE fence per get: DB::get takes
+  // a Storage::SyncScope (sequencer round-trip + tailer wait), and
+  // every later storage call in the get reuses that thread-local fence
+  // token, reading already-synced local state instead of re-fencing.
+  // Mutually exclusive with trust_background_tail — the
   // constructor rejects configs that set both. The end-to-end guarantee
   // also assumes the write side keeps its sync defaults (every put is
   // sequenced in the log before it acks; see CorfuDBStorage::sync_mode_).

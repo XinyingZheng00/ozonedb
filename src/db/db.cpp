@@ -9,6 +9,7 @@
 #endif
 #include <algorithm>
 #include <cmath>
+#include <optional>
 namespace ozonedb {
 
 namespace {
@@ -234,28 +235,39 @@ Status DB::get(std::string const& key, std::string const*& value,
     }
   }
 
-  // Strict mode (linearizable_reads): each attempt fences + rolls the
-  // metadata log forward before taking the snapshot, then validates
-  // after the scan that no metadata operation was sequenced meanwhile.
-  // syncView's first storage call samples the global log tail and waits
-  // for the tailer, so the snapshot reflects every LOGCREATE/COMPACT —
-  // and the file scan every data-log byte — sequenced before this get
-  // began. Without it the view lags by the background thread's ~100ms
-  // cycle, which both hides a peer's freshly rolled tail file and,
-  // during a peer compaction, opens a window where a key is temporarily
-  // in neither the (removed) input log file nor the (not-yet-visible)
-  // output SSTable.
+  // Strict mode (linearizable_reads): ONE fence per get, taken here.
+  // SyncScope samples the global log tail and waits for the tailer
+  // once (the linearization point); it records a thread-local fence
+  // token, so every fenced storage call below on this thread —
+  // syncView's metadata-log reads, the tail probe in checkReadMoreLog,
+  // the data-log reads (run inline in strict mode, see readRecord),
+  // and the post-scan validation — reuses the token instead of paying
+  // its own sequencer round-trip. After the fence, everything
+  // sequenced before this get began is in local state, so those reads
+  // need no further freshness. Without any of this the view lags by
+  // the background thread's ~100ms cycle, which both hides a peer's
+  // freshly rolled tail file and, during a peer compaction, opens a
+  // window where a key is temporarily in neither the (removed) input
+  // log file nor the (not-yet-visible) output SSTable.
   //
   // The post-scan check closes that compaction window against ops
   // sequenced *after* our fence: the tailer applies entries in address
-  // order, so if it removed a log file under our scan, the COMPACT that
-  // precedes the REMOVE has already grown the local metadata log past
-  // view_offset — the fenced size() below sees it and we retry against
-  // the fresh view. Equal sizes mean no metadata op overlapped the scan
-  // and the result is valid. Metadata ops are rare (log rolls and
-  // compactions), so retries are too; the cap only guards against a
-  // pathological storm, serving the last result instead of spinning.
+  // order, so if it removed a log file under our scan, the COMPACT
+  // that precedes the REMOVE has already grown the LOCAL metadata log
+  // past view_offset — the (token-fenced, i.e. local) size() below
+  // sees it and we retry against the fresh view. Ops not yet applied
+  // locally cannot have disturbed a scan that only read local state,
+  // which is also why retries do NOT re-fence: they only need to
+  // ingest what the tailer already applied, and the original fence
+  // remains a valid linearization point inside this get's window.
+  // Metadata ops are rare (log rolls and compactions), so retries are
+  // too; the cap only guards against a pathological storm, serving the
+  // last result instead of spinning.
   bool const strict = this->metadata->linearizable_reads;
+  std::optional<Storage::SyncScope> fence;
+  if (strict) {
+    fence.emplace(*log_storage);
+  }
   constexpr int kStrictMaxAttempts = 5;
   for (int attempt = 0;; ++attempt) {
     size_t view_offset = 0;

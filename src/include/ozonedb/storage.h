@@ -122,6 +122,37 @@ class Storage {
    */
   virtual void setRemoteAppendListener(RemoteAppendListener /*listener*/) {}
 
+  /**
+   * @brief Establish a linearization fence for the CALLING THREAD.
+   *
+   * On shared-log backends this samples the log's global tail once,
+   * waits for local state to cover it, and records a thread-local
+   * fence token; until clearSync(), every read/size/exist/isSealed on
+   * this thread reuses the token instead of re-fencing (their answers
+   * are then served from already-synced local state). Default no-op:
+   * on direct backends (local FS, S3, Azure) reads hit the backing
+   * store, which is always "synced".
+   *
+   * Token scope is one logical operation (a strict DB::get). Always
+   * clear via SyncScope — a leaked token would silently unfence later
+   * operations on the same thread.
+   */
+  virtual void sync() {}
+  virtual void clearSync() {}
+
+  // RAII for the sync() token: clears it on scope exit so early
+  // returns and exceptions in the caller can't leak the fence.
+  class SyncScope {
+   public:
+    explicit SyncScope(Storage& storage) : storage_(storage) { storage_.sync(); }
+    ~SyncScope() { storage_.clearSync(); }
+    SyncScope(SyncScope const&) = delete;
+    SyncScope& operator=(SyncScope const&) = delete;
+
+   private:
+    Storage& storage_;
+  };
+
 #include <unistd.h>  // For fsync()
   int GetFileDescriptor(std::filebuf& filebuf) {
     class MyFileBuf : public std::filebuf {

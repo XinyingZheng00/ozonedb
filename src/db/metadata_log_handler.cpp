@@ -384,9 +384,11 @@ void MetadataLogHandler::refreshTailSizeUnlocked() {
 // See the header comment for the linearizable_reads role.
 size_t MetadataLogHandler::syncView() {
   // `target` is the metadata-log length observed by the first
-  // readMetadataLog — on Corfu that size() fences on the global
-  // sequencer tail, so it covers every operation sequenced before this
-  // call. The loop guards against the offset-CAS race: a loser's batch
+  // readMetadataLog — on Corfu that size() is fenced on the global
+  // sequencer tail (or served from state already synced to the
+  // caller's SyncScope fence), so it covers every operation sequenced
+  // before the caller's fence point. The loop guards against the
+  // offset-CAS race: a loser's batch
   // is discarded by readMetadataLog while the winner may have committed
   // less than our target, and returning then would publish a view short
   // of our fence. Iteration count is bounded in practice (offset is
