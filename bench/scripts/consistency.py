@@ -349,41 +349,56 @@ def cmd_check_visibility(cfg, args):
     out = _outdir("visibility")
     tag = os.path.basename(out).split("-", 1)[1]
     stream = args.stream or f"{cfg['corfu']['stream_name']}-vis-{tag}"
+    n = max(1, args.writers)
     _kill_stale_probes()
-    cfgs = _make_configs(cfg, stream, 2, f"visibility-{tag}",
+    # Writers 0..n-1, reader is instance n. Every writer shares the one
+    # Corfu stream (that's the point of the scaling experiment); disjoint
+    # --key-base ranges keep the keyspaces from colliding.
+    cfgs = _make_configs(cfg, stream, n + 1, f"visibility-{tag}",
                          linearizable=args.linearizable)
     cp = _classpath(args.rebuild)
 
-    ready_w = os.path.join(out, "ready-writer")
-    ready_r = os.path.join(out, "ready-reader")
     go = os.path.join(out, "go")
-    notify = os.path.join(out, "notify.csv")
     done = os.path.join(out, "done")
-    writer_cmd = _probe_cmd(cp, "insert-probe", {
-        "config": cfgs[0], "ready-file": ready_w, "go-file": go,
-        "out-dir": out, "notify-file": notify, "done-file": done,
-        "rate": args.rate, "duration-s": args.duration,
-        "value-size": args.value_size,
-    })
-    reader_cmd = _probe_cmd(cp, "visibility-probe", {
-        "config": cfgs[1], "ready-file": ready_r, "go-file": go,
-        "out-dir": out, "notify-file": notify, "done-file": done,
+    ready_r = os.path.join(out, "ready-reader")
+    ready_ws = [os.path.join(out, f"ready-writer-{w}") for w in range(n)]
+    notify_files = [os.path.join(out, f"notify-{w}.csv") for w in range(n)]
+
+    writer_procs = []
+    for w in range(n):
+        writer_procs.append(_spawn(_probe_cmd(cp, "insert-probe", {
+            "config": cfgs[w], "ready-file": ready_ws[w], "go-file": go,
+            "out-dir": out, "notify-file": notify_files[w],
+            "inserts-file": f"inserts-w{w}.csv",
+            "key-base": w * 10_000_000,
+            "rate": args.rate, "duration-s": args.duration,
+            "value-size": args.value_size,
+        }), os.path.join(out, f"writer-{w}.log")))
+    reader_proc = _spawn(_probe_cmd(cp, "visibility-probe", {
+        "config": cfgs[n], "ready-file": ready_r, "go-file": go,
+        "out-dir": out, "notify-file": ",".join(notify_files),
+        "done-file": done,
         "poll-ms": args.poll_ms, "key-timeout-s": args.key_timeout_s,
         "run-timeout-s": args.duration + args.key_timeout_s + 120,
-    })
-
-    procs = [
-        _spawn(writer_cmd, os.path.join(out, "writer.log")),
-        _spawn(reader_cmd, os.path.join(out, "reader.log")),
-    ]
+    }), os.path.join(out, "reader.log"))
+    procs = writer_procs + [reader_proc]
     try:
-        _wait_ready_then_go(out, [ready_w, ready_r], procs)
-        _wait_all(procs)
+        _wait_ready_then_go(out, ready_ws + [ready_r], procs)
+        # Writers no longer touch the done file themselves: with n of
+        # them, "done" means ALL writers have exited, which only the
+        # orchestrator can observe. The reader then drains every notify
+        # file to EOF before finishing.
+        _wait_all(writer_procs)
+        with open(done, "w"):
+            pass
+        _wait_all([reader_proc])
     finally:
         _reap(procs)
 
     _analyze_visibility(out, ENGINE, args.linearizable, cross_node=False, params={
         "rate_per_s": args.rate,
+        "writers": n,
+        "aggregate_rate_per_s": n * args.rate,
         "duration_s": args.duration,
         "value_size": args.value_size,
         "poll_ms": args.poll_ms,
@@ -641,7 +656,11 @@ def main():
     sp = sub.add_parser("check-visibility",
                         help="insert visibility: retry-until-found latency "
                              "+ first-read miss rate (PBS-style)")
-    sp.add_argument("--rate", type=float, default=20.0, help="inserts/s")
+    sp.add_argument("--rate", type=float, default=20.0,
+                    help="inserts/s PER WRITER (aggregate = writers x rate)")
+    sp.add_argument("--writers", type=int, default=1,
+                    help="concurrent writer processes, all on the one shared "
+                         "stream, disjoint key ranges (scaling experiments)")
     sp.add_argument("--duration", type=int, default=15, help="insert phase seconds")
     sp.add_argument("--value-size", type=int, default=1000, help="value bytes")
     sp.add_argument("--poll-ms", type=int, default=1,

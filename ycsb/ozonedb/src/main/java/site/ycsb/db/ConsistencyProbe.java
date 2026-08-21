@@ -278,6 +278,12 @@ public final class ConsistencyProbe {
     double rate = Double.parseDouble(flags.getOrDefault("rate", "20"));
     long durationS = Long.parseLong(req(flags, "duration-s"));
     int valueSize = Integer.parseInt(flags.getOrDefault("value-size", "1000"));
+    // Multi-writer runs give each writer a disjoint idx range (writer w
+    // starts at w * 10_000_000) so keys never collide and the reader's
+    // pending map needs no writer id -- idx alone identifies the key.
+    long keyBase = Long.parseLong(flags.getOrDefault("key-base", "0"));
+    // ... and a private inserts file, since all writers share --out-dir.
+    String insertsName = flags.getOrDefault("inserts-file", "inserts.csv");
     String outDir = req(flags, "out-dir");
     String notifyPath = flags.get("notify-file");
     String connect = flags.get("notify-connect");
@@ -313,7 +319,7 @@ public final class ConsistencyProbe {
     long periodNs = (long) (1e9 / rate);
     long deadline = System.nanoTime() + durationS * 1_000_000_000L;
     List<long[]> inserts = new ArrayList<>();
-    long i = 0;
+    long i = keyBase;
     while (System.nanoTime() < deadline) {
       String key = CoreWorkload.buildKeyName(i, 1, false);
       rnd.nextBytes(value);
@@ -331,7 +337,7 @@ public final class ConsistencyProbe {
     if (sock != null) {
       sock.close();
     }
-    try (PrintWriter w = new PrintWriter(new File(outDir, "inserts.csv"), "UTF-8")) {
+    try (PrintWriter w = new PrintWriter(new File(outDir, insertsName), "UTF-8")) {
       w.println("idx,t_ack_ns");
       for (long[] ins : inserts) {
         w.println(ins[0] + "," + ins[1]);
@@ -341,7 +347,7 @@ public final class ConsistencyProbe {
       new File(donePath).createNewFile();
     }
     db.closeDB();
-    System.out.println("{\"inserts\": " + i + "}");
+    System.out.println("{\"inserts\": " + (i - keyBase) + "}");
   }
 
   private static Socket connectWithRetry(String hostPort, long timeoutS) throws Exception {
@@ -390,6 +396,63 @@ public final class ConsistencyProbe {
       System.err.println("notify socket closed: " + e);
     }
     done.set(true);
+  }
+
+  /**
+   * Open any newly-appeared notify files and drain complete lines into the
+   * pending map. Char-by-char with a persistent per-file remainder:
+   * readLine() would hand us a torn line at EOF and lose its tail when the
+   * writer's flush completes.
+   */
+  private static void drainNotifyFiles(File[] notifyFiles, BufferedReader[] notifies,
+                                       StringBuilder[] partials,
+                                       LinkedHashMap<Long, long[]> pending) throws Exception {
+    for (int k = 0; k < notifyFiles.length; k++) {
+      if (notifies[k] == null && notifyFiles[k].exists()) {
+        notifies[k] = new BufferedReader(new FileReader(notifyFiles[k]));
+      }
+      if (notifies[k] == null) {
+        continue;
+      }
+      while (notifies[k].ready()) {
+        int ch = notifies[k].read();
+        if (ch == -1) {
+          break;
+        }
+        if (ch != '\n') {
+          partials[k].append((char) ch);
+          continue;
+        }
+        String line = partials[k].toString();
+        partials[k].setLength(0);
+        int comma = line.indexOf(',');
+        if (comma <= 0) {
+          continue;
+        }
+        long idx = Long.parseLong(line.substring(0, comma));
+        long tAck = Long.parseLong(line.substring(comma + 1).trim());
+        pending.put(idx, new long[]{idx, tAck, System.nanoTime(), -1, 0, -1, 0});
+      }
+    }
+  }
+
+  /**
+   * File-channel done test. The orchestrator touches done-file only after
+   * every writer has exited, so a notify file that still doesn't exist then
+   * belongs to a writer that died before its first ack -- skip it rather
+   * than spin until the run timeout.
+   */
+  private static boolean notifyFilesDrained(File[] notifyFiles, BufferedReader[] notifies,
+                                            StringBuilder[] partials) throws Exception {
+    for (int k = 0; k < notifyFiles.length; k++) {
+      if (!notifyFiles[k].exists()) {
+        continue;
+      }
+      if (notifies[k] == null || notifies[k].ready() || partials[k].length() > 0) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // Column slots of a visibility-probe per-key record.
@@ -445,10 +508,24 @@ public final class ConsistencyProbe {
     }
     barrier(flags);
 
-    File notifyFile = notifyPath != null ? new File(notifyPath) : null;
+    // --notify-file is a comma-separated list in multi-writer runs: one
+    // file per writer, each tailed independently with its own torn-line
+    // remainder. Writers use disjoint --key-base idx ranges, so the
+    // pending map stays keyed by idx alone.
+    File[] notifyFiles = null;
+    BufferedReader[] notifies = null;
+    StringBuilder[] partials = null;
+    if (notifyPath != null) {
+      String[] parts = notifyPath.split(",");
+      notifyFiles = new File[parts.length];
+      notifies = new BufferedReader[parts.length];
+      partials = new StringBuilder[parts.length];
+      for (int k = 0; k < parts.length; k++) {
+        notifyFiles[k] = new File(parts[k]);
+        partials[k] = new StringBuilder();
+      }
+    }
     File doneFile = donePath != null ? new File(donePath) : null;
-    BufferedReader notify = null;
-    StringBuilder partial = new StringBuilder();
     // Insertion-ordered so per-tick checks walk keys oldest-first.
     LinkedHashMap<Long, long[]> pending = new LinkedHashMap<>();
     List<long[]> results = new ArrayList<>();
@@ -464,32 +541,8 @@ public final class ConsistencyProbe {
           pending.put(a[0], new long[]{a[0], a[1], a[2], -1, 0, -1, 0});
         }
       }
-      if (notifyFile != null && notify == null && notifyFile.exists()) {
-        notify = new BufferedReader(new FileReader(notifyFile));
-      }
-      // Drain complete notify lines. Char-by-char with a persistent
-      // remainder: readLine() would hand us a torn line at EOF and lose
-      // its tail when the writer's flush completes.
-      if (notify != null) {
-        while (notify.ready()) {
-          int ch = notify.read();
-          if (ch == -1) {
-            break;
-          }
-          if (ch != '\n') {
-            partial.append((char) ch);
-            continue;
-          }
-          String line = partial.toString();
-          partial.setLength(0);
-          int comma = line.indexOf(',');
-          if (comma <= 0) {
-            continue;
-          }
-          long idx = Long.parseLong(line.substring(0, comma));
-          long tAck = Long.parseLong(line.substring(comma + 1).trim());
-          pending.put(idx, new long[]{idx, tAck, System.nanoTime(), -1, 0, -1, 0});
-        }
+      if (notifyFiles != null) {
+        drainNotifyFiles(notifyFiles, notifies, partials, pending);
       }
 
       Iterator<Map.Entry<Long, long[]>> it = pending.entrySet().iterator();
@@ -516,8 +569,8 @@ public final class ConsistencyProbe {
       if (arrivals != null) {
         done = socketDone.get() && arrivals.isEmpty();
       } else {
-        done = doneFile.exists() && notify != null && !notify.ready()
-            && partial.length() == 0;
+        done = doneFile.exists()
+            && notifyFilesDrained(notifyFiles, notifies, partials);
       }
       if (done && pending.isEmpty()) {
         break;
@@ -530,8 +583,12 @@ public final class ConsistencyProbe {
       }
       sleepNs(pollMs * 1_000_000L);
     }
-    if (notify != null) {
-      notify.close();
+    if (notifies != null) {
+      for (BufferedReader r : notifies) {
+        if (r != null) {
+          r.close();
+        }
+      }
     }
     if (sock != null) {
       sock.close();

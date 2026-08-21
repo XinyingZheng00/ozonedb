@@ -25,6 +25,26 @@ visibility p50 7.7/25.8/104 ms ≈ interval/2 (log-log linear), miss rate
 Figure: crsqlite repo `plot/out/visibility_sweep.pdf`
 (`plot_consistency.py visibility-sweep <dirs...>`).
 
+**Writer-scaling sweep 2026-08-21 (all-cluster, both engines on amd121):**
+W ∈ {2,4,8,16} writers at 20/s each, 15 s, disjoint key ranges, one reader.
+ozonedb `linearizable_reads` (one-fence): **0 misses at every W** (0/567,
+0/1128, 0/2260, 0/4456), visibility p50 flat 2.3/4.3/3.5/5.6 ms — writers
+share one log, so the reader's fence cost is writer-count-independent
+(p99 grows to 390 ms at W=16: single reader polling 320 keys/s, tail is
+reader-side). cr-sqlite-syncread (fenced, 50 ms interval, the other
+0-miss config): p50 4.5/5.1/11.4/**82 ms**, p99 1.29 **s** at W=16 — the
+/barrier pull round contacts all W peers, so fenced reads degrade with
+the mesh. cr-sqlite async 10/50/200 ms: ~100% first-read misses at every
+W (structural), and W=16 breaks even the 10 ms interval (p50 31.7 ms,
+p90 279 ms, p99 971 ms). Figure (CDF-only, 2×2 facets by W): crsqlite
+repo `plot/out/visibility_scaling.pdf`
+(`plot_consistency.py visibility-scaling <dirs...>`; scaling runs are the
+dirs whose summary has `writers` ≥ 2). Multi-writer plumbing:
+`consistency.py check-visibility --writers N` (N insert-probes,
+`--key-base` = w·10⁷, per-writer notify files, orchestrator-touched done
+file); crsqlite `bench.py check-visibility --num-writers W` (writers on
+replicas 0..W-1, reader on replica W).
+
 **Rate sweep rerun 2026-08-21 after the one-fence strict-read optimization
 (engine commit 2bd77fbd: one `Storage::sync` fence per get + thread-local
 token, replacing 4–5 sequencer round-trips):** `linearizable_reads` still
