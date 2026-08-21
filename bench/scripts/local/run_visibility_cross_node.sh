@@ -72,9 +72,13 @@ mkdir -p "$LOCAL_OUT"
 echo "[visx] restarting corfu on $LOG_SSH (bind $BIND_HOST:$CORFU_PORT)"
 ssh "${SSH_OPTS[@]}" "$SSH_USER@$LOG_SSH" "
   fuser -k -9 $CORFU_PORT/tcp 2>/dev/null; sleep 2
-  rm -rf /mnt/corfu/run_batch && cp -r /mnt/corfu/load /mnt/corfu/run_batch
+  # Empty log dir, NOT a copy of /mnt/corfu/load: visibility clients open a
+  # fresh stream, and a fresh-stream openDB fences on the GLOBAL sequencer
+  # tail -- foreign-stream (YCSB load) data makes that fence unsatisfiable
+  # and openDB hangs. See run_consistency_with_corfu.sh.
+  rm -rf /mnt/corfu/run_consistency && mkdir -p /mnt/corfu/run_consistency
   cd \$HOME/CorfuDB && ( setsid nohup env CORFUDB_HEAP=$CORFU_HEAP \
-    ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $BIND_HOST $CORFU_PORT \
+    ./bin/corfu_server -l /mnt/corfu/run_consistency -s -a $BIND_HOST $CORFU_PORT \
     </dev/null >/tmp/corfu_server.log 2>&1 & )
   for i in \$(seq 1 15); do sleep 4; nc -z -w 2 $BIND_HOST $CORFU_PORT && exit 0; done
   echo 'corfu did not come up' >&2; tail -5 /tmp/corfu_server.log >&2; exit 1

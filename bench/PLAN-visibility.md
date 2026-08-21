@@ -25,6 +25,21 @@ visibility p50 7.7/25.8/104 ms ≈ interval/2 (log-log linear), miss rate
 Figure: crsqlite repo `plot/out/visibility_sweep.pdf`
 (`plot_consistency.py visibility-sweep <dirs...>`).
 
+**Rate sweep rerun 2026-08-21 after the one-fence strict-read optimization
+(engine commit 2bd77fbd: one `Storage::sync` fence per get + thread-local
+token, replacing 4–5 sequencer round-trips):** `linearizable_reads` still
+**0 misses at every rate** (0/73, 0/279, 0/1255, 0/3268), 0 timeouts;
+default 1.4%/0.4%/0.3%/0.2% — both unchanged, as expected. The strict
+latency premium is gone: strict visibility p50 2.21/1.98/2.02/2.57 ms vs
+default 3.34/2.82/1.77/2.80 ms — strict is now at or below default at 3
+of 4 rates, where the 2026-08-20 multi-fence run had strict p50 3.5 ms vs
+default ≈2.6 ms at rate 20. Harness note: this rerun exposed that the
+consistency wrappers restarted corfu on a COPY of /mnt/corfu/load; once
+the YCSB face-off load populated that dir (2026-08-20 14:17), every
+fresh-stream openDB hung on the global-tail fence (tailAddress is
+runtime-wide; the tailer only advances past its own stream's entries).
+Both wrappers now start corfu on an empty /mnt/corfu/run_consistency.
+
 ## Context and goal
 
 VLDB reviews ask for an empirical OzoneKV vs cr-sqlite comparison (R3-D3),
