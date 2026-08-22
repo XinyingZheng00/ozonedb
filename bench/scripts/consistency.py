@@ -430,6 +430,8 @@ def cmd_visibility_reader(cfg, args):
     cp = _classpath(args.rebuild)
     cmd = _probe_cmd(cp, "visibility-probe", {
         "config": cfgs[0], "out-dir": out, "notify-listen": args.port,
+        "notify-writers": args.writers,
+        "tick-fence": "true" if args.linearizable else "false",
         "poll-ms": args.poll_ms, "key-timeout-s": args.key_timeout_s,
         "run-timeout-s": args.run_timeout_s,
     })
@@ -447,20 +449,31 @@ def cmd_visibility_writer(cfg, args):
     """Writer half of the cross-node visibility experiment: insert new keys
     and ack each over TCP to the reader at --connect (reader's LAN
     address). Blocks until the insert phase ends; closing the socket is the
-    done signal the reader drains against."""
+    done signal the reader drains against.
+
+    Deliberately does NOT call _kill_stale_probes(): N writer invocations
+    run concurrently on this node in the multi-writer flow, and each
+    later-starting one would SIGKILL its already-running siblings (the
+    kill matches every ConsistencyProbe JVM). The laptop driver performs
+    ONE stale-probe kill over ssh before launching the writer fleet."""
     out = os.path.join(OZONEDB_HOME, args.out_dir)
     os.makedirs(out, exist_ok=True)
-    _kill_stale_probes()
+    # Per-worker config index / db_path / logs: N writer invocations share
+    # this node and this out-dir, so everything they create must be keyed
+    # by the worker index (930+w stays clear of the reader's 990).
     cfgs = _make_configs(cfg, args.stream, 1,
-                         f"visx-writer-{os.path.basename(out)}",
-                         idx_base=991, linearizable=args.linearizable)
+                         f"visx-writer{args.worker}-{os.path.basename(out)}",
+                         idx_base=930 + args.worker,
+                         linearizable=args.linearizable)
     cp = _classpath(args.rebuild)
     cmd = _probe_cmd(cp, "insert-probe", {
         "config": cfgs[0], "out-dir": out, "notify-connect": args.connect,
+        "key-base": args.worker * 10_000_000,
+        "inserts-file": f"inserts-w{args.worker}.csv",
         "rate": args.rate, "duration-s": args.duration,
         "value-size": args.value_size,
     })
-    proc = _spawn(cmd, os.path.join(out, "writer.log"))
+    proc = _spawn(cmd, os.path.join(out, f"writer-{args.worker}.log"))
     try:
         rc = proc["proc"].wait()
     finally:
@@ -682,6 +695,8 @@ def main():
                     help="run dir relative to OZONEDB_HOME")
     sp.add_argument("--stream", required=True)
     sp.add_argument("--port", type=int, default=7911)
+    sp.add_argument("--writers", type=int, default=1,
+                    help="writer connections to accept before the go barrier")
     sp.add_argument("--poll-ms", type=int, default=1)
     sp.add_argument("--key-timeout-s", type=int, default=30)
     sp.add_argument("--run-timeout-s", type=int, default=600)
@@ -691,6 +706,8 @@ def main():
     sp.add_argument("--out-dir", required=True)
     sp.add_argument("--stream", required=True)
     sp.add_argument("--connect", required=True, help="reader LAN host:port")
+    sp.add_argument("--worker", type=int, default=0,
+                    help="writer index: disjoint key range, config slot, logs")
     sp.add_argument("--rate", type=float, default=20.0)
     sp.add_argument("--duration", type=int, default=15)
     sp.add_argument("--value-size", type=int, default=1000)

@@ -118,6 +118,8 @@ def main():
     p.add_argument("--linearizable", action="store_true")
     p.add_argument("--cross-node", action="store_true")
     p.add_argument("--rate", type=float, default=None)
+    p.add_argument("--writers", type=int, default=None)
+    p.add_argument("--tick-fence", action="store_true")
     p.add_argument("--duration", type=int, default=None)
     p.add_argument("--value-size", type=int, default=None)
     p.add_argument("--poll-ms", type=float, default=None)
@@ -127,6 +129,10 @@ def main():
         k: v
         for k, v in [
             ("rate_per_s", args.rate),
+            ("writers", args.writers),
+            ("aggregate_rate_per_s",
+             args.writers * args.rate if args.writers and args.rate else None),
+            ("tick_fence", args.tick_fence or None),
             ("duration_s", args.duration),
             ("value_size", args.value_size),
             ("poll_ms", args.poll_ms),

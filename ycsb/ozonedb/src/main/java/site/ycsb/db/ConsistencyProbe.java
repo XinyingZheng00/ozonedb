@@ -24,7 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Standalone driver for the consistency experiments, mirroring the
@@ -295,14 +295,17 @@ public final class ConsistencyProbe {
 
     OzoneDBJNI db = open(flags);
     // TCP mode: the reader only listens after ITS openDB returned, so a
-    // successful connect doubles as the cross-node start barrier -- no
-    // ready/go files needed. The connect retries while the reader is
-    // still opening.
+    // successful connect proves the reader is up; the "go" line it sends
+    // once EVERY writer has connected is the start barrier, aligning
+    // multi-writer measurement windows despite seconds of JVM + corfu
+    // startup skew. No ready/go files needed.
     Socket sock = null;
     PrintWriter notify;
     if (connect != null) {
       sock = connectWithRetry(connect,
           Long.parseLong(flags.getOrDefault("connect-timeout-s", "240")));
+      new BufferedReader(new InputStreamReader(
+          sock.getInputStream(), StandardCharsets.UTF_8)).readLine();
       notify = new PrintWriter(
           new OutputStreamWriter(sock.getOutputStream(), StandardCharsets.UTF_8), true);
     } else {
@@ -371,13 +374,15 @@ public final class ConsistencyProbe {
     }
   }
 
-  // Socket-side notify drain: runs on its own thread so a blocking
-  // readLine never stalls the polling loop. t_notify is stamped HERE, at
-  // receipt -- the reader-clock anchor of the ack -> notify -> get
-  // happens-before chain. EOF (writer closed the socket) sets done.
+  // Socket-side notify drain: runs on its own thread (one per writer
+  // socket) so a blocking readLine never stalls the polling loop.
+  // t_notify is stamped HERE, at receipt -- the reader-clock anchor of
+  // the ack -> notify -> get happens-before chain. EOF (writer closed
+  // the socket) bumps `closed`; the poll loop treats closed == number
+  // of writer sockets as "every writer finished".
   private static void drainNotifySocket(BufferedReader in,
                                         ConcurrentLinkedQueue<long[]> queue,
-                                        AtomicBoolean done) {
+                                        AtomicInteger closed) {
     try {
       while (true) {
         String line = in.readLine();
@@ -395,7 +400,37 @@ public final class ConsistencyProbe {
     } catch (Exception e) {
       System.err.println("notify socket closed: " + e);
     }
-    done.set(true);
+    closed.incrementAndGet();
+  }
+
+  /**
+   * Accept `n` writer notify connections, then release them all at once by
+   * sending one "go" line down each socket -- the cross-node start
+   * barrier. Writers block on that line after connecting, so measurement
+   * windows align even though JVM + corfu startup skews their connect
+   * times by seconds. One daemon drainer thread per socket.
+   */
+  private static List<Socket> acceptNotifyWriters(ServerSocket server, int n,
+                                                  ConcurrentLinkedQueue<long[]> arrivals,
+                                                  AtomicInteger closed) throws Exception {
+    List<Socket> socks = new ArrayList<>();
+    for (int k = 0; k < n; k++) {
+      Socket s = server.accept();
+      s.setTcpNoDelay(true);
+      socks.add(s);
+    }
+    for (Socket s : socks) {
+      s.getOutputStream().write("go\n".getBytes(StandardCharsets.UTF_8));
+      s.getOutputStream().flush();
+    }
+    for (Socket s : socks) {
+      BufferedReader in = new BufferedReader(
+          new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+      Thread drainer = new Thread(() -> drainNotifySocket(in, arrivals, closed));
+      drainer.setDaemon(true);
+      drainer.start();
+    }
+    return socks;
   }
 
   /**
@@ -485,27 +520,21 @@ public final class ConsistencyProbe {
     OzoneDBJNI db = open(flags);
 
     // TCP mode: bind only after openDB so a successful writer connect
-    // implies this reader is fully up -- the handshake is the barrier.
-    // EOF on the socket is the writer's done signal.
+    // implies this reader is fully up. With N writers the "go" line sent
+    // after all N accepts is the start barrier (see acceptNotifyWriters);
+    // EOF on every socket is the collective done signal.
+    int notifyWriters = Integer.parseInt(flags.getOrDefault("notify-writers", "1"));
     ServerSocket server = null;
-    Socket sock = null;
+    List<Socket> socks = null;
     ConcurrentLinkedQueue<long[]> arrivals = null;
-    AtomicBoolean socketDone = null;
+    AtomicInteger socketsClosed = null;
     if (listen != null) {
       server = new ServerSocket(Integer.parseInt(listen));
       server.setSoTimeout(1000 * Integer.parseInt(
           flags.getOrDefault("accept-timeout-s", "300")));
-      sock = server.accept();
-      sock.setTcpNoDelay(true);
-      BufferedReader in = new BufferedReader(
-          new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8));
       arrivals = new ConcurrentLinkedQueue<>();
-      socketDone = new AtomicBoolean(false);
-      ConcurrentLinkedQueue<long[]> q = arrivals;
-      AtomicBoolean flag = socketDone;
-      Thread drainer = new Thread(() -> drainNotifySocket(in, q, flag));
-      drainer.setDaemon(true);
-      drainer.start();
+      socketsClosed = new AtomicInteger(0);
+      socks = acceptNotifyWriters(server, notifyWriters, arrivals, socketsClosed);
     }
     barrier(flags);
 
@@ -578,7 +607,7 @@ public final class ConsistencyProbe {
 
       boolean done;
       if (arrivals != null) {
-        done = socketDone.get() && arrivals.isEmpty();
+        done = socketsClosed.get() >= notifyWriters && arrivals.isEmpty();
       } else {
         done = doneFile.exists()
             && notifyFilesDrained(notifyFiles, notifies, partials);
@@ -601,8 +630,10 @@ public final class ConsistencyProbe {
         }
       }
     }
-    if (sock != null) {
-      sock.close();
+    if (socks != null) {
+      for (Socket s : socks) {
+        s.close();
+      }
     }
     if (server != null) {
       server.close();

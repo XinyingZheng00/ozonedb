@@ -25,7 +25,29 @@ visibility p50 7.7/25.8/104 ms ≈ interval/2 (log-log linear), miss rate
 Figure: crsqlite repo `plot/out/visibility_sweep.pdf`
 (`plot_consistency.py visibility-sweep <dirs...>`).
 
-**Writer-scaling sweep 2026-08-21 (all-cluster, both engines on amd121):**
+**Cross-node writer-scaling sweep 2026-08-21 (final figure):** all three
+nodes in play — W writers on amd121, reader ALONE on amd105, amd123
+serving corfu+minio; cr-sqlite's mesh spans the LAN the same way (W
+writer replicas + daemons on amd121, reader replica on amd105), which
+also removes the localhost-sync advantage its earlier numbers enjoyed.
+Latency referenced to reader-side notify receipt (clock-free misses).
+ozonedb strict (one fence per tick): **0 misses at every W** (0/560,
+0/1128, 0/2268, 0/4507) and p50 FLAT — 3.7/4.1/3.2/3.5 ms; with the
+reader isolated the W=16 tail is p90 8.3 / p99 14.2 ms (was 84 ms
+same-host — that residue was CPU/GC contention with 16 writer JVMs).
+cr-sqlite-syncread: 0 misses but p50 4.5/5.2/10.1/**56.3 ms**, p99
+184 ms at W=16 — the /barrier pull round scales with the mesh over the
+real network. cr-sqlite async 10/50/200 ms: ~100% first-read misses at
+every W; at W=16 the 10 ms interval collapses (p50 22.5, p90 503, p99
+962 ms). Figure: `plot_consistency.py visibility-scaling` over the
+`visibility-xnode-*` dirs (summaries carry cross_node + writers) —
+crsqlite repo `plot/out/visibility_scaling.pdf`. Harness notes: writer
+fleet ssh launches are staggered (sshd MaxStartups drops simultaneous
+unauthenticated connections) and `visibility-writer` no longer calls
+`_kill_stale_probes` (N concurrent invocations SIGKILLed each other);
+the driver does one sweep before launching.
+
+**Writer-scaling sweep 2026-08-21 (same-host precursor, both engines on amd121):**
 W ∈ {2,4,8,16} writers at 20/s each, 15 s, disjoint key ranges, one reader.
 ozonedb `linearizable_reads` (one-fence): **0 misses at every W** (0/567,
 0/1128, 0/2260, 0/4456), visibility p50 flat 2.3/4.3/3.5/5.6 ms — writers
