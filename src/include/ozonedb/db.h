@@ -197,6 +197,22 @@ class DB {
    */
   Status compareAndPut(std::string const& key, int64_t expected_version,
                        std::string const& value, int64_t& new_version);
+
+  /**
+   * @brief Batch fence for strict reads (Metadata::linearizable_reads).
+   *
+   * sync() takes ONE storage fence on the calling thread; every get()
+   * on this thread until clearSync() reuses it instead of fencing per
+   * call, so each of those reads linearizes at the sync() point — the
+   * analog of cr-sqlite's per-tick /barrier, and the amortization for
+   * read batches (poll loops, scans over many keys). The caller must
+   * pair every sync() with a clearSync(): a leaked token silently
+   * pins later reads on this thread to a stale fence. No-ops on
+   * non-fencing backends and in non-strict mode (a token is only
+   * consulted by the fenced read path).
+   */
+  Status sync();
+  Status clearSync();
 };
 }  // namespace ozonedb
 #endif  // DB_H

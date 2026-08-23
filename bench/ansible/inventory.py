@@ -61,7 +61,14 @@ def build_inventory():
         if not user:
             raise ConfigError(f"{where}: no ssh user (set nodes.ssh_user)")
         groups[group].append(host)
-        hostvars[host] = {
+        # A host can sit in several groups (one machine serving as both
+        # nodes.log and nodes.store is the normal small-cluster layout), so
+        # accumulate roles instead of overwriting the hostvars dict -- a
+        # plain assignment here once dropped corfu-server on a combined
+        # log+store node and bootstrap only ran the minio role.
+        role = {"clients": "client", "log": "corfu-server",
+                "store": "minio"}[group]
+        hv = hostvars.setdefault(host, {
             "ansible_host": host,
             "ansible_user": user,
             "ansible_ssh_private_key_file": key,
@@ -69,9 +76,12 @@ def build_inventory():
             # For playbooks that configure a bind/dial address. Not a connection
             # setting -- Ansible reaches the node via ansible_host.
             "lan_address": entry.get("lan") or host,
-            "ozonedb_role": {"clients": "client", "log": "corfu-server",
-                             "store": "minio"}[group],
-        }
+            "ozonedb_roles": [],
+        })
+        if role not in hv["ozonedb_roles"]:
+            hv["ozonedb_roles"].append(role)
+        # Kept for older playbooks that read the scalar: the first role wins.
+        hv["ozonedb_role"] = hv["ozonedb_roles"][0]
 
     for i, entry in enumerate(nodes.get("clients") or []):
         add(entry, "clients", f"nodes.clients[{i}]")

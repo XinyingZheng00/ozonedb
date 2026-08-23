@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 #
 # Laptop-side wrapper for the consistency experiments: restart corfu_server
-# with a wiped run_batch (REQUIRED -- a fresh client's openDB fences on the
-# global sequencer tail, and against a server with older entries from other
-# streams that fence never satisfies and openDB hangs; the YCSB sweep restarts
-# corfu before every run for the same reason), then run one experiment on the
-# first client node and pull its results back here.
+# on an EMPTY log dir (REQUIRED -- consistency clients open fresh streams,
+# and a fresh-stream openDB fences on the GLOBAL sequencer tail
+# (CorfuBridge.tailAddress is runtime-wide, not per-stream) while the tailer
+# only advances past entries of its OWN stream; any foreign-stream data on
+# the server therefore makes that fence unsatisfiable and openDB hangs.
+# Copying /mnt/corfu/load into the served dir, as run_ycsb_with_corfu.sh
+# does for the benchmark stream, broke every consistency run the moment a
+# real YCSB load populated /mnt/corfu/load -- hence the dedicated
+# /mnt/corfu/run_consistency dir, recreated empty per run), then run one
+# experiment on the first client node and pull its results back here.
 #
 #   bash bench/scripts/local/run_consistency_with_corfu.sh probe-staleness --write-rate 20 --duration 30
 #   bash bench/scripts/local/run_consistency_with_corfu.sh check-lost-updates --workers 2 --increments 2000
@@ -35,9 +40,9 @@ SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/de
 echo "[consistency] restarting corfu on $LOG_SSH (bind $BIND_HOST:$CORFU_PORT)"
 ssh "${SSH_OPTS[@]}" "$SSH_USER@$LOG_SSH" "
   fuser -k -9 $CORFU_PORT/tcp 2>/dev/null; sleep 2
-  rm -rf /mnt/corfu/run_batch && cp -r /mnt/corfu/load /mnt/corfu/run_batch
+  rm -rf /mnt/corfu/run_consistency && mkdir -p /mnt/corfu/run_consistency
   cd \$HOME/CorfuDB && ( setsid nohup env CORFUDB_HEAP=$CORFU_HEAP \
-    ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $BIND_HOST $CORFU_PORT \
+    ./bin/corfu_server -l /mnt/corfu/run_consistency -s -a $BIND_HOST $CORFU_PORT \
     </dev/null >/tmp/corfu_server.log 2>&1 & )
   for i in \$(seq 1 15); do sleep 4; nc -z -w 2 $BIND_HOST $CORFU_PORT && exit 0; done
   echo 'corfu did not come up' >&2; tail -5 /tmp/corfu_server.log >&2; exit 1

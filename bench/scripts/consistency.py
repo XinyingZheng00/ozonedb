@@ -19,6 +19,7 @@ so it neither disturbs nor replays the benchmark stream.
 
   python3 consistency.py probe-staleness --write-rate 20 --duration 30
   python3 consistency.py check-lost-updates --workers 2 --increments 2000
+  python3 consistency.py check-visibility --rate 20 --duration 15
   python3 consistency.py check-convergence --record-count 1000000 --sample 1000
 """
 
@@ -39,6 +40,7 @@ from load_local_ycsb_multiproc import (
     _resolve_ycsb_classpath,
     partition_records,
 )
+from visibility_analysis import analyze as _analyze_visibility
 from ycsb_config import derive as _derive_addresses
 
 OZONEDB_HOME = os.environ.get("OZONEDB_HOME")
@@ -332,6 +334,155 @@ def cmd_probe_staleness(cfg, args):
     )
 
 
+# ================================================================= visibility
+
+
+def cmd_check_visibility(cfg, args):
+    """Two benchmarks from one run over YCSB-keyspace inserts (PBS-style,
+    see bench/PLAN-visibility.md). A writer inserts brand-new keys and acks
+    each into a notify file; a reader polls every acked key until it
+    appears. B2 (miss rate): did the reader's FIRST get -- which starts
+    after the ack by construction, no clocks involved -- find the key?
+    B1 (t-visibility): how long after the ack until some get found it?
+    New keys make "not found" unambiguous staleness: no older value can
+    masquerade as success."""
+    out = _outdir("visibility")
+    tag = os.path.basename(out).split("-", 1)[1]
+    stream = args.stream or f"{cfg['corfu']['stream_name']}-vis-{tag}"
+    n = max(1, args.writers)
+    _kill_stale_probes()
+    # Writers 0..n-1, reader is instance n. Every writer shares the one
+    # Corfu stream (that's the point of the scaling experiment); disjoint
+    # --key-base ranges keep the keyspaces from colliding.
+    cfgs = _make_configs(cfg, stream, n + 1, f"visibility-{tag}",
+                         linearizable=args.linearizable)
+    cp = _classpath(args.rebuild)
+
+    go = os.path.join(out, "go")
+    done = os.path.join(out, "done")
+    ready_r = os.path.join(out, "ready-reader")
+    ready_ws = [os.path.join(out, f"ready-writer-{w}") for w in range(n)]
+    notify_files = [os.path.join(out, f"notify-{w}.csv") for w in range(n)]
+
+    writer_procs = []
+    for w in range(n):
+        writer_procs.append(_spawn(_probe_cmd(cp, "insert-probe", {
+            "config": cfgs[w], "ready-file": ready_ws[w], "go-file": go,
+            "out-dir": out, "notify-file": notify_files[w],
+            "inserts-file": f"inserts-w{w}.csv",
+            "key-base": w * 10_000_000,
+            "rate": args.rate, "duration-s": args.duration,
+            "value-size": args.value_size,
+        }), os.path.join(out, f"writer-{w}.log")))
+    reader_proc = _spawn(_probe_cmd(cp, "visibility-probe", {
+        "config": cfgs[n], "ready-file": ready_r, "go-file": go,
+        "out-dir": out, "notify-file": ",".join(notify_files),
+        "done-file": done,
+        # Strict runs fence once per tick and share it across the whole
+        # pending batch (DB::sync) -- the cr-sqlite /barrier analog.
+        # Without it each get fences individually and the reader's ~ms
+        # service time queues at high writer counts, inflating the tail
+        # with probe-side waiting (misses are unaffected either way).
+        "tick-fence": "true" if args.linearizable else "false",
+        "poll-ms": args.poll_ms, "key-timeout-s": args.key_timeout_s,
+        "run-timeout-s": args.duration + args.key_timeout_s + 120,
+    }), os.path.join(out, "reader.log"))
+    procs = writer_procs + [reader_proc]
+    try:
+        _wait_ready_then_go(out, ready_ws + [ready_r], procs)
+        # Writers no longer touch the done file themselves: with n of
+        # them, "done" means ALL writers have exited, which only the
+        # orchestrator can observe. The reader then drains every notify
+        # file to EOF before finishing.
+        _wait_all(writer_procs)
+        with open(done, "w"):
+            pass
+        _wait_all([reader_proc])
+    finally:
+        _reap(procs)
+
+    _analyze_visibility(out, ENGINE, args.linearizable, cross_node=False, params={
+        "rate_per_s": args.rate,
+        "writers": n,
+        "aggregate_rate_per_s": n * args.rate,
+        "tick_fence": bool(args.linearizable),
+        "duration_s": args.duration,
+        "value_size": args.value_size,
+        "poll_ms": args.poll_ms,
+        "stream": stream,
+    })
+
+
+def cmd_visibility_reader(cfg, args):
+    """Reader half of the cross-node visibility experiment: listen for the
+    writer's TCP ack notifications and poll every notified key. Started on
+    clients[1] by run_visibility_cross_node.sh; the writer's connect only
+    succeeds once this probe is listening (i.e. after its openDB), so the
+    socket handshake is the start barrier. Leaves visibility.csv in
+    --out-dir for the laptop to pull -- home dirs are NOT shared between
+    nodes."""
+    out = os.path.join(OZONEDB_HOME, args.out_dir)
+    os.makedirs(out, exist_ok=True)
+    _kill_stale_probes()
+    cfgs = _make_configs(cfg, args.stream, 1,
+                         f"visx-reader-{os.path.basename(out)}",
+                         idx_base=990, linearizable=args.linearizable)
+    cp = _classpath(args.rebuild)
+    cmd = _probe_cmd(cp, "visibility-probe", {
+        "config": cfgs[0], "out-dir": out, "notify-listen": args.port,
+        "notify-writers": args.writers,
+        "tick-fence": "true" if args.linearizable else "false",
+        "poll-ms": args.poll_ms, "key-timeout-s": args.key_timeout_s,
+        "run-timeout-s": args.run_timeout_s,
+    })
+    proc = _spawn(cmd, os.path.join(out, "reader.log"))
+    try:
+        rc = proc["proc"].wait()
+    finally:
+        _reap([proc])
+    if rc != 0:
+        raise RuntimeError(f"visibility-probe rc={rc}, see {proc['log_path']}")
+    print(f"reader done, visibility.csv in {out}")
+
+
+def cmd_visibility_writer(cfg, args):
+    """Writer half of the cross-node visibility experiment: insert new keys
+    and ack each over TCP to the reader at --connect (reader's LAN
+    address). Blocks until the insert phase ends; closing the socket is the
+    done signal the reader drains against.
+
+    Deliberately does NOT call _kill_stale_probes(): N writer invocations
+    run concurrently on this node in the multi-writer flow, and each
+    later-starting one would SIGKILL its already-running siblings (the
+    kill matches every ConsistencyProbe JVM). The laptop driver performs
+    ONE stale-probe kill over ssh before launching the writer fleet."""
+    out = os.path.join(OZONEDB_HOME, args.out_dir)
+    os.makedirs(out, exist_ok=True)
+    # Per-worker config index / db_path / logs: N writer invocations share
+    # this node and this out-dir, so everything they create must be keyed
+    # by the worker index (930+w stays clear of the reader's 990).
+    cfgs = _make_configs(cfg, args.stream, 1,
+                         f"visx-writer{args.worker}-{os.path.basename(out)}",
+                         idx_base=930 + args.worker,
+                         linearizable=args.linearizable)
+    cp = _classpath(args.rebuild)
+    cmd = _probe_cmd(cp, "insert-probe", {
+        "config": cfgs[0], "out-dir": out, "notify-connect": args.connect,
+        "key-base": args.worker * 10_000_000,
+        "inserts-file": f"inserts-w{args.worker}.csv",
+        "rate": args.rate, "duration-s": args.duration,
+        "value-size": args.value_size,
+    })
+    proc = _spawn(cmd, os.path.join(out, f"writer-{args.worker}.log"))
+    try:
+        rc = proc["proc"].wait()
+    finally:
+        _reap([proc])
+    if rc != 0:
+        raise RuntimeError(f"insert-probe rc={rc}, see {proc['log_path']}")
+    print(f"writer done, inserts.csv in {out}")
+
+
 # =============================================================== lost updates
 
 
@@ -543,6 +694,45 @@ def main():
                     help="seconds to wait before the final read")
     sp.add_argument("--stream", default=None)
 
+    sp = sub.add_parser("check-visibility",
+                        help="insert visibility: retry-until-found latency "
+                             "+ first-read miss rate (PBS-style)")
+    sp.add_argument("--rate", type=float, default=20.0,
+                    help="inserts/s PER WRITER (aggregate = writers x rate)")
+    sp.add_argument("--writers", type=int, default=1,
+                    help="concurrent writer processes, all on the one shared "
+                         "stream, disjoint key ranges (scaling experiments)")
+    sp.add_argument("--duration", type=int, default=15, help="insert phase seconds")
+    sp.add_argument("--value-size", type=int, default=1000, help="value bytes")
+    sp.add_argument("--poll-ms", type=int, default=1,
+                    help="reader poll interval (bounds B1 resolution)")
+    sp.add_argument("--key-timeout-s", type=int, default=30,
+                    help="give up on a key after this long (>> sync interval)")
+    sp.add_argument("--stream", default=None)
+
+    sp = sub.add_parser("visibility-reader",
+                        help="cross-node reader role (driven by run_visibility_cross_node.sh)")
+    sp.add_argument("--out-dir", required=True,
+                    help="run dir relative to OZONEDB_HOME")
+    sp.add_argument("--stream", required=True)
+    sp.add_argument("--port", type=int, default=7911)
+    sp.add_argument("--writers", type=int, default=1,
+                    help="writer connections to accept before the go barrier")
+    sp.add_argument("--poll-ms", type=int, default=1)
+    sp.add_argument("--key-timeout-s", type=int, default=30)
+    sp.add_argument("--run-timeout-s", type=int, default=600)
+
+    sp = sub.add_parser("visibility-writer",
+                        help="cross-node writer role (driven by run_visibility_cross_node.sh)")
+    sp.add_argument("--out-dir", required=True)
+    sp.add_argument("--stream", required=True)
+    sp.add_argument("--connect", required=True, help="reader LAN host:port")
+    sp.add_argument("--worker", type=int, default=0,
+                    help="writer index: disjoint key range, config slot, logs")
+    sp.add_argument("--rate", type=float, default=20.0)
+    sp.add_argument("--duration", type=int, default=15)
+    sp.add_argument("--value-size", type=int, default=1000)
+
     sp = sub.add_parser("check-convergence",
                         help="hash a key sample on N fresh instances of one stream")
     sp.add_argument("--record-count", type=int, default=None,
@@ -560,6 +750,12 @@ def main():
         cmd_probe_staleness(cfg, args)
     elif args.cmd == "check-lost-updates":
         cmd_check_lost_updates(cfg, args)
+    elif args.cmd == "check-visibility":
+        cmd_check_visibility(cfg, args)
+    elif args.cmd == "visibility-reader":
+        cmd_visibility_reader(cfg, args)
+    elif args.cmd == "visibility-writer":
+        cmd_visibility_writer(cfg, args)
     elif args.cmd == "check-convergence":
         cmd_check_convergence(cfg, args)
 

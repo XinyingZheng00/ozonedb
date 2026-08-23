@@ -191,9 +191,13 @@ Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& r
     size_t size = 0;
     this->cache->checkReadMoreLog(file_name, read_more, cached_offset, size);
     if (read_more) {
-      count++;
-      thread_pool->enqueue([this, file_name, cached_offset, size, key, i,
-                            &record_file, &record, &record_mutex, &cv, &cv_mutex, &finished_threads]() {
+      if (linearizable_reads_) {
+        // Strict mode reads inline on the caller thread: the fence
+        // token from DB::get's Storage::sync() is thread-local, so a
+        // pool thread would pay a fresh sequencer fence — and after
+        // the fence the read is a local-memory splice, so parallelism
+        // buys nothing. Sequential newest-first also lets a hit
+        // terminate the scan, like the cached branch below.
         this->cache->readDataLog(file_name, cached_offset, size);
         std::shared_ptr<Record> record_tmp;
         cache->getLog(file_name, key, record_tmp);
@@ -203,14 +207,30 @@ Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& r
             record = std::move(record_tmp);
             record_file = i;
           }
+          break;
         }
-        {
-          std::lock_guard<std::mutex> lock(cv_mutex);
-          finished_threads++;
-        }
-        cv.notify_one();
-      },
-                           ThreadPool::Priority::High);
+      } else {
+        count++;
+        thread_pool->enqueue([this, file_name, cached_offset, size, key, i,
+                              &record_file, &record, &record_mutex, &cv, &cv_mutex, &finished_threads]() {
+          this->cache->readDataLog(file_name, cached_offset, size);
+          std::shared_ptr<Record> record_tmp;
+          cache->getLog(file_name, key, record_tmp);
+          if (record_tmp) {
+            std::unique_lock<std::shared_mutex> lock(record_mutex);
+            if (i >= record_file) {
+              record = std::move(record_tmp);
+              record_file = i;
+            }
+          }
+          {
+            std::lock_guard<std::mutex> lock(cv_mutex);
+            finished_threads++;
+          }
+          cv.notify_one();
+        },
+                             ThreadPool::Priority::High);
+      }
     } else {
       std::shared_ptr<Record> record_tmp;
       cache->getLog(file_name, key, record_tmp);

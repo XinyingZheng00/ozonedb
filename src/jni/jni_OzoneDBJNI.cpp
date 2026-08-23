@@ -105,6 +105,18 @@ JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get(JNIEnv* env, jobject obj, j
   return byteArray;
 }
 
+// Batch fence for strict reads: one storage fence for the calling
+// thread, reused by every get() until clearSync() (see DB::sync).
+// The db_instance is thread_local, so the token's thread scope and the
+// DB's thread scope coincide by construction here.
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_sync(JNIEnv* env, jobject obj) {
+  db_instance->sync();
+}
+
+JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_clearSync(JNIEnv* env, jobject obj) {
+  db_instance->clearSync();
+}
+
 JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove(JNIEnv* env, jobject obj, jstring key) {
   char const* nativeKey = env->GetStringUTFChars(key, 0);
   ozonedb::Status status = db_instance->remove(std::string(nativeKey));

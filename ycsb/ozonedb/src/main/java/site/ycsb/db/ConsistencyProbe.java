@@ -3,15 +3,28 @@ package site.ycsb.db;
 import jni.OzoneDBJNI;
 import site.ycsb.workloads.CoreWorkload;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Standalone driver for the consistency experiments, mirroring the
@@ -40,6 +53,23 @@ import java.util.Map;
  *       with its log-address version and casPut is accepted only if the
  *       key is still at that version, so lost increments are impossible
  *       and conflicts are retried (and counted).
+ *   <li>insert-probe: insert brand-new YCSB-keyspace keys at --rate for
+ *       --duration-s; after each put() returns, append "i,t_ack_ns" to
+ *       --notify-file (flushed per line) and record it in inserts.csv.
+ *       Touches --done-file when finished. New keys make "not found" an
+ *       unambiguous staleness signal: there is no older value to serve.
+ *       Cross-node: --notify-connect host:port replaces --notify-file --
+ *       acks flow over TCP to the reader (retrying the connect until the
+ *       reader listens), and closing the socket is the done signal.
+ *   <li>visibility-probe: tail --notify-file; each notified key joins a
+ *       pending set that is polled every --poll-ms until found (or
+ *       --key-timeout-s). The first get per key necessarily starts after
+ *       the writer's ack (ack -&gt; notify -&gt; get), so a first-get miss is
+ *       a read-latest violation with no clock comparison involved. Emits
+ *       visibility.csv with per-key ack/notify/first/found timestamps.
+ *       Cross-node: --notify-listen port accepts the writer's TCP stream;
+ *       t_notify (this host's clock) is then the latency reference, since
+ *       t_ack lives in the writer's clock domain.
  *   <li>put-long / get-long: seed or read one 8-byte counter value.
  *   <li>hash: md5 over (key,value) for every --sample-every'th key of the
  *       YCSB keyspace (user + FNV hash, the workloads' insertorder=hashed
@@ -284,6 +314,399 @@ public final class ConsistencyProbe {
         + ", \"conflicts\": " + conflicts + "}");
   }
 
+  private static void insertProbe(Map<String, String> flags) throws Exception {
+    double rate = Double.parseDouble(flags.getOrDefault("rate", "20"));
+    long durationS = Long.parseLong(req(flags, "duration-s"));
+    int valueSize = Integer.parseInt(flags.getOrDefault("value-size", "1000"));
+    // Multi-writer runs give each writer a disjoint idx range (writer w
+    // starts at w * 10_000_000) so keys never collide and the reader's
+    // pending map needs no writer id -- idx alone identifies the key.
+    long keyBase = Long.parseLong(flags.getOrDefault("key-base", "0"));
+    // ... and a private inserts file, since all writers share --out-dir.
+    String insertsName = flags.getOrDefault("inserts-file", "inserts.csv");
+    String outDir = req(flags, "out-dir");
+    String notifyPath = flags.get("notify-file");
+    String connect = flags.get("notify-connect");
+    String donePath = flags.get("done-file");
+    if ((notifyPath == null) == (connect == null)) {
+      throw new IllegalArgumentException(
+          "pass exactly one of --notify-file / --notify-connect");
+    }
+
+    OzoneDBJNI db = open(flags);
+    // TCP mode: the reader only listens after ITS openDB returned, so a
+    // successful connect proves the reader is up; the "go" line it sends
+    // once EVERY writer has connected is the start barrier, aligning
+    // multi-writer measurement windows despite seconds of JVM + corfu
+    // startup skew. No ready/go files needed.
+    Socket sock = null;
+    PrintWriter notify;
+    if (connect != null) {
+      sock = connectWithRetry(connect,
+          Long.parseLong(flags.getOrDefault("connect-timeout-s", "240")));
+      new BufferedReader(new InputStreamReader(
+          sock.getInputStream(), StandardCharsets.UTF_8)).readLine();
+      notify = new PrintWriter(
+          new OutputStreamWriter(sock.getOutputStream(), StandardCharsets.UTF_8), true);
+    } else {
+      // Autoflush PrintWriter: each println pushes the full line (with its
+      // newline) through in one flush, so the tailing reader never sees a
+      // torn line under normal conditions (it also guards against partial
+      // lines itself).
+      notify = new PrintWriter(new FileWriter(notifyPath), true);
+    }
+    barrier(flags);
+
+    Random rnd = new Random(42);
+    byte[] value = new byte[Math.max(8, valueSize)];
+    long periodNs = (long) (1e9 / rate);
+    long deadline = System.nanoTime() + durationS * 1_000_000_000L;
+    List<long[]> inserts = new ArrayList<>();
+    long i = keyBase;
+    while (System.nanoTime() < deadline) {
+      String key = CoreWorkload.buildKeyName(i, 1, false);
+      rnd.nextBytes(value);
+      ByteBuffer.wrap(value).putLong(i);
+      db.put(key, value);
+      long tAck = System.nanoTime();
+      inserts.add(new long[]{i, tAck});
+      notify.println(i + "," + tAck);
+      i++;
+      sleepNs(periodNs);
+    }
+    // Closing the channel is the done signal in TCP mode (EOF at the
+    // reader); the done-file covers the same-host file channel.
+    notify.close();
+    if (sock != null) {
+      sock.close();
+    }
+    try (PrintWriter w = new PrintWriter(new File(outDir, insertsName), "UTF-8")) {
+      w.println("idx,t_ack_ns");
+      for (long[] ins : inserts) {
+        w.println(ins[0] + "," + ins[1]);
+      }
+    }
+    if (donePath != null) {
+      new File(donePath).createNewFile();
+    }
+    db.closeDB();
+    System.out.println("{\"inserts\": " + (i - keyBase) + "}");
+  }
+
+  private static Socket connectWithRetry(String hostPort, long timeoutS) throws Exception {
+    int colon = hostPort.lastIndexOf(':');
+    String host = hostPort.substring(0, colon);
+    int port = Integer.parseInt(hostPort.substring(colon + 1));
+    long deadline = System.nanoTime() + timeoutS * 1_000_000_000L;
+    while (true) {
+      Socket s = new Socket();
+      try {
+        s.connect(new InetSocketAddress(host, port), 2000);
+        s.setTcpNoDelay(true);
+        return s;
+      } catch (Exception e) {
+        s.close();
+        if (System.nanoTime() > deadline) {
+          throw new IllegalStateException("could not connect to " + hostPort, e);
+        }
+        Thread.sleep(200);
+      }
+    }
+  }
+
+  // Socket-side notify drain: runs on its own thread (one per writer
+  // socket) so a blocking readLine never stalls the polling loop.
+  // t_notify is stamped HERE, at receipt -- the reader-clock anchor of
+  // the ack -> notify -> get happens-before chain. EOF (writer closed
+  // the socket) bumps `closed`; the poll loop treats closed == number
+  // of writer sockets as "every writer finished".
+  private static void drainNotifySocket(BufferedReader in,
+                                        ConcurrentLinkedQueue<long[]> queue,
+                                        AtomicInteger closed) {
+    try {
+      while (true) {
+        String line = in.readLine();
+        if (line == null) {
+          break;
+        }
+        int comma = line.indexOf(',');
+        if (comma <= 0) {
+          continue;
+        }
+        long idx = Long.parseLong(line.substring(0, comma));
+        long tAck = Long.parseLong(line.substring(comma + 1).trim());
+        queue.add(new long[]{idx, tAck, System.nanoTime()});
+      }
+    } catch (Exception e) {
+      System.err.println("notify socket closed: " + e);
+    }
+    closed.incrementAndGet();
+  }
+
+  /**
+   * Accept `n` writer notify connections, then release them all at once by
+   * sending one "go" line down each socket -- the cross-node start
+   * barrier. Writers block on that line after connecting, so measurement
+   * windows align even though JVM + corfu startup skews their connect
+   * times by seconds. One daemon drainer thread per socket.
+   */
+  private static List<Socket> acceptNotifyWriters(ServerSocket server, int n,
+                                                  ConcurrentLinkedQueue<long[]> arrivals,
+                                                  AtomicInteger closed) throws Exception {
+    List<Socket> socks = new ArrayList<>();
+    for (int k = 0; k < n; k++) {
+      Socket s = server.accept();
+      s.setTcpNoDelay(true);
+      socks.add(s);
+    }
+    for (Socket s : socks) {
+      s.getOutputStream().write("go\n".getBytes(StandardCharsets.UTF_8));
+      s.getOutputStream().flush();
+    }
+    for (Socket s : socks) {
+      BufferedReader in = new BufferedReader(
+          new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+      Thread drainer = new Thread(() -> drainNotifySocket(in, arrivals, closed));
+      drainer.setDaemon(true);
+      drainer.start();
+    }
+    return socks;
+  }
+
+  /**
+   * Open any newly-appeared notify files and drain complete lines into the
+   * pending map. Char-by-char with a persistent per-file remainder:
+   * readLine() would hand us a torn line at EOF and lose its tail when the
+   * writer's flush completes.
+   */
+  private static void drainNotifyFiles(File[] notifyFiles, BufferedReader[] notifies,
+                                       StringBuilder[] partials,
+                                       LinkedHashMap<Long, long[]> pending) throws Exception {
+    for (int k = 0; k < notifyFiles.length; k++) {
+      if (notifies[k] == null && notifyFiles[k].exists()) {
+        notifies[k] = new BufferedReader(new FileReader(notifyFiles[k]));
+      }
+      if (notifies[k] == null) {
+        continue;
+      }
+      while (notifies[k].ready()) {
+        int ch = notifies[k].read();
+        if (ch == -1) {
+          break;
+        }
+        if (ch != '\n') {
+          partials[k].append((char) ch);
+          continue;
+        }
+        String line = partials[k].toString();
+        partials[k].setLength(0);
+        int comma = line.indexOf(',');
+        if (comma <= 0) {
+          continue;
+        }
+        long idx = Long.parseLong(line.substring(0, comma));
+        long tAck = Long.parseLong(line.substring(comma + 1).trim());
+        pending.put(idx, new long[]{idx, tAck, System.nanoTime(), -1, 0, -1, 0});
+      }
+    }
+  }
+
+  /**
+   * File-channel done test. The orchestrator touches done-file only after
+   * every writer has exited, so a notify file that still doesn't exist then
+   * belongs to a writer that died before its first ack -- skip it rather
+   * than spin until the run timeout.
+   */
+  private static boolean notifyFilesDrained(File[] notifyFiles, BufferedReader[] notifies,
+                                            StringBuilder[] partials) throws Exception {
+    for (int k = 0; k < notifyFiles.length; k++) {
+      if (!notifyFiles[k].exists()) {
+        continue;
+      }
+      if (notifies[k] == null || notifies[k].ready() || partials[k].length() > 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Column slots of a visibility-probe per-key record.
+  private static final int VIS_IDX = 0;
+  private static final int VIS_T_ACK = 1;
+  private static final int VIS_T_NOTIFY = 2;
+  private static final int VIS_T_FIRST = 3;
+  private static final int VIS_FOUND_FIRST = 4;
+  private static final int VIS_T_FOUND = 5;
+  private static final int VIS_ATTEMPTS = 6;
+
+  private static void visibilityProbe(Map<String, String> flags) throws Exception {
+    String outDir = req(flags, "out-dir");
+    String notifyPath = flags.get("notify-file");
+    String listen = flags.get("notify-listen");
+    String donePath = flags.get("done-file");
+    if ((notifyPath == null) == (listen == null)) {
+      throw new IllegalArgumentException(
+          "pass exactly one of --notify-file / --notify-listen");
+    }
+    if (notifyPath != null && donePath == null) {
+      throw new IllegalArgumentException("--notify-file needs --done-file");
+    }
+    long pollMs = Long.parseLong(flags.getOrDefault("poll-ms", "1"));
+    long keyTimeoutNs = Long.parseLong(flags.getOrDefault("key-timeout-s", "30"))
+        * 1_000_000_000L;
+    long runTimeoutS = Long.parseLong(flags.getOrDefault("run-timeout-s", "600"));
+    boolean tickFence = Boolean.parseBoolean(flags.getOrDefault("tick-fence", "false"));
+
+    OzoneDBJNI db = open(flags);
+
+    // TCP mode: bind only after openDB so a successful writer connect
+    // implies this reader is fully up. With N writers the "go" line sent
+    // after all N accepts is the start barrier (see acceptNotifyWriters);
+    // EOF on every socket is the collective done signal.
+    int notifyWriters = Integer.parseInt(flags.getOrDefault("notify-writers", "1"));
+    ServerSocket server = null;
+    List<Socket> socks = null;
+    ConcurrentLinkedQueue<long[]> arrivals = null;
+    AtomicInteger socketsClosed = null;
+    if (listen != null) {
+      server = new ServerSocket(Integer.parseInt(listen));
+      server.setSoTimeout(1000 * Integer.parseInt(
+          flags.getOrDefault("accept-timeout-s", "300")));
+      arrivals = new ConcurrentLinkedQueue<>();
+      socketsClosed = new AtomicInteger(0);
+      socks = acceptNotifyWriters(server, notifyWriters, arrivals, socketsClosed);
+    }
+    barrier(flags);
+
+    // --notify-file is a comma-separated list in multi-writer runs: one
+    // file per writer, each tailed independently with its own torn-line
+    // remainder. Writers use disjoint --key-base idx ranges, so the
+    // pending map stays keyed by idx alone.
+    File[] notifyFiles = null;
+    BufferedReader[] notifies = null;
+    StringBuilder[] partials = null;
+    if (notifyPath != null) {
+      String[] parts = notifyPath.split(",");
+      notifyFiles = new File[parts.length];
+      notifies = new BufferedReader[parts.length];
+      partials = new StringBuilder[parts.length];
+      for (int k = 0; k < parts.length; k++) {
+        notifyFiles[k] = new File(parts[k]);
+        partials[k] = new StringBuilder();
+      }
+    }
+    File doneFile = donePath != null ? new File(donePath) : null;
+    // Insertion-ordered so per-tick checks walk keys oldest-first.
+    LinkedHashMap<Long, long[]> pending = new LinkedHashMap<>();
+    List<long[]> results = new ArrayList<>();
+    long runDeadline = System.nanoTime() + runTimeoutS * 1_000_000_000L;
+
+    while (true) {
+      if (arrivals != null) {
+        while (!arrivals.isEmpty()) {
+          long[] a = arrivals.poll();
+          if (a == null) {
+            break;
+          }
+          pending.put(a[0], new long[]{a[0], a[1], a[2], -1, 0, -1, 0});
+        }
+      }
+      if (notifyFiles != null) {
+        drainNotifyFiles(notifyFiles, notifies, partials, pending);
+      }
+
+      // Per-tick batch fence (--tick-fence, strict runs): one fence
+      // covers every pending get below, the cr-sqlite /barrier analog.
+      // ack -> notify -> fence -> get, so miss counting is unchanged.
+      boolean fenced = tickFence && !pending.isEmpty();
+      if (fenced) {
+        db.sync();
+      }
+      Iterator<Map.Entry<Long, long[]>> it = pending.entrySet().iterator();
+      while (it.hasNext()) {
+        long[] r = it.next().getValue();
+        long tStart = System.nanoTime();
+        byte[] v = db.get(CoreWorkload.buildKeyName(r[VIS_IDX], 1, false));
+        r[VIS_ATTEMPTS]++;
+        if (r[VIS_T_FIRST] < 0) {
+          r[VIS_T_FIRST] = tStart;
+          r[VIS_FOUND_FIRST] = v != null ? 1 : 0;
+        }
+        if (v != null) {
+          r[VIS_T_FOUND] = System.nanoTime();
+          results.add(r);
+          it.remove();
+        } else if (tStart - r[VIS_T_NOTIFY] > keyTimeoutNs) {
+          results.add(r);
+          it.remove();
+        }
+      }
+      if (fenced) {
+        db.clearSync();
+      }
+
+      boolean done;
+      if (arrivals != null) {
+        done = socketsClosed.get() >= notifyWriters && arrivals.isEmpty();
+      } else {
+        done = doneFile.exists()
+            && notifyFilesDrained(notifyFiles, notifies, partials);
+      }
+      if (done && pending.isEmpty()) {
+        break;
+      }
+      if (System.nanoTime() > runDeadline) {
+        System.err.println("visibility-probe run timeout with "
+            + pending.size() + " keys still pending");
+        results.addAll(pending.values());
+        break;
+      }
+      sleepNs(pollMs * 1_000_000L);
+    }
+    if (notifies != null) {
+      for (BufferedReader r : notifies) {
+        if (r != null) {
+          r.close();
+        }
+      }
+    }
+    if (socks != null) {
+      for (Socket s : socks) {
+        s.close();
+      }
+    }
+    if (server != null) {
+      server.close();
+    }
+    db.closeDB();
+    writeVisibilityResults(outDir, results);
+  }
+
+  private static void writeVisibilityResults(String outDir, List<long[]> results)
+      throws Exception {
+    long missesFirst = 0;
+    long timeouts = 0;
+    for (long[] r : results) {
+      if (r[VIS_FOUND_FIRST] == 0) {
+        missesFirst++;
+      }
+      if (r[VIS_T_FOUND] < 0) {
+        timeouts++;
+      }
+    }
+    try (PrintWriter w = new PrintWriter(new File(outDir, "visibility.csv"), "UTF-8")) {
+      w.println("idx,t_ack_ns,t_notify_ns,t_first_ns,found_first,t_found_ns,attempts");
+      for (long[] r : results) {
+        w.println(r[VIS_IDX] + "," + r[VIS_T_ACK] + "," + r[VIS_T_NOTIFY] + ","
+            + r[VIS_T_FIRST] + "," + r[VIS_FOUND_FIRST] + "," + r[VIS_T_FOUND]
+            + "," + r[VIS_ATTEMPTS]);
+      }
+    }
+    System.out.println("{\"checked\": " + results.size()
+        + ", \"misses_first\": " + missesFirst
+        + ", \"timeouts\": " + timeouts + "}");
+  }
+
   private static void putLong(Map<String, String> flags) {
     OzoneDBJNI db = open(flags);
     db.put(req(flags, "key"), encodeLong(Long.parseLong(req(flags, "value"))));
@@ -373,7 +796,8 @@ public final class ConsistencyProbe {
   public static void main(String[] args) throws Exception {
     if (args.length == 0) {
       System.err.println("usage: ConsistencyProbe <write-probe|read-probe|counter-worker"
-          + "|put-long|get-long|hash> --config <shared_config.json> [--flag value ...]");
+          + "|insert-probe|visibility-probe|put-long|get-long|hash>"
+          + " --config <shared_config.json> [--flag value ...]");
       System.exit(2);
     }
     Map<String, String> flags = parseFlags(args, 1);
@@ -386,6 +810,12 @@ public final class ConsistencyProbe {
       break;
     case "counter-worker":
       counterWorker(flags);
+      break;
+    case "insert-probe":
+      insertProbe(flags);
+      break;
+    case "visibility-probe":
+      visibilityProbe(flags);
       break;
     case "put-long":
       putLong(flags);

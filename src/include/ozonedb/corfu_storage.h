@@ -66,6 +66,21 @@ class CorfuDBStorage : public Storage {
                        bool& deleted) override;
 
   void setSyncMode(bool sync) { sync_mode_ = sync; }
+
+  // One-fence-per-get support (Metadata::linearizable_reads). sync()
+  // performs the single sequencer query + tailer wait and records a
+  // thread-local {instance, target} token; fenceTargetForCaller() then
+  // lets read/size/exist/isSealed on the same thread reuse the token
+  // instead of re-querying the sequencer — the tailer wait degenerates
+  // to a no-op because last_applied_addr_ already covers the target.
+  // The token is thread-local, NOT process-wide: a fence taken by one
+  // get must not exempt a concurrent get on another thread whose
+  // invocation may postdate the sample. The instance field guards
+  // against a token from one CorfuDBStorage leaking into another.
+  void sync() override;
+  void clearSync() override;
+  bool hasSyncToken() const override { return fence_token_.instance == this; }
+
   void setRemoteAppendListener(RemoteAppendListener listener) override {
     bool cleared;
     {
@@ -236,6 +251,19 @@ class CorfuDBStorage : public Storage {
   long globalFenceTarget();
   void waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target);
   void reconcilePendingFrontLocked(std::string const& fileName);
+
+  // The calling thread's sync() token. Static thread_local (member
+  // thread_local is not a thing); the instance pointer scopes it to
+  // one storage object.
+  struct FenceToken {
+    CorfuDBStorage const* instance = nullptr;
+    long target = -1;
+  };
+  static thread_local FenceToken fence_token_;
+  // Fence target for the current fenced read: the token's target when
+  // this thread holds one for this instance, else a fresh (expensive)
+  // globalFenceTarget() sample.
+  long fenceTargetForCaller();
 };
 
 }  // namespace ozonedb

@@ -81,4 +81,14 @@ public class OzoneDBJNI {
    * retry), -1 on failure. Corfu backend only.
    */
   public native long casPut(String key, byte[] value, long expectedVersion);
+
+  /**
+   * Batch fence for strict reads (linearizable_reads): sync() takes one
+   * storage fence on the calling thread; every get() until clearSync()
+   * reuses it, linearizing each read at the sync() point (the cr-sqlite
+   * per-tick /barrier analog). Always pair with clearSync(). No-ops in
+   * non-strict mode / on non-fencing backends.
+   */
+  public native void sync();
+  public native void clearSync();
 }

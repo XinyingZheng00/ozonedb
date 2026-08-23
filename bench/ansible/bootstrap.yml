@@ -32,10 +32,11 @@
 
   vars:
     repo_src: "{{ playbook_dir }}/../../"
-    # Defaults to the role the inventory assigns from `nodes:` -- client for
-    # nodes.clients, corfu-server for nodes.log, minio for nodes.store. So
-    # `-e target=nodes` provisions the whole cluster correctly in one pass.
-    setup_roles: ["{{ ozonedb_role | default('client') }}"]
+    # Defaults to the roles the inventory assigns from `nodes:` -- client for
+    # nodes.clients, corfu-server for nodes.log, minio for nodes.store; a host
+    # in several groups gets all of its roles. So `-e target=nodes` provisions
+    # the whole cluster correctly in one pass.
+    setup_roles: "{{ ozonedb_roles | default([ozonedb_role | default('client')]) }}"
     setup_extra_args: ""
     run_setup: true
     include_git: true
