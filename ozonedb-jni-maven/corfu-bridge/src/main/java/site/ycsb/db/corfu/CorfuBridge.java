@@ -40,6 +40,20 @@ public class CorfuBridge {
   private final IStreamView pollView;
   private volatile boolean closed = false;
 
+  // Poller wake-up channel. When the stream has nothing new the poller
+  // used to Thread.sleep(IDLE_POLL_MS); a caller waiting for its OWN
+  // entry to be applied (CorfuDBStorage::appendConditional always does
+  // -- a compare-and-put is decided by the local tailer) paid up to one
+  // full sleep on every call. append() now bumps appendSeq under this
+  // monitor and notifies; the poller snapshots appendSeq before each
+  // pollView.next() and only parks if nothing local landed in between,
+  // so an own append is never missed and never waits. Peer appends
+  // still surface at the idle cadence -- a tailer that is already
+  // behind them is never parked.
+  private static final long IDLE_POLL_MS = 5;
+  private final Object pollSignal = new Object();
+  private long appendSeq = 0;  // guarded by pollSignal
+
   public CorfuBridge(String endpoint, String streamName) {
     // maxCacheEntries default is 2500 — too small, the tailer falls
     // into a cache-miss spiral (50–400 ms/entry) as soon as it's more
@@ -64,7 +78,37 @@ public class CorfuBridge {
    * @return the global log address assigned to the entry.
    */
   public long append(byte[] payload) {
-    return appendView.append(payload);
+    long addr = appendView.append(payload);
+    synchronized (pollSignal) {
+      appendSeq++;
+      pollSignal.notifyAll();
+    }
+    return addr;
+  }
+
+  private long appendSeqSnapshot() {
+    synchronized (pollSignal) {
+      return appendSeq;
+    }
+  }
+
+  /**
+   * Park until a local append lands or {@link #IDLE_POLL_MS} pass,
+   * unless one already landed since {@code seenSeq} was snapshotted.
+   *
+   * @return {@code false} if interrupted (the caller should give up).
+   */
+  private boolean awaitAppendOrTick(long seenSeq) {
+    synchronized (pollSignal) {
+      if (appendSeq != seenSeq) return true;
+      try {
+        pollSignal.wait(IDLE_POLL_MS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -78,6 +122,7 @@ public class CorfuBridge {
   public byte[] pollNext(long timeoutMs) {
     long deadline = System.currentTimeMillis() + timeoutMs;
     while (!closed) {
+      long seq = appendSeqSnapshot();
       ILogData data = pollView.next();
       if (data != null) {
         long addr = data.getGlobalAddress();
@@ -94,12 +139,7 @@ public class CorfuBridge {
         return buf.array();
       }
       if (System.currentTimeMillis() >= deadline) return null;
-      try {
-        Thread.sleep(5);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        return null;
-      }
+      if (!awaitAppendOrTick(seq)) return null;
     }
     return null;
   }
@@ -123,6 +163,7 @@ public class CorfuBridge {
     long deadline = System.currentTimeMillis() + timeoutMs;
     List<byte[]> batch = new ArrayList<>(Math.min(maxEntries, 256));
     while (!closed && batch.size() < maxEntries) {
+      long seq = appendSeqSnapshot();
       ILogData data = pollView.next();
       if (data == null) {
         // No entry ready right now. If we already have some, return
@@ -130,12 +171,7 @@ public class CorfuBridge {
         // adds latency for no throughput gain.
         if (!batch.isEmpty()) break;
         if (System.currentTimeMillis() >= deadline) return null;
-        try {
-          Thread.sleep(5);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          return null;
-        }
+        if (!awaitAppendOrTick(seq)) return null;
         continue;
       }
       long addr = data.getGlobalAddress();
@@ -184,6 +220,9 @@ public class CorfuBridge {
 
   public void close() {
     closed = true;
+    synchronized (pollSignal) {
+      pollSignal.notifyAll();
+    }
     try {
       runtime.shutdown();
     } catch (Exception ignored) {
