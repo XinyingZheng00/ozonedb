@@ -78,7 +78,7 @@ def _load_cfg(path):
         return _derive_addresses(yaml.safe_load(f))
 
 
-def _corfu_settings(cfg, stream, linearizable=False):
+def _corfu_settings(cfg, stream, linearizable=False, track_versions=False):
     s = dict(cfg["corfu"])
     s["stream_name"] = stream
     if linearizable:
@@ -87,6 +87,12 @@ def _corfu_settings(cfg, stream, linearizable=False):
         # global log tail (see src/db/db.cpp).
         s["linearizable_reads"] = True
         s["trust_background_tail"] = False
+    if track_versions:
+        # Required by compareAndPut: every writer's tailer keeps the
+        # log-ordered key -> version map (Metadata::track_versions).
+        # Off by default because it taxes the tailer with a key-only
+        # decode of every data-log entry.
+        s["track_versions"] = True
     return s
 
 
@@ -105,12 +111,13 @@ def _kill_stale_probes():
 
 
 def _make_configs(cfg, stream, count, name, idx_base=CFG_IDX_BASE,
-                  linearizable=False):
+                  linearizable=False, track_versions=False):
     """One shared_config JSON + fresh scratch db_path per probe process.
     The Corfu endpoint and stream are shared (that's the point); db_path
     must be private per process, exactly as in the multiproc runners."""
     data_root = cfg["local"]["run"]["ycsb_data_path"]
-    settings = _corfu_settings(cfg, stream, linearizable=linearizable)
+    settings = _corfu_settings(cfg, stream, linearizable=linearizable,
+                               track_versions=track_versions)
     paths = []
     for i in range(count):
         db_path = _fresh_dir(os.path.join(data_root, "consistency", f"{name}-w{i}"))
@@ -503,8 +510,12 @@ def cmd_check_lost_updates(cfg, args):
     n = args.workers
     _kill_stale_probes()
     # workers + seed + final reader each get their own instance
+    # --cas needs every instance (workers, seed, reader) to keep the
+    # log-ordered version map: the seed's blind put must be versioned and
+    # the reader must see the CAS values.
     cfgs = _make_configs(cfg, stream, n + 2, f"lost-updates-{tag}",
-                         linearizable=args.linearizable)
+                         linearizable=args.linearizable,
+                         track_versions=args.cas)
     cp = _classpath(args.rebuild)
 
     seed_cmd = _probe_cmd(cp, "put-long", {

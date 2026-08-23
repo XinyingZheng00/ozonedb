@@ -258,6 +258,16 @@ public final class ConsistencyProbe {
     String outDir = req(flags, "out-dir");
 
     boolean cas = Boolean.parseBoolean(flags.getOrDefault("cas", "false"));
+    // Conflict backoff: a -2 means another worker's CAS on this key was
+    // sequenced between our read and our write, so every worker that
+    // lost is about to re-read the same fresh version and collide
+    // again. Jittered exponential backoff (base doubling per consecutive
+    // loss, capped) spreads the retries; 0 disables it. Counted per
+    // increment in maxAttempts so the output shows how bad contention
+    // got, not just how often.
+    long backoffBaseUs = Long.parseLong(flags.getOrDefault("cas-backoff-us", "200"));
+    long backoffCapUs = Long.parseLong(flags.getOrDefault("cas-backoff-cap-us", "8000"));
+    Random backoffRng = new Random(0x5eed + 31L * Integer.parseInt(req(flags, "worker")));
 
     OzoneDBJNI db = open(flags);
     barrier(flags);
@@ -266,6 +276,7 @@ public final class ConsistencyProbe {
     long t0 = System.nanoTime();
     long acked = 0;
     long conflicts = 0;
+    long maxAttempts = 0;
     long lastWritten = -1;
     for (long i = 0; i < increments; i++) {
       if (cas) {
@@ -273,7 +284,9 @@ public final class ConsistencyProbe {
         // -2 means another worker advanced the version between our read
         // and our write's log position — re-read and try again. Nothing
         // is ever silently overwritten.
+        long attempts = 0;
         while (true) {
+          attempts++;
           byte[] vv = db.getVersioned(key);
           long version = decodeLong(vv);
           long seen = decodeLongAt(vv, 8);
@@ -289,6 +302,16 @@ public final class ConsistencyProbe {
             throw new IllegalStateException("casPut backend failure at increment " + i);
           }
           conflicts++;
+          if (backoffBaseUs > 0) {
+            long bound = Math.min(backoffCapUs, backoffBaseUs << Math.min(attempts - 1, 20));
+            long us = (long) (backoffRng.nextDouble() * bound);
+            if (us > 0) {
+              sleepNs(us * 1000L);
+            }
+          }
+        }
+        if (attempts > maxAttempts) {
+          maxAttempts = attempts;
         }
       } else {
         long seen = decodeLong(db.get(key));
@@ -308,6 +331,7 @@ public final class ConsistencyProbe {
       w.println("{\"worker\": " + workerIdx + ", \"acked\": " + acked
           + ", \"last_written\": " + lastWritten
           + ", \"cas\": " + cas + ", \"conflicts\": " + conflicts
+          + ", \"max_attempts\": " + maxAttempts
           + ", \"elapsed_s\": " + String.format("%.3f", elapsedS) + "}");
     }
     System.out.println("{\"worker\": " + workerIdx + ", \"acked\": " + acked
