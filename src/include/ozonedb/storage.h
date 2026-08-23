@@ -148,15 +148,31 @@ class Storage {
    * Returns false when the backend doesn't track versions or the key has
    * never been written. On true: version is the log address of the last
    * accepted write; when has_value is set the map also carries the
-   * record's value (kept for keys written via appendConditional) and
-   * value/deleted describe that record — an atomic (value, version) pair
-   * for read-modify-write callers.
+   * record's value and value/deleted describe that record — an atomic
+   * (value, version) pair for read-modify-write callers. The inline
+   * value exists only for keys last written via appendConditional and
+   * only until the log file holding the record is REMOVEd (compacted):
+   * from then on the record is served by the normal read path. See
+   * CorfuDBStorage::KeyVersion for why that window needs it.
    */
   virtual bool versionedLookup(std::string const& /*key*/, int64_t& /*version*/,
                                std::string& /*value*/, bool& /*has_value*/,
                                bool& /*deleted*/) {
     return false;
   }
+
+  /**
+   * @brief Block until every remote-append event the backend's tailer
+   * has enqueued so far has been delivered to the listener.
+   *
+   * On Corfu the listener (LogHandler::onRemoteAppend) runs on a
+   * dispatch thread that lags the tailer, so a fence alone (sync())
+   * guarantees the *storage buffers* cover the target but not that the
+   * listener-fed key index does. Callers that read through the index
+   * after fencing (DB::getVersioned) call this to close that gap.
+   * Default no-op: direct backends have no listener pipeline.
+   */
+  virtual void syncListeners() {}
 
   /**
    * @brief Establish a linearization fence for the CALLING THREAD.

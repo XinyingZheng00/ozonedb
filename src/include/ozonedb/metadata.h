@@ -104,6 +104,18 @@ class Metadata {
   // sequenced in the log before it acks; see CorfuDBStorage::sync_mode_).
   bool linearizable_reads = false;
 
+  // When true (Corfu backend only), the storage tailer maintains a
+  // log-ordered key -> version map over every data-log APPEND so that
+  // DB::compareAndPut can be decided deterministically at its log
+  // position and DB::getVersioned can pair a value with its version.
+  // Costs the tailer a key-only decode of every data-log payload (own
+  // entries included, which it otherwise skips), so it is off by
+  // default — a run that never calls compareAndPut pays nothing. Must
+  // be uniform across every writer of a stream: a replica with it off
+  // cannot evaluate a peer's conditional entry (it applies the bytes
+  // unconditionally and logs the misconfiguration once).
+  bool track_versions = false;
+
   /**
    * @brief Local Metadata, read from local config file
    *
@@ -224,6 +236,11 @@ class Metadata {
           "config error: linearizable_reads and trust_background_tail are "
           "mutually exclusive (one demands a fence per get, the other skips "
           "it)");
+    }
+
+    auto tv_it = result.find("track_versions");
+    if (tv_it != result.end()) {
+      track_versions = (tv_it->second == "true" || tv_it->second == "1");
     }
 
     // std::cout<<shared_config_path<<std::endl;

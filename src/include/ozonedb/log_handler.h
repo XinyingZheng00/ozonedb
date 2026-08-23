@@ -113,9 +113,14 @@ class LogHandler {
    *
    * @param key
    * @param value
+   * @param force_strict  take the linearizable_reads path for this call
+   *                      even when the handler was built without it
+   *                      (DB::getVersioned: the caller holds the fence
+   *                      token, and the unfenced index probe could
+   *                      pair a lagging value with a fresh version)
    * @return Status
    */
-  Status readRecord(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset, std::string& latest_offset);
+  Status readRecord(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset, std::string& latest_offset, bool force_strict = false);
 
   // View-independent fast path: probe the in-memory key index without
   // touching latest_view or any storage backend. Returns true and sets

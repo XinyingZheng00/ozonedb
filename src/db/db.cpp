@@ -32,7 +32,7 @@ Storage* makeStorage(BackendKind kind, Metadata const& md, bool for_sstables) {
 #ifdef OZONEDB_ENABLE_CORFU
       return new CorfuDBStorage(md.corfu_endpoint, md.corfu_jar_path,
                                 md.corfu_jvm_opts, md.corfu_stream_name,
-                                md.DBpath, md.log_prefix);
+                                md.DBpath, md.log_prefix, md.track_versions);
 #else
       throw std::runtime_error(
           "OzoneDB was built without CorfuDB support (rebuild with "
@@ -229,6 +229,7 @@ Status DB::remove(std::string const& key) {
 
 Status DB::compareAndPut(std::string const& key, int64_t expected_version,
                          std::string const& value, int64_t& new_version) {
+  if (!this->metadata->track_versions) return Status::kFailure;
   Record record;
   record.set_key(key);
   record.set_value(value);
@@ -238,33 +239,44 @@ Status DB::compareAndPut(std::string const& key, int64_t expected_version,
 
 Status DB::getVersioned(std::string const& key, std::string& value,
                         int64_t& version) {
-  // Fence first: syncView blocks until the local tailer has applied at
-  // least up to the global log tail sampled now, so the version map
-  // reflects every write acked before this call — including our own
-  // (globalFenceTarget takes max with last_written_addr_). Runs
-  // regardless of the linearizable_reads config; CAS callers need this
-  // freshness unconditionally.
-  metadata_log->syncView();
-
   version = -1;
+  if (!this->metadata->track_versions) return Status::kFailure;
+
+  // ONE fence for the whole versioned read, taken here and reused by
+  // the strict get() below through the thread-local token (a caller-
+  // held DB::sync() token takes precedence, as in get()). Everything
+  // sequenced before the fence — our own writes included, via
+  // last_written_addr_ — is in local storage state once it returns.
+  std::optional<Storage::SyncScope> fence;
+  if (!log_storage->hasSyncToken()) {
+    fence.emplace(*log_storage);
+  }
+  // The key index is fed by the tailer's dispatch thread, which lags
+  // the tailer; drain it so nothing read below can predate the fence.
+  log_storage->syncListeners();
+
   bool has_value = false;
   bool deleted = false;
-  if (log_storage->versionedLookup(key, version, value, has_value, deleted)) {
-    if (has_value) {
-      // Key last written by an accepted CAS: the map carries value and
-      // version from the same log entry — an atomic pair.
-      return deleted ? Status::kNotFound : Status::kSuccess;
-    }
+  if (log_storage->versionedLookup(key, version, value, has_value, deleted) &&
+      has_value) {
+    // Key last written by an accepted CAS whose log file is not yet
+    // compacted: the map carries value and version from the same log
+    // entry — an atomic pair, independent of file visibility.
+    return deleted ? Status::kNotFound : Status::kSuccess;
   }
 
-  // Key last written by a blind put (or unknown to the backend): the
-  // value comes from the normal read path. The version was read first,
-  // so the value can only be same-or-newer than the version — a stale
-  // pairing makes a subsequent compareAndPut fail (never wrongly
-  // succeed), and the caller retries with a fresh read.
+  // Otherwise the value comes from the normal read path, forced strict:
+  // with the fence held, the scan reads local state that is at least as
+  // new as the version just looked up, so the value can only be
+  // same-or-newer — a newer value pairs with an older version and makes
+  // the CAS fail at its log position (never wrongly succeed), and the
+  // caller retries. The only way to pair an OLDER value with this
+  // version is a blind put whose bytes sit past a LOGCREATE-frozen file
+  // size (see CorfuDBStorage::KeyVersion), a transient window that
+  // compaction closes; CAS-written keys are immune by construction.
   std::string const* vptr = nullptr;
   std::shared_ptr<Record> guard;
-  Status s = get(key, vptr, guard);
+  Status s = get(key, vptr, guard, /*force_strict=*/true);
   if (s != Status::kSuccess) {
     return version >= 0 ? Status::kNotFound : s;
   }
@@ -273,14 +285,14 @@ Status DB::getVersioned(std::string const& key, std::string& value,
 }
 
 Status DB::get(std::string const& key, std::string const*& value,
-               std::shared_ptr<Record>& guard) {
+               std::shared_ptr<Record>& guard, bool force_strict) {
   // Fast path: probe the log key index before refreshing the view.
   // When trust_background_tail is enabled, the index is authoritative
   // for log reads — kept current by local addRecord and, on Corfu, by
   // the tailer's onRemoteAppend callback. A hit here avoids the O(N)
   // View deep-copy at getLatestView, the tail_cache lock, and the
   // setLatestView calls below. Tombstones still terminate the read.
-  if (this->metadata->trust_background_tail) {
+  if (this->metadata->trust_background_tail && !force_strict) {
     std::shared_ptr<Record> fast_hit;
     if (this->log_handler->tryIndexLookup(key, fast_hit)) {
       if (fast_hit->type() == kTypeDeletion) return Status::kFailure;
@@ -322,7 +334,7 @@ Status DB::get(std::string const& key, std::string const*& value,
   // this thread already holds a token, the get linearizes at the
   // caller's fence point instead of taking its own — one sequencer
   // round-trip amortized over the caller's whole read batch.
-  bool const strict = this->metadata->linearizable_reads;
+  bool const strict = this->metadata->linearizable_reads || force_strict;
   std::optional<Storage::SyncScope> fence;
   if (strict && !log_storage->hasSyncToken()) {
     fence.emplace(*log_storage);
@@ -357,7 +369,8 @@ Status DB::get(std::string const& key, std::string const*& value,
     std::shared_ptr<Record> log_record;
     std::string const empty_offset;
     std::string latest_offset;
-    log_handler->readRecord(key, log_record, empty_offset, latest_offset);
+    log_handler->readRecord(key, log_record, empty_offset, latest_offset,
+                            force_strict);
 
     std::shared_ptr<Record> latest_record;
     if (log_record) {

@@ -157,16 +157,18 @@ class DB {
    * @return Status
    */
   Status get(std::string const& key, std::string const*& value,
-             std::shared_ptr<Record>& guard);
+             std::shared_ptr<Record>& guard, bool force_strict = false);
 
   /**
    * @brief read the value and version of a key for read-modify-write
    *
    * The version is the global log address of the key's last accepted
-   * write, suitable as compareAndPut's expected_version. Fences on the
-   * shared log tail before reading, so the pair reflects every write
-   * acked before the call. version is -1 when the key has never been
-   * written (or the backend doesn't track versions).
+   * write, suitable as compareAndPut's expected_version. Takes ONE
+   * storage fence (reusing a caller-held DB::sync() token if any) and
+   * reads strictly — regardless of linearizable_reads — so the pair
+   * reflects every write acked before the call and the value never
+   * lags the version. version is -1 when the key has never been
+   * written. Requires Metadata::track_versions (kFailure otherwise).
    *
    * @param key
    * @param value    output: copy of the value bytes

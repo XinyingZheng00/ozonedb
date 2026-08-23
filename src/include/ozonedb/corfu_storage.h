@@ -42,7 +42,8 @@ class CorfuDBStorage : public Storage {
                  std::string const& jvm_opts,
                  std::string const& stream_name,
                  std::string const& db_path,
-                 std::string const& log_prefix = "datalog");
+                 std::string const& log_prefix = "datalog",
+                 bool track_versions = false);
   ~CorfuDBStorage();
 
   void createDirectory(std::string name) override;
@@ -80,6 +81,10 @@ class CorfuDBStorage : public Storage {
   void sync() override;
   void clearSync() override;
   bool hasSyncToken() const override { return fence_token_.instance == this; }
+  // Wait for the dispatch thread to deliver every remote-append event
+  // enqueued so far (see Storage::syncListeners). Takes dispatch_mtx_
+  // only — never mtx_ — so it composes with a held fence token.
+  void syncListeners() override;
 
   void setRemoteAppendListener(RemoteAppendListener listener) override {
     bool cleared;
@@ -121,22 +126,60 @@ class CorfuDBStorage : public Storage {
   // payloads under this prefix as Records to maintain key_versions_.
   std::string log_prefix_;
 
+  // Version tracking (Metadata::track_versions). Off: the apply loop
+  // is byte-for-byte the pre-CAS one — no payload is ever decoded and
+  // own APPENDs are skipped outright. On: every data-log APPEND costs a
+  // key-only decode (decodeRecordHeaders, run OUTSIDE mtx_) plus an
+  // O(records) map update under it.
+  bool track_versions_ = false;
+  std::atomic<bool> warned_untracked_conditional_{false};
+
   // Log-ordered per-key version map, guarded by mtx_. addr is the global
   // log address of the key's last *accepted* write — every replica's
   // apply loop computes the identical map because entries are evaluated
-  // in address order, own entries included (they are parsed for version
-  // tracking even when their byte-apply is skipped). For keys last
-  // written by an accepted conditional entry the record's value rides
-  // along (has_value), giving readers an atomic (value, version) pair
-  // that never depends on file visibility. Rebuilt from the stream on
-  // every open by drainInitialEntries, so it is complete, not a cache.
+  // in address order, own entries included (they are decoded for
+  // version tracking even when their byte-apply is skipped). Rebuilt
+  // from the stream on every open by drainInitialEntries, so it is
+  // complete, not a cache. Memory: one entry per live key
+  // (~key + 48 B), never evicted — a version must outlive the record's
+  // move into an SSTable, or a CAS with expected_version = -1 could
+  // wrongly succeed on a compacted key.
+  //
+  // Inline values. A key last written by an accepted conditional entry
+  // also carries the record's value (has_value) so DB::getVersioned can
+  // serve (value, version) as one atomic pair. The reason is a window in
+  // the read path, not the map: a LOGCREATE freezes the superseded
+  // tail's size from the rolling writer's (lagging) view, and the scan
+  // of a sealed log file stops at that size, so a record appended near
+  // a roll can be invisible to scans until compaction rewrites the file
+  // in full into an SSTable (Compaction reads storage->read(file), not
+  // the frozen size). A blind put re-issues itself when it detects the
+  // roll; a CAS cannot (re-issuing an accepted CAS would double-apply
+  // it), so its value is pinned here instead — and released by the
+  // apply loop when the file holding it is REMOVEd, i.e. exactly when
+  // the SSTable takes over (releaseInlineValuesLocked). The retained
+  // set is therefore bounded by the CAS records in not-yet-compacted
+  // log files, not by the CAS working set. Two exceptions keep a value
+  // pinned until the key is next written: the target file was already
+  // sealed/removed at the entry's log position (the bytes may have
+  // missed the compactor's read), and a blind overwrite clears it
+  // anyway. Pinning is replica-local memory policy, never an
+  // accept/reject input, so it need not be deterministic.
   struct KeyVersion {
     long addr = -1;
     bool has_value = false;
     bool deleted = false;
     std::string value;
+    // Log file whose bytes carry the inline value; empty when there is
+    // no inline value or it is pinned (see above).
+    std::string file;
   };
   std::unordered_map<std::string, KeyVersion> key_versions_;
+  // Keys holding an inline value per log file, consumed by
+  // releaseInlineValuesLocked on that file's REMOVE. May contain keys
+  // whose value has since moved on (re-checked against KeyVersion::file
+  // at release), so it is a hint list, not an index.
+  std::unordered_map<std::string, std::vector<std::string>> inline_keys_by_file_;
 
   // Outcome of this process's own conditional appends, keyed by log
   // address; recorded by the apply loop, consumed (erased) by
@@ -215,6 +258,13 @@ class CorfuDBStorage : public Storage {
   // hasn't returned yet. drainDispatchQueue() must block on this in
   // addition to an empty queue.
   bool dispatch_in_flight_ = false;
+  // Monotone event counters, guarded by dispatch_mtx_: events pushed
+  // by the tailer and events whose listener call has returned.
+  // syncListeners() waits for delivered >= enqueued-as-of-the-call —
+  // bounded by the queue length at that instant — rather than for an
+  // idle dispatcher, which under sustained peer writes may never come.
+  uint64_t dispatch_enqueued_ = 0;
+  uint64_t dispatch_delivered_ = 0;
   std::thread dispatch_thread_;
 
   void startJvm(std::string const& jar_path, std::string const& jvm_opts);
@@ -224,17 +274,36 @@ class CorfuDBStorage : public Storage {
   long jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
                       unsigned char const* data, int length,
                       bool conditional = false, long expected_version = -1);
-  // True for files whose APPEND payloads are parsed for version
+  // True for files whose APPEND payloads are decoded for version
   // tracking (data-log files: "<log_prefix_>/N").
   bool isVersionTracked(std::string const& file_name) const {
     return file_name.compare(0, log_prefix_.size(), log_prefix_) == 0;
   }
-  // Parse + evaluate + (maybe) apply one entry's version effects.
-  // Called by applyEntryBytes with mtx_ held. Returns whether a
-  // conditional entry was accepted (true for unconditional).
-  bool applyVersionedLocked(::CorfuEntry const& entry, long addr,
-                            bool own, bool& should_apply_bytes,
-                            bool& should_notify);
+  // What the version map needs from one Record of a data-log payload:
+  // the key, whether it is a tombstone, and where the value bytes sit
+  // in the payload (copied only if a conditional entry is accepted).
+  struct RecordHeader {
+    std::string key;
+    bool deleted = false;
+    bool has_value = false;
+    size_t value_off = 0;
+    size_t value_len = 0;
+  };
+  // Key-only decode of a data-log payload (a sequence of varint-length-
+  // prefixed Record protos, protobuf::serializeMessage's format) with
+  // no Record materialized and no lock held. False on malformed input.
+  static bool decodeRecordHeaders(std::string const& payload,
+                                  std::vector<RecordHeader>& out);
+  // Version effects of one APPEND entry at its log position; both run
+  // with mtx_ held from applyEntryBytes. The conditional variant
+  // returns acceptance (and records it in cas_outcomes_ for own
+  // entries); a decode failure rejects, identically on every replica.
+  void applyBlindVersionsLocked(std::vector<RecordHeader> const& recs, long addr);
+  bool applyConditionalLocked(::CorfuEntry const& entry, bool decode_ok,
+                              std::vector<RecordHeader> const& recs,
+                              long addr, bool own);
+  // Drop the inline values whose bytes lived in `file` (REMOVE applied).
+  void releaseInlineValuesLocked(std::string const& file);
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
   // Core apply logic, takes already-JNI-extracted bytes. Shared by
   // applyEntryFromJava (single-entry path, kept for drainInitialEntries)

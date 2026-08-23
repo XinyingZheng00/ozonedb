@@ -213,6 +213,40 @@ end-to-end guarantee assumes the sync write defaults (`commit_interval_ = 0`,
 The returned `value` **aliases bytes inside the `guard` `shared_ptr<Record>`** — callers must keep
 the guard alive while dereferencing.
 
+### Compare-and-put (Corfu only, `track_versions`)
+
+`DB::getVersioned` / `DB::compareAndPut` (JNI `getVersioned`/`casPut`) give an atomic
+read-modify-write on top of the total order, with no coordination beyond the append itself:
+`compareAndPut` appends a `CorfuEntry` flagged `conditional` with `expected_version` = the global
+log address of the key's last accepted write (`-1` = unwritten). **Every replica's tailer decides
+the condition at the entry's log position** against a log-ordered key → version map
+(`CorfuDBStorage::key_versions_`, rebuilt from the stream on open, own entries included), so the
+verdict is identical everywhere; the writer never self-applies a conditional entry — it waits for
+its own tailer and reads the outcome from `cas_outcomes_`. Invariants to preserve:
+
+- The map is maintained only when `track_versions` is set (`Metadata`, off by default, must be
+  uniform across a stream's writers). With it on, the tailer does a **key-only decode** of every
+  data-log payload (`decodeRecordHeaders`, no `Record` allocated) **outside `mtx_`**, then an
+  O(records) map update under it. With it off the apply loop must stay byte-for-byte the old one —
+  that is what makes the default throughput numbers comparable.
+- An accepted CAS keeps its value inline in the map until the log file holding its bytes is
+  `REMOVE`d (compacted): a LOGCREATE freezes a superseded tail's size from the roller's lagging view,
+  so records near a roll can be invisible to scans until compaction rewrites the file in full. Blind
+  puts survive that window by re-issuing; a CAS cannot (double-apply), hence the pin. Release is
+  `releaseInlineValuesLocked` on `REMOVE`; a value stays pinned if its target file was already sealed
+  or removed at the entry's log position.
+- `getVersioned` takes one `Storage::SyncScope` (reusing a held `DB::sync()` token), calls
+  `syncListeners()` (drains the tailer's dispatch queue so the key index can't lag the fence), then
+  reads the value **forced strict** (`DB::get(..., force_strict=true)`) — the unfenced index probe
+  could otherwise pair a lagging value with a fresh version and let a CAS wrongly succeed.
+- Latency: a CAS always waits for its *own* just-appended entry, so the bridge's poller must not
+  park on an idle stream when a local append lands — `CorfuBridge.append` bumps `appendSeq` and
+  notifies the poller (`awaitAppendOrTick`). Fenced gets rarely hit this (their target is usually
+  already applied); CAS hits it on every call.
+- Limitations worth stating in any write-up: a blind `put()` to a CAS-managed key always wins (the
+  check is only on conditional entries); a CAS whose process dies between append and tailer verdict
+  has an unknown outcome (re-read); the version map is O(live keys), never evicted.
+
 ### Caching
 
 `LRUCache` (`cache.h`) holds parsed log records *and* SSTable blocks/tables, bounded by

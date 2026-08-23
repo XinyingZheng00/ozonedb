@@ -146,13 +146,16 @@ bool LogHandler::tryIndexLookup(std::string const& key, std::shared_ptr<Record>&
   return true;
 }
 
-Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset, std::string& latest_offset) {
+Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset, std::string& latest_offset, bool force_strict) {
+  // force_strict: DB::getVersioned holds the fence token and must not
+  // take the unfenced index probe (see the header).
+  bool const strict = linearizable_reads_ || force_strict;
   // Fast path: check the in-memory key index first. This skips the
   // multi-file backward scan (and, on Corfu, the per-file fenced
   // storage->size() call in checkReadMoreLog). On miss, fall through
   // to the existing scan and backfill on success. Bypassed entirely in
   // linearizable mode — see the linearizable_reads_ member comment.
-  if (key_index_ && !linearizable_reads_) {
+  if (key_index_ && !strict) {
     if (auto hit = key_index_->lookup(key)) {
       record = std::move(hit);
       return Status::kSuccess;
@@ -191,7 +194,7 @@ Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& r
     size_t size = 0;
     this->cache->checkReadMoreLog(file_name, read_more, cached_offset, size);
     if (read_more) {
-      if (linearizable_reads_) {
+      if (strict) {
         // Strict mode reads inline on the caller thread: the fence
         // token from DB::get's Storage::sync() is thread-local, so a
         // pool thread would pay a fresh sequencer fence — and after
