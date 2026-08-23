@@ -11,6 +11,9 @@ defaults: &defaults
   key_size: ["1KB"]
   db_name: ["ozonedb-corfu"]
   threads: [1] # sweep with e.g. [1, 4, 8, 16, 32, 64]
+  # Must stay 1 for the run phase: run_local_ycsb_multiproc.py refuses
+  # anything else, because every repeat rewrites the same _trial{N} result
+  # files. Repetition is expressed as trials (--trial N / --trials N).
   repeated: 1
   ycsb_data_path: "/tmp/ycsb_data"
 
@@ -31,7 +34,9 @@ local:
     workload_name: ["c"] # a b c d f
     operation_cnt: [999999999]
     # Cap each YCSB run at this many seconds (YCSB -p maxexecutiontime).
-    # Unset or 0 means runs are bounded only by operation_cnt.
+    # Unset or 0 means runs are bounded only by operation_cnt. For one sweep,
+    # run_multinode_ycsb_with_corfu.sh --duration (run_multinode_ycsb.py
+    # --max_exec_time) overrides this on every client without editing it.
     max_exec_time: 300
 
     # Writer-process counts.
@@ -95,6 +100,14 @@ corfu:
   port: 9090
   stream_name: "ozonedb-ycsb"
   jvm_opts: "-Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 --add-opens=java.base/java.util=ALL-UNNAMED"
+  # Read mode: leave unset here. Pass --linearizable to
+  # run_multinode_ycsb_with_corfu.sh / run_multinode_ycsb.py /
+  # run_local_ycsb_multiproc.py (or consistency.py): it sets
+  # linearizable_reads=true + trust_background_tail=false in every writer's
+  # generated shared_config AND labels the result files
+  # ozonedb-corfu-linearizable. `linearizable_reads: true` here is honoured
+  # and labelled the same way, but it has to be synced to every client per
+  # cell -- a forgotten sync is how two identical "default" sweeps happen.
 
 # --------------------------------------------------------------------- s3 --
 # S3-compatible store for SSTables

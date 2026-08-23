@@ -131,6 +131,16 @@ python3 bench/scripts/local/run_corfu_compaction_contention.py
 
 - `run_ycsb_with_corfu.sh` restarts the remote Corfu server between every (trial, workload, writers)
   iteration and tags all results with one `OZONEDB_RUN_TAG`.
+- `run_multinode_ycsb_with_corfu.sh` is the cluster path (`run_multinode_ycsb.py` →
+  `run_local_ycsb_multiproc.py` on every client). Campaign-driver flags: `--linearizable`,
+  `--duration S`, `--trial N` (one trial; `--trials N` runs 1..N), `--run-tag TAG`, `--dry-run`.
+  `--linearizable` forces `linearizable_reads=true` + `trust_background_tail=false` into every
+  generated per-writer config (`linearizable_corfu_settings`, shared with `consistency.py`) and
+  suffixes the result-file engine token — `ozonedb-corfu-linearizable_w0of8_…` — while `db_name`
+  itself never changes (the runner branches on it). Select the read mode with the flag, not by
+  editing `ycsb.yaml`: the label is derived from the effective settings either way, but a YAML
+  toggle has to be synced to every client. `local.run.repeated` must be 1 — the run phase refuses
+  anything else because repeats overwrite the `_trial{N}` files; use trials.
 - Each writer process gets its **own generated config**: `_make_local_config_per_writer` /
   `_make_corfu_config_per_writer` template `src/config/{local,corfu}/shared_config_base.json` into
   `shared_config_w{i}.json`. Never point multiple writers at a single `shared_config.json`.

@@ -13,7 +13,15 @@ set -euo pipefail
 #
 # Loop order: trials -> workloads -> writers_per_host. Corfu is restarted on
 # every (trial, workload, writers_per_host) iteration. All iterations share
-# one OZONEDB_RUN_TAG so result files land in one tagged dir.
+# one OZONEDB_RUN_TAG (--run-tag, default: timestamp) so result files land in
+# one tagged dir.
+#
+# A campaign driver (crsqlite/bench/scripts/campaign/throughput.py) calls this
+# once per cell: --trial N --duration S --run-tag TAG [--linearizable]
+# --workloads <wl> --writers-list <wph> --client-hosts <prefix>. The read mode
+# is a flag, never a ycsb.yaml edit: --linearizable is forwarded to every
+# client and shows up in the result filenames as ozonedb-corfu-linearizable,
+# so a default and a strict sweep cannot be mistaken for one another.
 #
 # Per iteration:
 #   1. stop corfu on $CORFU_BIND_HOST (best-effort)
@@ -21,6 +29,7 @@ set -euo pipefail
 #   3. wait until $CORFU_BIND_HOST:$CORFU_PORT is reachable
 #   4. run run_multinode_ycsb.py with
 #        --workloads=<wl> --writers_per_host=<n> --trial=<k>
+#        [--max_exec_time=<s>] [--linearizable]
 #      (this SSHes to every client host and launches its writer slice)
 #   5. stop corfu
 # After the full sweep, corfu is started one more time so the cluster is
@@ -61,6 +70,12 @@ CLIENT_SSH_KEY=""
 WORKLOADS="a b c d f"
 WRITERS_LIST="1 2 4 8"
 TRIALS=1
+TRIALS_SET=0
+TRIAL=""          # --trial N: exactly this trial (what a campaign driver passes)
+DURATION=""       # --duration S: forwarded to every client as --max_exec_time
+LINEARIZABLE=0    # --linearizable: strict reads, label ozonedb-corfu-linearizable
+RUN_TAG=""        # --run-tag: bench/results/local/<tag> on every host and here
+DRY_RUN=0
 
 usage() {
   cat <<EOF
@@ -91,8 +106,25 @@ Usage: $(basename "$0") [options]
                             (default: "$WORKLOADS")
   --writers-list "1 2"      space-separated writers_per_host values
                             (default: "$WRITERS_LIST")
-  --trials N                trials per (workload, writers_per_host)
+  --trials N                run trials 1..N per (workload, writers_per_host)
                             (default: $TRIALS)
+  --trial N                 run exactly trial N -- one cell per invocation,
+                            as a campaign driver does. Excludes --trials.
+  --duration SECONDS        cap every YCSB run at this many seconds
+                            (forwarded to each client as --max_exec_time;
+                            default: each client's local.run.max_exec_time)
+  --linearizable            strict reads: every writer's generated
+                            shared_config gets linearizable_reads=true +
+                            trust_background_tail=false, and result files
+                            are labelled ozonedb-corfu-linearizable instead
+                            of ozonedb-corfu. Use this, never a ycsb.yaml edit.
+  --run-tag TAG             results dir bench/results/local/TAG on every host
+                            and locally (default: timestamp). Reusing a tag
+                            across invocations is safe -- trial, workload
+                            and writer count are all in the filenames.
+  --dry-run                 print the iteration plan and the exact
+                            run_multinode_ycsb.py command per iteration;
+                            no ssh, no corfu restart.
 
   -h | --help
 EOF
@@ -113,7 +145,12 @@ while [[ $# -gt 0 ]]; do
   --client-ssh-key) CLIENT_SSH_KEY="$2"; shift 2 ;;
   --workloads)      WORKLOADS="$2"; shift 2 ;;
   --writers-list)   WRITERS_LIST="$2"; shift 2 ;;
-  --trials)         TRIALS="$2"; shift 2 ;;
+  --trials)         TRIALS="$2"; TRIALS_SET=1; shift 2 ;;
+  --trial)          TRIAL="$2"; shift 2 ;;
+  --duration)       DURATION="$2"; shift 2 ;;
+  --linearizable)   LINEARIZABLE=1; shift ;;
+  --run-tag)        RUN_TAG="$2"; shift 2 ;;
+  --dry-run)        DRY_RUN=1; shift ;;
   -h | --help)      usage; exit 0 ;;
   *)
     echo "Unknown option: $1" >&2
@@ -131,6 +168,28 @@ if [[ ${#WORKLOADS_ARR[@]} -eq 0 || ${#WRITERS_ARR[@]} -eq 0 ]]; then
 fi
 if ! [[ "$TRIALS" =~ ^[1-9][0-9]*$ ]]; then
   echo "--trials must be a positive integer (got: $TRIALS)" >&2
+  exit 1
+fi
+if [[ -n "$TRIAL" ]]; then
+  if [[ "$TRIALS_SET" -eq 1 ]]; then
+    echo "--trial and --trials are mutually exclusive" >&2
+    exit 1
+  fi
+  if ! [[ "$TRIAL" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--trial must be a positive integer (got: $TRIAL)" >&2
+    exit 1
+  fi
+  TRIAL_SEQ=("$TRIAL")
+else
+  # read -r -a rather than mapfile: this also runs on a macOS bash 3.2.
+  read -r -a TRIAL_SEQ <<<"$(seq 1 "$TRIALS" | tr '\n' ' ')"
+fi
+if [[ -n "$DURATION" ]] && ! [[ "$DURATION" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--duration must be a positive integer (got: $DURATION)" >&2
+  exit 1
+fi
+if [[ -n "$RUN_TAG" ]] && ! [[ "$RUN_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "--run-tag is a directory name and must match [A-Za-z0-9._-]+ (got: $RUN_TAG)" >&2
   exit 1
 fi
 
@@ -226,16 +285,21 @@ RESULTS=()
 
 # All trials/workloads/writers iterations land under this single tag.
 # run_multinode_ycsb.py also passes it through to each client host so
-# every node writes into the same tag dir.
-export OZONEDB_RUN_TAG="$(date +%Y%m%d-%H%M%S)"
+# every node writes into the same tag dir. --run-tag lets a campaign driver
+# accumulate many invocations (one per cell) in one dir.
+export OZONEDB_RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
+READ_MODE=default
+[[ "$LINEARIZABLE" -eq 1 ]] && READ_MODE=linearizable
 
 # Common args to every run_multinode_ycsb.py invocation.
 COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG")
 [[ -n "$CLIENT_HOSTS"   ]] && COMMON_ARGS+=(--hosts "$CLIENT_HOSTS")
 [[ -n "$CLIENT_USER"    ]] && COMMON_ARGS+=(--ssh_user "$CLIENT_USER")
 [[ -n "$CLIENT_SSH_KEY" ]] && COMMON_ARGS+=(--ssh_key "$CLIENT_SSH_KEY")
+[[ -n "$DURATION"       ]] && COMMON_ARGS+=(--max_exec_time "$DURATION")
+[[ "$LINEARIZABLE" -eq 1 ]] && COMMON_ARGS+=(--linearizable)
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=$TRIALS run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
 echo "=== corfu server: $CORFU_TARGET:$CORFU_PORT ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="
@@ -243,11 +307,24 @@ else
   echo "=== client hosts: from cloudlab.hosts in $CONFIG ==="
 fi
 
-for ((TRIAL = 1; TRIAL <= TRIALS; TRIAL++)); do
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  for TRIAL in "${TRIAL_SEQ[@]}"; do
+    for WL in "${WORKLOADS_ARR[@]}"; do
+      for NW in "${WRITERS_ARR[@]}"; do
+        echo "[dry-run] trial=$TRIAL workload=$WL writers_per_host=$NW: restart corfu on $CORFU_TARGET, then"
+        echo "[dry-run]   python3 $BENCH_SCRIPT ${COMMON_ARGS[*]} --workloads $WL --writers_per_host $NW --trial $TRIAL"
+      done
+    done
+  done
+  FINAL_STATE_LEFT_RUNNING=1 # nothing was touched; cleanup must not stop corfu
+  exit 0
+fi
+
+for TRIAL in "${TRIAL_SEQ[@]}"; do
   for WL in "${WORKLOADS_ARR[@]}"; do
     for NW in "${WRITERS_ARR[@]}"; do
       echo ""
-      echo "### iteration: trial=$TRIAL/$TRIALS workload=$WL writers_per_host=$NW ###"
+      echo "### iteration: trial=$TRIAL (of: ${TRIAL_SEQ[*]}) workload=$WL writers_per_host=$NW ###"
 
       stop_corfu || true
       start_corfu

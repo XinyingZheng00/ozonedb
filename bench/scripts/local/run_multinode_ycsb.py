@@ -42,7 +42,10 @@ those into the same tag-named dir locally and aggregates.
 Hosts/SSH come from cloudlab.{hosts,ssh_user,ssh_private_key_path} in
 ycsb.yaml (overridable via --hosts / --ssh_user / --ssh_key). Per-node
 slice size and pass-throughs come from local.run.writers_per_host (or
---writers_per_host) plus optional --workloads / --trial.
+--writers_per_host) plus optional --workloads / --trial / --max_exec_time
+/ --linearizable, all forwarded verbatim to every host's runner so one
+orchestrator invocation fully determines what every client runs -- no
+per-client ycsb.yaml edit is needed for a cell.
 """
 
 ozonedb_home = os.environ.get("OZONEDB_HOME")
@@ -167,7 +170,8 @@ def host_log_name(host, log_dir):
 
 
 def build_remote_command(remote_home, run_tag, host_offset, host_writers,
-                         total_writers, workloads, trial):
+                         total_writers, workloads, trial, max_exec_time=None,
+                         linearizable=False):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -185,11 +189,15 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             ]
             + (["--workloads", shlex.quote(workloads)] if workloads else [])
             + (["--trial", str(trial)] if trial is not None else [])
+            + (["--max_exec_time", str(int(max_exec_time))] if max_exec_time else [])
+            + (["--linearizable"] if linearizable else [])
         ),
     ]
     return " && ".join(parts)
 
 
+# `db` is the result LABEL, which may carry a read-mode suffix
+# (ozonedb-corfu-linearizable); the lazy `.+?` stops at the `_w{idx}of` tail.
 _PERWRITER_RE = re.compile(
     r"^(?P<ks>[^-]+)-(?P<opcnt>\d+)-(?P<rc>\d+)-workload(?P<wl>[^-]+)-"
     r"(?P<db>.+?)_w(?P<widx>\d+)of(?P<total>\d+)_t(?P<thread>\d+)"
@@ -303,6 +311,20 @@ def main():
         help="Pass-through trial index. Caller drives the trial loop.",
     )
     parser.add_argument(
+        "--max_exec_time",
+        type=int,
+        default=None,
+        help="Cap every writer's YCSB run at this many seconds (forwarded to each "
+             "host's run_local_ycsb_multiproc.py, overriding its local.run.max_exec_time).",
+    )
+    parser.add_argument(
+        "--linearizable",
+        action="store_true",
+        help="Strict reads on every writer (linearizable_reads=true + "
+             "trust_background_tail=false in each generated shared_config); "
+             "result files are labelled ozonedb-corfu-linearizable.",
+    )
+    parser.add_argument(
         "--run_tag",
         help="Tag for results dir; defaults to YYYYmmdd-HHMMSS. All hosts share this tag.",
     )
@@ -372,7 +394,9 @@ def main():
     print(
         f"[orchestrator] tag={run_tag} hosts={len(hosts)} "
         f"writers_per_host={writers_per_host} total_writers={total_writers} "
-        f"trial={trial}"
+        f"trial={trial} workloads={args.workloads or 'yaml'} "
+        f"max_exec_time={args.max_exec_time or 'yaml'} "
+        f"read_mode={'linearizable' if args.linearizable else 'default'}"
     )
     for p in plan:
         print(
@@ -381,6 +405,12 @@ def main():
         )
 
     if args.dry_run:
+        sample = build_remote_command(
+            "$OZONEDB_HOME", run_tag, plan[0]["offset"], plan[0]["writers"],
+            total_writers, args.workloads, trial,
+            max_exec_time=args.max_exec_time, linearizable=args.linearizable,
+        )
+        print(f"[orchestrator] per-host command (first host): {sample}")
         print("[orchestrator] --dry_run: not launching.")
         return
 
@@ -396,6 +426,7 @@ def main():
         cmd = build_remote_command(
             remote_home, run_tag, p["offset"], p["writers"],
             total_writers, args.workloads, trial,
+            max_exec_time=args.max_exec_time, linearizable=args.linearizable,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

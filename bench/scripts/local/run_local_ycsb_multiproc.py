@@ -14,7 +14,9 @@ from load_local_ycsb_multiproc import (
     _resolve_ycsb_classpath,
     _java_binary,
     YCSB_DB_CLASSNAMES,
+    linearizable_corfu_settings,
     partition_records,
+    result_label,
     spawn_parallel,
     write_aggregate,
 )
@@ -43,10 +45,19 @@ num_writers). Defaults (offset=0, total_writers=num_writers) match
 the original single-machine behavior.
 
 Per-writer results are written as:
-  {ks}-{opcnt}-{rc}-workload{w}-{db}_w{writer_idx}of{total}_t{thread}.result
+  {ks}-{opcnt}-{rc}-workload{w}-{label}_w{writer_idx}of{total}_t{thread}_trial{trial}.result
 Aggregate is:
-  ..._agg_w{total}_t{thread}.result                        (single-machine)
-  ..._agg_w{num}of{total}_off{offset}_t{thread}.result     (partial / multi-machine)
+  ..._agg_w{total}_t{thread}_trial{trial}.result                    (single-machine)
+  ..._agg_w{num}of{total}_off{offset}_t{thread}_trial{trial}.result (partial / multi-machine)
+
+{label} is the db_name plus the read mode: `ozonedb-corfu-linearizable`
+when --linearizable (or corfu.linearizable_reads) is on, else the plain
+db_name. Only the label changes -- db_name still selects the binding and
+the scratch/cached paths.
+
+One invocation runs ONE trial. `local.run.repeated` must be 1: a repeat
+would rewrite the very same _trial{N} files, so repetition is expressed
+as trials (--trial N, driven by the caller), never as repeats.
 
 Set `num_writers`, `offset`, `total_writers` under `local.run` in
 ycsb.yaml, or pass the matching --flags.
@@ -71,6 +82,7 @@ def run_ycsb(
     s3_settings=None,
     max_exec_time=None,
     trial=1,
+    linearizable=False,
 ):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
@@ -80,6 +92,23 @@ def run_ycsb(
         raise ValueError("offset must be >= 0")
     if trial < 1:
         raise ValueError("trial must be >= 1")
+    if repeated != 1:
+        # Every repeat would write the identical _trial{N} filenames and
+        # overwrite the previous round's numbers. Trials are the only
+        # supported repetition: one invocation per --trial N.
+        raise ValueError(
+            f"local.run.repeated must be 1 (got {repeated}): repeats overwrite "
+            "the _trial{N} result files. Run once per trial with --trial N instead."
+        )
+    if linearizable:
+        unsupported = [d for d in db_names if d != "ozonedb-corfu"]
+        if unsupported:
+            raise ValueError(
+                f"--linearizable only applies to db_name ozonedb-corfu (got {unsupported})"
+            )
+        # Same override consistency.py --linearizable applies; the label
+        # below picks it up from the effective settings.
+        corfu_settings = linearizable_corfu_settings(corfu_settings)
     if total_writers is None:
         total_writers = num_writers
     if total_writers < offset + num_writers:
@@ -138,148 +167,150 @@ def run_ycsb(
                     base_cp = _resolve_ycsb_classpath(ycsb_path, binding)
                     db_classname = YCSB_DB_CLASSNAMES[binding]
                     java_bin = _java_binary()
+                    # Filenames carry the read mode; db_name (paths, binding,
+                    # thread sweep) does not.
+                    label = result_label(db_name, corfu_settings)
 
-                    for _round in range(repeated):
-                        for thread in thread_list:
-                            print(
-                                f"[trial {trial}] "
-                                f"workload={workload_name} db={db_name} thread={thread}"
+                    for thread in thread_list:
+                        print(
+                            f"[trial {trial}] "
+                            f"workload={workload_name} db={db_name} label={label} thread={thread}"
+                        )
+                        jobs = []
+                        per_writer_files = []
+                        for local_idx, (_, writer_ops) in enumerate(local_partitions):
+                            writer_idx = offset + local_idx
+                            cached_data_path = os.path.join(
+                                ycsb_data_path,
+                                f"cached_data-{db_name}-{each_key_size}-{record_cnt}-w{writer_idx}/",
                             )
-                            jobs = []
-                            per_writer_files = []
-                            for local_idx, (_, writer_ops) in enumerate(local_partitions):
-                                writer_idx = offset + local_idx
-                                cached_data_path = os.path.join(
-                                    ycsb_data_path,
-                                    f"cached_data-{db_name}-{each_key_size}-{record_cnt}-w{writer_idx}/",
-                                )
-                                run_data_path = os.path.join(
-                                    ycsb_data_path,
-                                    f"{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}-w{writer_idx}/",
-                                )
-
-                                if db_name != "ozonedb-corfu":
-                                    if not os.path.exists(cached_data_path):
-                                        print(
-                                            f"cached_data_path {cached_data_path} does not exist, skipping writer {writer_idx}..."
-                                        )
-                                        continue
-                                    subprocess.run(["rm", "-rf", run_data_path])
-                                    subprocess.run(
-                                        ["cp", "-r", cached_data_path, run_data_path]
-                                    )
-                                else:
-                                    subprocess.run(["rm", "-rf", run_data_path])
-                                    os.makedirs(run_data_path, exist_ok=True)
-
-                                ycsb_props = [
-                                    "-threads",
-                                    thread,
-                                    "-s",
-                                    "-P",
-                                    workload_path,
-                                    "-p",
-                                    f"recordcount={total_records}",
-                                    "-p",
-                                    f"operationcount={writer_ops}",
-                                    "-p",
-                                    "status.interval=1",
-                                ]
-                                if max_exec_time:
-                                    ycsb_props += [
-                                        "-p",
-                                        f"maxexecutiontime={int(max_exec_time)}",
-                                    ]
-                                extra_cp_entries = []
-
-                                if db_name == "rocksdb":
-                                    ycsb_props += ["-p", f"rocksdb.dir={run_data_path}"]
-                                elif db_name == "ozonedb":
-                                    cfg = _make_local_config_per_writer(
-                                        writer_idx, run_data_path
-                                    )
-                                    ycsb_props += ["-p", f"shared_config={cfg}"]
-                                elif db_name == "ozonedb-corfu":
-                                    cfg = _make_corfu_config_per_writer(
-                                        writer_idx,
-                                        run_data_path,
-                                        corfu_settings,
-                                        s3_settings,
-                                    )
-                                    ycsb_props += ["-p", f"shared_config={cfg}"]
-                                    extra_cp_entries.append(corfu_bridge_jar_path())
-                                elif db_name == "sqlite":
-                                    db_file = os.path.join(run_data_path, "mydb.db")
-                                    sqlite_cfg = os.path.join(
-                                        ozonedb_home,
-                                        f"bench/scripts/config/sqlite_w{writer_idx}.properties",
-                                    )
-                                    with open(sqlite_cfg, "w") as pf:
-                                        pf.write("db.driver=org.sqlite.JDBC\n")
-                                        pf.write(f"db.url=jdbc:sqlite:{db_file}\n")
-                                    ycsb_props += ["-P", sqlite_cfg]
-                                    extra_cp_entries.append(
-                                        os.path.join(
-                                            ycsb_path,
-                                            "jdbc/target/dependency/sqlite-jdbc-3.49.1.0.jar",
-                                        )
-                                    )
-
-                                full_cp = (
-                                    os.pathsep.join(extra_cp_entries + [base_cp])
-                                    if extra_cp_entries
-                                    else base_cp
-                                )
-                                cmd = (
-                                    [
-                                        java_bin,
-                                        "-cp",
-                                        full_cp,
-                                        "site.ycsb.Client",
-                                        "-db",
-                                        db_classname,
-                                    ]
-                                    + ycsb_props
-                                    + ["-t"]
-                                )
-
-                                result_file = os.path.join(
-                                    result_path,
-                                    f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}_w{writer_idx}of{total_writers}_t{thread}_trial{trial}.result",
-                                )
-                                jobs.append((cmd, result_file))
-                                per_writer_files.append(result_file)
-
-                            if not jobs:
-                                continue
-
-                            wall_start = time.time()
-                            rcs = spawn_parallel(jobs)
-                            wall_ms = (time.time() - wall_start) * 1000.0
-                            if any(r != 0 for r in rcs):
-                                print(f"[warning] writer return codes: {rcs}")
-
-                            if num_writers == total_writers and offset == 0:
-                                agg_tag = f"_agg_w{total_writers}"
-                            else:
-                                agg_tag = (
-                                    f"_agg_w{num_writers}of{total_writers}_off{offset}"
-                                )
-                            agg_file = os.path.join(
-                                result_path,
-                                f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{db_name}{agg_tag}_t{thread}_trial{trial}.result",
-                            )
-                            write_aggregate(
-                                agg_file, per_writer_files, wall_ms, num_writers
+                            run_data_path = os.path.join(
+                                ycsb_data_path,
+                                f"{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}-w{writer_idx}/",
                             )
 
-                            for local_idx in range(num_writers):
-                                writer_idx = offset + local_idx
-                                run_data_path = os.path.join(
-                                    ycsb_data_path,
-                                    f"{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}-w{writer_idx}/",
-                                )
+                            if db_name != "ozonedb-corfu":
+                                if not os.path.exists(cached_data_path):
+                                    print(
+                                        f"cached_data_path {cached_data_path} does not exist, skipping writer {writer_idx}..."
+                                    )
+                                    continue
                                 subprocess.run(["rm", "-rf", run_data_path])
+                                subprocess.run(
+                                    ["cp", "-r", cached_data_path, run_data_path]
+                                )
+                            else:
+                                subprocess.run(["rm", "-rf", run_data_path])
+                                os.makedirs(run_data_path, exist_ok=True)
+
+                            ycsb_props = [
+                                "-threads",
+                                thread,
+                                "-s",
+                                "-P",
+                                workload_path,
+                                "-p",
+                                f"recordcount={total_records}",
+                                "-p",
+                                f"operationcount={writer_ops}",
+                                "-p",
+                                "status.interval=1",
+                            ]
+                            if max_exec_time:
+                                ycsb_props += [
+                                    "-p",
+                                    f"maxexecutiontime={int(max_exec_time)}",
+                                ]
+                            extra_cp_entries = []
+
+                            if db_name == "rocksdb":
+                                ycsb_props += ["-p", f"rocksdb.dir={run_data_path}"]
+                            elif db_name == "ozonedb":
+                                cfg = _make_local_config_per_writer(
+                                    writer_idx, run_data_path
+                                )
+                                ycsb_props += ["-p", f"shared_config={cfg}"]
+                            elif db_name == "ozonedb-corfu":
+                                cfg = _make_corfu_config_per_writer(
+                                    writer_idx,
+                                    run_data_path,
+                                    corfu_settings,
+                                    s3_settings,
+                                )
+                                ycsb_props += ["-p", f"shared_config={cfg}"]
+                                extra_cp_entries.append(corfu_bridge_jar_path())
+                            elif db_name == "sqlite":
+                                db_file = os.path.join(run_data_path, "mydb.db")
+                                sqlite_cfg = os.path.join(
+                                    ozonedb_home,
+                                    f"bench/scripts/config/sqlite_w{writer_idx}.properties",
+                                )
+                                with open(sqlite_cfg, "w") as pf:
+                                    pf.write("db.driver=org.sqlite.JDBC\n")
+                                    pf.write(f"db.url=jdbc:sqlite:{db_file}\n")
+                                ycsb_props += ["-P", sqlite_cfg]
+                                extra_cp_entries.append(
+                                    os.path.join(
+                                        ycsb_path,
+                                        "jdbc/target/dependency/sqlite-jdbc-3.49.1.0.jar",
+                                    )
+                                )
+
+                            full_cp = (
+                                os.pathsep.join(extra_cp_entries + [base_cp])
+                                if extra_cp_entries
+                                else base_cp
+                            )
+                            cmd = (
+                                [
+                                    java_bin,
+                                    "-cp",
+                                    full_cp,
+                                    "site.ycsb.Client",
+                                    "-db",
+                                    db_classname,
+                                ]
+                                + ycsb_props
+                                + ["-t"]
+                            )
+
+                            result_file = os.path.join(
+                                result_path,
+                                f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{label}_w{writer_idx}of{total_writers}_t{thread}_trial{trial}.result",
+                            )
+                            jobs.append((cmd, result_file))
+                            per_writer_files.append(result_file)
+
+                        if not jobs:
+                            continue
+
+                        wall_start = time.time()
+                        rcs = spawn_parallel(jobs)
+                        wall_ms = (time.time() - wall_start) * 1000.0
+                        if any(r != 0 for r in rcs):
+                            print(f"[warning] writer return codes: {rcs}")
+
+                        if num_writers == total_writers and offset == 0:
+                            agg_tag = f"_agg_w{total_writers}"
+                        else:
+                            agg_tag = (
+                                f"_agg_w{num_writers}of{total_writers}_off{offset}"
+                            )
+                        agg_file = os.path.join(
+                            result_path,
+                            f"{each_key_size}-{each_operation_cnt}-{record_cnt}-workload{workload_name}-{label}{agg_tag}_t{thread}_trial{trial}.result",
+                        )
+                        write_aggregate(
+                            agg_file, per_writer_files, wall_ms, num_writers
+                        )
+
+                        for local_idx in range(num_writers):
+                            writer_idx = offset + local_idx
+                            run_data_path = os.path.join(
+                                ycsb_data_path,
+                                f"{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}-w{writer_idx}/",
+                            )
+                            subprocess.run(["rm", "-rf", run_data_path])
 
 
 if __name__ == "__main__":
@@ -329,6 +360,14 @@ if __name__ == "__main__":
         default=None,
         help="Cap each YCSB run at this many seconds via maxexecutiontime (overrides local.run.max_exec_time).",
     )
+    parser.add_argument(
+        "--linearizable",
+        action="store_true",
+        help="Strict reads (ozonedb-corfu only): every writer's generated shared_config gets "
+             "linearizable_reads=true + trust_background_tail=false, and result files are "
+             "labelled ozonedb-corfu-linearizable instead of ozonedb-corfu. Prefer this over "
+             "toggling corfu.linearizable_reads in ycsb.yaml.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -375,7 +414,8 @@ if __name__ == "__main__":
 
     print(
         f"Launching {num_writers} parallel runner processes "
-        f"(offset={offset}, total_writers={total_writers}, trial={trial})"
+        f"(offset={offset}, total_writers={total_writers}, trial={trial}, "
+        f"read_mode={'linearizable' if args.linearizable else 'default'})"
     )
     run_ycsb(
         workload_names,
@@ -393,4 +433,5 @@ if __name__ == "__main__":
         s3_settings=s3_settings,
         max_exec_time=max_exec_time,
         trial=trial,
+        linearizable=args.linearizable,
     )
