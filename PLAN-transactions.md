@@ -368,6 +368,60 @@ p99 17.7 ms. The no-validate row is the evidence for the read-only
 validation record: unvalidated reads under one fence tear 6.6% of audits
 against 8 concurrent writers.
 
+### E0 (2026-08-25): gate off matches the baseline; the update path is faster
+
+Cluster re-provisioned the same morning (all nodes rebooted 11:55, empty
+home directories). `ycsb.yaml` now names amd217 (log+store, 10.10.1.1) and
+**seven** clients: amd207 (node3, 10.10.1.4) has no second ConnectX-5 in
+`lspci`, so it never gets a LAN address and is left out until swapped.
+Bootstrapped with `bootstrap.yml -e target=nodes -e include_git=false`
+(the minio role's `curl` of dl.min.io failed once with rc 6 on amd217;
+`setup.sh --role minio` rerun by hand succeeded). `visibility` was merged
+into `cas` first (`2c567563`, one conflict in `consistency.py`), so both
+builds share the same harness. Load: `load_corfu_dataset.sh --num-writers 8`
+(new; 1M × 1 KB in 141 s, log 1.1 GB, bucket snapshot 6.6 GB / 70
+objects). The multinode wrapper now restores the SSTable bucket from that
+snapshot before every cell (`5cacc48b`) — a run's compaction REMOVEs input
+SSTables the restored load-time log still references.
+
+Same nodes, same load, same harness, 7 hosts × 1 writer, 120 s, 3 trials,
+`track_versions` off on `cas` (`SumWriterThroughput`, mean ± std):
+
+| wl | metric | `cas` gate off | `visibility` | Δ |
+|---|---|---|---|---|
+| c | ops/s | 5,539 ±29 | 5,567 ±35 | −0.5% |
+| c | read avg / max-p99 (µs) | 700 / 2,436 | 700 / 2,404 | 0% / +1% |
+| a | ops/s | 1,418 ±50 | 1,011 ±9 | **+40%** |
+| a | read avg / max-p99 (µs) | 2,465 / 13,892 | 3,545 / 12,935 | −30% / +7% |
+| a | update avg / max-p99 (µs) | 3,127 / 14,620 | 4,182 / 13,895 | −25% / +5% |
+
+Verdict: no regression with the gate off — the read-only workload is
+identical within trial noise. The update-heavy workload is *faster* on
+`cas` for a known reason: `88e47612` (bridge wakes the poller on a local
+append, written for the CAS verdict wait) also shortens the read-my-writes
+fence after every blind put, which the old 5 ms poll quantization used to
+pay on the default read path. State this when quoting `cas` throughput
+next to older `visibility` numbers; it is a latency fix, not a gate
+effect. Raw cells: `bench/results/local/e0-cas/`, `e0-vis/` (laptop copy,
+gitignored). Old-cluster reference (amd132, w8, 2026-08-21): a 1,755,
+c 6,234–9,230 ops/s.
+
+Two pitfalls found on the way, both fixed in the tree:
+
+- **rsync preserves mtimes, so a branch switch does not rebuild.** The
+  first `visibility` "build" finished in 21 s and left the `cas`
+  `libOzoneDB.so` in place (its objects were newer than the synced
+  sources). Its partial sweep was discarded. `touch` the sources before
+  `sync.yml -e build=true` when switching trees, and check the `.so` mtime
+  (or `nm -D … | grep appendTransaction`) before trusting a sweep.
+- **Two of the seven clients ran every cell at ~53%** (amd209 = `w4`,
+  amd210 = `w6`: 126–141 vs 221–246 ops/s on a, 456–491 vs 899–939 on c,
+  identically on both builds). They boot with `acpi-cpufreq` + `schedutil`
+  (1.5 GHz idle, ~2.4 GHz under one YCSB thread); the other five expose no
+  cpufreq and sit at ~3.0 GHz. `setup.sh` now pins `performance` where
+  cpufreq exists (`328137f6`). Per-host sums in E3–E5 must be read with
+  this in mind if a node is not pinned.
+
 Operational note: every check needs a fresh `corfu_server` first. The
 fence target is the *global* sequencer tail and the tailer only advances on
 its own stream's entries, so a new stream never catches up with entries
