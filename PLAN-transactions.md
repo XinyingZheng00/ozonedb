@@ -347,13 +347,21 @@ number carries n and trial count in the caption.
 
 Nothing in this plan is implemented. The prerequisites listed under "What
 the branch already provides" are committed on `cas` (`e0e39b2f`,
-`80ca93f1`, `88e47612`, `578e239c`) and are not cluster-validated. The CAS
-validation commands from the previous report must pass before step 1
-starts:
+`80ca93f1`, `88e47612`, `578e239c`).
 
-```
-bash bench/scripts/local/run_consistency_with_corfu.sh check-lost-updates --cas --workers 2 --increments 1000 --settle 3
-```
+CAS base validated on the new 9-node cluster (amd217 log/store, 8 clients,
+`49e76a49`; bootstrapped from this worktree with `bootstrap.yml -e
+target=nodes -e include_git=false`, harness fix `371e41f4`). One client
+node, `check-lost-updates`:
+
+| run | workers | increments | lost | conflicts | elapsed |
+|---|---|---|---|---|---|
+| blind get+put | 2 | 1000 | 500 (50%) | — | 1.22 s |
+| `--cas` | 2 | 1000 | 0 | 197 | 2.36 s |
+| `--cas` | 8 | 4000 | 0 | 3698 | 6.71 s |
+
+At w8 the max attempts per increment were 11–19, so the backoff holds on
+one hot key. Step 1 of the implementation order can start.
 
 ## Decisions taken here (change them if wrong)
 
