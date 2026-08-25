@@ -413,6 +413,28 @@ stream, or make the binding open the DB before YCSB's timer) and say which
 one every figure uses. E0's comparison is unaffected: both builds paid the
 same init.
 
+#### E0 with the bridge wake in both modes (2026-08-25, afternoon)
+
+`88e47612` was cherry-picked onto `visibility` (`585b71f0`, pushed) so the
+baseline carries the poller wake too, and both builds were rerun under the
+same host state (governor pinned on amd209/amd210, which lifts every sum
+above the morning numbers) on the reloaded dataset. Steady-state
+(init excluded), 7 hosts × 1 writer, 120 s, 3 trials:
+
+| wl | `cas` gate off (`e0-cas2`) | `visibility` + wake (`e0-vis-wake`) | Δ |
+|---|---|---|---|
+| a | 2,605 ±13 | 2,562 ±9 | +1.7% |
+| c | 10,660 ±126 | 10,675 ±116 | −0.1% |
+
+Read and update latencies (avg and max-p99) agree within 1–2%. This is
+the E0 verdict to quote: **with the wake in both modes, the transaction
+gate costs nothing when off.** The raw YCSB sums still read +18% / +17%
+for `cas`, entirely because `cas` also has the replay fix (first op at
+37 s vs 48 s) and YCSB's timer includes that init. Note for the record:
+a concurrent test from another session rewrote `/mnt/corfu/load` and
+killed the Corfu server under the baseline's trial 3, so that trial was
+rerun; the cluster is shared — check for other drivers before a sweep.
+
 #### Load time (openDB replay), measured 2026-08-25
 
 The replay drains 1,022,163 entries — one Corfu entry per loaded record
