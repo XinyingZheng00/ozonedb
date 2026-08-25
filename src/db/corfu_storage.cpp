@@ -209,7 +209,8 @@ void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& 
 
 long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
                                     unsigned char const* data, int length,
-                                    bool conditional, long expected_version) {
+                                    bool conditional, long expected_version,
+                                    std::vector<ReadVersion> const* read_set) {
   ::CorfuEntry entry;
   entry.set_file_name(file_name);
   entry.set_op(static_cast<::CorfuEntry_Op>(op));
@@ -219,7 +220,17 @@ long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, i
   }
   if (conditional) {
     entry.set_conditional(true);
-    entry.set_expected_version(expected_version);
+    if (read_set != nullptr) {
+      // Transaction encoding: expected_version stays unset (its
+      // presence is what selects the legacy path in the apply loop).
+      for (auto const& rv : *read_set) {
+        ::ReadSetEntry* e = entry.add_read_set();
+        e->set_key(rv.key);
+        e->set_expected_version(static_cast<int64_t>(rv.version));
+      }
+    } else {
+      entry.set_expected_version(expected_version);
+    }
   }
   std::string serialized;
   entry.SerializeToString(&serialized);
@@ -300,15 +311,17 @@ bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
           // map takes every entry at its log position regardless.
           should_apply = !own;
           should_notify = !own;
-          if (tracked) applyBlindVersionsLocked(recs, addr);
+          if (tracked) applyBlindVersionsLocked(entry, recs, addr);
         } else if (track_versions_) {
-          // Conditional (CAS) APPEND: never self-applied by its writer,
-          // so an accepted one is applied here for own and peer entries
-          // alike; a rejected one leaves no trace in the file.
+          // Conditional APPEND (single-key CAS or transaction commit
+          // record): never self-applied by its writer, so an accepted
+          // one is applied here for own and peer entries alike; a
+          // rejected one leaves no trace in the file. A read-only
+          // validation record has no bytes to apply or announce.
           bool const accepted =
               applyConditionalLocked(entry, decode_ok, recs, addr, own);
           should_apply = accepted;
-          should_notify = accepted;
+          should_notify = accepted && entry.has_payload() && !entry.payload().empty();
         } else {
           // A peer issued a conditional append but this replica does
           // not track versions, so it cannot evaluate the condition.
@@ -771,62 +784,79 @@ bool CorfuDBStorage::decodeRecordHeaders(std::string const& payload,
   return true;
 }
 
-// Blind APPEND at `addr`: every record it carries now has version
-// `addr`. A blind write also drops any inline value the key held — its
-// own value is not tracked, so readers go back to the file-scan path.
-void CorfuDBStorage::applyBlindVersionsLocked(std::vector<RecordHeader> const& recs,
-                                              long addr) {
-  for (auto const& h : recs) {
-    KeyVersion& kv = key_versions_[h.key];
-    kv.addr = addr;
-    kv.deleted = h.deleted;
-    if (kv.has_value) {
-      kv.has_value = false;
-      std::string().swap(kv.value);
-      kv.file.clear();
-    }
+// One record of an entry applied at `addr`: the key's version becomes
+// `addr`, the tombstone flag follows the record, and the value is kept
+// inline (see KeyVersion) attributed to the target file so REMOVE can
+// release it — unless the file was already sealed or removed at this
+// position, in which case the bytes may have missed the compactor's
+// read and the value stays pinned until the key is next written.
+void CorfuDBStorage::applyRecordVersionLocked(::CorfuEntry const& entry,
+                                              RecordHeader const& h, long addr) {
+  KeyVersion& kv = key_versions_[h.key];
+  kv.addr = addr;
+  kv.deleted = h.deleted;
+  kv.has_value = true;
+  if (h.has_value) {
+    kv.value.assign(entry.payload().data() + h.value_off, h.value_len);
+  } else {
+    kv.value.clear();
+  }
+  std::string const& fn = entry.file_name();
+  if (sealed_files_.count(fn) || removed_files_.count(fn)) {
+    kv.file.clear();  // pinned
+  } else if (kv.file != fn) {
+    kv.file = fn;
+    inline_keys_by_file_[fn].push_back(h.key);
   }
 }
 
-// Conditional (CAS) APPEND at `addr`: payload must decode to exactly one
-// Record; accepted iff the key's version at this log position equals
-// expected_version. Every replica runs this at the same position with
-// the same bytes, so the verdict is identical everywhere. On accept the
-// value is kept inline (see KeyVersion) and attributed to the target
-// file so REMOVE can release it — unless the file was already sealed or
-// removed at this position, in which case the bytes may have missed
-// the compactor's read and the value stays pinned until the key is
-// next written.
+// Blind APPEND at `addr`: every record it carries now has version
+// `addr` and its value inline. Own entries pass through here too (their
+// bytes are reconciled by the writer, but the version map takes every
+// entry at its log position).
+void CorfuDBStorage::applyBlindVersionsLocked(::CorfuEntry const& entry,
+                                              std::vector<RecordHeader> const& recs,
+                                              long addr) {
+  for (auto const& h : recs) {
+    applyRecordVersionLocked(entry, h, addr);
+  }
+}
+
+// Conditional APPEND at `addr`. Two encodings (see CorfuEntry):
+//   - legacy single-key CAS (expected_version set): the payload must
+//     decode to exactly one Record and that key's version at this log
+//     position must equal expected_version;
+//   - transaction commit record (expected_version unset): every
+//     read_set entry's key must be at its expected version. The payload
+//     is the write set — zero or more Records — and a non-empty payload
+//     that does not decode rejects. An empty read set accepts.
+// On accept every payload record is applied to the version map in
+// order (later records win on duplicate keys). Every replica runs this
+// at the same position with the same bytes, so the verdict is
+// identical everywhere; own entries also record it in cas_outcomes_.
 bool CorfuDBStorage::applyConditionalLocked(::CorfuEntry const& entry,
                                             bool decode_ok,
                                             std::vector<RecordHeader> const& recs,
                                             long addr, bool own) {
   bool accepted = false;
-  if (decode_ok && recs.size() == 1) {
-    RecordHeader const& h = recs[0];
-    long const expected = entry.has_expected_version()
-                              ? static_cast<long>(entry.expected_version())
-                              : -1;
-    auto it = key_versions_.find(h.key);
-    long const current = it == key_versions_.end() ? -1 : it->second.addr;
-    if (current == expected) {
-      accepted = true;
-      KeyVersion& kv = it == key_versions_.end() ? key_versions_[h.key] : it->second;
-      kv.addr = addr;
-      kv.deleted = h.deleted;
-      kv.has_value = true;
-      if (h.has_value) {
-        kv.value.assign(entry.payload().data() + h.value_off, h.value_len);
-      } else {
-        kv.value.clear();
+  bool const payload_empty = !entry.has_payload() || entry.payload().empty();
+  if (entry.has_expected_version()) {
+    if (decode_ok && recs.size() == 1) {
+      long const expected = static_cast<long>(entry.expected_version());
+      accepted = currentVersionLocked(recs[0].key) == expected;
+    }
+  } else if (decode_ok || payload_empty) {
+    accepted = true;
+    for (auto const& rs : entry.read_set()) {
+      if (currentVersionLocked(rs.key()) != static_cast<long>(rs.expected_version())) {
+        accepted = false;
+        break;
       }
-      std::string const& fn = entry.file_name();
-      if (sealed_files_.count(fn) || removed_files_.count(fn)) {
-        kv.file.clear();  // pinned
-      } else if (kv.file != fn) {
-        kv.file = fn;
-        inline_keys_by_file_[fn].push_back(h.key);
-      }
+    }
+  }
+  if (accepted) {
+    for (auto const& h : recs) {
+      applyRecordVersionLocked(entry, h, addr);
     }
   }
   if (own) {
@@ -855,10 +885,29 @@ Status CorfuDBStorage::appendConditional(std::string const& fileName,
                                          unsigned char const* data, int length,
                                          int64_t expected_version,
                                          int64_t& result_version) {
+  return submitConditional(fileName, data, length,
+                           static_cast<long>(expected_version),
+                           /*read_set=*/nullptr, result_version);
+}
+
+Status CorfuDBStorage::appendTransaction(std::string const& fileName,
+                                         unsigned char const* data, int length,
+                                         std::vector<ReadVersion> const& read_set,
+                                         int64_t& result_version) {
+  return submitConditional(fileName, data, length, /*expected_version=*/-1,
+                           &read_set, result_version);
+}
+
+Status CorfuDBStorage::submitConditional(std::string const& fileName,
+                                         unsigned char const* data, int length,
+                                         long expected_version,
+                                         std::vector<ReadVersion> const* read_set,
+                                         int64_t& result_version) {
   if (!track_versions_) {
     if (!warned_untracked_conditional_.exchange(true)) {
-      std::cerr << "[corfu] appendConditional needs track_versions=true "
-                   "(compare-and-put is disabled on this instance)\n";
+      std::cerr << "[corfu] conditional appends need track_versions=true "
+                   "(compare-and-put and transactions are disabled on "
+                   "this instance)\n";
     }
     return Status::kFailure;
   }
@@ -878,8 +927,8 @@ Status CorfuDBStorage::appendConditional(std::string const& fileName,
   JNIEnv* env = attachThread();
   if (!env) return Status::kFailure;
   long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND, data,
-                             length, /*conditional=*/true,
-                             static_cast<long>(expected_version));
+                             length, /*conditional=*/true, expected_version,
+                             read_set);
   if (addr < 0) return Status::kFailure;
   long prev = last_written_addr_.load(std::memory_order_acquire);
   while (addr > prev &&

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 thread_local ozonedb::DB* db_instance = nullptr;
 class EventListenerOzonedb : public ozonedb::EventListener {
@@ -109,6 +110,91 @@ JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get(JNIEnv* env, jobject obj, j
 // thread, reused by every get() until clearSync() (see DB::sync).
 // The db_instance is thread_local, so the token's thread scope and the
 // DB's thread scope coincide by construction here.
+namespace {
+// Copy one element of a byte[][] into a std::string. A null element
+// yields an empty string.
+std::string byteArrayElementToString(JNIEnv* env, jobjectArray arr, jsize i) {
+  jbyteArray elem = static_cast<jbyteArray>(env->GetObjectArrayElement(arr, i));
+  if (elem == nullptr) return std::string();
+  jsize len = env->GetArrayLength(elem);
+  std::string out(static_cast<size_t>(len), '\0');
+  if (len > 0) {
+    env->GetByteArrayRegion(elem, 0, len, reinterpret_cast<jbyte*>(&out[0]));
+  }
+  env->DeleteLocalRef(elem);
+  return out;
+}
+}  // namespace
+
+// Commit a transaction whose read phase ran through sync() /
+// getVersioned() on this thread. readKeys/readVersions are the read
+// set (parallel arrays; a version of -1 means "observed unwritten"),
+// writeKeys/writeValues/deletes the write set (parallel arrays; a
+// deleted key's value is ignored and may be null). Returns the commit
+// record's log address (>= 0, the new version of every written key)
+// when accepted, -2 when a read-set version changed (abort: re-read
+// and retry), -3 when both sets are empty (nothing appended), -1 on
+// error. An empty write set with a non-empty read set appends a
+// read-only validation record. The caller still owns the fence token:
+// pair this with clearSync().
+JNIEXPORT jlong JNICALL Java_jni_OzoneDBJNI_txnCommit(JNIEnv* env, jobject obj,
+                                                      jobjectArray readKeys,
+                                                      jlongArray readVersions,
+                                                      jobjectArray writeKeys,
+                                                      jobjectArray writeValues,
+                                                      jbooleanArray deletes) {
+  std::vector<ozonedb::ReadVersion> read_set;
+  if (readKeys != nullptr) {
+    jsize n = env->GetArrayLength(readKeys);
+    if (readVersions == nullptr || env->GetArrayLength(readVersions) != n) {
+      std::cerr << "txnCommit: readKeys/readVersions length mismatch" << std::endl;
+      return -1;
+    }
+    std::vector<jlong> versions(static_cast<size_t>(n));
+    if (n > 0) env->GetLongArrayRegion(readVersions, 0, n, versions.data());
+    read_set.reserve(static_cast<size_t>(n));
+    for (jsize i = 0; i < n; ++i) {
+      read_set.push_back({byteArrayElementToString(env, readKeys, i),
+                          static_cast<int64_t>(versions[static_cast<size_t>(i)])});
+    }
+  }
+
+  std::vector<Record> write_set;
+  if (writeKeys != nullptr) {
+    jsize n = env->GetArrayLength(writeKeys);
+    if (writeValues == nullptr || env->GetArrayLength(writeValues) != n ||
+        deletes == nullptr || env->GetArrayLength(deletes) != n) {
+      std::cerr << "txnCommit: write-set array length mismatch" << std::endl;
+      return -1;
+    }
+    std::vector<jboolean> del(static_cast<size_t>(n));
+    if (n > 0) env->GetBooleanArrayRegion(deletes, 0, n, del.data());
+    write_set.reserve(static_cast<size_t>(n));
+    for (jsize i = 0; i < n; ++i) {
+      Record r;
+      r.set_key(byteArrayElementToString(env, writeKeys, i));
+      if (del[static_cast<size_t>(i)]) {
+        r.set_type(kTypeDeletion);
+      } else {
+        r.set_value(byteArrayElementToString(env, writeValues, i));
+        r.set_type(kTypeValue);
+      }
+      write_set.push_back(std::move(r));
+    }
+  }
+
+  int64_t version = -1;
+  ozonedb::Status status = db_instance->commitTransaction(read_set, write_set, version);
+  if (status == ozonedb::Status::kSuccess) {
+    return version >= 0 ? static_cast<jlong>(version) : -3;
+  }
+  if (status == ozonedb::Status::kCasConflict) {
+    return -2;
+  }
+  std::cerr << "txnCommit failed" << std::endl;
+  return -1;
+}
+
 JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_sync(JNIEnv* env, jobject obj) {
   db_instance->sync();
 }

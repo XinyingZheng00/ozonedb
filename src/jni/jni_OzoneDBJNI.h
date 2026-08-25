@@ -65,6 +65,14 @@ JNIEXPORT jlong JNICALL Java_jni_OzoneDBJNI_casPut
 
 /*
  * Class:     jni_OzoneDBJNI
+ * Method:    txnCommit
+ * Signature: ([[B[J[[B[[B[Z)J
+ */
+JNIEXPORT jlong JNICALL Java_jni_OzoneDBJNI_txnCommit
+  (JNIEnv *, jobject, jobjectArray, jlongArray, jobjectArray, jobjectArray, jbooleanArray);
+
+/*
+ * Class:     jni_OzoneDBJNI
  * Method:    sync
  * Signature: ()V
  */

@@ -237,6 +237,10 @@ if (OZONEDB_ENABLE_CORFU)
     add_executable(corfu_multiwriter_smoke tests/corfu_multiwriter_smoke.cpp)
     target_include_directories(corfu_multiwriter_smoke PRIVATE ${JNI_INCLUDE_DIRS})
     target_link_libraries(corfu_multiwriter_smoke OzoneDB ${JNI_LIBRARIES})
+
+    add_executable(corfu_txn_smoke tests/corfu_txn_smoke.cpp)
+    target_include_directories(corfu_txn_smoke PRIVATE ${JNI_INCLUDE_DIRS})
+    target_link_libraries(corfu_txn_smoke OzoneDB ${JNI_LIBRARIES})
 endif()
 
 target_link_libraries(runUnitTests 

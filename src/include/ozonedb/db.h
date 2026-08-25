@@ -8,6 +8,8 @@
 #include "sstable/sstable_handler.h"
 #include <memory>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 #include <assert.h>
 
 namespace ozonedb {
@@ -36,8 +38,10 @@ enum class Mode {
   Singleton,
   MultipleProcesses,
 };
+class Transaction;
 class DB {
  private:
+  friend class Transaction;
   /**
    * @brief the state of the database
    *
@@ -201,6 +205,42 @@ class DB {
                        std::string const& value, int64_t& new_version);
 
   /**
+   * @brief start a serializable transaction (see Transaction)
+   *
+   * Takes ONE fence (DB::sync()) on the calling thread; every get()
+   * inside the transaction reuses it. The Transaction must be used and
+   * finished (commit or abort) on this same thread — the fence token is
+   * thread-local. Requires Metadata::track_versions: without it the
+   * returned Transaction is closed and every call on it fails.
+   *
+   * @param validate_read_only  commit() of a transaction with no writes
+   *        appends a read-only validation record (one append) so the
+   *        reads are proven serializable; false skips the append and
+   *        such a commit always succeeds.
+   */
+  Transaction begin(bool validate_read_only = true);
+
+  /**
+   * @brief commit a read set and a write set as one atomic log record
+   *
+   * The building block under Transaction::commit, exposed for callers
+   * that collect the read set themselves (the JNI binding pairs it
+   * with sync()/getVersioned()/clearSync()). Semantics are
+   * Storage::appendTransaction's: accepted iff every read-set version
+   * still holds at the record's log position, then the whole write set
+   * is applied atomically; write-set keys absent from the read set are
+   * blind writes. Does not touch the calling thread's fence token.
+   *
+   * @param version  output: the commit record's log address (every
+   *                 written key's new version); -1 when nothing was
+   *                 appended (both sets empty)
+   * @return Status kSuccess | kCasConflict | kFailure
+   */
+  Status commitTransaction(std::vector<ReadVersion> const& read_set,
+                           std::vector<Record> const& write_set,
+                           int64_t& version);
+
+  /**
    * @brief Batch fence for strict reads (Metadata::linearizable_reads).
    *
    * sync() takes ONE storage fence on the calling thread; every get()
@@ -215,6 +255,81 @@ class DB {
    */
   Status sync();
   Status clearSync();
+};
+
+/**
+ * @brief serializable optimistic transaction on the shared log
+ *
+ * Obtained from DB::begin(). get() records {key, version} in the read
+ * set (write-buffered keys are served from the write set instead);
+ * put()/remove() buffer records; commit() appends ONE conditional
+ * entry carrying both sets (Storage::appendTransaction) and returns
+ * the shared log's verdict — kSuccess with the commit record's address
+ * as the new version of every written key, kCasConflict if any read
+ * key was written since it was read, kFailure otherwise.
+ *
+ * Isolation: the commit record's log position is the linearization
+ * point; because every read-set version equals the version at that
+ * position, the transaction is equivalent to one that ran alone there
+ * (strictly serializable). Reads are NOT a snapshot — a later get()
+ * may observe a newer state than an earlier one — but validation
+ * rejects such a transaction, so this only ever costs an abort. Keys
+ * written but never read are blind writes and are not validated. There
+ * is no range read, so phantoms cannot arise.
+ *
+ * Lifetime: a Transaction that goes out of scope still open aborts,
+ * releasing the fence token begin() took on this thread (a leaked
+ * token would pin later reads on the thread to a stale fence). Not
+ * copyable; movable. Single-threaded: use it only on the thread that
+ * called begin().
+ */
+class Transaction {
+ public:
+  Transaction(Transaction&& other) noexcept;
+  Transaction(Transaction const&) = delete;
+  Transaction& operator=(Transaction const&) = delete;
+  Transaction& operator=(Transaction&&) = delete;
+  ~Transaction();
+
+  /**
+   * @brief read a key; adds {key, observed version} to the read set
+   *
+   * @return kSuccess, kNotFound (absent or deleted — still recorded, so
+   *         the commit validates that the key stayed unwritten),
+   *         kFailure (transaction not open, or track_versions off)
+   */
+  Status get(std::string const& key, std::string& value);
+  void put(std::string const& key, std::string const& value);
+  void remove(std::string const& key);
+  /**
+   * @brief append the commit record and close the transaction
+   *
+   * With an empty write set: appends a read-only validation record when
+   * begin(validate_read_only=true) and the read set is non-empty, else
+   * appends nothing and returns kSuccess (version = -1).
+   *
+   * @return kSuccess | kCasConflict | kFailure (also for a closed txn)
+   */
+  Status commit(int64_t& version);
+  void abort();
+
+  bool isOpen() const { return open_; }
+  std::vector<ReadVersion> const& readSet() const { return read_set_; }
+  std::vector<Record> const& writeSet() const { return write_set_; }
+
+ private:
+  friend class DB;
+  Transaction(DB* db, bool validate_read_only);
+  void putRecord(std::string const& key, std::string const* value);
+  void close();
+
+  DB* db_;
+  bool open_ = false;
+  bool validate_read_only_;
+  std::vector<ReadVersion> read_set_;
+  std::unordered_map<std::string, size_t> read_index_;
+  std::vector<Record> write_set_;
+  std::unordered_map<std::string, size_t> write_index_;
 };
 }  // namespace ozonedb
 #endif  // DB_H

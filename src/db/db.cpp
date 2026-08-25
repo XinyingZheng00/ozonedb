@@ -278,10 +278,123 @@ Status DB::getVersioned(std::string const& key, std::string& value,
   std::shared_ptr<Record> guard;
   Status s = get(key, vptr, guard, /*force_strict=*/true);
   if (s != Status::kSuccess) {
-    return version >= 0 ? Status::kNotFound : s;
+    // Absent (version stays -1) or deleted: kNotFound either way, so a
+    // transaction can record the observation and validate on it.
+    return Status::kNotFound;
   }
   value = *vptr;
   return Status::kSuccess;
+}
+
+Status DB::commitTransaction(std::vector<ReadVersion> const& read_set,
+                             std::vector<Record> const& write_set,
+                             int64_t& version) {
+  version = -1;
+  if (!this->metadata->track_versions) return Status::kFailure;
+  if (read_set.empty() && write_set.empty()) return Status::kSuccess;
+  return log_handler->addTransaction(write_set, read_set, version);
+}
+
+Transaction DB::begin(bool validate_read_only) {
+  Transaction txn(this, validate_read_only);
+  if (this->metadata->track_versions) {
+    // ONE fence for the whole read phase; every get() below reuses the
+    // thread-local token (DB::getVersioned checks hasSyncToken()).
+    sync();
+    txn.open_ = true;
+  }
+  return txn;
+}
+
+Transaction::Transaction(DB* db, bool validate_read_only)
+    : db_(db), validate_read_only_(validate_read_only) {}
+
+Transaction::Transaction(Transaction&& other) noexcept
+    : db_(other.db_),
+      open_(other.open_),
+      validate_read_only_(other.validate_read_only_),
+      read_set_(std::move(other.read_set_)),
+      read_index_(std::move(other.read_index_)),
+      write_set_(std::move(other.write_set_)),
+      write_index_(std::move(other.write_index_)) {
+  other.open_ = false;
+}
+
+Transaction::~Transaction() {
+  if (open_) abort();
+}
+
+Status Transaction::get(std::string const& key, std::string& value) {
+  if (!open_) return Status::kFailure;
+  auto wit = write_index_.find(key);
+  if (wit != write_index_.end()) {
+    Record const& r = write_set_[wit->second];
+    if (r.type() == kTypeDeletion) return Status::kNotFound;
+    value = r.value();
+    return Status::kSuccess;
+  }
+  int64_t version = -1;
+  Status s = db_->getVersioned(key, value, version);
+  if (s != Status::kSuccess && s != Status::kNotFound) return s;
+  // Reads are not a snapshot: a repeat read may observe a newer
+  // version. Keep the first observation; a differing second one is
+  // recorded as well, and the two cannot both hold at commit, so the
+  // transaction aborts there instead of committing on mixed state.
+  auto rit = read_index_.find(key);
+  if (rit == read_index_.end()) {
+    read_index_[key] = read_set_.size();
+    read_set_.push_back({key, version});
+  } else if (read_set_[rit->second].version != version) {
+    read_set_.push_back({key, version});
+  }
+  return s;
+}
+
+void Transaction::put(std::string const& key, std::string const& value) {
+  putRecord(key, &value);
+}
+
+void Transaction::remove(std::string const& key) {
+  putRecord(key, nullptr);
+}
+
+void Transaction::putRecord(std::string const& key, std::string const* value) {
+  if (!open_) return;
+  Record r;
+  r.set_key(key);
+  if (value != nullptr) {
+    r.set_value(*value);
+    r.set_type(kTypeValue);
+  } else {
+    r.set_type(kTypeDeletion);
+  }
+  auto it = write_index_.find(key);
+  if (it != write_index_.end()) {
+    write_set_[it->second] = std::move(r);
+  } else {
+    write_index_[key] = write_set_.size();
+    write_set_.push_back(std::move(r));
+  }
+}
+
+Status Transaction::commit(int64_t& version) {
+  version = -1;
+  if (!open_) return Status::kFailure;
+  Status s = Status::kSuccess;
+  if (!write_set_.empty() || (validate_read_only_ && !read_set_.empty())) {
+    s = db_->commitTransaction(read_set_, write_set_, version);
+  }
+  close();
+  return s;
+}
+
+void Transaction::abort() {
+  if (open_) close();
+}
+
+void Transaction::close() {
+  db_->clearSync();
+  open_ = false;
 }
 
 Status DB::get(std::string const& key, std::string const*& value,

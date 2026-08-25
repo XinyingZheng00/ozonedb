@@ -83,6 +83,27 @@ public class OzoneDBJNI {
   public native long casPut(String key, byte[] value, long expectedVersion);
 
   /**
+   * Commit a transaction as one conditional log record. The read phase
+   * runs through {@link #sync()} / {@link #getVersioned(String)} on this
+   * thread; {@code readKeys}/{@code readVersions} are what it observed
+   * (parallel arrays, version -1 = unwritten), {@code writeKeys}/
+   * {@code writeValues}/{@code deletes} the write set (parallel arrays;
+   * a deleted key's value is ignored and may be null). Write-set keys
+   * absent from the read set are blind writes.
+   *
+   * @return the commit record's log address ({@code >= 0}, the new
+   *         version of every written key) when accepted; {@code -2}
+   *         when a read-set version changed (re-read and retry);
+   *         {@code -3} when both sets were empty (nothing appended);
+   *         {@code -1} on error. An empty write set with a non-empty
+   *         read set appends a read-only validation record. The caller
+   *         still owns the fence token and must call {@link #clearSync()}.
+   */
+  public native long txnCommit(byte[][] readKeys, long[] readVersions,
+                               byte[][] writeKeys, byte[][] writeValues,
+                               boolean[] deletes);
+
+  /**
    * Batch fence for strict reads (linearizable_reads): sync() takes one
    * storage fence on the calling thread; every get() until clearSync()
    * reuses it, linearizing each read at the sync() point (the cr-sqlite

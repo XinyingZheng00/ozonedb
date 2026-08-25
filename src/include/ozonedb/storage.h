@@ -4,6 +4,7 @@
 #include <azure/identity/client_secret_credential.hpp>
 #include <azure/storage/blobs.hpp>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -16,6 +17,15 @@
 #include <utility>
 #include <vector>
 namespace ozonedb {
+
+// One read-set entry of a transaction: the key and the version the
+// caller observed for it through versionedLookup / DB::getVersioned
+// (-1 = unwritten). Storage::appendTransaction validates the whole set
+// at the commit record's log position.
+struct ReadVersion {
+  std::string key;
+  int64_t version = -1;
+};
 
 enum class Status { kSuccess,
                     kFailure,
@@ -143,6 +153,32 @@ class Storage {
   }
 
   /**
+   * @brief Append a transaction commit record: `data` is the write set
+   * (zero or more serialized Records, appendInBatch's layout) and
+   * `read_set` the {key, version} pairs it depends on.
+   *
+   * The record takes effect only if every read-set version equals the
+   * key's version at the record's log position; then the whole payload
+   * is applied atomically and every written key's version becomes the
+   * record's address. Every replica evaluates the same rule at the
+   * same position, so the verdict is identical everywhere. Keys in the
+   * payload but not in the read set are blind writes (not validated).
+   * An empty payload with a non-empty read set is a read-only
+   * validation record (appends no bytes). Like appendConditional the
+   * writer never self-applies; it waits for its own apply loop.
+   *
+   * @return kSuccess (result_version = the record's log address),
+   *         kCasConflict (a read-set version changed), kSealed (the
+   *         target is sealed or removed; retry on a new tail), kFailure.
+   */
+  virtual Status appendTransaction(std::string const& /*fileName*/,
+                                   unsigned char const* /*data*/, int /*length*/,
+                                   std::vector<ReadVersion> const& /*read_set*/,
+                                   int64_t& /*result_version*/) {
+    return Status::kFailure;
+  }
+
+  /**
    * @brief Look up a key in the log-ordered version map.
    *
    * Returns false when the backend doesn't track versions or the key has
@@ -150,10 +186,10 @@ class Storage {
    * accepted write; when has_value is set the map also carries the
    * record's value and value/deleted describe that record — an atomic
    * (value, version) pair for read-modify-write callers. The inline
-   * value exists only for keys last written via appendConditional and
-   * only until the log file holding the record is REMOVEd (compacted):
-   * from then on the record is served by the normal read path. See
-   * CorfuDBStorage::KeyVersion for why that window needs it.
+   * value exists for every tracked write (blind or conditional) from
+   * its log position until the log file holding the record is REMOVEd
+   * (compacted): from then on the record is served by the normal read
+   * path. See CorfuDBStorage::KeyVersion for why that window needs it.
    */
   virtual bool versionedLookup(std::string const& /*key*/, int64_t& /*version*/,
                                std::string& /*value*/, bool& /*has_value*/,

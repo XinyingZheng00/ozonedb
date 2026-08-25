@@ -62,6 +62,10 @@ class CorfuDBStorage : public Storage {
                            unsigned char const* data, int length,
                            int64_t expected_version,
                            int64_t& result_version) override;
+  Status appendTransaction(std::string const& fileName,
+                           unsigned char const* data, int length,
+                           std::vector<ReadVersion> const& read_set,
+                           int64_t& result_version) override;
   bool versionedLookup(std::string const& key, int64_t& version,
                        std::string& value, bool& has_value,
                        bool& deleted) override;
@@ -145,26 +149,30 @@ class CorfuDBStorage : public Storage {
   // move into an SSTable, or a CAS with expected_version = -1 could
   // wrongly succeed on a compacted key.
   //
-  // Inline values. A key last written by an accepted conditional entry
-  // also carries the record's value (has_value) so DB::getVersioned can
-  // serve (value, version) as one atomic pair. The reason is a window in
-  // the read path, not the map: a LOGCREATE freezes the superseded
-  // tail's size from the rolling writer's (lagging) view, and the scan
-  // of a sealed log file stops at that size, so a record appended near
-  // a roll can be invisible to scans until compaction rewrites the file
-  // in full into an SSTable (Compaction reads storage->read(file), not
-  // the frozen size). A blind put re-issues itself when it detects the
-  // roll; a CAS cannot (re-issuing an accepted CAS would double-apply
-  // it), so its value is pinned here instead — and released by the
-  // apply loop when the file holding it is REMOVEd, i.e. exactly when
-  // the SSTable takes over (releaseInlineValuesLocked). The retained
-  // set is therefore bounded by the CAS records in not-yet-compacted
-  // log files, not by the CAS working set. Two exceptions keep a value
-  // pinned until the key is next written: the target file was already
-  // sealed/removed at the entry's log position (the bytes may have
-  // missed the compactor's read), and a blind overwrite clears it
-  // anyway. Pinning is replica-local memory policy, never an
-  // accept/reject input, so it need not be deterministic.
+  // Inline values. Every tracked write — blind or conditional — also
+  // leaves the record's value in the map (has_value) so
+  // DB::getVersioned can serve (value, version) as one atomic pair.
+  // The reason is a window in the read path, not the map: a LOGCREATE
+  // freezes the superseded tail's size from the rolling writer's
+  // (lagging) view, and the scan of a sealed log file stops at that
+  // size, so a record appended near a roll can be invisible to scans
+  // until compaction rewrites the file in full into an SSTable
+  // (Compaction reads storage->read(file), not the frozen size). A
+  // blind put re-issues itself when it detects the roll, but the
+  // version map already carries the first copy's address — a reader
+  // that paired that fresh version with a stale scanned value would
+  // let a transaction validate against a write it never saw (a lost
+  // update), so the value is pinned here for blind writes too. A CAS
+  // cannot re-issue at all (double-apply). Values are released by the
+  // apply loop when the file holding them is REMOVEd, i.e. exactly
+  // when the SSTable takes over (releaseInlineValuesLocked). The
+  // retained set is therefore one copy of the not-yet-compacted log
+  // tail (bounded by log_file_size_limit times the compaction lag),
+  // not the working set. One exception keeps a value pinned until the
+  // key is next written: the target file was already sealed/removed at
+  // the entry's log position (the bytes may have missed the
+  // compactor's read). Pinning is replica-local memory policy, never
+  // an accept/reject input, so it need not be deterministic.
   struct KeyVersion {
     long addr = -1;
     bool has_value = false;
@@ -181,10 +189,11 @@ class CorfuDBStorage : public Storage {
   // at release), so it is a hint list, not an index.
   std::unordered_map<std::string, std::vector<std::string>> inline_keys_by_file_;
 
-  // Outcome of this process's own conditional appends, keyed by log
-  // address; recorded by the apply loop, consumed (erased) by
-  // appendConditional after its waitForTailerLocked returns. Guarded by
-  // mtx_. Bounded: one in-flight entry per concurrent CAS caller.
+  // Outcome of this process's own conditional appends (single-key CAS
+  // and transaction commit records alike), keyed by log address;
+  // recorded by the apply loop, consumed (erased) by submitConditional
+  // after its waitForTailerLocked returns. Guarded by mtx_. Bounded:
+  // one in-flight entry per concurrent caller.
   std::unordered_map<long, bool> cas_outcomes_;
 
   // Pending batched writes (same role as AzureBlobStorage::cached_file)
@@ -271,9 +280,21 @@ class CorfuDBStorage : public Storage {
   JNIEnv* attachThread();
   void detachThread();
   void loadBridge(std::string const& endpoint, std::string const& stream_name);
+  // Serialize one CorfuEntry and hand it to CorfuBridge.append. A
+  // non-null read_set selects the transaction encoding (read_set set,
+  // expected_version unset); conditional without a read set is the
+  // legacy single-key CAS. See CorfuEntry in record.proto.
   long jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
                       unsigned char const* data, int length,
-                      bool conditional = false, long expected_version = -1);
+                      bool conditional = false, long expected_version = -1,
+                      std::vector<ReadVersion> const* read_set = nullptr);
+  // Shared body of appendConditional and appendTransaction: sealed
+  // check, append, wait for the own apply loop's verdict.
+  Status submitConditional(std::string const& fileName,
+                           unsigned char const* data, int length,
+                           long expected_version,
+                           std::vector<ReadVersion> const* read_set,
+                           int64_t& result_version);
   // True for files whose APPEND payloads are decoded for version
   // tracking (data-log files: "<log_prefix_>/N").
   bool isVersionTracked(std::string const& file_name) const {
@@ -294,14 +315,25 @@ class CorfuDBStorage : public Storage {
   // no Record materialized and no lock held. False on malformed input.
   static bool decodeRecordHeaders(std::string const& payload,
                                   std::vector<RecordHeader>& out);
-  // Version effects of one APPEND entry at its log position; both run
+  // Version effects of one APPEND entry at its log position; all run
   // with mtx_ held from applyEntryBytes. The conditional variant
   // returns acceptance (and records it in cas_outcomes_ for own
-  // entries); a decode failure rejects, identically on every replica.
-  void applyBlindVersionsLocked(std::vector<RecordHeader> const& recs, long addr);
+  // entries); a decode failure of a non-empty payload rejects,
+  // identically on every replica.
+  void applyBlindVersionsLocked(::CorfuEntry const& entry,
+                                std::vector<RecordHeader> const& recs, long addr);
   bool applyConditionalLocked(::CorfuEntry const& entry, bool decode_ok,
                               std::vector<RecordHeader> const& recs,
                               long addr, bool own);
+  // One record of an applied entry: version, tombstone flag, inline
+  // value and the file bookkeeping that lets REMOVE release the value.
+  void applyRecordVersionLocked(::CorfuEntry const& entry,
+                                RecordHeader const& h, long addr);
+  // Version of `key` at the current apply position, -1 if unwritten.
+  long currentVersionLocked(std::string const& key) const {
+    auto it = key_versions_.find(key);
+    return it == key_versions_.end() ? -1 : it->second.addr;
+  }
   // Drop the inline values whose bytes lived in `file` (REMOVE applied).
   void releaseInlineValuesLocked(std::string const& file);
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);

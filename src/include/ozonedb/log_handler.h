@@ -109,6 +109,25 @@ class LogHandler {
                               int64_t& new_version);
 
   /**
+   * @brief append a transaction commit record (Storage::appendTransaction)
+   *
+   * Serializes `records` (the write set) back to back in appendInBatch's
+   * layout and appends them as ONE conditional entry that carries
+   * `read_set`; the shared log's apply order decides the outcome and
+   * every replica applies the whole write set or none of it. Retries
+   * only on kSealed (newTail), never on a tail move — see
+   * addRecordConditional for why a re-issue is unsafe here. No
+   * cache/index upsert: an accepted record arrives through the storage's
+   * remote-append listener like a peer write. An empty write set with a
+   * non-empty read set appends a read-only validation record.
+   *
+   * @return kSuccess | kCasConflict | kFailure
+   */
+  Status addTransaction(std::vector<Record> const& records,
+                        std::vector<ReadVersion> const& read_set,
+                        int64_t& new_version);
+
+  /**
    * @brief read record from this level, end to the offset
    *
    * @param key

@@ -138,6 +138,35 @@ Status LogHandler::addRecordConditional(Record const& record,
   return s;
 }
 
+Status LogHandler::addTransaction(std::vector<Record> const& records,
+                                  std::vector<ReadVersion> const& read_set,
+                                  int64_t& new_version) {
+  // One buffer, one Corfu entry: the write set is applied atomically
+  // at the entry's log position or not at all.
+  std::vector<unsigned char> buffer;
+  for (auto const& record : records) {
+    int size = 0;
+    unsigned char* one = protobuf::serializeMessage(record, size);
+    buffer.insert(buffer.end(), one, one + size);
+    delete[] one;
+  }
+  if (this->active_unit.empty()) {
+    newTail();
+  }
+
+  Status s = Status::kFailure;
+  constexpr int kMaxSealRetries = 8;
+  for (int attempt = 0; attempt <= kMaxSealRetries; ++attempt) {
+    s = this->storage->appendTransaction(this->active_unit,
+                                         buffer.empty() ? nullptr : buffer.data(),
+                                         static_cast<int>(buffer.size()),
+                                         read_set, new_version);
+    if (s != Status::kSealed) break;
+    newTail();
+  }
+  return s;
+}
+
 bool LogHandler::tryIndexLookup(std::string const& key, std::shared_ptr<Record>& record) {
   if (!key_index_) return false;
   auto hit = key_index_->lookup(key);

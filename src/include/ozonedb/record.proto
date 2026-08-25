@@ -37,6 +37,14 @@ message OperationRecord {
   optional int64 sealed_input_bytes = 8;
 }
 
+// One entry of a transaction's read set: the key and the version the
+// transaction observed for it (global log address of the key's last
+// accepted write, -1 = unwritten). See CorfuEntry.read_set.
+message ReadSetEntry {
+  required bytes key = 1;
+  required sint64 expected_version = 2;
+}
+
 message CorfuEntry {
   enum Op {
     APPEND = 0;
@@ -52,18 +60,31 @@ message CorfuEntry {
   // so entries written before this field existed still parse; those
   // entries just fall through to the unconditional-apply branch.
   optional uint64 client_id = 4;
-  // Conditional append (compare-and-swap). The payload must be exactly
-  // one serialized Record; the entry takes effect only if the key's
-  // version at this entry's log position equals expected_version. The
-  // check runs in every replica's tailer against the log-ordered
-  // key-version map, so all replicas accept or reject identically. A
-  // conditional entry is never self-applied by its writer — the writer
-  // learns the outcome from its own tailer (CorfuDBStorage::
-  // appendConditional).
+  // Conditional append: the entry takes effect only if every version
+  // it depends on is unchanged at this entry's log position. The check
+  // runs in every replica's tailer against the log-ordered key-version
+  // map, so all replicas accept or reject identically. A conditional
+  // entry is never self-applied by its writer — the writer learns the
+  // outcome from its own tailer (CorfuDBStorage::appendConditional /
+  // appendTransaction). Two encodings share the flag:
+  //   - legacy single-key CAS: expected_version is set, read_set is
+  //     empty, and the payload is exactly one Record whose key is the
+  //     one checked;
+  //   - transaction commit record: expected_version is unset, read_set
+  //     carries the {key, version} pairs to validate, and the payload is
+  //     the write set (zero or more Records, applied atomically on
+  //     accept). An empty read_set accepts unconditionally (atomic
+  //     blind multi-record write); an empty payload with a non-empty
+  //     read_set is a read-only validation record that appends no bytes.
   optional bool conditional = 5;
-  // Expected version for a conditional entry: the global log address of
-  // the entry that last wrote the key, or -1 if the key must be unwritten.
+  // Legacy CAS only: expected version of the payload's key — the global
+  // log address of the entry that last wrote it, or -1 if the key must
+  // be unwritten. Its presence selects the legacy encoding above.
   optional sint64 expected_version = 6;
+  // Transaction commit record only: the read set to validate. Every
+  // entry must match the map at this log position for the entry to be
+  // accepted. Keys in the payload but not here are blind writes.
+  repeated ReadSetEntry read_set = 7;
 }
 
 message TaskRecord {

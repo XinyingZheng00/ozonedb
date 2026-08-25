@@ -107,6 +107,7 @@ cd build && ./runUnitTests                               # all
   ```bash
   ./corfu_smoke <shared-config.json> [num_keys]
   ./corfu_multiwriter_smoke <shared-config.json> [keys_per_writer]
+  ./corfu_txn_smoke <shared-config.json> [accounts] [transfers_per_writer]   # needs track_versions=true
   ```
 
 ## Benchmarks
@@ -213,39 +214,64 @@ end-to-end guarantee assumes the sync write defaults (`commit_interval_ = 0`,
 The returned `value` **aliases bytes inside the `guard` `shared_ptr<Record>`** — callers must keep
 the guard alive while dereferencing.
 
-### Compare-and-put (Corfu only, `track_versions`)
+### Compare-and-put and transactions (Corfu only, `track_versions`)
 
 `DB::getVersioned` / `DB::compareAndPut` (JNI `getVersioned`/`casPut`) give an atomic
 read-modify-write on top of the total order, with no coordination beyond the append itself:
 `compareAndPut` appends a `CorfuEntry` flagged `conditional` with `expected_version` = the global
-log address of the key's last accepted write (`-1` = unwritten). **Every replica's tailer decides
-the condition at the entry's log position** against a log-ordered key → version map
-(`CorfuDBStorage::key_versions_`, rebuilt from the stream on open, own entries included), so the
-verdict is identical everywhere; the writer never self-applies a conditional entry — it waits for
-its own tailer and reads the outcome from `cas_outcomes_`. Invariants to preserve:
+log address of the key's last accepted write (`-1` = unwritten). `DB::begin()` → `Transaction`
+(`get`/`put`/`remove`/`commit`/`abort`; JNI `txnCommit` after a `sync`/`getVersioned` read phase)
+generalizes that to a read set and a write set: `commit()` appends ONE conditional entry whose
+`read_set` (proto field 7, `{key, expected_version}` pairs) is validated and whose payload — the
+write set, zero or more `Record`s in `appendInBatch`'s layout — is applied atomically on accept
+(`Storage::appendTransaction` → `LogHandler::addTransaction`). The two encodings are told apart by
+`expected_version`: set = legacy single-key CAS (payload is exactly one record), unset = commit
+record (`read_set` may be empty = atomic blind multi-record write; payload may be empty = read-only
+validation record, which appends no bytes and proves the reads serializable at the cost of one
+append — `begin(validate_read_only)` controls whether a read-only `commit()` issues it).
+**Every replica's tailer decides the condition at the entry's log position** against a log-ordered
+key → version map (`CorfuDBStorage::key_versions_`, rebuilt from the stream on open, own entries
+included), so the verdict is identical everywhere; the writer never self-applies a conditional
+entry — it waits for its own tailer and reads the outcome from `cas_outcomes_`. Validation rule:
+accept iff every read-set key's version at that position equals its `expected_version`; write-set
+keys absent from the read set are blind writes and are not validated (two transactions that
+blind-write the same key both commit, log order decides — still serializable). Invariants:
 
 - The map is maintained only when `track_versions` is set (`Metadata`, off by default, must be
   uniform across a stream's writers). With it on, the tailer does a **key-only decode** of every
   data-log payload (`decodeRecordHeaders`, no `Record` allocated) **outside `mtx_`**, then an
   O(records) map update under it. With it off the apply loop must stay byte-for-byte the old one —
   that is what makes the default throughput numbers comparable.
-- An accepted CAS keeps its value inline in the map until the log file holding its bytes is
-  `REMOVE`d (compacted): a LOGCREATE freezes a superseded tail's size from the roller's lagging view,
-  so records near a roll can be invisible to scans until compaction rewrites the file in full. Blind
-  puts survive that window by re-issuing; a CAS cannot (double-apply), hence the pin. Release is
+- **Every tracked write — blind or conditional — keeps its value inline in the map**
+  (`applyRecordVersionLocked`) until the log file holding its bytes is `REMOVE`d (compacted): a
+  LOGCREATE freezes a superseded tail's size from the roller's lagging view, so records near a roll
+  can be invisible to scans until compaction rewrites the file in full. A blind put re-issues itself
+  across that window, but the map already carries the first copy's address, so a reader that paired
+  that version with a stale scanned value would validate a transaction against a write it never saw
+  (a lost update) — hence blind writes are pinned too, not only CAS (which cannot re-issue at all).
+  Cost: one extra copy of the uncompacted log tail per process with the gate on. Release is
   `releaseInlineValuesLocked` on `REMOVE`; a value stays pinned if its target file was already sealed
   or removed at the entry's log position.
 - `getVersioned` takes one `Storage::SyncScope` (reusing a held `DB::sync()` token), calls
   `syncListeners()` (drains the tailer's dispatch queue so the key index can't lag the fence), then
   reads the value **forced strict** (`DB::get(..., force_strict=true)`) — the unfenced index probe
-  could otherwise pair a lagging value with a fresh version and let a CAS wrongly succeed.
-- Latency: a CAS always waits for its *own* just-appended entry, so the bridge's poller must not
-  park on an idle stream when a local append lands — `CorfuBridge.append` bumps `appendSeq` and
-  notifies the poller (`awaitAppendOrTick`). Fenced gets rarely hit this (their target is usually
-  already applied); CAS hits it on every call.
+  could otherwise pair a lagging value with a fresh version and let a CAS wrongly succeed. It
+  returns `kNotFound` (version `-1`) for a never-written key so a transaction can record and
+  validate "still absent".
+- `Transaction` is thread-affine: `begin()` takes the fence once (`DB::sync()`), every `get()` reuses
+  the thread-local token, and `commit()`/`abort()`/the destructor clear it — a leaked token would pin
+  later reads on that thread. Reads inside a transaction are **not a snapshot**; a repeat read that
+  observes a different version is recorded as well, so validation aborts rather than commits on
+  mixed state. No range reads exist, so no phantoms.
+- Latency: a CAS or commit always waits for its *own* just-appended entry, so the bridge's poller
+  must not park on an idle stream when a local append lands — `CorfuBridge.append` bumps
+  `appendSeq` and notifies the poller (`awaitAppendOrTick`). Fenced gets rarely hit this (their
+  target is usually already applied); CAS and commit hit it on every call.
 - Limitations worth stating in any write-up: a blind `put()` to a CAS-managed key always wins (the
-  check is only on conditional entries); a CAS whose process dies between append and tailer verdict
-  has an unknown outcome (re-read); the version map is O(live keys), never evicted.
+  check is only on conditional entries); a CAS or commit whose process dies between append and
+  tailer verdict has an unknown outcome (re-read); the version map is O(live keys), never evicted;
+  a replica with `track_versions` off applies conditional entries unconditionally (warns once) —
+  for a commit record that is a correctness violation, so the gate must be uniform.
 
 ### Caching
 
