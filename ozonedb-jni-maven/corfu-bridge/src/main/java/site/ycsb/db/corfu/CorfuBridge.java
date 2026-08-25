@@ -60,9 +60,27 @@ public class CorfuBridge {
     // than 2500 behind the writer. 500K caps Corfu's ILogData LRU at
     // ~500 MB (at ~1 KB/LogData) while leaving plenty of headroom for
     // multi-writer bursts; tune via -Xmx in corfu_jvm_opts if needed.
+    // Read batching for a tailer that is behind (the open-time replay of
+    // a loaded stream, or a lagging tailer). Two Corfu parameters gate it
+    // and BOTH default to 10: streamBatchSize is how many resolved
+    // addresses one read-cache miss asks for (AddressSpaceView.getBatch),
+    // and bulkReadSize is how many of those go into one log-unit RPC
+    // (AddressSpaceView.fetchAll partitions by it). Raising only the
+    // first changed nothing -- the request was split back into RPCs of
+    // 10. With both at 10 a 1 M-entry loaded log replayed in 41 s, ~38 us
+    // per entry, essentially all of it waiting on ~100 k sequential RPCs;
+    // JNI-side batching of the drain made no difference. The address
+    // queue is resolved from the sequencer's address map, so it is deep
+    // enough for large batches; at 1 KB records a 1000-address RPC is
+    // ~1 MB. A tailer that is caught up still fetches only what exists.
+    // Override with -Dozonedb.corfu.streamBatchSize / .bulkReadSize.
+    int streamBatchSize = Integer.getInteger("ozonedb.corfu.streamBatchSize", 1000);
+    int bulkReadSize = Integer.getInteger("ozonedb.corfu.bulkReadSize", 1000);
     CorfuRuntimeParameters params = CorfuRuntimeParameters.builder()
         .cacheDisabled(false)
         .maxCacheEntries(500_000L)
+        .streamBatchSize(streamBatchSize)
+        .bulkReadSize(bulkReadSize)
         .build();
     this.runtime = CorfuRuntime.fromParameters(params)
         .parseConfigurationString(endpoint)
