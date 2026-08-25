@@ -388,7 +388,7 @@ role_client() {
   # added as a submodule, and skipped when the tree arrived by rsync
   # (bench/ansible/bootstrap.yml -e include_git=false) rather than by clone,
   # where it would otherwise abort the run under `set -e`.
-  if [[ -e "$REPO_ROOT/.git" ]]; then
+  if [[ -d "$REPO_ROOT/.git" ]]; then
     log "updating git submodules"
     (cd "$REPO_ROOT" && git submodule update --init --recursive)
   else

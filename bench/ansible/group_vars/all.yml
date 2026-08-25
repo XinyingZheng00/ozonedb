@@ -57,7 +57,7 @@ rsync_excludes_vcpkg_local:
 
 # Incremental (sync.yml): the node already has vcpkg and .git from the
 # bootstrap, and re-sending 11.7k unchanged port files every push is waste.
-rsync_excludes_incremental: "{{ rsync_excludes_base + ['--exclude=.git/', '--exclude=vcpkg/'] }}"
+rsync_excludes_incremental: "{{ rsync_excludes_base + ['--exclude=.git', '--exclude=vcpkg/'] }}"
 
 # Bootstrap (bootstrap.yml): everything the build needs, nothing platform-local.
 rsync_excludes_bootstrap: "{{ rsync_excludes_base + rsync_excludes_vcpkg_local }}"
