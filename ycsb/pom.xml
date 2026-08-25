@@ -117,7 +117,9 @@ LICENSE file.
     <asynchbase.version>1.8.2</asynchbase.version>
     <azurecosmos.version>4.8.0</azurecosmos.version>
     <azurestorage.version>4.0.0</azurestorage.version>
-    <cassandra.cql.version>3.0.0</cassandra.cql.version>
+    <!-- 3.11.x is the last DataStax 3.x line; it speaks protocol v4/v5 to
+         Cassandra 4.x/5.x, which the upstream 3.0.0 pin predates. -->
+    <cassandra.cql.version>3.11.5</cassandra.cql.version>
     <cloudspanner.version>6.71.0</cloudspanner.version>
     <couchbase.version>1.4.10</couchbase.version>
 		<couchbase2.version>2.3.1</couchbase2.version>
@@ -161,6 +163,7 @@ LICENSE file.
     <!-- all the datastore bindings, lex sorted please -->
     <module>ozonedb</module>
     <module>rocksdb</module>
+    <module>cassandra</module>
     <module>jdbc</module>
     <module>azurecosmos</module>
     <module>azuretablestorage</module>

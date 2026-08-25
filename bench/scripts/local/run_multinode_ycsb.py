@@ -171,7 +171,8 @@ def host_log_name(host, log_dir):
 
 def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          total_writers, workloads, trial, max_exec_time=None,
-                         linearizable=False):
+                         linearizable=False, db_name=None,
+                         cassandra_consistency=None):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -191,6 +192,8 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--trial", str(trial)] if trial is not None else [])
             + (["--max_exec_time", str(int(max_exec_time))] if max_exec_time else [])
             + (["--linearizable"] if linearizable else [])
+            + (["--db_name", shlex.quote(db_name)] if db_name else [])
+            + (["--cassandra_consistency", cassandra_consistency] if cassandra_consistency else [])
         ),
     ]
     return " && ".join(parts)
@@ -325,6 +328,18 @@ def main():
              "result files are labelled ozonedb-corfu-linearizable.",
     )
     parser.add_argument(
+        "--db_name",
+        help="Pass-through to per-host runner: comma-separated backends "
+             "(overrides local.run.db_name on every client), e.g. cassandra.",
+    )
+    parser.add_argument(
+        "--cassandra_consistency",
+        choices=["one", "quorum", "serial"],
+        default=None,
+        help="Pass-through to per-host runner (cassandra only): force the consistency "
+             "mode; result files are labelled cassandra-<mode>.",
+    )
+    parser.add_argument(
         "--run_tag",
         help="Tag for results dir; defaults to YYYYmmdd-HHMMSS. All hosts share this tag.",
     )
@@ -396,7 +411,9 @@ def main():
         f"writers_per_host={writers_per_host} total_writers={total_writers} "
         f"trial={trial} workloads={args.workloads or 'yaml'} "
         f"max_exec_time={args.max_exec_time or 'yaml'} "
-        f"read_mode={'linearizable' if args.linearizable else 'default'}"
+        f"read_mode={'linearizable' if args.linearizable else 'default'} "
+        f"db_name={args.db_name or 'yaml'} "
+        f"cassandra_consistency={args.cassandra_consistency or 'yaml'}"
     )
     for p in plan:
         print(
@@ -409,6 +426,7 @@ def main():
             "$OZONEDB_HOME", run_tag, plan[0]["offset"], plan[0]["writers"],
             total_writers, args.workloads, trial,
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
+            db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         print("[orchestrator] --dry_run: not launching.")
@@ -427,6 +445,7 @@ def main():
             remote_home, run_tag, p["offset"], p["writers"],
             total_writers, args.workloads, trial,
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
+            db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

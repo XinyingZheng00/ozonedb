@@ -141,6 +141,19 @@ python3 bench/scripts/local/run_corfu_compaction_contention.py
   editing `ycsb.yaml`: the label is derived from the effective settings either way, but a YAML
   toggle has to be synced to every client. `local.run.repeated` must be 1 — the run phase refuses
   anything else because repeats overwrite the `_trial{N}` files; use trials.
+- **Cassandra baseline** (server-based comparison for the consistency/throughput frontier).
+  `ycsb/cassandra/` is upstream YCSB's CQL binding plus a `cassandra.lwt` switch (every write an
+  `IF [NOT] EXISTS` Paxos round) — see its README. `setup.sh --role cassandra` installs the Apache
+  tarball on every `nodes.cassandra` entry (default: the log node, so both systems get the same
+  server box; **never run Corfu and Cassandra benchmarks at once**) with its own JDK 17 under
+  `cassandra.install_dir/env.sh` — the node's JDK 25 stays for Corfu. `bench/scripts/cassandra_ctl.sh`
+  runs on the server (`start|stop|wipe|schema|save-load|restore-load`); `save-load`/`restore-load`
+  are the `/mnt/corfu/{load,run_batch}` pattern so every trial starts from the drained load
+  snapshot. `load_multinode_cassandra.sh` wipes, creates the schema, loads from one client and
+  snapshots; `run_multinode_ycsb_with_cassandra.sh --consistency one|quorum|serial` is the sweep,
+  passing `--db_name cassandra --cassandra_consistency MODE` to every client (a flag, never a
+  `ycsb.yaml` edit) and labelling results `cassandra-<mode>`. `serial` = SERIAL reads + LWT
+  writes, the linearizable point; `one` == `quorum` at RF=1.
 - Each writer process gets its **own generated config**: `_make_local_config_per_writer` /
   `_make_corfu_config_per_writer` template `src/config/{local,corfu}/shared_config_base.json` into
   `shared_config_w{i}.json`. Never point multiple writers at a single `shared_config.json`.

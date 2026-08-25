@@ -22,6 +22,13 @@ into the config dict under the keys the existing consumers already read:
     cloudlab.ssh_private_key_path  <- nodes.ssh_private_key_path
     corfu.endpoint                 <- nodes.log.lan   : corfu.port
     s3.endpoint                    <- nodes.store.lan : s3.port  (with scheme)
+    cassandra.hosts                <- [n.lan for n in nodes.cassandra]
+    cassandra.ssh_hosts            <- [n.ssh for n in nodes.cassandra]
+    cassandra.contact_points       <- ",".join(cassandra.hosts)
+
+nodes.cassandra is a list (one node is the common case) and is optional: when
+absent it falls back to [nodes.log], so the baseline server lands on the same
+box as CorfuDB and the two systems see identical server hardware.
 
 That is why callers only had to swap `yaml.safe_load(f)` for `load(path)`;
 everything downstream still reads corfu_settings["endpoint"] as before.
@@ -31,6 +38,7 @@ Also usable from shell:
     python3 ycsb_config.py --get corfu.endpoint
     python3 ycsb_config.py --ssh-target log        # user@public-name
     python3 ycsb_config.py --node log --field lan  # bind address
+    python3 ycsb_config.py --list cassandra --field ssh   # one address per line
     python3 ycsb_config.py --check                 # validate and print the plan
 """
 
@@ -48,8 +56,18 @@ DEFAULT_CORFU_PORT = 9090
 DEFAULT_S3_PORT = 9000
 DEFAULT_S3_SCHEME = "http"
 
-# Roles that name exactly one machine. `clients` is the list role.
+# Roles that name exactly one machine. `clients` and `cassandra` are list roles.
 SINGLETON_ROLES = ("log", "store")
+LIST_ROLES = ("clients", "cassandra")
+
+# Which nodes: entry each derived section comes from, for the error message
+# when someone sets a derived key by hand.
+_DERIVED_FROM = {
+    "cloudlab": "nodes.clients",
+    "corfu": "nodes.log",
+    "s3": "nodes.store",
+    "cassandra": "nodes.cassandra (or nodes.log when unset)",
+}
 
 
 class ConfigError(ValueError):
@@ -88,11 +106,30 @@ def _reject_derived(cfg, dotted):
     section, _, key = dotted.partition(".")
     if isinstance(cfg.get(section), dict) and key in cfg[section]:
         raise ConfigError(
-            f"{dotted} is derived from nodes: and must not be set by hand. "
-            f"Delete it; the value comes from nodes.{'log' if section == 'corfu' else 'store'}."
-            if section in ("corfu", "s3")
-            else f"{dotted} is derived from nodes.clients and must not be set by hand. Delete it."
+            f"{dotted} is derived from {_DERIVED_FROM[section]} and must not be "
+            f"set by hand. Delete it."
         )
+
+
+def list_nodes(nodes, role):
+    """The `nodes:` entries for a list role, always as a list of mappings.
+
+    `cassandra` accepts a single mapping too, and falls back to [nodes.log]
+    when absent -- the baseline server takes the shared-log node's place."""
+    if role not in LIST_ROLES:
+        raise ConfigError(f"nodes.{role} is not a list role (have: {LIST_ROLES})")
+    raw = nodes.get(role)
+    if raw is None and role == "cassandra":
+        raw = nodes.get("log")
+        if raw is None:
+            raise ConfigError("nodes.cassandra is not set and there is no nodes.log to fall back to.")
+    if raw is None:
+        raise ConfigError(f"nodes.{role} is not set.")
+    if isinstance(raw, (str, dict)):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(f"nodes.{role} must be a non-empty list.")
+    return [_as_node(e, f"nodes.{role}[{i}]") for i, e in enumerate(raw)]
 
 
 def derive(cfg):
@@ -101,7 +138,14 @@ def derive(cfg):
     if not nodes:
         return cfg
 
-    for dotted in ("cloudlab.hosts", "corfu.endpoint", "s3.endpoint"):
+    for dotted in (
+        "cloudlab.hosts",
+        "corfu.endpoint",
+        "s3.endpoint",
+        "cassandra.hosts",
+        "cassandra.ssh_hosts",
+        "cassandra.contact_points",
+    ):
         _reject_derived(cfg, dotted)
 
     clients = [
@@ -133,6 +177,18 @@ def derive(cfg):
         port = cfg["s3"].get("port", DEFAULT_S3_PORT)
         scheme = cfg["s3"].get("scheme", DEFAULT_S3_SCHEME)
         cfg["s3"]["endpoint"] = f"{scheme}://{lan_addr(store, 'nodes.store')}:{port}"
+
+    if isinstance(cfg.get("cassandra"), dict):
+        servers = list_nodes(nodes, "cassandra")
+        cfg["cassandra"]["hosts"] = [
+            lan_addr(n, f"nodes.cassandra[{i}]") for i, n in enumerate(servers)
+        ]
+        cfg["cassandra"]["ssh_hosts"] = [
+            ssh_addr(n, f"nodes.cassandra[{i}]") for i, n in enumerate(servers)
+        ]
+        # What the YCSB binding's `hosts` property takes: the LAN addresses,
+        # comma-joined, the way the clients dial corfu.endpoint.
+        cfg["cassandra"]["contact_points"] = ",".join(cfg["cassandra"]["hosts"])
 
     return cfg
 
@@ -188,10 +244,22 @@ def _plan(cfg):
         out.append(
             f"{'client'+str(i):<8} ssh={ssh_addr(n, 'c'):<28} lan={n.get('lan', '-')}"
         )
+    if isinstance(cfg.get("cassandra"), dict):
+        origin = "" if "cassandra" in nodes else "  (fallback: nodes.log)"
+        for i, n in enumerate(list_nodes(nodes, "cassandra")):
+            out.append(
+                f"{'cass'+str(i):<8} ssh={ssh_addr(n, 'cassandra'):<28} "
+                f"lan={lan_addr(n, 'cassandra')}{origin}"
+            )
     out.append("")
     out.append(f"corfu.endpoint  = {get(cfg, 'corfu.endpoint')}   (clients dial this; also corfu_server -a)")
     out.append(f"s3.endpoint     = {get(cfg, 's3.endpoint')}")
     out.append(f"cloudlab.hosts  = {get(cfg, 'cloudlab.hosts')}")
+    if isinstance(cfg.get("cassandra"), dict):
+        out.append(
+            f"cassandra.contact_points = {get(cfg, 'cassandra.contact_points')}"
+            f"   (clients dial this; also listen/rpc_address)"
+        )
     return "\n".join(out)
 
 
@@ -200,7 +268,11 @@ def main():
     p.add_argument("--config", default=None)
     p.add_argument("--get", metavar="DOTTED", help="print one value, e.g. corfu.endpoint")
     p.add_argument("--node", metavar="ROLE", help="a role under nodes: (log, store)")
-    p.add_argument("--field", default="lan", help="with --node: ssh or lan (default lan)")
+    p.add_argument(
+        "--list", metavar="ROLE",
+        help="a list role under nodes: (clients, cassandra); prints one address per line",
+    )
+    p.add_argument("--field", default="lan", help="with --node/--list: ssh or lan (default lan)")
     p.add_argument("--ssh-target", metavar="ROLE", help="print user@host for a role")
     p.add_argument("--check", action="store_true", help="validate and print the resolved plan")
     p.add_argument("--json", action="store_true", help="dump the fully resolved config")
@@ -216,6 +288,9 @@ def main():
         elif args.node:
             n = node(cfg, args.node)
             print(ssh_addr(n, args.node) if args.field == "ssh" else lan_addr(n, args.node))
+        elif args.list:
+            for n in list_nodes(cfg.get("nodes") or {}, args.list):
+                print(ssh_addr(n, args.list) if args.field == "ssh" else lan_addr(n, args.list))
         elif args.json:
             print(json.dumps(cfg, indent=2, default=str))
         else:

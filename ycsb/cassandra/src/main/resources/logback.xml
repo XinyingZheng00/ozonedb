@@ -1,0 +1,20 @@
+<configuration>
+    <!-- The runners chdir into ycsb/ before launching, so this lands in
+         bench/results/local/ like the rocksdb binding's log. The DataStax
+         driver is very chatty below WARN; the binding itself logs the
+         effective consistency settings and the LWT not-applied count at INFO. -->
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>../bench/results/local/cassandra_client.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{20} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="site.ycsb.db" level="info" />
+    <logger name="com.datastax" level="warn" />
+
+    <root level="warn">
+        <appender-ref ref="FILE" />
+    </root>
+</configuration>

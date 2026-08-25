@@ -13,7 +13,11 @@ from load_local_ycsb_multiproc import (
     _resolve_binding,
     _resolve_ycsb_classpath,
     _java_binary,
+    CASSANDRA_MODES,
+    SERVER_BACKENDS,
     YCSB_DB_CLASSNAMES,
+    cassandra_mode_settings,
+    cassandra_ycsb_props,
     linearizable_corfu_settings,
     partition_records,
     result_label,
@@ -83,6 +87,8 @@ def run_ycsb(
     max_exec_time=None,
     trial=1,
     linearizable=False,
+    cassandra_settings=None,
+    cassandra_consistency=None,
 ):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
@@ -109,6 +115,13 @@ def run_ycsb(
         # Same override consistency.py --linearizable applies; the label
         # below picks it up from the effective settings.
         corfu_settings = linearizable_corfu_settings(corfu_settings)
+    if cassandra_consistency:
+        unsupported = [d for d in db_names if d != "cassandra"]
+        if unsupported:
+            raise ValueError(
+                f"--cassandra_consistency only applies to db_name cassandra (got {unsupported})"
+            )
+        cassandra_settings = cassandra_mode_settings(cassandra_settings, cassandra_consistency)
     if total_writers is None:
         total_writers = num_writers
     if total_writers < offset + num_writers:
@@ -158,7 +171,7 @@ def run_ycsb(
                 )
 
                 for db_name in db_names:
-                    if db_name in ("ozonedb", "ozonedb-corfu"):
+                    if db_name == "ozonedb" or db_name in SERVER_BACKENDS:
                         thread_list = [str(t) for t in threads]
                     else:
                         thread_list = ["1"]
@@ -169,7 +182,7 @@ def run_ycsb(
                     java_bin = _java_binary()
                     # Filenames carry the read mode; db_name (paths, binding,
                     # thread sweep) does not.
-                    label = result_label(db_name, corfu_settings)
+                    label = result_label(db_name, corfu_settings, cassandra_settings)
 
                     for thread in thread_list:
                         print(
@@ -189,7 +202,7 @@ def run_ycsb(
                                 f"{db_name}-{each_key_size}-workload{workload_name}-{each_operation_cnt}-w{writer_idx}/",
                             )
 
-                            if db_name != "ozonedb-corfu":
+                            if db_name not in SERVER_BACKENDS:
                                 if not os.path.exists(cached_data_path):
                                     print(
                                         f"cached_data_path {cached_data_path} does not exist, skipping writer {writer_idx}..."
@@ -239,6 +252,8 @@ def run_ycsb(
                                 )
                                 ycsb_props += ["-p", f"shared_config={cfg}"]
                                 extra_cp_entries.append(corfu_bridge_jar_path())
+                            elif db_name == "cassandra":
+                                ycsb_props += cassandra_ycsb_props(cassandra_settings)
                             elif db_name == "sqlite":
                                 db_file = os.path.join(run_data_path, "mydb.db")
                                 sqlite_cfg = os.path.join(
@@ -368,6 +383,21 @@ if __name__ == "__main__":
              "labelled ozonedb-corfu-linearizable instead of ozonedb-corfu. Prefer this over "
              "toggling corfu.linearizable_reads in ycsb.yaml.",
     )
+    parser.add_argument(
+        "--db_name",
+        type=str,
+        default=None,
+        help="Comma-separated backends (overrides local.run.db_name), e.g. cassandra. "
+             "Prefer this over editing ycsb.yaml on every client.",
+    )
+    parser.add_argument(
+        "--cassandra_consistency",
+        choices=sorted(CASSANDRA_MODES),
+        default=None,
+        help="Cassandra only: force the consistency mode (overrides cassandra.consistency "
+             "in ycsb.yaml); result files are labelled cassandra-<mode>. The analogue of "
+             "--linearizable for the baseline.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -381,6 +411,8 @@ if __name__ == "__main__":
     operation_cnts = run_config["operation_cnt"]
     key_sizes = run_config["key_size"]
     db_names = run_config["db_name"]
+    if args.db_name:
+        db_names = [d.strip() for d in args.db_name.split(",") if d.strip()]
     repeated = run_config["repeated"]
     ycsb_data_path = run_config["ycsb_data_path"]
     threads = run_config["threads"]
@@ -414,8 +446,9 @@ if __name__ == "__main__":
 
     print(
         f"Launching {num_writers} parallel runner processes "
-        f"(offset={offset}, total_writers={total_writers}, trial={trial}, "
-        f"read_mode={'linearizable' if args.linearizable else 'default'})"
+        f"(db={db_names}, offset={offset}, total_writers={total_writers}, trial={trial}, "
+        f"read_mode={'linearizable' if args.linearizable else 'default'}, "
+        f"cassandra_consistency={args.cassandra_consistency or 'yaml'})"
     )
     run_ycsb(
         workload_names,
@@ -434,4 +467,6 @@ if __name__ == "__main__":
         max_exec_time=max_exec_time,
         trial=trial,
         linearizable=args.linearizable,
+        cassandra_settings=config.get("cassandra"),
+        cassandra_consistency=args.cassandra_consistency,
     )
