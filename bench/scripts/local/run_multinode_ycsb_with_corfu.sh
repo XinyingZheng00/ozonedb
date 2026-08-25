@@ -210,6 +210,7 @@ cfg() { python3 "$OZONEDB_HOME/bench/scripts/ycsb_config.py" --config "$CONFIG" 
 [[ -n "$CORFU_USER"      ]] || CORFU_USER="$(cfg --get nodes.ssh_user)"        || exit 1
 [[ -n "$CORFU_SSH_KEY"   ]] || CORFU_SSH_KEY="$(cfg --get nodes.ssh_private_key_path)" || exit 1
 [[ -n "$CORFU_PORT"      ]] || CORFU_PORT="$(cfg --get corfu.port)"            || exit 1
+S3_BUCKET="$(cfg --get s3.bucket 2>/dev/null || echo ozonedb-ycsb)"
 echo "[corfu] node: ssh=$CORFU_SSH_HOST bind=$CORFU_BIND_HOST port=$CORFU_PORT (from $CONFIG)"
 
 CORFU_SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new)
@@ -229,6 +230,14 @@ port_open() {
 
 start_corfu() {
   echo "[corfu] starting on $CORFU_TARGET ($CORFU_BIND_HOST:$CORFU_PORT)"
+  # The SSTable bucket must be restored together with the log: a run's
+  # compaction REMOVEs its input SSTables from the store, and the restored
+  # load-time log still references them, so without this every cell after
+  # the first reads against missing files (and the bucket accumulates one
+  # run's output per cell). load_corfu_dataset.sh writes the snapshot to
+  # /mnt/corfu/load-bucket on the corfu node; when it is absent (log-only
+  # deployments, sstable_backend unset) this is a no-op.
+  corfu_sh "if [ -d /mnt/corfu/load-bucket ]; then mc mirror --overwrite --remove --quiet /mnt/corfu/load-bucket ozonedb-local/$S3_BUCKET >/dev/null && echo '[corfu] bucket restored from /mnt/corfu/load-bucket'; fi"
   # Trailing & must apply only to nohup, not to the whole chain — otherwise
   # ssh holds stdout open on a foregrounded subshell and hangs.
   corfu_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $CORFU_BIND_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
