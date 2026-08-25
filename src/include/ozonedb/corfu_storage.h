@@ -231,8 +231,9 @@ class CorfuDBStorage : public Storage {
                       unsigned char const* data, int length);
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
   // Core apply logic, takes already-JNI-extracted bytes. Shared by
-  // applyEntryFromJava (single-entry path, kept for drainInitialEntries)
-  // and applyBatchFromJava (steady-state path driven by pollBatch).
+  // applyEntryFromJava (single-entry path, no longer on any hot path)
+  // and applyBatchFromJava (pollBatch path, used by both the open-time
+  // replay and the steady-state tailer).
   bool applyEntryBytes(unsigned char const* data, size_t len);
   // Parse a pollBatch-formatted byte array (big-endian count +
   // length-prefixed entries) and apply each via applyEntryBytes.

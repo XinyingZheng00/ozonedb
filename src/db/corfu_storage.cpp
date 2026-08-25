@@ -20,6 +20,12 @@ constexpr long kPollTimeoutMs = 100;
 // with a cold cache (50-400 ms/entry) we'll return partial batches
 // via the in-Java short-circuit.
 constexpr int kPollBatchSize = 256;
+// Batch size for the open-time replay (drainInitialEntries). Larger than
+// the tailer's: the replay is a bulk read of a log that already exists,
+// nothing waits on per-batch latency, and the per-batch cost (one JNI
+// round trip + one byte[] copy) is what made the old one-entry-per-call
+// drain take ~43 us per entry — 49 s for a 1 M-entry loaded log.
+constexpr int kDrainBatchSize = 4096;
 
 std::vector<std::string> splitJvmOpts(std::string const& opts) {
   std::vector<std::string> out;
@@ -421,21 +427,38 @@ int CorfuDBStorage::applyBatchFromJava(JNIEnv* env, jbyteArray jbuf) {
 void CorfuDBStorage::drainInitialEntries() {
   JNIEnv* env = attachThread();
   if (!env) return;
-  // Use timeoutMs=0 so pollNext returns null as soon as the stream cursor
-  // reaches the end of pre-existing entries. Keeps cold-start latency low.
-  int drained = 0;
+  // Same batch path as the tailer (pollBatch + applyBatchFromJava). A
+  // zero timeout makes pollBatch return null as soon as the stream view
+  // has nothing ready and the batch is empty, i.e. at the current tail.
+  using clock = std::chrono::steady_clock;
+  auto const t0 = clock::now();
+  long drained = 0;
+  long batches = 0;
+  long long poll_us = 0;   // inside CorfuBridge.pollBatch (stream read + payload decode)
+  long long apply_us = 0;  // applyBatchFromJava (JNI copy + protobuf parse + apply under mtx_)
   while (true) {
+    auto const tp = clock::now();
     jbyteArray jbuf = static_cast<jbyteArray>(
-        env->CallObjectMethod(bridge_global_, mid_pollNext_, static_cast<jlong>(0)));
+        env->CallObjectMethod(bridge_global_, mid_pollBatch_,
+                              static_cast<jlong>(0),
+                              static_cast<jint>(kDrainBatchSize)));
+    auto const ta = clock::now();
+    poll_us += std::chrono::duration_cast<std::chrono::microseconds>(ta - tp).count();
     if (env->ExceptionCheck()) {
       env->ExceptionDescribe();
       env->ExceptionClear();
       break;
     }
     if (jbuf == nullptr) break;
-    if (applyEntryFromJava(env, jbuf)) ++drained;
+    drained += applyBatchFromJava(env, jbuf);
+    apply_us += std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - ta).count();
+    ++batches;
   }
-  std::cerr << "[corfu] initial replay drained " << drained << " entries\n";
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+  std::cerr << "[corfu] initial replay drained " << drained << " entries in "
+            << batches << " batches, " << ms << " ms"
+            << (ms > 0 ? " (" + std::to_string(drained * 1000 / ms) + " entries/s)" : "")
+            << "; poll " << poll_us / 1000 << " ms, apply " << apply_us / 1000 << " ms\n";
 }
 
 void CorfuDBStorage::tailerLoop() {
