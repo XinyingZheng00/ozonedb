@@ -356,8 +356,28 @@ install_corfu_runtime() {
 
 # ------------------------------------------------------------------- roles
 
+# Some CloudLab c6525-25g nodes boot with acpi-cpufreq + schedutil (idle at
+# 1.5 GHz, ramping to ~2.4 GHz under a single YCSB thread) while their
+# siblings expose no cpufreq at all and sit at ~3.0 GHz. On the 2026-08-25
+# cluster that made two of seven clients run every workload at ~53% of the
+# others. Pin the governor to performance wherever cpufreq exists; no-op
+# elsewhere. Not persisted across reboots (CloudLab experiments rarely
+# reboot; re-run setup.sh if one does).
+pin_cpu_governor() {
+  local d=/sys/devices/system/cpu/cpu0/cpufreq
+  [[ -d "$d" ]] || { log "cpufreq: not exposed on this node (fixed frequency), nothing to pin"; return 0; }
+  if ! grep -qw performance "$d/scaling_available_governors" 2>/dev/null; then
+    warn "cpufreq: performance governor not available (have: $(cat "$d/scaling_available_governors"))"
+    return 0
+  fi
+  local before; before="$(cat "$d/scaling_governor")"
+  echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null
+  log "cpufreq: governor $before -> $(cat "$d/scaling_governor") on $(ls -d /sys/devices/system/cpu/cpu*/cpufreq | wc -l) cpus"
+}
+
 role_client() {
   log "=== role: client ==="
+  pin_cpu_governor
 
   apt_install cmake maven python3-pip zip pkg-config build-essential git ninja-build
 
@@ -421,6 +441,7 @@ role_client() {
 
 role_corfu_server() {
   log "=== role: corfu-server ==="
+  pin_cpu_governor
 
   apt_install maven git
 
