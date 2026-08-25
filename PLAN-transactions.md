@@ -345,14 +345,38 @@ number carries n and trial count in the caption.
 
 ## Status (2026-08-24, evening)
 
-Steps 1–3 of the implementation order are written and committed on `cas`
-(`95ab122d`: T1–T8 and `corfu_txn_smoke`; the following commit: B1 probe
-modes and B2 `consistency.py` subcommands). Nothing is built or run yet.
-The C++ passed `clang -fsyntax-only` on the laptop (only the pre-existing
-Azure/libstdc++ lines in `storage.h` fail on macOS) and the Java passed
-`javac` against the built YCSB core jar. Next: `bash bench/scripts/build.sh`
-on a client node, then `./corfu_txn_smoke <config-with-track_versions>`,
-then E0 and E1 on one host (step 4). B3–B5 and T9 are not started.
+Steps 1–4 of the implementation order are done. Engine, API, JNI, smoke
+(`95ab122d`) and the harness (`de0d3fe6`) are committed on `cas`, built on
+all eight clients (`sync.yml -e build=true`), and E1 passed on one host
+(client0 = amd223) with zero anomalies on the first run — no engine fix was
+needed. `corfu_txn_smoke 16 200`: 400 transfers, 18 aborts (max 3
+attempts), audit sum 1600/1600, validation accepted at address 435.
+
+| check (client0, 2026-08-24) | result | contention |
+|---|---|---|
+| `check-txn-lost-updates --workers 8 --increments 4000` | 4000/4000, **0 lost**, 6.7 s | 3910 aborts, max 15 attempts |
+| same, `--seed-blind` | 4000/4000, **0 lost**, 6.7 s | 3957 aborts, max 18 attempts |
+| `check-txn-transfer --workers 8 --accounts 100 --duration 60` | 112,483 commits, 1,856/s, **0 violations** in 5,409 validated audits (11,632 audit aborts), final sum OK | 8,230 aborts (6.8%), max 7 attempts |
+| same, `--no-validate` | 133,964 commits, 2,211/s, **1,064 torn sums** in 16,182 unvalidated audits (first: 9,990 of 10,000), final sum OK | 6,960 aborts (4.9%) |
+| `check-txn-skew --rounds 1000` | **0 double commits**, 1000 commits (one per round), 717 aborts, 283 skips | 717 of 1000 rounds contended |
+| `check-txn-crash --workers 4 --kills 3 --duration 60` | 3 SIGKILL+restart, 67,798 commits, **0 violations**, final sum OK | 1,019 aborts (1.5%) |
+
+Per-attempt latency at w8 (transfer, 2 keys, committed attempts): fence
+p50 270 µs, reads p50 6 µs (both keys served from the inline version map),
+commit (append + verdict) p50 1.29 ms / p99 11.8 ms, total p50 1.94 ms /
+p99 17.7 ms. The no-validate row is the evidence for the read-only
+validation record: unvalidated reads under one fence tear 6.6% of audits
+against 8 concurrent writers.
+
+Operational note: every check needs a fresh `corfu_server` first. The
+fence target is the *global* sequencer tail and the tailer only advances on
+its own stream's entries, so a new stream never catches up with entries
+another stream left in the log (`openDB`/the first put block forever —
+this is what the first smoke attempt did). The E1 driver restarted the
+server (`-l /mnt/corfu/run_consistency`, wiped) before each run; B3 must
+do the same. Summaries are under `bench/results/consistency/` (gitignored)
+on the laptop and on client0. Next: E0 (gate-off regression), then B3 and
+E1 on 2 and 8 hosts (step 5). B3–B5 and T9 are not started.
 
 Deviations from the plan text above, all deliberate:
 
