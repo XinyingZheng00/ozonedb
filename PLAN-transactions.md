@@ -395,6 +395,24 @@ Same nodes, same load, same harness, 7 hosts × 1 writer, 120 s, 3 trials,
 | a | read avg / max-p99 (µs) | 2,465 / 13,892 | 3,545 / 12,935 | −30% / +7% |
 | a | update avg / max-p99 (µs) | 3,127 / 14,620 | 4,182 / 13,895 | −25% / +5% |
 
+Those are YCSB's raw numbers, and they are diluted: YCSB's `RunTime`
+starts before `DB.init()`, and `openDB` replays the 1.1 GB loaded log for
+44–66 s per process (first operation at 49 s on a pinned host; the two
+unpinned hosts took 60–66 s). With init excluded (`ops ÷ (RunTime − first
+op)`, the number to quote):
+
+| wl | `cas` gate off | `visibility` | Δ |
+|---|---|---|---|
+| c | 9,737 ±73 | 9,774 ±58 | −0.4% |
+| a | 2,464 ±11 | 1,800 ±16 | **+37%** |
+
+At 120 s the raw sum is ~57% of steady state; at 300 s it would be ~84%.
+Harness to-do before E2–E5: have the multiproc runner report a
+steady-state throughput (subtract the first-op time from the `-s` status
+stream, or make the binding open the DB before YCSB's timer) and say which
+one every figure uses. E0's comparison is unaffected: both builds paid the
+same init.
+
 Verdict: no regression with the gate off — the read-only workload is
 identical within trial noise. The update-heavy workload is *faster* on
 `cas` for a known reason: `88e47612` (bridge wakes the poller on a local
@@ -419,8 +437,11 @@ Two pitfalls found on the way, both fixed in the tree:
   identically on both builds). They boot with `acpi-cpufreq` + `schedutil`
   (1.5 GHz idle, ~2.4 GHz under one YCSB thread); the other five expose no
   cpufreq and sit at ~3.0 GHz. `setup.sh` now pins `performance` where
-  cpufreq exists (`328137f6`). Per-host sums in E3–E5 must be read with
-  this in mind if a node is not pinned.
+  cpufreq exists (`328137f6`); pinned by hand on both nodes after E0 and
+  verified with one 60 s workload-c cell: per-writer 193–201 ops/s on all
+  seven hosts (was 456–491 vs 899–939), and `openDB` replay 49 s on every
+  host (was 60–66 s on the two). A reboot resets the governor — check
+  `scaling_governor` before any performance run.
 
 Operational note: every check needs a fresh `corfu_server` first. The
 fence target is the *global* sequencer tail and the tailer only advances on
