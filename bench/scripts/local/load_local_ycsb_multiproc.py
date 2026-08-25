@@ -116,6 +116,52 @@ def _java_binary():
     return "java"
 
 
+# Suffix appended to the result-file engine token when strict reads are on.
+LINEARIZABLE_LABEL_SUFFIX = "-linearizable"
+
+
+def _truthy(v):
+    """The spellings of true that reach the corfu settings dict (YAML bool,
+    CLI/JSON strings, the odd 1)."""
+    return v in (True, "true", "True", "1", 1)
+
+
+def linearizable_corfu_settings(corfu_settings):
+    """Copy of `corfu_settings` with strict reads forced on.
+
+    Every get then fences on the global log tail (one sequencer round-trip,
+    see src/db/db.cpp) instead of trusting the background tailer. Metadata
+    rejects linearizable_reads together with trust_background_tail, so the
+    two are always set as a pair. This is the ONE place the override lives:
+    run_local_ycsb_multiproc.py --linearizable and consistency.py
+    --linearizable both call it, so the throughput and consistency runs
+    cannot drift apart in what "linearizable" means.
+    """
+    s = dict(corfu_settings or {})
+    s["linearizable_reads"] = True
+    s["trust_background_tail"] = False
+    return s
+
+
+def result_label(db_name, corfu_settings):
+    """Engine token for result filenames: db_name plus the read mode.
+
+    db_name itself is branched on by the runners (binding, cached-data
+    handling, thread sweep, scratch paths) and must not change. The read
+    mode rides along as a suffix -- `ozonedb-corfu-linearizable` -- so a
+    linearizable run can never produce the same filenames as a default run.
+    Before this, the only trace of the mode was corfu.linearizable_reads in
+    ycsb.yaml, and a forgotten toggle yielded two identical "default" sweeps.
+    Derived from the EFFECTIVE settings, not just the --linearizable flag,
+    so the YAML route is labelled too.
+    """
+    if db_name == "ozonedb-corfu" and _truthy(
+        (corfu_settings or {}).get("linearizable_reads")
+    ):
+        return db_name + LINEARIZABLE_LABEL_SUFFIX
+    return db_name
+
+
 def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settings):
     """Write a per-writer shared_config_w{i}.json.
 
@@ -157,11 +203,7 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         # letting json.dump emit a bare true/false literal.
         for k in ("trust_background_tail", "linearizable_reads", "track_versions"):
             if k in corfu_settings:
-                data[k] = (
-                    "true"
-                    if corfu_settings[k] in (True, "true", "1", 1)
-                    else "false"
-                )
+                data[k] = "true" if _truthy(corfu_settings[k]) else "false"
     if s3_settings:
         data["sstable_backend"] = "s3"
         if "endpoint" in s3_settings:

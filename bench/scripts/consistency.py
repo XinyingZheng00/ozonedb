@@ -48,6 +48,7 @@ from load_local_ycsb_multiproc import (
     _java_binary,
     _make_corfu_config_per_writer,
     _resolve_ycsb_classpath,
+    linearizable_corfu_settings,
     partition_records,
 )
 from visibility_analysis import analyze as _analyze_visibility
@@ -92,16 +93,17 @@ def _corfu_settings(cfg, stream, linearizable=False, track_versions=False):
     s = dict(cfg["corfu"])
     s["stream_name"] = stream
     if linearizable:
-        # Passed through to the per-writer shared_config by
-        # _make_corfu_config_per_writer; makes every get fence on the
+        # The same override run_local_ycsb_multiproc.py --linearizable
+        # applies (linearizable_reads=true + trust_background_tail=false);
+        # passed through to the per-writer shared_config by
+        # _make_corfu_config_per_writer and makes every get fence on the
         # global log tail (see src/db/db.cpp).
-        s["linearizable_reads"] = True
-        s["trust_background_tail"] = False
+        s = linearizable_corfu_settings(s)
     if track_versions:
-        # Required by compareAndPut: every writer's tailer keeps the
-        # log-ordered key -> version map (Metadata::track_versions).
-        # Off by default because it taxes the tailer with a key-only
-        # decode of every data-log entry.
+        # Required by compareAndPut and transactions: every writer's
+        # tailer keeps the log-ordered key -> version map
+        # (Metadata::track_versions). Off by default because it taxes the
+        # tailer with a key-only decode of every data-log entry.
         s["track_versions"] = True
     return s
 

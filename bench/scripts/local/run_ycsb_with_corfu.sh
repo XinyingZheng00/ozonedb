@@ -39,6 +39,7 @@ WORKLOADS="a b c d f"
 WRITERS_LIST="1 2 4 8"
 TRIALS=1
 DURATION=""
+LINEARIZABLE=0
 BENCH_SCRIPT_OVERRIDE=""
 
 usage() {
@@ -60,11 +61,16 @@ Usage: $(basename "$0") [options]
   --duration SECONDS    cap each YCSB iteration at this many seconds via
                         YCSB's maxexecutiontime property (default: from
                         ycsb.yaml local.run.max_exec_time, else uncapped)
+  --linearizable        strict reads: linearizable_reads=true +
+                        trust_background_tail=false in every writer's
+                        generated shared_config, and result files labelled
+                        ozonedb-corfu-linearizable instead of ozonedb-corfu.
+                        Use this rather than editing ycsb.yaml.
   --script PATH         override the inner python bench script
                         (default: \$OZONEDB_HOME/bench/scripts/local/run_local_ycsb_multiproc.py).
                         The override must accept the same flags this script
                         passes: --config --workloads --num_writers --trial
-                        [--max_exec_time].
+                        [--max_exec_time] [--linearizable].
   -h | --help
 EOF
 }
@@ -110,6 +116,10 @@ while [[ $# -gt 0 ]]; do
   --duration)
     DURATION="$2"
     shift 2
+    ;;
+  --linearizable)
+    LINEARIZABLE=1
+    shift
     ;;
   --script)
     BENCH_SCRIPT_OVERRIDE="$2"
@@ -243,7 +253,9 @@ RESULTS=()
 # iterations of this sweep. Per-trial result files are differentiated by the
 # _trial{N} suffix that the python script appends.
 export OZONEDB_RUN_TAG="$(date +%Y%m%d-%H%M%S)"
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers=(${WRITERS_ARR[*]}) trials=$TRIALS run_tag=$OZONEDB_RUN_TAG ==="
+READ_MODE=default
+[[ "$LINEARIZABLE" -eq 1 ]] && READ_MODE=linearizable
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers=(${WRITERS_ARR[*]}) trials=$TRIALS read_mode=$READ_MODE run_tag=$OZONEDB_RUN_TAG ==="
 
 for ((TRIAL = 1; TRIAL <= TRIALS; TRIAL++)); do
   for WL in "${WORKLOADS_ARR[@]}"; do
@@ -257,6 +269,7 @@ for ((TRIAL = 1; TRIAL <= TRIALS; TRIAL++)); do
 
       bench_args=(--config "$CONFIG" --workloads "$WL" --num_writers "$NW" --trial "$TRIAL")
       [[ -n "$DURATION" ]] && bench_args+=(--max_exec_time "$DURATION")
+      [[ "$LINEARIZABLE" -eq 1 ]] && bench_args+=(--linearizable)
       echo "[bench] python3 $BENCH_SCRIPT ${bench_args[*]}"
       set +e
       python3 "$BENCH_SCRIPT" "${bench_args[@]}"
