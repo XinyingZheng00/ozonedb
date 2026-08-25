@@ -213,9 +213,11 @@ JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove(JNIEnv* env, jobject obj, jstr
   }
 }
 
-// Returns null when the key is absent; otherwise an 8-byte big-endian
-// version (the key's global log address; -1 encodes "unwritten")
-// followed by the value bytes. One array keeps the (value, version)
+// Returns an 8-byte big-endian version (the key's global log address;
+// -1 encodes "unwritten") followed by the value bytes; for an absent or
+// deleted key only the 8-byte version (so a transaction can validate
+// "still absent" with the exact version it observed); null on backend
+// failure (track_versions off). One array keeps the (value, version)
 // pair atomic across the JNI boundary.
 JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_getVersioned(JNIEnv* env, jobject obj, jstring key) {
   char const* nativeKey = env->GetStringUTFChars(key, 0);
@@ -224,7 +226,9 @@ JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_getVersioned(JNIEnv* env, jobje
   ozonedb::Status status = db_instance->getVersioned(std::string(nativeKey), value, version);
   env->ReleaseStringUTFChars(key, nativeKey);
 
-  if (status != ozonedb::Status::kSuccess) {
+  if (status == ozonedb::Status::kNotFound) {
+    value.clear();
+  } else if (status != ozonedb::Status::kSuccess) {
     return nullptr;
   }
   jbyteArray byteArray = env->NewByteArray(8 + value.length());

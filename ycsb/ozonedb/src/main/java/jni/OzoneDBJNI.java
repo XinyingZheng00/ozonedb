@@ -67,10 +67,13 @@ public class OzoneDBJNI {
   public native void remove(String key);
 
   /**
-   * Versioned read for read-modify-write: null when the key is absent, else an
-   * 8-byte big-endian version (the key's global log address, -1 = unwritten)
-   * followed by the value bytes. The pair comes from one fenced lookup, so the
-   * version is safe to feed straight into {@link #casPut}.
+   * Versioned read for read-modify-write: an 8-byte big-endian version (the
+   * key's global log address, -1 = unwritten) followed by the value bytes;
+   * for an absent or deleted key only the 8-byte version (length 8), so a
+   * transaction can validate "still absent"; null when the backend cannot
+   * answer (track_versions off). The pair comes from one fenced lookup, so
+   * the version is safe to feed straight into {@link #casPut} or
+   * {@link #txnCommit}.
    */
   public native byte[] getVersioned(String key);
 

@@ -343,11 +343,45 @@ number carries n and trial count in the caption.
 - **No range predicates.** Say so in the paper. Phantoms cannot occur
   because the API cannot express a range read.
 
-## Status (2026-08-24)
+## Status (2026-08-24, evening)
 
-Nothing in this plan is implemented. The prerequisites listed under "What
-the branch already provides" are committed on `cas` (`e0e39b2f`,
-`80ca93f1`, `88e47612`, `578e239c`).
+Steps 1–3 of the implementation order are written and committed on `cas`
+(`95ab122d`: T1–T8 and `corfu_txn_smoke`; the following commit: B1 probe
+modes and B2 `consistency.py` subcommands). Nothing is built or run yet.
+The C++ passed `clang -fsyntax-only` on the laptop (only the pre-existing
+Azure/libstdc++ lines in `storage.h` fail on macOS) and the Java passed
+`javac` against the built YCSB core jar. Next: `bash bench/scripts/build.sh`
+on a client node, then `./corfu_txn_smoke <config-with-track_versions>`,
+then E0 and E1 on one host (step 4). B3–B5 and T9 are not started.
+
+Deviations from the plan text above, all deliberate:
+
+- **T4.** `CorfuBridge.append(byte[])` is untouched: the read set travels
+  inside the serialized `CorfuEntry` (C++ builds the proto), so the bridge
+  jar needs no source change (`build.sh` rebuilds it anyway).
+- **T3.** Legacy CAS and commit records share `conditional = true` and are
+  told apart by `expected_version` *presence*, not by an empty `read_set`:
+  a commit record with an empty read set is a legal atomic blind
+  multi-record write, so "empty read set" cannot mean "legacy".
+- **T6.** `DB::commitTransaction(read_set, write_set, version)` is public
+  under `Transaction::commit`; the JNI uses it directly and leaves the
+  fence token to the Java caller. `getVersioned` (C++ and JNI) reports a
+  never-written key as `kNotFound` with version `-1` (JNI: an 8-byte
+  version with no value) so a transaction can validate "still absent".
+- **B1.** The per-commit CSV has `fence_us, read_us, commit_us`: Java
+  cannot split append from verdict wait, both happen inside `txnCommit`.
+  `txn-mixed-worker` is `txn-transfer-worker` with `--keys` and `--zipf`.
+- **B2.** `check-txn-crash` kills and restarts *transfer* workers and
+  judges with the final validated audit (torn transfers are the crash
+  hazard); the counter variant would need per-worker durable ack logs.
+  `--seed-blind` on `check-txn-lost-updates` makes every worker blind-put
+  the counter to 0 before the go barrier (race-free), so first reads pair
+  a blind-written value with its version. A blind put *during* the run
+  cannot be made race-free (blind wins), so the roll-window case of T1
+  is covered only by the transfer checks' blind seeds plus log rolls.
+
+The prerequisites listed under "What the branch already provides" are
+committed on `cas` (`e0e39b2f`, `80ca93f1`, `88e47612`, `578e239c`).
 
 CAS base validated on the new 9-node cluster (amd217 log/store, 8 clients,
 `49e76a49`; bootstrapped from this worktree with `bootstrap.yml -e
@@ -361,7 +395,7 @@ node, `check-lost-updates`:
 | `--cas` | 8 | 4000 | 0 | 3698 | 6.71 s |
 
 At w8 the max attempts per increment were 11–19, so the backoff holds on
-one hot key. Step 1 of the implementation order can start.
+one hot key.
 
 ## Decisions taken here (change them if wrong)
 

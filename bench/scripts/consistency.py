@@ -21,12 +21,22 @@ so it neither disturbs nor replays the benchmark stream.
   python3 consistency.py check-lost-updates --workers 2 --increments 2000
   python3 consistency.py check-visibility --rate 20 --duration 15
   python3 consistency.py check-convergence --record-count 1000000 --sample 1000
+
+Transaction checks (PLAN-transactions B2; every instance runs with
+track_versions=true, the probes commit through OzoneDBJNI.txnCommit):
+
+  python3 consistency.py check-txn-lost-updates --workers 8 --increments 4000 [--seed-blind]
+  python3 consistency.py check-txn-transfer --workers 8 --accounts 100 --duration 60 [--no-validate]
+  python3 consistency.py check-txn-skew --rounds 1000
+  python3 consistency.py check-txn-crash --workers 4 --kills 3 --duration 60
 """
 
 import argparse
 import bisect
 import json
 import os
+import random
+import signal
 import subprocess
 import sys
 import time
@@ -513,9 +523,10 @@ def cmd_check_lost_updates(cfg, args):
     # --cas needs every instance (workers, seed, reader) to keep the
     # log-ordered version map: the seed's blind put must be versioned and
     # the reader must see the CAS values.
+    txn = getattr(args, "txn", False)
     cfgs = _make_configs(cfg, stream, n + 2, f"lost-updates-{tag}",
                          linearizable=args.linearizable,
-                         track_versions=args.cas)
+                         track_versions=args.cas or txn)
     cp = _classpath(args.rebuild)
 
     seed_cmd = _probe_cmd(cp, "put-long", {
@@ -531,12 +542,15 @@ def cmd_check_lost_updates(cfg, args):
     for i, (_, cnt) in enumerate(per_worker):
         ready = os.path.join(out, f"ready-{i}")
         ready_files.append(ready)
-        cmd = _probe_cmd(cp, "counter-worker", {
+        flags = {
             "config": cfgs[i], "key": "__counter__", "increments": cnt,
             "rate": args.rate, "worker": i, "out-dir": out,
             "ready-file": ready, "go-file": go,
             "cas": "true" if args.cas else "false",
-        })
+        }
+        if txn and getattr(args, "seed_blind", False):
+            flags["blind-zero"] = "true"
+        cmd = _probe_cmd(cp, "txn-counter-worker" if txn else "counter-worker", flags)
         procs.append(_spawn(cmd, os.path.join(out, f"worker-{i}.log")))
 
     try:
@@ -565,17 +579,28 @@ def cmd_check_lost_updates(cfg, args):
     k = args.increments
     conflicts = sum(w.get("conflicts", 0) for w in workers)
     engine = ENGINE
-    if args.cas:
+    if txn:
+        engine += "-txn"
+    elif args.cas:
         engine += "-cas"
     elif args.linearizable:
         engine += "-linearizable"
+    if txn:
+        mode = "ozonedb writers, one-key transactions (txnCommit)"
+    elif args.cas:
+        mode = "ozonedb writers, conditional appends (CAS)"
+    else:
+        mode = "ozonedb writers (shared Corfu log)"
     summary = {
         "engine": engine,
         "linearizable_reads": args.linearizable,
         "cas": args.cas,
+        "txn": txn,
+        "seed_blind": bool(txn and getattr(args, "seed_blind", False)),
         "cas_conflicts": conflicts,
-        "mode": ("ozonedb writers, conditional appends (CAS)" if args.cas
-                 else "ozonedb writers (shared Corfu log)"),
+        "aborts": conflicts,
+        "max_attempts": max(w.get("max_attempts", 0) for w in workers),
+        "mode": mode,
         "replicas": n,
         "workers": n,
         "increments_issued": k,
@@ -596,10 +621,13 @@ def cmd_check_lost_updates(cfg, args):
     print(json.dumps(summary, indent=2))
     if k == f_val:
         verdict = "no updates lost"
-        if args.cas:
+        if txn:
+            verdict += f" ({conflicts} transaction aborts retried)"
+        elif args.cas:
             verdict += f" ({conflicts} CAS conflicts retried)"
-    elif args.cas:
-        verdict = (f"{k - f_val} of {k} increments lost DESPITE CAS -- this "
+    elif txn or args.cas:
+        verdict = (f"{k - f_val} of {k} increments lost DESPITE "
+                   f"{'transactions' if txn else 'CAS'} -- this "
                    "should be impossible; check worker logs")
     else:
         verdict = (
@@ -608,6 +636,334 @@ def cmd_check_lost_updates(cfg, args):
             "put was discarded by the log itself"
         )
     print(f"\n=> final counter {f_val} after {k} increments: {verdict}. Results in {out}")
+
+
+# =============================================================== transactions
+
+
+def _seed_accounts(cp, cfg_path, out, prefix, count, value):
+    cmd = _probe_cmd(cp, "seed-accounts", {
+        "config": cfg_path, "prefix": prefix, "count": count, "value": value,
+    })
+    with open(os.path.join(out, "seed.log"), "w") as log:
+        subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
+
+
+def _read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _txn_latency_stats(out, n):
+    """Per-attempt latency lines from txn-latency-{i}.csv (transfer workers):
+    p50/p99 of fence, read and commit microseconds over committed attempts,
+    plus the attempt count per outcome."""
+    fence, read, commit = [], [], []
+    outcomes = {}
+    for i in range(n):
+        path = os.path.join(out, f"txn-latency-{i}.csv")
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            next(f, None)
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) < 7:
+                    continue
+                outcomes[parts[6]] = outcomes.get(parts[6], 0) + 1
+                if parts[6] == "commit":
+                    fence.append(int(parts[3]))
+                    read.append(int(parts[4]))
+                    commit.append(int(parts[5]))
+    return {
+        "attempts_by_outcome": outcomes,
+        "n_committed": len(commit),
+        "fence_us_p50": _pct(fence, 50), "fence_us_p99": _pct(fence, 99),
+        "read_us_p50": _pct(read, 50), "read_us_p99": _pct(read, 99),
+        "commit_us_p50": _pct(commit, 50), "commit_us_p99": _pct(commit, 99),
+        "total_us_p50": _pct([a + b + c for a, b, c in zip(fence, read, commit)], 50),
+        "total_us_p99": _pct([a + b + c for a, b, c in zip(fence, read, commit)], 99),
+    }
+
+
+def _final_audit(cp, cfg_path, out, accounts, expected, prefix="acct_", idx=1):
+    """One validated all-account audit from a fresh instance after the
+    writers stopped; its sum is the atomicity verdict."""
+    cmd = _probe_cmd(cp, "txn-audit", {
+        "config": cfg_path, "prefix": prefix, "accounts": accounts,
+        "expected-sum": expected, "validate": "true", "rounds": 1,
+        "worker": idx, "out-dir": out,
+    })
+    log_path = os.path.join(out, "final-audit.log")
+    with open(log_path, "w") as log:
+        subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
+    return _last_json_line(log_path)
+
+
+def _transfer_flags(args, cfg_path, i, out, ready, go):
+    return {
+        "config": cfg_path, "prefix": "acct_", "accounts": args.accounts,
+        "keys": args.keys, "zipf": args.zipf, "duration-s": args.duration,
+        "rate": args.rate, "worker": i, "out-dir": out,
+        "ready-file": ready, "go-file": go,
+    }
+
+
+def _txn_transfer_summary(args, out, stream, n, workers, elapsed, extra):
+    commits = sum(w["commits"] for w in workers)
+    aborts = sum(w["aborts"] for w in workers)
+    summary = {
+        "engine": ENGINE + "-txn",
+        "txn": True,
+        "mode": "ozonedb writers, sum-preserving transfer transactions (txnCommit)",
+        "workers": n,
+        "replicas": n,
+        "accounts": args.accounts,
+        "keys": args.keys,
+        "zipf": args.zipf,
+        "duration_s": args.duration,
+        "elapsed_s": round(elapsed, 2),
+        "commits": commits,
+        "aborts": aborts,
+        "errors": sum(w.get("errors", 0) for w in workers),
+        "abort_fraction": aborts / (commits + aborts) if commits + aborts else 0.0,
+        "commits_per_s": commits / elapsed if elapsed else 0.0,
+        "max_attempts": max((w.get("max_attempts", 0) for w in workers), default=0),
+        "expected_sum": args.accounts * args.seed_value,
+        "latency": _txn_latency_stats(out, n),
+        "stream": stream,
+    }
+    summary.update(extra)
+    with open(os.path.join(out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
+def cmd_check_txn_transfer(cfg, args):
+    """N writer processes run sum-preserving transfer transactions over
+    --accounts (seeded to --seed-value each) for --duration seconds while a
+    concurrent audit process reads every account inside one transaction and
+    checks the sum. With validation (default) every counted audit is a
+    serializable snapshot, so audit_violations must be 0; with --no-validate
+    the audit is unvalidated reads under one fence, and torn sums are
+    expected -- reported, not failed. A final validated audit from a fresh
+    instance is the atomicity verdict (final_sum_ok)."""
+    out = _outdir("txn-transfer")
+    tag = os.path.basename(out).split("-", 2)[2]
+    stream = args.stream or f"{cfg['corfu']['stream_name']}-txnxfer-{tag}"
+    n = args.workers
+    expected = args.accounts * args.seed_value
+    _kill_stale_probes()
+    # workers + seed + live audit + final audit
+    cfgs = _make_configs(cfg, stream, n + 3, f"txn-transfer-{tag}",
+                         linearizable=args.linearizable, track_versions=True)
+    cp = _classpath(args.rebuild)
+    _seed_accounts(cp, cfgs[n], out, "acct_", args.accounts, args.seed_value)
+
+    go = os.path.join(out, "go")
+    ready_files = []
+    procs = []
+    for i in range(n):
+        ready = os.path.join(out, f"ready-{i}")
+        ready_files.append(ready)
+        cmd = _probe_cmd(cp, "txn-transfer-worker",
+                         _transfer_flags(args, cfgs[i], i, out, ready, go))
+        procs.append(_spawn(cmd, os.path.join(out, f"worker-{i}.log")))
+    ready_a = os.path.join(out, "ready-audit")
+    ready_files.append(ready_a)
+    audit_cmd = _probe_cmd(cp, "txn-audit", {
+        "config": cfgs[n + 1], "prefix": "acct_", "accounts": args.accounts,
+        "expected-sum": expected, "validate": "false" if args.no_validate else "true",
+        "duration-s": args.duration, "worker": 0, "out-dir": out,
+        "ready-file": ready_a, "go-file": go,
+    })
+    procs.append(_spawn(audit_cmd, os.path.join(out, "audit-0.log")))
+
+    try:
+        t_go = _wait_ready_then_go(out, ready_files, procs)
+        _wait_all(procs)
+        elapsed = time.time() - t_go
+    finally:
+        _reap(procs)
+
+    workers = [_read_json(os.path.join(out, f"worker-{i}.json")) for i in range(n)]
+    audit = _read_json(os.path.join(out, "audit-0.json"))
+    final = _final_audit(cp, cfgs[n + 2], out, args.accounts, expected)
+    validate = not args.no_validate
+    summary = _txn_transfer_summary(args, out, stream, n, workers, elapsed, {
+        "audit_validate": validate,
+        "audits": audit["audits"],
+        "audit_aborts": audit["aborts"],
+        "audit_violations": audit["violations"],
+        "audit_first_bad_sum": audit.get("first_bad_sum"),
+        "final_audit": final,
+        "final_sum_ok": final["violations"] == 0 and final["audits"] == 1,
+    })
+    ok = summary["final_sum_ok"] and (not validate or summary["audit_violations"] == 0)
+    if validate:
+        verdict = (f"{summary['audit_violations']} violations in {summary['audits']} validated "
+                   f"audits ({summary['audit_aborts']} audit aborts)")
+    else:
+        verdict = (f"{summary['audit_violations']} torn sums in {summary['audits']} UNVALIDATED "
+                   "audits (expected > 0: this is what validation buys)")
+    print(f"\n=> {summary['commits']} commits, {summary['aborts']} aborts "
+          f"({summary['abort_fraction']:.1%}); {verdict}; final sum "
+          f"{'OK' if summary['final_sum_ok'] else 'WRONG'}. Results in {out}")
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_check_txn_skew(cfg, args):
+    """Two workers, --rounds rounds of the write-skew shape on fresh key
+    pairs (see ConsistencyProbe.skewWorker). skew_double_commits counts the
+    rounds where BOTH commits were accepted -- serializability forbids it,
+    so the pass condition is 0. skew_contended_rounds counts the rounds
+    where both workers actually raced (neither saw the other's write
+    first); it measures how hard the test pushed, not correctness."""
+    out = _outdir("txn-skew")
+    tag = os.path.basename(out).split("-", 2)[2]
+    stream = args.stream or f"{cfg['corfu']['stream_name']}-txnskew-{tag}"
+    _kill_stale_probes()
+    cfgs = _make_configs(cfg, stream, 2, f"txn-skew-{tag}",
+                         linearizable=args.linearizable, track_versions=True)
+    cp = _classpath(args.rebuild)
+
+    go = os.path.join(out, "go")
+    ready_files = []
+    procs = []
+    for i in range(2):
+        ready = os.path.join(out, f"ready-{i}")
+        ready_files.append(ready)
+        cmd = _probe_cmd(cp, "txn-skew-worker", {
+            "config": cfgs[i], "prefix": "skew_", "rounds": args.rounds,
+            "round-ms": args.round_ms, "worker": i, "out-dir": out,
+            "ready-file": ready, "go-file": go,
+        })
+        procs.append(_spawn(cmd, os.path.join(out, f"worker-{i}.log")))
+    try:
+        t_go = _wait_ready_then_go(out, ready_files, procs)
+        _wait_all(procs)
+        elapsed = time.time() - t_go
+    finally:
+        _reap(procs)
+
+    outcomes = []
+    for i in range(2):
+        per_round = {}
+        with open(os.path.join(out, f"skew-{i}.csv")) as f:
+            next(f, None)
+            for line in f:
+                r, o = line.strip().split(",")
+                per_round[int(r)] = o
+        outcomes.append(per_round)
+    rounds = sorted(set(outcomes[0]) | set(outcomes[1]))
+    double = sum(1 for r in rounds
+                 if outcomes[0].get(r) == "commit" and outcomes[1].get(r) == "commit")
+    contended = sum(1 for r in rounds
+                    if outcomes[0].get(r) in ("commit", "abort")
+                    and outcomes[1].get(r) in ("commit", "abort"))
+    workers = [_read_json(os.path.join(out, f"worker-{i}.json")) for i in range(2)]
+    summary = {
+        "engine": ENGINE + "-txn",
+        "txn": True,
+        "mode": "two writers, write-skew rounds on fresh key pairs (txnCommit)",
+        "workers": 2,
+        "replicas": 2,
+        "round_ms": args.round_ms,
+        "elapsed_s": round(elapsed, 2),
+        "skew_rounds": len(rounds),
+        "skew_double_commits": double,
+        "skew_contended_rounds": contended,
+        "commits": sum(w["commits"] for w in workers),
+        "aborts": sum(w["aborts"] for w in workers),
+        "skips": sum(w["skips"] for w in workers),
+        "errors": sum(w["errors"] for w in workers),
+        "per_worker": workers,
+        "stream": stream,
+    }
+    with open(os.path.join(out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(json.dumps(summary, indent=2))
+    print(f"\n=> {double} double commits in {len(rounds)} rounds "
+          f"({contended} contended). Results in {out}")
+    if double != 0 or summary["errors"] != 0:
+        sys.exit(1)
+
+
+def cmd_check_txn_crash(cfg, args):
+    """The transfer workload with --kills SIGKILLs: at random points during
+    the run one worker is killed and restarted (same config, fresh process,
+    remaining duration). A commit record is one log entry, so a torn
+    transfer is impossible whatever the kill point; the final validated
+    audit must find the seeded sum. A writer that dies between append and
+    verdict has an unknown outcome -- that only affects its own counters,
+    which is why commits/aborts here cover the surviving processes only."""
+    out = _outdir("txn-crash")
+    tag = os.path.basename(out).split("-", 2)[2]
+    stream = args.stream or f"{cfg['corfu']['stream_name']}-txncrash-{tag}"
+    n = args.workers
+    expected = args.accounts * args.seed_value
+    _kill_stale_probes()
+    cfgs = _make_configs(cfg, stream, n + 2, f"txn-crash-{tag}",
+                         linearizable=args.linearizable, track_versions=True)
+    cp = _classpath(args.rebuild)
+    _seed_accounts(cp, cfgs[n], out, "acct_", args.accounts, args.seed_value)
+
+    go = os.path.join(out, "go")
+    ready_files = []
+    procs = []
+    for i in range(n):
+        ready = os.path.join(out, f"ready-{i}")
+        ready_files.append(ready)
+        cmd = _probe_cmd(cp, "txn-transfer-worker",
+                         _transfer_flags(args, cfgs[i], i, out, ready, go))
+        procs.append(_spawn(cmd, os.path.join(out, f"worker-{i}.log")))
+
+    rng = random.Random(args.seed)
+    kill_log = []
+    try:
+        t_go = _wait_ready_then_go(out, ready_files, procs)
+        deadline = t_go + args.duration
+        # Kill points spread over the run, none in the last 20%.
+        kill_at = sorted(t_go + rng.uniform(0.05, 0.8) * args.duration for _ in range(args.kills))
+        for k, t_kill in enumerate(kill_at):
+            time.sleep(max(0.0, t_kill - time.time()))
+            i = rng.randrange(n)
+            victim = procs[i]
+            if victim["proc"].poll() is None:
+                victim["proc"].send_signal(signal.SIGKILL)
+                victim["proc"].wait()
+            victim["log"].close()
+            remaining = max(1, int(deadline - time.time()))
+            print(f"[crash] kill {k}: worker {i} at t+{t_kill - t_go:.1f}s, "
+                  f"restarting for {remaining}s")
+            kill_log.append({"kill": k, "worker": i, "t_s": round(t_kill - t_go, 2),
+                             "restart_duration_s": remaining})
+            flags = _transfer_flags(args, cfgs[i], i, out, None, None)
+            flags.pop("ready-file")
+            flags.pop("go-file")
+            flags["duration-s"] = remaining
+            procs[i] = _spawn(_probe_cmd(cp, "txn-transfer-worker", flags),
+                              os.path.join(out, f"worker-{i}-restart{k}.log"))
+        _wait_all(procs)
+        elapsed = time.time() - t_go
+    finally:
+        _reap(procs)
+
+    workers = [_read_json(os.path.join(out, f"worker-{i}.json")) for i in range(n)]
+    final = _final_audit(cp, cfgs[n + 1], out, args.accounts, expected)
+    summary = _txn_transfer_summary(args, out, stream, n, workers, elapsed, {
+        "kills": args.kills,
+        "kill_log": kill_log,
+        "final_audit": final,
+        "audit_violations": final["violations"],
+        "final_sum_ok": final["violations"] == 0 and final["audits"] == 1,
+    })
+    print(f"\n=> {args.kills} kills; final sum "
+          f"{'OK' if summary['final_sum_ok'] else 'WRONG'}. Results in {out}")
+    if not summary["final_sum_ok"]:
+        sys.exit(1)
 
 
 # ================================================================ convergence
@@ -705,6 +1061,50 @@ def main():
                     help="seconds to wait before the final read")
     sp.add_argument("--stream", default=None)
 
+    def _txn_common(sp):
+        sp.add_argument("--stream", default=None)
+        sp.add_argument("--seed-value", type=int, default=100, help="initial balance per account")
+
+    sp = sub.add_parser("check-txn-lost-updates",
+                        help="check-lost-updates through one-key transactions (txnCommit)")
+    sp.add_argument("--workers", type=int, default=8)
+    sp.add_argument("--increments", type=int, default=4000, help="total across workers")
+    sp.add_argument("--seed-blind", action="store_true",
+                    help="every worker blind-puts the counter to 0 before the go barrier, "
+                         "so first reads pair a blind-written value with its version")
+    sp.add_argument("--rate", type=float, default=0.0)
+    sp.add_argument("--settle", type=float, default=3.0)
+    sp.add_argument("--stream", default=None)
+
+    sp = sub.add_parser("check-txn-transfer",
+                        help="sum-preserving transfer transactions + concurrent audit")
+    sp.add_argument("--workers", type=int, default=8)
+    sp.add_argument("--accounts", type=int, default=100)
+    sp.add_argument("--duration", type=int, default=60, help="seconds")
+    sp.add_argument("--keys", type=int, default=2, help="accounts per transaction")
+    sp.add_argument("--zipf", type=float, default=0.0, help="Zipfian theta (0 = uniform)")
+    sp.add_argument("--rate", type=float, default=0.0, help="transactions/s per worker (0 = max)")
+    sp.add_argument("--no-validate", action="store_true",
+                    help="audit without the read-only validation record (torn sums expected)")
+    _txn_common(sp)
+
+    sp = sub.add_parser("check-txn-skew", help="write-skew rounds across two workers")
+    sp.add_argument("--rounds", type=int, default=1000)
+    sp.add_argument("--round-ms", type=int, default=20, help="round period on the shared schedule")
+    _txn_common(sp)
+
+    sp = sub.add_parser("check-txn-crash",
+                        help="transfer workload with SIGKILLed and restarted workers")
+    sp.add_argument("--workers", type=int, default=4)
+    sp.add_argument("--kills", type=int, default=3)
+    sp.add_argument("--accounts", type=int, default=100)
+    sp.add_argument("--duration", type=int, default=60)
+    sp.add_argument("--keys", type=int, default=2)
+    sp.add_argument("--zipf", type=float, default=0.0)
+    sp.add_argument("--rate", type=float, default=0.0)
+    sp.add_argument("--seed", type=int, default=1, help="kill schedule RNG seed")
+    _txn_common(sp)
+
     sp = sub.add_parser("check-visibility",
                         help="insert visibility: retry-until-found latency "
                              "+ first-read miss rate (PBS-style)")
@@ -761,6 +1161,16 @@ def main():
         cmd_probe_staleness(cfg, args)
     elif args.cmd == "check-lost-updates":
         cmd_check_lost_updates(cfg, args)
+    elif args.cmd == "check-txn-lost-updates":
+        args.cas = False
+        args.txn = True
+        cmd_check_lost_updates(cfg, args)
+    elif args.cmd == "check-txn-transfer":
+        cmd_check_txn_transfer(cfg, args)
+    elif args.cmd == "check-txn-skew":
+        cmd_check_txn_skew(cfg, args)
+    elif args.cmd == "check-txn-crash":
+        cmd_check_txn_crash(cfg, args)
     elif args.cmd == "check-visibility":
         cmd_check_visibility(cfg, args)
     elif args.cmd == "visibility-reader":

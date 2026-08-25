@@ -1,6 +1,7 @@
 package site.ycsb.db;
 
 import jni.OzoneDBJNI;
+import site.ycsb.generator.ZipfianGenerator;
 import site.ycsb.workloads.CoreWorkload;
 
 import java.io.BufferedReader;
@@ -53,6 +54,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       with its log-address version and casPut is accepted only if the
  *       key is still at that version, so lost increments are impossible
  *       and conflicts are retried (and counted).
+ *   <li>txn-counter-worker / txn-transfer-worker (txn-mixed-worker) /
+ *       txn-audit / txn-skew-worker / seed-accounts: the transaction checks
+ *       (PLAN-transactions B1). The same RMW as one transaction; sum-
+ *       preserving transfers over --accounts with --keys per transaction
+ *       and optional --zipf skew, with a per-attempt latency CSV; a
+ *       repeated all-account audit with or without a read-only validation
+ *       record; and the write-skew shape on fresh key pairs per round. All
+ *       commit through OzoneDBJNI.txnCommit after a sync/getVersioned read
+ *       phase; -2 is a read-set conflict, retried and counted as an abort.
  *   <li>insert-probe: insert brand-new YCSB-keyspace keys at --rate for
  *       --duration-s; after each put() returns, append "i,t_ack_ns" to
  *       --notify-file (flushed per line) and record it in inserts.csv.
@@ -258,6 +268,15 @@ public final class ConsistencyProbe {
     String outDir = req(flags, "out-dir");
 
     boolean cas = Boolean.parseBoolean(flags.getOrDefault("cas", "false"));
+    // txn: the same RMW as one transaction (read set of one, write set of
+    // one) through sync/getVersioned/txnCommit -- what txn-counter-worker
+    // selects. Same verdicts as casPut: -2 is a conflict, retried.
+    boolean txn = Boolean.parseBoolean(flags.getOrDefault("txn", "false"));
+    // blind-zero: a blind put of 0 BEFORE the go barrier, so every worker's
+    // first transaction reads a blind-written (value, version) pair from
+    // some instance -- the version-value coupling the engine must keep for
+    // blind writes too. Before the barrier it cannot race an increment.
+    boolean blindZero = Boolean.parseBoolean(flags.getOrDefault("blind-zero", "false"));
     // Conflict backoff: a -2 means another worker's CAS on this key was
     // sequenced between our read and our write, so every worker that
     // lost is about to re-read the same fresh version and collide
@@ -270,6 +289,9 @@ public final class ConsistencyProbe {
     Random backoffRng = new Random(0x5eed + 31L * Integer.parseInt(req(flags, "worker")));
 
     OzoneDBJNI db = open(flags);
+    if (blindZero) {
+      db.put(key, encodeLong(0));
+    }
     barrier(flags);
 
     long periodNs = rate > 0 ? (long) (1e9 / rate) : 0;
@@ -278,8 +300,42 @@ public final class ConsistencyProbe {
     long conflicts = 0;
     long maxAttempts = 0;
     long lastWritten = -1;
+    byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
     for (long i = 0; i < increments; i++) {
-      if (cas) {
+      if (txn) {
+        long attempts = 0;
+        while (true) {
+          attempts++;
+          db.sync();
+          byte[] vv = db.getVersioned(key);
+          long version = decodeLong(vv);
+          long seen = decodeLongAt(vv, 8);
+          if (seen < 0) {
+            seen = 0;
+          }
+          long r = db.txnCommit(new byte[][]{keyBytes}, new long[]{version},
+              new byte[][]{keyBytes}, new byte[][]{encodeLong(seen + 1)}, new boolean[]{false});
+          db.clearSync();
+          if (r >= 0) {
+            lastWritten = seen + 1;
+            break;
+          }
+          if (r != -2) {
+            throw new IllegalStateException("txnCommit backend failure at increment " + i);
+          }
+          conflicts++;
+          if (backoffBaseUs > 0) {
+            long bound = Math.min(backoffCapUs, backoffBaseUs << Math.min(attempts - 1, 20));
+            long us = (long) (backoffRng.nextDouble() * bound);
+            if (us > 0) {
+              sleepNs(us * 1000L);
+            }
+          }
+        }
+        if (attempts > maxAttempts) {
+          maxAttempts = attempts;
+        }
+      } else if (cas) {
         // Atomic RMW: retry until this increment's conditional put wins.
         // -2 means another worker advanced the version between our read
         // and our write's log position — re-read and try again. Nothing
@@ -330,7 +386,8 @@ public final class ConsistencyProbe {
     try (PrintWriter w = new PrintWriter(new File(outDir, "worker-" + workerIdx + ".json"), "UTF-8")) {
       w.println("{\"worker\": " + workerIdx + ", \"acked\": " + acked
           + ", \"last_written\": " + lastWritten
-          + ", \"cas\": " + cas + ", \"conflicts\": " + conflicts
+          + ", \"cas\": " + cas + ", \"txn\": " + txn
+          + ", \"conflicts\": " + conflicts + ", \"aborts\": " + conflicts
           + ", \"max_attempts\": " + maxAttempts
           + ", \"elapsed_s\": " + String.format("%.3f", elapsedS) + "}");
     }
@@ -731,6 +788,333 @@ public final class ConsistencyProbe {
         + ", \"timeouts\": " + timeouts + "}");
   }
 
+  // ------------------------------------------------------------ transactions
+
+  /** {@code --prefix}{@code i} = encodeLong({@code --value}) for i in [0, {@code --count}), blind puts. */
+  private static void seedAccounts(Map<String, String> flags) {
+    OzoneDBJNI db = open(flags);
+    String prefix = flags.getOrDefault("prefix", "acct_");
+    int count = Integer.parseInt(req(flags, "count"));
+    long value = Long.parseLong(flags.getOrDefault("value", "100"));
+    for (int i = 0; i < count; i++) {
+      db.put(prefix + i, encodeLong(value));
+    }
+    db.closeDB();
+    System.out.println("{\"seeded\": " + count + ", \"value\": " + value + "}");
+  }
+
+  private static long jitteredBackoffUs(Random rng, long attempts, long baseUs, long capUs) {
+    if (baseUs <= 0) {
+      return 0;
+    }
+    long bound = Math.min(capUs, baseUs << Math.min(attempts - 1, 20));
+    return (long) (rng.nextDouble() * bound);
+  }
+
+  /**
+   * {@code keys} distinct account ids: uniform when theta is 0, else
+   * Zipfian over [0, accounts) with the hot set at the low ids.
+   */
+  private static int[] pickAccounts(int keys, int accounts, Random rng, ZipfianGenerator zipf) {
+    int[] ids = new int[keys];
+    for (int j = 0; j < keys; j++) {
+      while (true) {
+        int id = zipf != null ? (int) zipf.nextValue().longValue() : rng.nextInt(accounts);
+        boolean dup = false;
+        for (int k = 0; k < j; k++) {
+          if (ids[k] == id) {
+            dup = true;
+            break;
+          }
+        }
+        if (!dup) {
+          ids[j] = id;
+          break;
+        }
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * txn-transfer-worker / txn-mixed-worker: for --duration-s, each
+   * transaction reads --keys distinct accounts (uniform, or Zipfian with
+   * --zipf theta over --accounts) and moves a random amount from the first
+   * to each of the others, so the sum over all accounts is invariant.
+   * Commits through txnCommit; -2 (a read-set version changed) retries
+   * with the same jittered backoff as counter-worker. Per attempt one CSV
+   * line: fence (sync), reads, and commit (append + verdict wait) in
+   * microseconds. Emits worker-N.json with commits/aborts/max_attempts.
+   */
+  private static void transferWorker(Map<String, String> flags) throws Exception {
+    String prefix = flags.getOrDefault("prefix", "acct_");
+    int accounts = Integer.parseInt(req(flags, "accounts"));
+    int keys = Integer.parseInt(flags.getOrDefault("keys", "2"));
+    double theta = Double.parseDouble(flags.getOrDefault("zipf", "0"));
+    long durationS = Long.parseLong(req(flags, "duration-s"));
+    double rate = Double.parseDouble(flags.getOrDefault("rate", "0"));
+    int workerIdx = Integer.parseInt(req(flags, "worker"));
+    String outDir = req(flags, "out-dir");
+    long backoffBaseUs = Long.parseLong(flags.getOrDefault("cas-backoff-us", "200"));
+    long backoffCapUs = Long.parseLong(flags.getOrDefault("cas-backoff-cap-us", "8000"));
+    if (keys < 2 || keys > accounts) {
+      throw new IllegalArgumentException("--keys must be in [2, --accounts]");
+    }
+    Random rng = new Random(0x7a7 + 31L * workerIdx);
+    ZipfianGenerator zipf = theta > 0 ? new ZipfianGenerator(0, accounts - 1, theta) : null;
+
+    OzoneDBJNI db = open(flags);
+    barrier(flags);
+
+    long periodNs = rate > 0 ? (long) (1e9 / rate) : 0;
+    long commits = 0;
+    long aborts = 0;
+    long errors = 0;
+    long maxAttempts = 0;
+    long t0 = System.nanoTime();
+    long deadline = t0 + durationS * 1_000_000_000L;
+    try (PrintWriter lat = new PrintWriter(new File(outDir, "txn-latency-" + workerIdx + ".csv"), "UTF-8")) {
+      lat.println("t_end_ns,keys,attempt,fence_us,read_us,commit_us,outcome");
+      while (System.nanoTime() < deadline) {
+        int[] ids = pickAccounts(keys, accounts, rng, zipf);
+        long amt = 1 + rng.nextInt(10);
+        byte[][] rk = new byte[keys][];
+        for (int j = 0; j < keys; j++) {
+          rk[j] = (prefix + ids[j]).getBytes(StandardCharsets.UTF_8);
+        }
+        long attempts = 0;
+        while (true) {
+          attempts++;
+          long tf0 = System.nanoTime();
+          db.sync();
+          long tf1 = System.nanoTime();
+          long[] rv = new long[keys];
+          long[] bal = new long[keys];
+          for (int j = 0; j < keys; j++) {
+            byte[] vv = db.getVersioned(prefix + ids[j]);
+            rv[j] = decodeLong(vv);
+            bal[j] = decodeLongAt(vv, 8);
+            if (bal[j] < 0) {
+              db.clearSync();
+              throw new IllegalStateException("account " + prefix + ids[j] + " missing: run seed-accounts first");
+            }
+          }
+          long tr1 = System.nanoTime();
+          long give = Math.min(amt, Math.max(0, bal[0] / (keys - 1)));
+          byte[][] wv = new byte[keys][];
+          wv[0] = encodeLong(bal[0] - give * (keys - 1));
+          for (int j = 1; j < keys; j++) {
+            wv[j] = encodeLong(bal[j] + give);
+          }
+          long r = db.txnCommit(rk, rv, rk, wv, new boolean[keys]);
+          long tc1 = System.nanoTime();
+          db.clearSync();
+          String outcome = r >= 0 ? "commit" : (r == -2 ? "abort" : "error");
+          lat.println(tc1 + "," + keys + "," + attempts + "," + (tf1 - tf0) / 1000 + ","
+              + (tr1 - tf1) / 1000 + "," + (tc1 - tr1) / 1000 + "," + outcome);
+          if (r >= 0) {
+            commits++;
+            break;
+          }
+          if (r != -2) {
+            errors++;
+            break;
+          }
+          aborts++;
+          long us = jitteredBackoffUs(rng, attempts, backoffBaseUs, backoffCapUs);
+          if (us > 0) {
+            sleepNs(us * 1000L);
+          }
+        }
+        if (attempts > maxAttempts) {
+          maxAttempts = attempts;
+        }
+        sleepNs(periodNs);
+      }
+    }
+    double elapsedS = (System.nanoTime() - t0) / 1e9;
+    db.closeDB();
+
+    String json = "{\"worker\": " + workerIdx + ", \"commits\": " + commits
+        + ", \"aborts\": " + aborts + ", \"errors\": " + errors
+        + ", \"max_attempts\": " + maxAttempts + ", \"keys\": " + keys
+        + ", \"zipf\": " + theta
+        + ", \"elapsed_s\": " + String.format("%.3f", elapsedS) + "}";
+    try (PrintWriter w = new PrintWriter(new File(outDir, "worker-" + workerIdx + ".json"), "UTF-8")) {
+      w.println(json);
+    }
+    System.out.println(json);
+  }
+
+  /**
+   * txn-audit: read every account inside one fence and check the sum
+   * against --expected-sum, repeatedly until --duration-s (or --rounds)
+   * elapses. With --validate true the reads are committed as a read-only
+   * validation record: a -2 means a transfer landed between two of the
+   * reads and the audit is discarded (an abort), so every counted audit is
+   * a serializable snapshot and must sum correctly. With validation off
+   * every audit counts, torn sums included -- that difference is what the
+   * validation record buys. Emits audit-N.json.
+   */
+  private static void txnAudit(Map<String, String> flags) throws Exception {
+    String prefix = flags.getOrDefault("prefix", "acct_");
+    int accounts = Integer.parseInt(req(flags, "accounts"));
+    long expected = Long.parseLong(req(flags, "expected-sum"));
+    boolean validate = Boolean.parseBoolean(flags.getOrDefault("validate", "true"));
+    long durationS = Long.parseLong(flags.getOrDefault("duration-s", "0"));
+    long rounds = Long.parseLong(flags.getOrDefault("rounds", "0"));
+    int workerIdx = Integer.parseInt(flags.getOrDefault("worker", "0"));
+    String outDir = req(flags, "out-dir");
+    if (durationS <= 0 && rounds <= 0) {
+      rounds = 1;
+    }
+
+    OzoneDBJNI db = open(flags);
+    barrier(flags);
+
+    byte[][] rk = new byte[accounts][];
+    for (int i = 0; i < accounts; i++) {
+      rk[i] = (prefix + i).getBytes(StandardCharsets.UTF_8);
+    }
+    long audits = 0;
+    long aborts = 0;
+    long violations = 0;
+    long firstBadSum = Long.MIN_VALUE;
+    long t0 = System.nanoTime();
+    long deadline = durationS > 0 ? t0 + durationS * 1_000_000_000L : Long.MAX_VALUE;
+    long done = 0;
+    while (System.nanoTime() < deadline && (rounds <= 0 || done < rounds)) {
+      done++;
+      db.sync();
+      long[] rv = new long[accounts];
+      long sum = 0;
+      for (int i = 0; i < accounts; i++) {
+        byte[] vv = db.getVersioned(prefix + i);
+        rv[i] = decodeLong(vv);
+        long bal = decodeLongAt(vv, 8);
+        if (bal < 0) {
+          db.clearSync();
+          throw new IllegalStateException("account " + prefix + i + " missing: run seed-accounts first");
+        }
+        sum += bal;
+      }
+      if (validate) {
+        long r = db.txnCommit(rk, rv, new byte[0][], new byte[0][], new boolean[0]);
+        db.clearSync();
+        if (r == -2) {
+          aborts++;
+          continue;
+        }
+        if (r < 0 && r != -3) {
+          throw new IllegalStateException("txnCommit backend failure in audit " + done);
+        }
+      } else {
+        db.clearSync();
+      }
+      audits++;
+      if (sum != expected) {
+        violations++;
+        if (firstBadSum == Long.MIN_VALUE) {
+          firstBadSum = sum;
+        }
+      }
+    }
+    double elapsedS = (System.nanoTime() - t0) / 1e9;
+    db.closeDB();
+
+    String json = "{\"worker\": " + workerIdx + ", \"audits\": " + audits
+        + ", \"aborts\": " + aborts + ", \"violations\": " + violations
+        + ", \"validate\": " + validate + ", \"expected_sum\": " + expected
+        + ", \"first_bad_sum\": " + (firstBadSum == Long.MIN_VALUE ? "null" : String.valueOf(firstBadSum))
+        + ", \"elapsed_s\": " + String.format("%.3f", elapsedS) + "}";
+    try (PrintWriter w = new PrintWriter(new File(outDir, "audit-" + workerIdx + ".json"), "UTF-8")) {
+      w.println(json);
+    }
+    System.out.println(json);
+  }
+
+  /**
+   * txn-skew-worker: the write-skew shape. Round r uses two fresh keys
+   * {@code --prefix}r_a and {@code --prefix}r_b, both unwritten (an absent
+   * key reads as "1"). Each of the two workers reads both; if both are
+   * still absent, worker 0 writes r_a = 0 and worker 1 writes r_b = 0, and
+   * commits. Both commits succeeding is write skew -- impossible here,
+   * because both keys are in both read sets, so the second commit in log
+   * order sees the first one's write and is rejected. Rounds start on a
+   * shared schedule (the go file's mtime + r * --round-ms) so the two
+   * transactions overlap. Emits skew-N.csv (round,outcome) and
+   * worker-N.json.
+   */
+  private static void skewWorker(Map<String, String> flags) throws Exception {
+    String prefix = flags.getOrDefault("prefix", "skew_");
+    long rounds = Long.parseLong(req(flags, "rounds"));
+    long roundMs = Long.parseLong(flags.getOrDefault("round-ms", "20"));
+    int workerIdx = Integer.parseInt(req(flags, "worker"));
+    String outDir = req(flags, "out-dir");
+    if (workerIdx != 0 && workerIdx != 1) {
+      throw new IllegalArgumentException("--worker must be 0 or 1");
+    }
+
+    OzoneDBJNI db = open(flags);
+    barrier(flags);
+    String goPath = flags.get("go-file");
+    long t0 = goPath != null ? new File(goPath).lastModified() : System.currentTimeMillis();
+
+    long commits = 0;
+    long aborts = 0;
+    long skips = 0;
+    long errors = 0;
+    try (PrintWriter csv = new PrintWriter(new File(outDir, "skew-" + workerIdx + ".csv"), "UTF-8")) {
+      csv.println("round,outcome");
+      for (long r = 0; r < rounds; r++) {
+        long start = t0 + r * roundMs;
+        long wait = start - System.currentTimeMillis();
+        if (wait > 0) {
+          Thread.sleep(wait);
+        }
+        String ka = prefix + r + "_a";
+        String kb = prefix + r + "_b";
+        db.sync();
+        byte[] va = db.getVersioned(ka);
+        byte[] vb = db.getVersioned(kb);
+        boolean aPresent = va != null && va.length > 8;
+        boolean bPresent = vb != null && vb.length > 8;
+        String outcome;
+        if (aPresent || bPresent) {
+          db.clearSync();
+          skips++;
+          outcome = "skip";
+        } else {
+          byte[][] rk = {ka.getBytes(StandardCharsets.UTF_8), kb.getBytes(StandardCharsets.UTF_8)};
+          long[] rv = {decodeLong(va), decodeLong(vb)};
+          byte[][] wk = {rk[workerIdx]};
+          long res = db.txnCommit(rk, rv, wk, new byte[][]{encodeLong(0)}, new boolean[]{false});
+          db.clearSync();
+          if (res >= 0) {
+            commits++;
+            outcome = "commit";
+          } else if (res == -2) {
+            aborts++;
+            outcome = "abort";
+          } else {
+            errors++;
+            outcome = "error";
+          }
+        }
+        csv.println(r + "," + outcome);
+      }
+    }
+    db.closeDB();
+
+    String json = "{\"worker\": " + workerIdx + ", \"rounds\": " + rounds
+        + ", \"commits\": " + commits + ", \"aborts\": " + aborts
+        + ", \"skips\": " + skips + ", \"errors\": " + errors + "}";
+    try (PrintWriter w = new PrintWriter(new File(outDir, "worker-" + workerIdx + ".json"), "UTF-8")) {
+      w.println(json);
+    }
+    System.out.println(json);
+  }
+
   private static void putLong(Map<String, String> flags) {
     OzoneDBJNI db = open(flags);
     db.put(req(flags, "key"), encodeLong(Long.parseLong(req(flags, "value"))));
@@ -820,7 +1204,8 @@ public final class ConsistencyProbe {
   public static void main(String[] args) throws Exception {
     if (args.length == 0) {
       System.err.println("usage: ConsistencyProbe <write-probe|read-probe|counter-worker"
-          + "|insert-probe|visibility-probe|put-long|get-long|hash>"
+          + "|txn-counter-worker|txn-transfer-worker|txn-mixed-worker|txn-audit|txn-skew-worker"
+          + "|seed-accounts|insert-probe|visibility-probe|put-long|get-long|hash>"
           + " --config <shared_config.json> [--flag value ...]");
       System.exit(2);
     }
@@ -834,6 +1219,23 @@ public final class ConsistencyProbe {
       break;
     case "counter-worker":
       counterWorker(flags);
+      break;
+    case "txn-counter-worker":
+      flags.put("txn", "true");
+      counterWorker(flags);
+      break;
+    case "txn-transfer-worker":
+    case "txn-mixed-worker":
+      transferWorker(flags);
+      break;
+    case "txn-audit":
+      txnAudit(flags);
+      break;
+    case "txn-skew-worker":
+      skewWorker(flags);
+      break;
+    case "seed-accounts":
+      seedAccounts(flags);
       break;
     case "insert-probe":
       insertProbe(flags);
