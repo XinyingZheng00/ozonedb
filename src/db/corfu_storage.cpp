@@ -1054,7 +1054,12 @@ Status CorfuDBStorage::appendInBatch(std::string const& fileName, unsigned char*
     std::unique_lock<std::mutex> lock(mtx_);
     auto now = std::chrono::system_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_commited_time_).count();
-    bool should_flush = elapsed > commit_interval_;
+    size_t cached_bytes = 0;
+    if (auto cit = cached_file_.find(fileName); cit != cached_file_.end()) {
+      cached_bytes = cit->second.size();
+    }
+    bool should_flush = elapsed > commit_interval_ ||
+                        (batch_bytes_ > 0 && cached_bytes >= batch_bytes_);
 
     if (!should_flush && sync_mode_) {
       auto remaining_ms = commit_interval_ - elapsed;
@@ -1161,6 +1166,20 @@ Status CorfuDBStorage::flush(std::string const& fileName) {
   }
   if (!env || addr < 0) return Status::kFailure;
   return Status::kSuccess;
+}
+
+bool CorfuDBStorage::migrateCached(std::string const& from, std::string const& to) {
+  std::lock_guard<std::mutex> lk(mtx_);
+  auto it = cached_file_.find(from);
+  if (it == cached_file_.end() || it->second.empty()) return false;
+  auto& dst = cached_file_[to];
+  if (dst.empty()) {
+    dst = std::move(it->second);
+  } else {
+    dst.insert(dst.end(), it->second.begin(), it->second.end());
+  }
+  cached_file_.erase(it);
+  return true;
 }
 
 // Reads splice file_buffers_ (tailer-applied, cross-process-visible),

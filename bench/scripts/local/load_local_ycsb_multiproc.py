@@ -204,6 +204,16 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         for k in ("trust_background_tail", "linearizable_reads", "track_versions"):
             if k in corfu_settings:
                 data[k] = "true" if _truthy(corfu_settings[k]) else "false"
+        # Write batching, load phase only (load_corfu_dataset.sh ->
+        # --corfu-batch-bytes / --corfu-commit-interval-ms). The run phase
+        # never sets these, so writers keep the sync defaults every read
+        # guarantee assumes. Names match Metadata's corfu_* keys.
+        if "sync_mode" in corfu_settings:
+            data["corfu_sync_mode"] = "true" if _truthy(corfu_settings["sync_mode"]) else "false"
+        if "batch_bytes" in corfu_settings:
+            data["corfu_batch_bytes"] = int(corfu_settings["batch_bytes"])
+        if "commit_interval_ms" in corfu_settings:
+            data["corfu_commit_interval_ms"] = int(corfu_settings["commit_interval_ms"])
     if s3_settings:
         data["sstable_backend"] = "s3"
         if "endpoint" in s3_settings:
@@ -633,6 +643,21 @@ if __name__ == "__main__":
         default=None,
         help="Number of parallel writer processes (overrides local.load.num_writers).",
     )
+    parser.add_argument(
+        "--corfu-batch-bytes",
+        type=int,
+        default=0,
+        help="ozonedb-corfu only: cache puts and write ONE Corfu entry per this many "
+             "bytes (async, ack before sequencing). 0 = one entry per put (default). "
+             "Fewer entries make the open-time replay proportionally faster.",
+    )
+    parser.add_argument(
+        "--corfu-commit-interval-ms",
+        type=int,
+        default=0,
+        help="ozonedb-corfu only, with --corfu-batch-bytes: also flush a partial batch "
+             "after this many ms since the last flush.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -651,6 +676,15 @@ if __name__ == "__main__":
         else load_config.get("num_writers", 2)
     )
     corfu_settings = config.get("corfu")
+    if args.corfu_batch_bytes > 0 or args.corfu_commit_interval_ms > 0:
+        corfu_settings = dict(corfu_settings or {})
+        corfu_settings["sync_mode"] = False
+        corfu_settings["batch_bytes"] = args.corfu_batch_bytes
+        corfu_settings["commit_interval_ms"] = args.corfu_commit_interval_ms
+        print(
+            f"[load] corfu write batching: {args.corfu_batch_bytes} bytes / "
+            f"{args.corfu_commit_interval_ms} ms per entry (async acks)"
+        )
     s3_settings = config.get("s3")
     os.makedirs(ycsb_data_path, exist_ok=True)
 

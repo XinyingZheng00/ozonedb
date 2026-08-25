@@ -66,11 +66,17 @@ class CorfuDBStorage : public Storage {
                            unsigned char const* data, int length,
                            std::vector<ReadVersion> const& read_set,
                            int64_t& result_version) override;
+  bool migrateCached(std::string const& from, std::string const& to) override;
   bool versionedLookup(std::string const& key, int64_t& version,
                        std::string& value, bool& has_value,
                        bool& deleted) override;
 
+  // Write batching knobs (see commit_interval_ below). Set right after
+  // construction, before the first append; not thread-safe against
+  // concurrent appends.
   void setSyncMode(bool sync) { sync_mode_ = sync; }
+  void setCommitInterval(int ms) { commit_interval_ = ms; }
+  void setBatchBytes(size_t bytes) { batch_bytes_ = bytes; }
 
   // One-fence-per-get support (Metadata::linearizable_reads). sync()
   // performs the single sequencer query + tailer wait and records a
@@ -105,8 +111,21 @@ class CorfuDBStorage : public Storage {
     // be a use-after-free. Draining here closes that window.
     if (cleared) drainDispatchQueue();
   }
+  // Write batching for appendInBatch. The defaults — sync, interval 0,
+  // no byte threshold — flush every append as its own Corfu entry, which
+  // is the mode every read guarantee assumes (a put acks only once it is
+  // sequenced). With sync_mode_ false, appends are only cached and are
+  // flushed as ONE entry when commit_interval_ ms have passed since the
+  // last flush or the cached bytes for the file reach batch_bytes_
+  // (0 = time only); seal(), flush() and the destructor drain the rest.
+  // Acks then precede sequencing, so that mode is for bulk loads only:
+  // Metadata::corfu_sync_mode / corfu_commit_interval_ms /
+  // corfu_batch_bytes, set by load_corfu_dataset.sh. The point is the
+  // open-time replay: it costs ~28 us per Corfu entry, so a 1 M-record
+  // load written one record per entry replays in 30 s.
   int commit_interval_ = 0;
   bool sync_mode_ = true;
+  size_t batch_bytes_ = 0;
 
  private:
   // JVM / JNI handles

@@ -71,6 +71,9 @@ Status LogHandler::addRecord(Record const& record) {
 
     while (this->storage->appendInBatch(target, buffer, buffer_size) == Status::kSealed) {
       newTail();
+      // A batched writer may still hold unsequenced bytes for the sealed
+      // file; carry them to the new tail (see migrateCached).
+      this->storage->migrateCached(target, this->active_unit);
       target = this->active_unit;
     }
 
@@ -89,6 +92,17 @@ Status LogHandler::addRecord(Record const& record) {
            view.current_log_tail != this->active_unit) {
       newTail();
       metadata_log->getLatestView(view);
+    }
+    // Batched writes (corfu_sync_mode=false): if the bytes for `target`
+    // are still only cached, they were never sequenced, so moving them
+    // to the new tail loses nothing and keeps them out of the old tail's
+    // region past its LOGCREATE-frozen size (invisible until
+    // compaction). The record just appended is among them, so it must
+    // not be re-issued. In sync mode nothing is cached and the re-issue
+    // below runs as before.
+    if (this->storage->migrateCached(target, this->active_unit)) {
+      final_target = this->active_unit;
+      break;
     }
   }
 

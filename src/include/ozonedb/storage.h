@@ -153,6 +153,24 @@ class Storage {
   }
 
   /**
+   * @brief Move bytes that were appended to `from` but not yet sequenced
+   * (a backend's write batch) onto `to`.
+   *
+   * Only backends with an unflushed write cache do anything here
+   * (CorfuDBStorage with corfu_sync_mode=false). LogHandler::addRecord
+   * calls it when the data-log tail moved under a batched writer: the
+   * cached bytes are in no file yet, so moving them to the new tail
+   * loses nothing and keeps them out of the old tail's invisible region
+   * past its LOGCREATE-frozen size.
+   *
+   * @return true if bytes were moved (the caller's last record is among
+   *         them and must not be re-issued), false if nothing was cached.
+   */
+  virtual bool migrateCached(std::string const& /*from*/, std::string const& /*to*/) {
+    return false;
+  }
+
+  /**
    * @brief Append a transaction commit record: `data` is the write set
    * (zero or more serialized Records, appendInBatch's layout) and
    * `read_set` the {key, version} pairs it depends on.

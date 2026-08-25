@@ -3,6 +3,7 @@
 
 #include "protobuf/record.pb.h"
 #include "read_json.h"
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,6 +22,13 @@ enum class BackendKind {
   kS3
 };
 
+namespace detail {
+inline bool track_versions_requested(std::map<std::string, std::string> const& r) {
+  auto it = r.find("track_versions");
+  return it != r.end() && (it->second == "true" || it->second == "1");
+}
+}  // namespace detail
+
 class Metadata {
  public:
   /**
@@ -36,6 +44,12 @@ class Metadata {
   std::string corfu_jar_path;
   std::string corfu_jvm_opts;
   std::string corfu_stream_name = "ozonedb";
+  // Write batching (CorfuDBStorage::commit_interval_ et al.). Defaults
+  // are the sync mode every read guarantee assumes; the load script
+  // turns batching on for the bulk load only.
+  bool corfu_sync_mode = true;
+  int corfu_commit_interval_ms = 0;
+  size_t corfu_batch_bytes = 0;
 
   // Optional separate backend for SSTable storage. When unset, SSTables
   // share the main backend (backward-compat with all existing configs).
@@ -165,6 +179,14 @@ class Metadata {
       if (opts_it != result.end()) corfu_jvm_opts = opts_it->second;
       auto stream_it = result.find("corfu_stream_name");
       if (stream_it != result.end()) corfu_stream_name = stream_it->second;
+      auto sync_it = result.find("corfu_sync_mode");
+      if (sync_it != result.end()) {
+        corfu_sync_mode = !(sync_it->second == "false" || sync_it->second == "0");
+      }
+      auto ci_it = result.find("corfu_commit_interval_ms");
+      if (ci_it != result.end()) corfu_commit_interval_ms = std::stoi(ci_it->second);
+      auto bb_it = result.find("corfu_batch_bytes");
+      if (bb_it != result.end()) corfu_batch_bytes = std::stoull(bb_it->second);
     }
 
     // Optional SSTable-specific backend. See paper §3.5 — SSTables don't
@@ -236,6 +258,12 @@ class Metadata {
           "config error: linearizable_reads and trust_background_tail are "
           "mutually exclusive (one demands a fence per get, the other skips "
           "it)");
+    }
+    if (!corfu_sync_mode && (linearizable_reads || detail::track_versions_requested(result))) {
+      throw std::runtime_error(
+          "config error: corfu_sync_mode=false (batched, ack-before-sequence "
+          "writes) is a bulk-load mode and cannot be combined with "
+          "linearizable_reads or track_versions");
     }
 
     auto tv_it = result.find("track_versions");
