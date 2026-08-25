@@ -413,6 +413,40 @@ stream, or make the binding open the DB before YCSB's timer) and say which
 one every figure uses. E0's comparison is unaffected: both builds paid the
 same init.
 
+#### Load time (openDB replay), measured 2026-08-25
+
+The replay drains 1,022,163 entries — one Corfu entry per loaded record
+plus ~100 LOGCREATE/COMPACT/REMOVE records; most of them belong to data-log
+files that compaction already REMOVEd, and the tailer reads and parses them
+anyway. Steps tried, all on the same 1 M-entry load, 60 s workload-c cells:
+
+| change | replay | poll / apply | first YCSB op |
+|---|---|---|---|
+| baseline (`pollNext` per entry, Corfu batch sizes 10/10) | 41.5 s | — | 49 s |
+| drain via `pollBatch` × 4096 (`553392b5`) | 41.0 s | 39.3 s / 1.7 s | 48 s |
+| + `streamBatchSize = 1000` only | 40.5 s | 38.9 / 1.7 | 48 s |
+| + `bulkReadSize = 1000` as well (`553392b5`) | **30.0 s** | 28.3 / 1.7 | **37 s** |
+
+The JNI round trip was never the cost. Corfu reads a lagging stream in
+RPCs of `bulkReadSize` addresses (`AddressSpaceView.fetchAll`) out of a
+`streamBatchSize` window; both default to 10, i.e. ~100 k sequential RPCs.
+Raising only `streamBatchSize` does nothing because `fetchAll` splits the
+request back into tens. Both at 1000 removes the RTT share (~27%). A JFR
+profile of the remaining 28 s (`jcmd <ycsb java pid> JFR.start`; the bridge
+runs inside the YCSB JVM — `startJvm` reuses it, so `corfu_jvm_opts` is
+ignored on the YCSB path) shows the drain thread executing Java for ~1.2 s
+(netty `readBytes`, `ByteBuffer.allocate`, `LogData.getPayload`) and
+parked the rest of the time on each RPC's reply: the cost is **server-side,
+~28 µs per address, on one sequential request stream** (a fresh
+`corfu_server` per cell has a cold entry cache). One replayer and seven
+concurrent replayers see the same per-entry time, so the server has
+headroom; a client that issues several batch reads concurrently (a
+read-ahead pool in `CorfuBridge` that fills Corfu's read cache ahead of
+`pollView.next()`) should scale until the server saturates, and a batched
+load (fewer, larger entries) cuts the count itself. The real fix remains a
+checkpoint + `prefixTrim` (design notes in the 2026-08-25 discussion:
+the checkpoint must carry `key_versions_` or redefine "not in map").
+
 Verdict: no regression with the gate off — the read-only workload is
 identical within trial noise. The update-heavy workload is *faster* on
 `cas` for a known reason: `88e47612` (bridge wakes the poller on a local
