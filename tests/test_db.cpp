@@ -19,7 +19,7 @@ class DBTest : public ::testing::Test {
 TEST_F(DBTest, open) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -30,7 +30,7 @@ TEST_F(DBTest, open) {
 TEST_F(DBTest, single_put_get) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -41,7 +41,8 @@ TEST_F(DBTest, single_put_get) {
 
   DB::openDB(db, shared_config_path);
   std::string const* value = nullptr;
-  status = db->get("key", value);
+  std::shared_ptr<Record> guard;
+  status = db->get("key", value, guard);
   EXPECT_EQ(Status::kSuccess, status);
   EXPECT_EQ("value", *value);
 
@@ -51,7 +52,7 @@ TEST_F(DBTest, single_put_get) {
 TEST_F(DBTest, multiple_put_get) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -65,8 +66,9 @@ TEST_F(DBTest, multiple_put_get) {
   DB::openDB(db, shared_config_path);
   for (size_t i = 0; i < 10; i++) {
     std::string const* value = nullptr;
+    std::shared_ptr<Record> guard;
     auto start = std::chrono::high_resolution_clock::now();
-    status = db->get("key" + std::to_string(i), value);
+    status = db->get("key" + std::to_string(i), value, guard);
     auto end = std::chrono::high_resolution_clock::now();
     std::cout << "Time taken to get the value " << i << " : " << std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() << "ns" << std::endl;
     EXPECT_EQ(Status::kSuccess, status);
@@ -79,7 +81,7 @@ TEST_F(DBTest, multiple_put_get) {
 TEST_F(DBTest, put_after_put_return_new_value) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -93,7 +95,8 @@ TEST_F(DBTest, put_after_put_return_new_value) {
 
   DB::openDB(db, shared_config_path);
   std::string const* value = nullptr;
-  status = db->get("key", value);
+  std::shared_ptr<Record> guard;
+  status = db->get("key", value, guard);
   EXPECT_EQ(Status::kSuccess, status);
   EXPECT_EQ("new_value", *value);
 
@@ -103,7 +106,7 @@ TEST_F(DBTest, put_after_put_return_new_value) {
 TEST_F(DBTest, delete_after_put) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -116,7 +119,8 @@ TEST_F(DBTest, delete_after_put) {
 
   DB::openDB(db, shared_config_path);
   std::string const* value = nullptr;
-  status = db->get("key", value);
+  std::shared_ptr<Record> guard;
+  status = db->get("key", value, guard);
   EXPECT_EQ(Status::kFailure, status);
 
   DB::closeDB(db);
@@ -125,7 +129,7 @@ TEST_F(DBTest, delete_after_put) {
 TEST_F(DBTest, large_put) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -140,7 +144,7 @@ TEST_F(DBTest, large_put) {
 TEST_F(DBTest, tailcache) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -154,7 +158,8 @@ TEST_F(DBTest, tailcache) {
   DB::openDB(db, shared_config_path);
   for (size_t i = 0; i < 10; i++) {
     std::string const* value = nullptr;
-    status = db->get("key" + std::to_string(i * 10), value);
+    std::shared_ptr<Record> guard;
+    status = db->get("key" + std::to_string(i * 10), value, guard);
     EXPECT_EQ(Status::kSuccess, status);
     EXPECT_EQ("value" + std::to_string(i * 10), *value);
   }
@@ -167,12 +172,14 @@ TEST_F(DBTest, tailcache) {
   DB::openDB(db, shared_config_path);
   for (size_t i = 0; i < 10; i++) {
     std::string const* value = nullptr;
-    status = db->get("key" + std::to_string(i * 10), value);
+    std::shared_ptr<Record> guard;
+    status = db->get("key" + std::to_string(i * 10), value, guard);
     EXPECT_EQ(Status::kSuccess, status);
     EXPECT_EQ("value_new" + std::to_string(i * 10), *value);
   }
   std::string const* value = nullptr;
-  status = db->get("key100", value);
+  std::shared_ptr<Record> guard;
+  status = db->get("key100", value, guard);
   EXPECT_EQ(Status::kFailure, status);
 
   DB::closeDB(db);
@@ -181,7 +188,7 @@ TEST_F(DBTest, tailcache) {
 TEST_F(DBTest, tailcache1) {
   DB* db = nullptr;
 
-  std::string shared_config_path = "../src/config/cloud/shared_config_rocksdb_base.json";
+  std::string shared_config_path = "../src/config/local/test_db.json";
 
   Status status = DB::openDB(db, shared_config_path);
   EXPECT_EQ(Status::kSuccess, status);
@@ -195,8 +202,9 @@ TEST_F(DBTest, tailcache1) {
   DB::openDB(db, shared_config_path);
   for (size_t i = 0; i < 10; i++) {
     std::string const* value = nullptr;
+    std::shared_ptr<Record> guard;
     auto start = std::chrono::high_resolution_clock::now();
-    status = db->get("key" + std::to_string(i), value);
+    status = db->get("key" + std::to_string(i), value, guard);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed_time = end - start;
     std::cout << "Time taken to get the value: " << elapsed_time.count() << "s" << std::endl;
@@ -205,8 +213,9 @@ TEST_F(DBTest, tailcache1) {
   }
   for (size_t i = 0; i < 10; i++) {
     std::string const* value = nullptr;
+    std::shared_ptr<Record> guard;
     auto start = std::chrono::high_resolution_clock::now();
-    status = db->get("key" + std::to_string(i), value);
+    status = db->get("key" + std::to_string(i), value, guard);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed_time = end - start;
     std::cout << "Time taken to get the value: " << elapsed_time.count() << "s" << std::endl;

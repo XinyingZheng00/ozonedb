@@ -53,19 +53,20 @@ TEST(SSTableTest, ReadTableTest) {
   std::cout << "finish adding key value pairs to table" << std::endl;
 
   // read table
-  Table* table;
+  Table* table = nullptr;
   LRUCache* lru_cache = new LRUCache(33554432, storage);
   lru_cache->setFileMutexManager(new FileMutexManager());
   lru_cache->getSSTable(fileName, table);
+  ASSERT_NE(nullptr, table);
   std::cout << "ready to read key value pairs to table" << std::endl;
   for (int i = 0; i < 100; i++) {
-    Record* record;
+    std::shared_ptr<Record> record;
     table->get(keys[i], record);
     ASSERT_EQ(keys[i], record->key());
     ASSERT_EQ("value", record->value());
     ASSERT_EQ(kTypeValue, record->type());
   }
-  Record* record;
+  std::shared_ptr<Record> record;
   status = table->get("key100", record);
   ASSERT_EQ(status, Status::kNotFound);
 }
@@ -95,13 +96,14 @@ TEST(SSTableTest, SSTableReadWholeTableTest) {
   std::cout << "finish adding key value pairs to table" << std::endl;
 
   // read table
-  Table* table;
+  Table* table = nullptr;
   LRUCache* lru_cache = new LRUCache(33554432, storage);
   lru_cache->setFileMutexManager(new FileMutexManager());
   lru_cache->getSSTable(fileName, table);
+  ASSERT_NE(nullptr, table);
   assert(status == Status::kSuccess);
   std::cout << "ready to read key value pairs to table" << std::endl;
-  std::unordered_map<std::string, Record*> result = table->getAll();
+  std::unordered_map<std::string, std::shared_ptr<Record>> result = table->getAll();
   for (int i = 0; i < 100; i++) {
     ASSERT_EQ(result[keys[i]]->key(), keys[i]);
     ASSERT_EQ(result[keys[i]]->value(), "value");
@@ -140,19 +142,20 @@ TEST(SSTableTest, ReadTableWithFilterTest) {
   std::cout << "finish adding key value pairs to table" << std::endl;
 
   // read table
-  Table* table;
+  Table* table = nullptr;
   LRUCache* lru_cache = new LRUCache(33554432, storage);
   lru_cache->setFileMutexManager(new FileMutexManager());
   lru_cache->getSSTable(fileName, table);
+  ASSERT_NE(nullptr, table);
   std::cout << "ready to read key value pairs to table" << std::endl;
   for (int i = 0; i < 99; i++) {
-    Record* record;
+    std::shared_ptr<Record> record;
     table->get(keys[i], record);
     ASSERT_EQ(keys[i], record->key());
     ASSERT_EQ(value, record->value());
     ASSERT_EQ(kTypeValue, record->type());
   }
-  Record* record;
+  std::shared_ptr<Record> record;
   // count the time for the get
   auto start = std::chrono::high_resolution_clock::now();
   status = table->get("key55", record);
