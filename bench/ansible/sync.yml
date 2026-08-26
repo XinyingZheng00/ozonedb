@@ -57,6 +57,27 @@
         # Reuse the ControlPersist connection from ansible.cfg.
         use_ssh_args: true
         rsync_opts: "{{ rsync_excludes_incremental }}"
+      register: sync_result
+      tags: [sync]
+
+    # rsync -a preserves the SOURCE mtime, which is the operator's local
+    # edit time. When that time falls before the node's last build -- easy
+    # across machines with different clocks, or after a rebase that
+    # restores an older file -- make sees a source older than its .o and
+    # skips it. The build then succeeds while silently linking stale
+    # objects, and the node runs code that is not what was pushed.
+    #
+    # Stamp the sources with the current node time whenever anything was
+    # transferred, so make compares against times it set itself. This
+    # forces a full rebuild after a sync that changed something, which
+    # costs about a minute on a 32-core node -- cheap next to debugging a
+    # binary that does not contain the change you just pushed.
+    - name: Refresh source mtimes so make rebuilds what changed
+      ansible.builtin.raw: >-
+        bash -lc 'cd {{ repo_dest | quote }} &&
+        find src tests ozonedb-jni-maven CMakeLists.txt -type f -exec touch {} + 2>/dev/null; true'
+      when: sync_result is changed
+      changed_when: false
       tags: [sync]
 
     - name: Sync extra repos

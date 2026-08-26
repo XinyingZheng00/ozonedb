@@ -14,7 +14,7 @@ std::shared_ptr<Record> LogKeyIndex::lookup(std::string const& key) {
 }
 
 void LogKeyIndex::upsert(std::string const& key, std::shared_ptr<Record> rec,
-                         std::string const& source_file, Rank rank) {
+                         std::string const& source_file, LogRank rank) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = map_.find(key);
   if (it != map_.end()) {

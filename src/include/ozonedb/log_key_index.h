@@ -18,26 +18,32 @@ namespace ozonedb {
 // keeps a reference so a cache invalidate (compaction, REMOVE) cannot
 // free the Record out from under a reader that just lifted it out of
 // the index.
+// Position of a record in the shared log's global order.
+//
+// `addr` is the Corfu global address of the entry that carried the
+// record. `sub` orders records inside one entry, because a single
+// batched APPEND carries many records and the later ones are newer.
+//
+// An unordered source (a local backend with no global order, or a
+// backfill scan) uses addr = -1, which never displaces a ranked entry
+// and is always displaced by one.
+//
+// At namespace scope, not nested in LogKeyIndex: a nested type's default
+// member initializers are not usable in a default argument of the
+// enclosing class, which is still incomplete at that point.
+struct LogRank {
+  long addr = -1;
+  uint32_t sub = 0;
+
+  bool operator<(LogRank const& o) const {
+    if (addr != o.addr) return addr < o.addr;
+    return sub < o.sub;
+  }
+};
+
 class LogKeyIndex {
  public:
-  // Position of a record in the shared log's global order.
-  //
-  // `addr` is the Corfu global address of the entry that carried the
-  // record. `sub` orders records inside one entry, because a single
-  // batched APPEND carries many records and the later ones are newer.
-  //
-  // An unordered source (a local backend with no global order, or a
-  // backfill scan) uses addr = -1, which never displaces a ranked entry
-  // and is always displaced by one.
-  struct Rank {
-    long addr = -1;
-    uint32_t sub = 0;
-
-    bool operator<(Rank const& o) const {
-      if (addr != o.addr) return addr < o.addr;
-      return sub < o.sub;
-    }
-  };
+  using Rank = LogRank;
 
   explicit LogKeyIndex(size_t capacity) : capacity_(capacity) {}
 
@@ -49,7 +55,7 @@ class LogKeyIndex {
   // last-writer-by-arrival-time rule let that stale record win, and
   // nothing ever corrected it.
   void upsert(std::string const& key, std::shared_ptr<Record> rec,
-              std::string const& source_file, Rank rank = Rank{});
+              std::string const& source_file, LogRank rank = LogRank{});
   void invalidateFile(std::string const& file);
   size_t size() const;
 
@@ -57,7 +63,7 @@ class LogKeyIndex {
   struct Entry {
     std::shared_ptr<Record> rec;
     std::string source_file;
-    Rank rank;
+    LogRank rank;
     std::list<std::string>::iterator lru_it;
   };
 

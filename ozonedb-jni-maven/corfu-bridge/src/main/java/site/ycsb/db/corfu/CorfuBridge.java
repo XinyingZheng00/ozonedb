@@ -38,6 +38,10 @@ public class CorfuBridge {
   // append view writes (ordered via the Corfu sequencer).
   private final IStreamView appendView;
   private final IStreamView pollView;
+  // The stream both views subscribe to. Needed by tailAddress(): a fence
+  // target must be an address on THIS stream, because that is the only
+  // thing the tailer advances over.
+  private final UUID streamId;
   private volatile boolean closed = false;
 
   // Poller wake-up channel. When the stream has nothing new the poller
@@ -67,7 +71,7 @@ public class CorfuBridge {
     this.runtime = CorfuRuntime.fromParameters(params)
         .parseConfigurationString(endpoint)
         .connect();
-    UUID streamId = CorfuRuntime.getStreamID(streamName);
+    this.streamId = CorfuRuntime.getStreamID(streamName);
     this.appendView = runtime.getStreamsView().get(streamId);
     this.pollView = runtime.getStreamsView().get(streamId);
   }
@@ -197,9 +201,19 @@ public class CorfuBridge {
     return out.array();
   }
 
-  /** @return the last known global log tail (for read-after-write waits). */
+  /**
+   * @return the tail address of THIS stream (for read-after-write waits).
+   *
+   * Must be the stream tail, not the global log tail. The C++ tailer waits
+   * until it has applied every address up to this value, but it advances
+   * only over this stream. A global tail includes addresses belonging to
+   * other streams -- and any hole -- which this stream will never deliver,
+   * so the wait could never be satisfied and every fenced read in the
+   * process blocked forever. {@code query(UUID)} returns the per-stream
+   * tail, which the tailer does reach.
+   */
   public long tailAddress() {
-    return runtime.getSequencerView().query().getSequence();
+    return runtime.getSequencerView().query(streamId);
   }
 
   /**
