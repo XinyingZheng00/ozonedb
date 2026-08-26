@@ -3,11 +3,35 @@
 Bound the log that a process replays when it joins. Move the trimmed prefix of the
 shared log into the object store as a checkpoint, then trim the Corfu stream behind it.
 
-## 0. Status — planned, not started (2026-08-26)
+## 0. Status — phases 0–4 implemented, cluster validation (phase 5) pending (2026-08-26)
 
-Nothing in this plan is implemented. Branch: `worktree-plan-trimming`, from `visibility` at
-`25dab3a0`. That head already contains the durability fixes (`PLAN-durability.md`, merged at
-`ca03ba2b`) and the batched open-time replay.
+Branch: `worktree-plan-trimming`, from `visibility` at `25dab3a0`. That head already contains
+the durability fixes (`PLAN-durability.md`, merged at `ca03ba2b`) and the batched open-time
+replay.
+
+Implemented on the branch, not yet built or run on the cluster:
+
+| Phase | Where |
+|---|---|
+| 0 replay line with live bytes | `drainInitialEntries` prints `stream_MB`, `live_files`, `live_MB`, `top_level={…}` |
+| 1 bridge | `CorfuBridge.prefixTrim/trimMark/seekPollView`, TRIMMED = zero-length array |
+| 2 snapshot + format | `write_gate_`, `takeSnapshot`, `CheckpointManifest`, `src/db/checkpoint.{h,cpp}` |
+| 3 join | `bootstrap`, `DB::DB` builds the SSTable store first, TRIMMED retry, fail-stop |
+| 4 trimmer + bench | `src/db/log_trimmer.{h,cpp}`, five `Metadata` keys, `corfu.log_trim` in `ycsb.yaml`, `--log-trim` on the loader, runner, orchestrator and cluster wrapper |
+| tests | `tests/test_checkpoint.cpp` (FileStorage, no Corfu), four new `CorfuStorageTest` cases |
+
+Two deviations from the text below, both deliberate:
+
+- **The completeness guard uses a `TRIM` entry, not the log unit's trim mark** (§3.5). The
+  trimmer appends `CorfuEntry{op=TRIM, payload=X}` right before `prefixTrim(X)`. A replay that
+  starts at `S` and meets `X >= S` throws. The log unit's mark is global: a fresh stream on a
+  server trimmed for another stream must still open. The sequencer's per-stream mark is in
+  memory only. The entry is per stream and survives a restart. `bootstrap` also throws when
+  the checkpoint is ahead of the stream tail (a log dir older than the bucket).
+- **The gate is taken at the entry of every path that pushes into `pending_`**, not inside
+  `submitBatch` (§3.3). A batch queued by a thread that still waits for the gate blocks the
+  stamped batch behind it, whose writer holds the gate, which blocks the snapshot, which
+  blocks the first thread. Taking the gate before the push removes the cycle.
 
 Baseline, measured 2026-08-25 on the 1M × 1 KB load (`PLAN-transactions.md`, "Load time",
 and the message of `25dab3a0`):
@@ -140,10 +164,10 @@ loads such a copy and replays from `C+1` duplicates bytes or loses bytes.
 
 Fix: a `std::shared_mutex write_gate_` in `CorfuDBStorage`.
 
-- Every local submit path holds the gate **shared** from the moment a batch leaves
-  `cached_file_` until `finishBatchLocked` runs. Those paths are `submitBatch`
-  (`src/db/corfu_storage.cpp:761`), `seal` (`:1002`), and `remove` (`:1054`). The destructor
-  flush (`:85`) runs after the trimmer stops, so it needs no gate.
+- Every path that pushes a batch into `pending_` or appends to the log holds the gate
+  **shared** from its entry until its batch is settled: `append`, `appendInBatch`, `flush`,
+  `drainForRead`, `seal`, `remove`. `submitBatch` assumes the caller holds it. The
+  destructor flush runs after the trimmer stops, so it needs no gate.
 - `takeSnapshot()` holds the gate **exclusive**. Under the gate no local write is between
   "sequenced" and "reconciled", so `pending_` is empty. Then, under `mtx_`:
   1. Wait until `last_applied_addr_ >= last_written_addr_`.
@@ -175,8 +199,9 @@ Every `log_trim_interval_ms`, the trimmer reads the stream tail. If
 3. `prefixTrim(C_{N-1})` — trim behind the **previous** checkpoint, not the new one.
 4. `AddressSpaceView.gc()` to make the log unit delete whole segments below the mark.
 5. Delete checkpoint `C_{N-2}` (best effort, `log_trim_keep_checkpoints`, default 2).
-6. Append nothing to the stream. The stream needs no marker: `LATEST` and Corfu's own trim
-   mark are the two sources of truth.
+6. Before step 3, append `TRIM(C_{N-1})` to the stream. It is the per-stream, persisted
+   record of the trim that §3.5 checks. `LATEST` names the checkpoint, the `TRIM` entry names
+   the trim.
 
 Step 3 is the grace rule. A live member that lags the tailer by less than one interval is
 never below the trim mark. A joiner always uses `LATEST`, which is above the mark by one full
@@ -195,17 +220,18 @@ loader's last trim is what makes the load snapshot small (§5).
    sealed set, `sealed_at_addr_`, and the removed set. Set `last_applied_addr_ = C`.
 4. Call the bridge `seekPollView(C + 1)`. Drain from there with `pollBatch` and
    `kDrainBatchSize`, as today.
-5. Ask the bridge for `trimMark()` (first untrimmed address, §3.7). If it is above the first
-   address this process replayed (`C + 1`, or 0 without a checkpoint), the log was trimmed
-   past what we loaded. Throw. This is the guard against a bucket restored without its log,
-   or a log restored without its bucket (§5).
+5. Two completeness checks. (a) Before the seek: the stream tail must be `>= C`, or the log
+   dir is older than the bucket (or empty). (b) After the drain: the highest `X` of any `TRIM`
+   entry replayed must be `< C + 1` (or `< 0` without a checkpoint), or the log was trimmed
+   past what we loaded. Throw in both cases. This is the guard against a bucket restored
+   without its log, or a log restored without its bucket (§5).
 6. If a poll returns the TRIMMED sentinel, discard all state and retry from step 2, at most
-   three times. Then throw.
+   three times. Then throw. A Corfu error during the drain throws at once.
 
-Step 5 matters because the sequencer's trim mark is not known to survive a server restart
-(§3.7, unverified). After a restart a fresh view without `seek` can start at the first surviving
-entry with no exception and build a partial state in silence. The log unit's trim mark is
-persisted, so step 5 detects that case.
+Check (b) reads the `TRIM` entry, not Corfu's marks, because the sequencer's per-stream mark
+is in memory only and the log unit's mark is global (§0, deviations). After a server restart
+a fresh view without `seek` can start at the first surviving entry with no exception; the
+`TRIM` entry above that point is what makes the partial state visible.
 
 `DB::DB` must build `sstable_storage` before `log_storage` when `sstable_backend_set`, and
 pass it to `bootstrap`. `makeStorage` for S3 does not depend on the log backend, so the reorder

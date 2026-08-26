@@ -3,6 +3,7 @@
 #include "thread_pool.h"
 #ifdef OZONEDB_ENABLE_CORFU
 #include "corfu_storage.h"
+#include "log_trimmer.h"
 #endif
 #ifdef OZONEDB_ENABLE_S3
 #include "s3_storage.h"
@@ -16,8 +17,11 @@ namespace {
 // Build a Storage instance for one of the supported backend kinds.
 // Used twice from DB::DB — once for the log layer (always required) and
 // optionally a second time for SSTable storage if the config picks a
-// separate backend per paper §3.5.
-Storage* makeStorage(BackendKind kind, Metadata const& md, bool for_sstables) {
+// separate backend per paper §3.5. checkpoint_store is only read by the
+// Corfu backend: the object store it loads the newest checkpoint from at
+// open (null => replay from address 0).
+Storage* makeStorage(BackendKind kind, Metadata const& md, bool for_sstables,
+                     Storage* checkpoint_store) {
   switch (kind) {
     case BackendKind::kLocal:
       return new FileStorage(for_sstables && !md.sstable_dir.empty()
@@ -32,7 +36,7 @@ Storage* makeStorage(BackendKind kind, Metadata const& md, bool for_sstables) {
 #ifdef OZONEDB_ENABLE_CORFU
       return new CorfuDBStorage(md.corfu_endpoint, md.corfu_jar_path,
                                 md.corfu_jvm_opts, md.corfu_stream_name,
-                                md.DBpath);
+                                md.DBpath, checkpoint_store, md.checkpoint_dir);
 #else
       throw std::runtime_error(
           "OzoneDB was built without CorfuDB support (rebuild with "
@@ -62,12 +66,18 @@ DB::DB(std::string const& shared_config_path) {
     this->mode = Mode::MultipleProcesses;
   }
 
-  this->log_storage = makeStorage(this->metadata->backend_kind,
-                                  *this->metadata, /*for_sstables=*/false);
+  // The SSTable store is built FIRST when it is separate: the Corfu log
+  // backend loads the newest checkpoint from it during construction
+  // (CorfuDBStorage::bootstrap), so it has to exist before the log does.
   if (this->metadata->sstable_backend_set) {
     this->sstable_storage = makeStorage(this->metadata->sstable_backend_kind,
-                                        *this->metadata, /*for_sstables=*/true);
-  } else {
+                                        *this->metadata, /*for_sstables=*/true,
+                                        /*checkpoint_store=*/nullptr);
+  }
+  this->log_storage = makeStorage(this->metadata->backend_kind,
+                                  *this->metadata, /*for_sstables=*/false,
+                                  /*checkpoint_store=*/this->sstable_storage);
+  if (!this->metadata->sstable_backend_set) {
     // Backward-compat: SSTables share the main backend.
     this->sstable_storage = this->log_storage;
   }
@@ -99,7 +109,7 @@ DB::DB(std::string const& shared_config_path) {
   this->thread_pool = new ThreadPool(std::thread::hardware_concurrency());
   this->log_handler->setThreadPool(this->thread_pool);
   this->sstable_handler->setThreadPool(this->thread_pool);
-  std::string fingerprint = generateFingerprint();
+  this->fingerprint = generateFingerprint();
   this->watcher = new CompactionWatcher(this->metadata, this->log_storage, this->log_handler, metadata_log, this->sstable_handler, fingerprint);
   this->watcher->setSSTableStorage(this->sstable_storage);
   this->watcher->setLRUCache(this->lru_cache);
@@ -113,6 +123,9 @@ DB::DB(std::string const& shared_config_path) {
 };
 
 DB::~DB() {
+#ifdef OZONEDB_ENABLE_CORFU
+  delete this->trimmer;  // uses both stores: first out
+#endif
   delete this->watcher;
   delete this->sstable_handler;
   delete this->log_handler;
@@ -154,6 +167,21 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
     db->watcher->startCompactionWatcher(&(db->active));
   }
   db->metadata_log->startViewUpdate(&(db->active));
+#ifdef OZONEDB_ENABLE_CORFU
+  if (db->metadata->log_trim_enabled) {
+    auto* corfu = dynamic_cast<CorfuDBStorage*>(db->log_storage);
+    if (corfu != nullptr && db->sstable_storage != db->log_storage) {
+      LogTrimmer::Options options;
+      options.dir = db->metadata->checkpoint_dir;
+      options.interval_ms = db->metadata->log_trim_interval_ms;
+      options.min_entries = db->metadata->log_trim_min_entries;
+      options.keep = db->metadata->log_trim_keep_checkpoints;
+      options.creator = db->fingerprint;
+      db->trimmer = new LogTrimmer(corfu, db->sstable_storage, options);
+      db->trimmer->start();
+    }
+  }
+#endif
   return Status::kSuccess;
 }
 
@@ -164,6 +192,12 @@ Status DB::closeDB(DB*& db) {
   }
   // db->thread_pool->waitForCompletion();
   db->metadata_log->stopViewUpdate();
+#ifdef OZONEDB_ENABLE_CORFU
+  // Final checkpoint + trim before the stores go away, so a process that
+  // leaves publishes everything it saw (the load's last cycle is what
+  // keeps the bench's log snapshot small).
+  if (db->trimmer != nullptr) db->trimmer->stop();
+#endif
   db->lru_cache->printCacheStats();
   delete db;
   return Status::kSuccess;

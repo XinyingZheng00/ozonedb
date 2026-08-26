@@ -143,6 +143,21 @@ def linearizable_corfu_settings(corfu_settings):
     return s
 
 
+def log_trim_corfu_settings(corfu_settings):
+    """Copy of `corfu_settings` with log trimming switched on.
+
+    Only global writer 0 becomes the trimmer (see
+    _make_corfu_config_per_writer); every writer loads the newest checkpoint
+    at open. The ONE place the --log-trim override lives, shared by the
+    loader, the runner and the multinode orchestrator.
+    """
+    s = dict(corfu_settings or {})
+    lt = dict(s.get("log_trim") or {})
+    lt["enabled"] = True
+    s["log_trim"] = lt
+    return s
+
+
 def result_label(db_name, corfu_settings):
     """Engine token for result filenames: db_name plus the read mode.
 
@@ -204,6 +219,16 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         for k in ("trust_background_tail", "linearizable_reads"):
             if k in corfu_settings:
                 data[k] = "true" if _truthy(corfu_settings[k]) else "false"
+        # Log trimming (PLAN-trimming.md): exactly one trimmer per cluster,
+        # global writer 0. writer_idx is global (offset + local index), so
+        # on a multi-host run only the first host's first writer trims.
+        # Every writer still loads the newest checkpoint at open.
+        lt = corfu_settings.get("log_trim") or {}
+        trimmer = _truthy(lt.get("enabled")) and writer_idx == 0
+        data["log_trim_enabled"] = "true" if trimmer else "false"
+        for k in ("interval_ms", "min_entries", "keep_checkpoints"):
+            if k in lt:
+                data[f"log_trim_{k}"] = str(lt[k])
     if s3_settings:
         data["sstable_backend"] = "s3"
         if "endpoint" in s3_settings:
@@ -633,6 +658,14 @@ if __name__ == "__main__":
         default=None,
         help="Number of parallel writer processes (overrides local.load.num_writers).",
     )
+    parser.add_argument(
+        "--log-trim",
+        action="store_true",
+        help="Log trimming (ozonedb-corfu only): global writer 0 checkpoints the "
+             "Corfu stream to the SSTable bucket and trims behind the checkpoint; "
+             "its final cycle at close is what keeps the load snapshot small. "
+             "Prefer this over toggling corfu.log_trim.enabled in ycsb.yaml.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -651,10 +684,13 @@ if __name__ == "__main__":
         else load_config.get("num_writers", 2)
     )
     corfu_settings = config.get("corfu")
+    if args.log_trim:
+        corfu_settings = log_trim_corfu_settings(corfu_settings)
     s3_settings = config.get("s3")
     os.makedirs(ycsb_data_path, exist_ok=True)
 
-    print(f"Launching {num_writers} parallel writer processes")
+    print(f"Launching {num_writers} parallel writer processes"
+          f" (log_trim={'on' if args.log_trim else 'yaml'})")
     load_ycsb(
         record_cnts,
         key_sizes,

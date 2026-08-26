@@ -36,6 +36,7 @@ enum class Mode {
   Singleton,
   MultipleProcesses,
 };
+class LogTrimmer;
 class DB {
  private:
   /**
@@ -59,6 +60,12 @@ class DB {
   Storage* sstable_storage = nullptr;
   Metadata* metadata;
   CompactionWatcher* watcher = nullptr;
+  // Only when Metadata::log_trim_enabled and the log backend is Corfu:
+  // this process checkpoints the log to sstable_storage and trims behind
+  // the checkpoint (PLAN-trimming.md). Stopped in closeDB, which also runs
+  // its final cycle, and deleted first in ~DB because it uses both stores.
+  LogTrimmer* trimmer = nullptr;
+  std::string fingerprint;
   // Holds an immutable snapshot of the metadata-log view. Refreshed
   // once per DB::get via std::atomic_load on the handler's internal
   // shared_ptr — the shared_ptr extends the View's lifetime across

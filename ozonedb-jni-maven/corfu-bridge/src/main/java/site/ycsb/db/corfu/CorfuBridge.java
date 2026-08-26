@@ -6,8 +6,10 @@ import java.util.List;
 import java.util.UUID;
 
 import org.corfudb.protocols.wireprotocol.ILogData;
+import org.corfudb.protocols.wireprotocol.Token;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuRuntime.CorfuRuntimeParameters;
+import org.corfudb.runtime.exceptions.TrimmedException;
 import org.corfudb.runtime.view.stream.IStreamView;
 
 /**
@@ -57,6 +59,15 @@ public class CorfuBridge {
   private static final long IDLE_POLL_MS = 5;
   private final Object pollSignal = new Object();
   private long appendSeq = 0;  // guarded by pollSignal
+
+  // Returned by pollNext/pollBatch when the poll view's next address is
+  // below the log's trim mark (Corfu throws TrimmedException). A null
+  // return keeps its meaning (timeout, nothing new); a ZERO-LENGTH array
+  // is the marker. The C++ side restarts from a newer checkpoint during
+  // bootstrap, and fail-stops a live tailer -- it never skips the trimmed
+  // entries, which is why the poll view is NOT opened with
+  // StreamOptions.ignoreTrimmed: that option drops them in silence.
+  private static final byte[] TRIMMED = new byte[0];
 
   public CorfuBridge(String endpoint, String streamName) {
     // maxCacheEntries default is 2500 — too small, the tailer falls
@@ -145,7 +156,12 @@ public class CorfuBridge {
     long deadline = System.currentTimeMillis() + timeoutMs;
     while (!closed) {
       long seq = appendSeqSnapshot();
-      ILogData data = pollView.next();
+      ILogData data;
+      try {
+        data = pollView.next();
+      } catch (TrimmedException e) {
+        return TRIMMED;
+      }
       if (data != null) {
         long addr = data.getGlobalAddress();
         Object raw = data.getPayload(runtime);
@@ -186,7 +202,16 @@ public class CorfuBridge {
     List<byte[]> batch = new ArrayList<>(Math.min(maxEntries, 256));
     while (!closed && batch.size() < maxEntries) {
       long seq = appendSeqSnapshot();
-      ILogData data = pollView.next();
+      ILogData data;
+      try {
+        data = pollView.next();
+      } catch (TrimmedException e) {
+        // Entries already collected were read above the mark at the time;
+        // hand them over, and let the next call surface the marker (the
+        // view's pointer does not advance, so next() throws again).
+        if (!batch.isEmpty()) break;
+        return TRIMMED;
+      }
       if (data == null) {
         // No entry ready right now. If we already have some, return
         // them immediately — holding them back to pad a full batch
@@ -248,6 +273,50 @@ public class CorfuBridge {
    */
   public void gcPollView(long trimMark) {
     pollView.gc(trimMark);
+  }
+
+  /**
+   * Mark every address {@code <= addr} trimmed, then ask the log units to
+   * reclaim the space.
+   *
+   * {@code prefixTrim} alone frees nothing on disk: the log unit only
+   * persists a new starting address. {@code gc()} sends {@code compact()}
+   * to every log unit, which deletes the whole segments
+   * ({@code RECORDS_PER_LOG_FILE} entries) below the mark; the last partial
+   * segment stays until the mark passes it. Without the call the server
+   * compacts on its own schedule (first after 10 min, then every 45 min).
+   * The client read cache is pruned as well.
+   *
+   * @return the trim mark after the call: the FIRST UNTRIMMED address
+   *         ({@code addr + 1} once every log unit has applied it).
+   */
+  public long prefixTrim(long addr) {
+    long epoch = runtime.getLayoutView().getLayout().getEpoch();
+    runtime.getAddressSpaceView().prefixTrim(new Token(epoch, addr));
+    runtime.getAddressSpaceView().gc(addr + 1);
+    runtime.getAddressSpaceView().gc();
+    return trimMark();
+  }
+
+  /**
+   * @return the first untrimmed address, as persisted by the log units
+   *         (0 or -1 on a log that was never trimmed). Unlike the
+   *         sequencer's in-memory mark this value survives a server
+   *         restart, which is why bootstrap checks it.
+   */
+  public long trimMark() {
+    return runtime.getAddressSpaceView().getTrimMark().getSequence();
+  }
+
+  /**
+   * Position the poll view so that the next {@link #pollNext} /
+   * {@link #pollBatch} returns the first entry of this stream at or above
+   * {@code addr}. A joiner that restored checkpoint C calls this with C+1.
+   * Seeking at or above the trim mark is what keeps a fresh view from
+   * throwing {@code TrimmedException} on its first read.
+   */
+  public void seekPollView(long addr) {
+    pollView.seek(addr);
   }
 
   public void close() {

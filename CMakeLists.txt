@@ -107,6 +107,7 @@ set(OZONEDB_SOURCES
     src/db/cache.cpp
     src/db/metadata_log_handler.cpp
     src/db/task_log_handler.cpp
+    src/db/checkpoint.cpp
     src/db/storage.cpp
     src/db/azure_blob_storage.cpp
     src/db/sstable/block_handler.cpp
@@ -125,7 +126,7 @@ set(OZONEDB_SOURCES
     ${PROTO_SRCS} ${PROTO_HDRS}
 )
 if (OZONEDB_ENABLE_CORFU)
-    list(APPEND OZONEDB_SOURCES src/db/corfu_storage.cpp)
+    list(APPEND OZONEDB_SOURCES src/db/corfu_storage.cpp src/db/log_trimmer.cpp)
 endif()
 if (OZONEDB_ENABLE_S3)
     list(APPEND OZONEDB_SOURCES src/db/s3_storage.cpp)
@@ -220,6 +221,7 @@ set(OZONEDB_TEST_SOURCES
     tests/test_protobuf.cpp
     tests/test_sstable.cpp
     tests/test_filter_block.cpp
+    tests/test_checkpoint.cpp
 )
 if (OZONEDB_ENABLE_CORFU)
     list(APPEND OZONEDB_TEST_SOURCES tests/test_corfu_storage.cpp)

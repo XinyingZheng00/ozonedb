@@ -1,10 +1,14 @@
 #ifdef OZONEDB_ENABLE_CORFU
+#include "checkpoint.h"
 #include "corfu_storage.h"
+#include "log_trimmer.h"
 #include "gtest/gtest.h"
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace ozonedb;
@@ -152,6 +156,228 @@ TEST(CorfuStorageTest, remove_clears_file) {
   storage->remove(file);
   EXPECT_FALSE(storage->exist(file));
   delete storage;
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints and trimming (PLAN-trimming.md). These trim the shared test
+// server's log, so they sit at the end of the file: a later test on a
+// fresh stream is unaffected (the sequencer's per-stream mark for a new
+// stream is empty), but a reopen of an EARLIER stream would not be.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string checkpointRoot(std::string const& tag) {
+  auto p = std::filesystem::temp_directory_path() /
+           ("ozonedb_corfu_ckpt_" + std::to_string(getpid()) + "_" + tag);
+  std::filesystem::remove_all(p);
+  std::filesystem::create_directories(p);
+  return p.string() + "/";
+}
+
+CorfuDBStorage* makeStorageWithStore(std::string const& stream, Storage* store) {
+  return new CorfuDBStorage(
+      CorfuStorageEnv::endpoint(),
+      CorfuStorageEnv::jarPath(),
+      /*jvm_opts=*/"-Xmx512m",
+      stream,
+      /*db_path=*/"test/",
+      store,
+      "checkpoint");
+}
+
+std::vector<unsigned char> readAll(Storage* s, std::string const& file) {
+  unsigned char* data = nullptr;
+  size_t size = 0;
+  std::vector<unsigned char> out;
+  if (s->read(file, data, size) == Status::kSuccess) out.assign(data, data + size);
+  delete[] data;
+  return out;
+}
+
+std::vector<uint8_t> payload(int i) {
+  return {static_cast<uint8_t>(i & 0xff), static_cast<uint8_t>((i >> 8) & 0xff), 7, 9};
+}
+
+void appendN(Storage* s, std::string const& file, int from, int to) {
+  for (int i = from; i < to; ++i) {
+    auto p = payload(i);
+    ASSERT_EQ(Status::kSuccess, s->append(file, p.data(), p.size())) << file << " #" << i;
+  }
+}
+
+}  // namespace
+
+TEST(CorfuStorageTest, join_from_checkpoint) {
+  SKIP_IF_NO_CORFU();
+  std::string stream = CorfuStorageEnv::uniqueStream("corfu_join");
+  std::string root = checkpointRoot("join");
+  FileStorage store(root);
+  CorfuDBStorage* a = makeStorage(stream);
+  std::string const f1 = "datalog/1", f2 = "datalog/2", f3 = "datalog/3";
+
+  appendN(a, f1, 0, 200);
+  appendN(a, f2, 0, 50);
+  a->seal(f2);
+  appendN(a, f3, 0, 1);
+  a->remove(f3);
+
+  checkpoint::State snap = a->takeSnapshot();
+  ASSERT_GE(snap.covered_addr, 0);
+  EXPECT_EQ(2u, snap.files.size());
+  EXPECT_EQ(800u, snap.files[f1].size());
+  EXPECT_EQ(1u, snap.sealed.count(f2));
+  EXPECT_GE(snap.sealed[f2], 0);  // our own SEAL address is known
+  EXPECT_EQ(1u, snap.removed.count(f3));
+  snap.creator = "test";
+  ASSERT_EQ(Status::kSuccess, checkpoint::write(store, "checkpoint", snap));
+  ASSERT_TRUE(a->prefixTrim(snap.covered_addr));
+  EXPECT_EQ(snap.covered_addr + 1, a->trimMark());
+
+  // Writes after the trim land above the checkpoint; the joiner must
+  // replay exactly those.
+  appendN(a, f1, 200, 300);
+
+  CorfuDBStorage* b = makeStorageWithStore(stream, &store);
+  EXPECT_TRUE(b->loadedFromCheckpoint());
+  EXPECT_FALSE(b->trimmedOut());
+  EXPECT_EQ(readAll(a, f1), readAll(b, f1));
+  EXPECT_EQ(1200u, readAll(b, f1).size());
+  EXPECT_EQ(200u, readAll(b, f2).size());
+  EXPECT_TRUE(b->isSealed(f2));
+  EXPECT_FALSE(b->exist(f3));
+  {
+    auto p = payload(0);
+    EXPECT_EQ(Status::kSealed, b->append(f2, p.data(), p.size()));
+  }
+  // A live append after the join is visible to the joiner (fenced read).
+  appendN(a, f1, 300, 301);
+  EXPECT_EQ(readAll(a, f1), readAll(b, f1));
+  // And the joiner's own appends are visible to the original member.
+  appendN(b, f1, 301, 302);
+  EXPECT_EQ(readAll(b, f1), readAll(a, f1));
+
+  delete b;
+  delete a;
+  std::filesystem::remove_all(root);
+}
+
+TEST(CorfuStorageTest, trimmed_stream_without_checkpoint_refuses_to_open) {
+  SKIP_IF_NO_CORFU();
+  std::string stream = CorfuStorageEnv::uniqueStream("corfu_trim_nockpt");
+  std::string root = checkpointRoot("nockpt");
+  FileStorage store(root);
+  CorfuDBStorage* a = makeStorage(stream);
+  appendN(a, "f", 0, 50);
+  checkpoint::State snap = a->takeSnapshot();
+  ASSERT_GE(snap.covered_addr, 0);
+  ASSERT_EQ(Status::kSuccess, checkpoint::write(store, "checkpoint", snap));
+  ASSERT_TRUE(a->prefixTrim(snap.covered_addr));
+  appendN(a, "f", 50, 60);
+
+  // No checkpoint store: a replay from address 0 cannot be complete.
+  EXPECT_THROW({ delete makeStorage(stream); }, std::runtime_error);
+  // With the store it opens, and holds everything.
+  CorfuDBStorage* b = makeStorageWithStore(stream, &store);
+  EXPECT_EQ(240u, readAll(b, "f").size());
+  delete b;
+  delete a;
+  std::filesystem::remove_all(root);
+}
+
+TEST(CorfuStorageTest, snapshot_under_concurrent_writes_is_a_prefix) {
+  SKIP_IF_NO_CORFU();
+  std::string stream = CorfuStorageEnv::uniqueStream("corfu_snap_conc");
+  std::string root = checkpointRoot("conc");
+  FileStorage store(root);
+  CorfuDBStorage* a = makeStorage(stream);
+
+  constexpr int kWrites = 1500;
+  std::thread writer([&] {
+    for (int i = 0; i < kWrites; ++i) {
+      auto p = payload(i);
+      if (a->append("f", p.data(), p.size()) != Status::kSuccess) break;
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  checkpoint::State snap = a->takeSnapshot();
+  writer.join();
+  ASSERT_GE(snap.covered_addr, 0);
+  ASSERT_EQ(Status::kSuccess, checkpoint::write(store, "checkpoint", snap));
+  ASSERT_TRUE(a->prefixTrim(snap.covered_addr));
+
+  // The joiner restores the snapshot and replays covered_addr+1..tail. If
+  // the snapshot were not an exact prefix, bytes would be duplicated or
+  // missing and the two reads would differ.
+  CorfuDBStorage* b = makeStorageWithStore(stream, &store);
+  EXPECT_EQ(static_cast<size_t>(kWrites) * 4, readAll(a, "f").size());
+  EXPECT_EQ(readAll(a, "f"), readAll(b, "f"));
+  delete b;
+  delete a;
+  std::filesystem::remove_all(root);
+}
+
+TEST(CorfuStorageTest, trimmer_two_cycles) {
+  SKIP_IF_NO_CORFU();
+  std::string stream = CorfuStorageEnv::uniqueStream("corfu_trimmer");
+  std::string root = checkpointRoot("trimmer");
+  FileStorage store(root);
+  CorfuDBStorage* a = makeStorage(stream);
+  long c1 = -1, c2 = -1;
+  {
+    LogTrimmer::Options options;
+    options.dir = "checkpoint";
+    options.interval_ms = 3600 * 1000;  // never fires on its own here
+    options.min_entries = 10;
+    options.keep = 2;
+    options.creator = "test";
+    LogTrimmer trimmer(a, &store, options);
+
+    // Nothing to checkpoint yet.
+    EXPECT_FALSE(trimmer.runCycle(false));
+
+    appendN(a, "f", 0, 20);
+    ASSERT_TRUE(trimmer.runCycle(false));
+    c1 = trimmer.lastCheckpointAddr();
+    EXPECT_GE(c1, 0);
+    EXPECT_EQ(-1, trimmer.lastTrimAddr());  // first cycle trims nothing
+    EXPECT_EQ(1u, trimmer.checkpointsKept());
+
+    appendN(a, "f", 20, 40);
+    ASSERT_TRUE(trimmer.runCycle(false));
+    c2 = trimmer.lastCheckpointAddr();
+    EXPECT_GT(c2, c1);
+    EXPECT_EQ(c1, trimmer.lastTrimAddr());  // trimmed behind the PREVIOUS one
+    EXPECT_EQ(c1 + 1, a->trimMark());
+    EXPECT_EQ(2u, trimmer.checkpointsKept());
+
+    // Too little since the last checkpoint: no cycle.
+    EXPECT_FALSE(trimmer.runCycle(false));
+
+    appendN(a, "f", 40, 60);
+    ASSERT_TRUE(trimmer.runCycle(true));
+    EXPECT_EQ(2u, trimmer.checkpointsKept());
+    EXPECT_EQ(c2, trimmer.lastTrimAddr());
+    checkpoint::State gone;
+    EXPECT_NE(Status::kSuccess, checkpoint::read(store, "checkpoint", c1, gone));
+    checkpoint::State kept;
+    EXPECT_EQ(Status::kSuccess, checkpoint::read(store, "checkpoint", c2, kept));
+  }
+  // A restarted trimmer picks the chain up from LATEST.
+  {
+    LogTrimmer::Options options;
+    options.dir = "checkpoint";
+    options.min_entries = 10;
+    LogTrimmer again(a, &store, options);
+    EXPECT_GT(again.lastCheckpointAddr(), c2);
+    EXPECT_EQ(2u, again.checkpointsKept());
+  }
+  CorfuDBStorage* b = makeStorageWithStore(stream, &store);
+  EXPECT_TRUE(b->loadedFromCheckpoint());
+  EXPECT_EQ(240u, readAll(b, "f").size());
+  EXPECT_EQ(readAll(a, "f"), readAll(b, "f"));
+  delete b;
+  delete a;
+  std::filesystem::remove_all(root);
 }
 
 #endif  // OZONEDB_ENABLE_CORFU

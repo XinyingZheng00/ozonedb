@@ -69,30 +69,49 @@ nodes:
 
   # CorfuDB
   log:
-    ssh: "amd215.utah.cloudlab.us"
+    ssh: "amd127.utah.cloudlab.us"
     lan: "10.10.1.1"
 
   # Object Store
   store:
-    ssh: "amd215.utah.cloudlab.us"
+    ssh: "amd127.utah.cloudlab.us"
     lan: "10.10.1.1"
 
   clients:
-    # clients[0] runs the writers, clients[1] runs the isolated reader
-    # (run_visibility_cross_node.sh). With a two-node reservation the
-    # reader shares amd215 with corfu_server and MinIO: fine for the miss
-    # count, which is clock-free, but read latency there carries their
-    # noise. Put the reader on its own machine before quoting tail numbers.
-    - ssh: "amd211.utah.cloudlab.us"
+    - ssh: "amd160.utah.cloudlab.us"
       lan: "10.10.1.2"
-    - ssh: "amd215.utah.cloudlab.us"
-      lan: "10.10.1.1"
+    - ssh: "amd126.utah.cloudlab.us"
+      lan: "10.10.1.3"
+    - ssh: "amd138.utah.cloudlab.us"
+      lan: "10.10.1.4"
+    - ssh: "amd135.utah.cloudlab.us"
+      lan: "10.10.1.5"
+    - ssh: "amd166.utah.cloudlab.us"
+      lan: "10.10.1.6"
+    - ssh: "amd146.utah.cloudlab.us"
+      lan: "10.10.1.7"
+    - ssh: "amd159.utah.cloudlab.us"
+      lan: "10.10.1.8"
+    - ssh: "amd133.utah.cloudlab.us"
+      lan: "10.10.1.9"
 
 # ------------------------------------------------------------------ corfu --
 corfu:
   port: 9090
   stream_name: "ozonedb-ycsb"
   jvm_opts: "-Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100 --add-opens=java.base/java.util=ALL-UNNAMED"
+  # Log trimming (PLAN-trimming.md). Prefer --log-trim on
+  # load_local_ycsb_multiproc.py / run_local_ycsb_multiproc.py /
+  # run_multinode_ycsb.py over `enabled: true` here: the flag needs no sync
+  # to every client. Only global writer 0 gets log_trim_enabled=true in its
+  # generated config; every writer loads the newest checkpoint at open. The
+  # checkpoint lives in the SSTable bucket under <sstable_dir>/checkpoint/,
+  # so a load snapshot must copy the bucket AND the Corfu log dir together.
+  log_trim:
+    enabled: false
+    interval_ms: 30000
+    min_entries: 100000
+    keep_checkpoints: 2
   # Read mode: leave unset here. Pass --linearizable to
   # run_multinode_ycsb_with_corfu.sh / run_multinode_ycsb.py /
   # run_local_ycsb_multiproc.py (or consistency.py): it sets

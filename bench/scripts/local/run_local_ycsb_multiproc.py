@@ -15,6 +15,7 @@ from load_local_ycsb_multiproc import (
     _java_binary,
     YCSB_DB_CLASSNAMES,
     linearizable_corfu_settings,
+    log_trim_corfu_settings,
     partition_records,
     result_label,
     spawn_parallel,
@@ -368,6 +369,14 @@ if __name__ == "__main__":
              "labelled ozonedb-corfu-linearizable instead of ozonedb-corfu. Prefer this over "
              "toggling corfu.linearizable_reads in ycsb.yaml.",
     )
+    parser.add_argument(
+        "--log-trim",
+        action="store_true",
+        help="Log trimming (ozonedb-corfu only): global writer 0 checkpoints the Corfu "
+             "stream to the SSTable bucket every corfu.log_trim.interval_ms and trims "
+             "behind the checkpoint. Every writer loads the newest checkpoint at open. "
+             "Prefer this over toggling corfu.log_trim.enabled in ycsb.yaml.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -400,6 +409,8 @@ if __name__ == "__main__":
         else run_config.get("total_writers", num_writers)
     )
     corfu_settings = config.get("corfu")
+    if args.log_trim:
+        corfu_settings = log_trim_corfu_settings(corfu_settings)
     s3_settings = config.get("s3")
     max_exec_time = (
         args.max_exec_time
@@ -415,7 +426,8 @@ if __name__ == "__main__":
     print(
         f"Launching {num_writers} parallel runner processes "
         f"(offset={offset}, total_writers={total_writers}, trial={trial}, "
-        f"read_mode={'linearizable' if args.linearizable else 'default'})"
+        f"read_mode={'linearizable' if args.linearizable else 'default'}, "
+        f"log_trim={'on' if args.log_trim else 'yaml'})"
     )
     run_ycsb(
         workload_names,

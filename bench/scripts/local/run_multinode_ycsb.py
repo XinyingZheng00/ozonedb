@@ -171,7 +171,7 @@ def host_log_name(host, log_dir):
 
 def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          total_writers, workloads, trial, max_exec_time=None,
-                         linearizable=False):
+                         linearizable=False, log_trim=False):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -191,6 +191,7 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--trial", str(trial)] if trial is not None else [])
             + (["--max_exec_time", str(int(max_exec_time))] if max_exec_time else [])
             + (["--linearizable"] if linearizable else [])
+            + (["--log-trim"] if log_trim else [])
         ),
     ]
     return " && ".join(parts)
@@ -325,6 +326,12 @@ def main():
              "result files are labelled ozonedb-corfu-linearizable.",
     )
     parser.add_argument(
+        "--log-trim",
+        action="store_true",
+        help="Log trimming: forwarded to every host's run_local_ycsb_multiproc.py; "
+             "global writer 0 (first writer on the first host) runs the trimmer.",
+    )
+    parser.add_argument(
         "--run_tag",
         help="Tag for results dir; defaults to YYYYmmdd-HHMMSS. All hosts share this tag.",
     )
@@ -409,6 +416,7 @@ def main():
             "$OZONEDB_HOME", run_tag, plan[0]["offset"], plan[0]["writers"],
             total_writers, args.workloads, trial,
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
+            log_trim=args.log_trim,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         print("[orchestrator] --dry_run: not launching.")
@@ -427,6 +435,7 @@ def main():
             remote_home, run_tag, p["offset"], p["writers"],
             total_writers, args.workloads, trial,
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
+            log_trim=args.log_trim,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

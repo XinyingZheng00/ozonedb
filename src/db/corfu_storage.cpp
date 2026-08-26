@@ -40,7 +40,9 @@ CorfuDBStorage::CorfuDBStorage(std::string const& endpoint,
                                std::string const& jar_path,
                                std::string const& jvm_opts,
                                std::string const& stream_name,
-                               std::string const& db_path)
+                               std::string const& db_path,
+                               Storage* checkpoint_store,
+                               std::string const& checkpoint_dir)
     : Storage(db_path) {
   {
     std::random_device rd;
@@ -51,10 +53,11 @@ CorfuDBStorage::CorfuDBStorage(std::string const& endpoint,
   startJvm(jar_path, jvm_opts);
   loadBridge(endpoint, stream_name);
   last_commited_time_ = std::chrono::system_clock::now();
-  // Synchronously replay all existing stream entries before returning so
-  // reads issued immediately after construction (e.g. by DB::openDB ->
-  // rollForwardMetadataLog) see prior state.
-  drainInitialEntries();
+  // Synchronously bring local state up to the stream tail before returning
+  // so reads issued immediately after construction (e.g. by DB::openDB ->
+  // rollForwardMetadataLog) see prior state: newest checkpoint first when
+  // a store is given, then the entries above it.
+  bootstrap(checkpoint_store, checkpoint_dir);
   running_ = true;
   tailer_thread_ = std::thread(&CorfuDBStorage::tailerLoop, this);
   // Dispatch thread must be running by the time the tailer starts
@@ -201,9 +204,13 @@ void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& 
   mid_pollBatch_ = env->GetMethodID(bridge_class_global_, "pollBatch", "(JI)[B");
   mid_tailAddress_ = env->GetMethodID(bridge_class_global_, "tailAddress", "()J");
   mid_gcPollView_ = env->GetMethodID(bridge_class_global_, "gcPollView", "(J)V");
+  mid_prefixTrim_ = env->GetMethodID(bridge_class_global_, "prefixTrim", "(J)J");
+  mid_trimMark_ = env->GetMethodID(bridge_class_global_, "trimMark", "()J");
+  mid_seekPollView_ = env->GetMethodID(bridge_class_global_, "seekPollView", "(J)V");
   mid_close_ = env->GetMethodID(bridge_class_global_, "close", "()V");
   if (!mid_append_ || !mid_pollNext_ || !mid_pollBatch_ || !mid_tailAddress_ ||
-      !mid_gcPollView_ || !mid_close_) {
+      !mid_gcPollView_ || !mid_prefixTrim_ || !mid_trimMark_ ||
+      !mid_seekPollView_ || !mid_close_) {
     throw std::runtime_error("CorfuBridge method lookup failed");
   }
 }
@@ -341,6 +348,18 @@ bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
           listener_snapshot = remote_listener_;
         }
         break;
+      case ::CorfuEntry_Op_TRIM: {
+        // Bookkeeping only: no file changes. Own entries included (the
+        // trimmer's own process must see its marker too), max is idempotent.
+        long x = -1;
+        try {
+          x = std::stol(entry.payload());
+        } catch (std::exception const&) {
+          std::cerr << "[corfu] TRIM entry at " << addr << " has no address payload\n";
+        }
+        if (x > trim_marker_addr_) trim_marker_addr_ = x;
+        break;
+      }
     }
     last_applied_addr_.store(addr, std::memory_order_release);
     // Enqueue while still holding mtx_ so "listener check" and
@@ -424,9 +443,9 @@ int CorfuDBStorage::applyBatchFromJava(JNIEnv* env, jbyteArray jbuf) {
   return applied;
 }
 
-void CorfuDBStorage::drainInitialEntries() {
+CorfuDBStorage::DrainResult CorfuDBStorage::drainInitialEntries() {
   JNIEnv* env = attachThread();
-  if (!env) return;
+  if (!env) return DrainResult::kError;
   // Same batch path as the tailer (pollBatch + applyBatchFromJava). A
   // zero timeout makes pollBatch return null as soon as the stream view
   // has nothing ready and the batch is empty, i.e. at the current tail.
@@ -434,8 +453,11 @@ void CorfuDBStorage::drainInitialEntries() {
   auto const t0 = clock::now();
   long drained = 0;
   long batches = 0;
+  long long stream_bytes = 0;  // raw pollBatch bytes: every entry, live or dead
   long long poll_us = 0;   // inside CorfuBridge.pollBatch (stream read + payload decode)
   long long apply_us = 0;  // applyBatchFromJava (JNI copy + protobuf parse + apply under mtx_)
+  bool trimmed = false;
+  bool failed = false;
   while (true) {
     auto const tp = clock::now();
     jbyteArray jbuf = static_cast<jbyteArray>(
@@ -445,20 +467,295 @@ void CorfuDBStorage::drainInitialEntries() {
     auto const ta = clock::now();
     poll_us += std::chrono::duration_cast<std::chrono::microseconds>(ta - tp).count();
     if (env->ExceptionCheck()) {
+      // A Java exception other than TrimmedException (the bridge turns
+      // that one into the marker). The state is partial; say so.
       env->ExceptionDescribe();
       env->ExceptionClear();
+      failed = true;
       break;
     }
     if (jbuf == nullptr) break;
+    jsize len = env->GetArrayLength(jbuf);
+    if (len == 0) {
+      // The bridge's TRIMMED marker: the next address is below the trim
+      // mark. Nothing applied from this call.
+      env->DeleteLocalRef(jbuf);
+      trimmed = true;
+      break;
+    }
+    stream_bytes += len;
     drained += applyBatchFromJava(env, jbuf);
     apply_us += std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - ta).count();
     ++batches;
   }
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+  // Live fraction: what a checkpoint would carry. Top-level files (no '/'
+  // in the name: metadata.log, task.log) are listed by name because they
+  // grow across checkpoints and their size is the one to watch.
+  size_t live_files = 0, live_bytes = 0;
+  std::string top_level;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    live_files = file_buffers_.size();
+    for (auto const& kv : file_buffers_) {
+      live_bytes += kv.second.size();
+      if (kv.first.find('/') == std::string::npos) {
+        top_level += (top_level.empty() ? "" : ",") + kv.first + ":" +
+                     std::to_string(kv.second.size());
+      }
+    }
+  }
   std::cerr << "[corfu] initial replay drained " << drained << " entries in "
             << batches << " batches, " << ms << " ms"
             << (ms > 0 ? " (" + std::to_string(drained * 1000 / ms) + " entries/s)" : "")
-            << "; poll " << poll_us / 1000 << " ms, apply " << apply_us / 1000 << " ms\n";
+            << "; poll " << poll_us / 1000 << " ms, apply " << apply_us / 1000 << " ms"
+            << "; stream_MB=" << (stream_bytes >> 20)
+            << " live_files=" << live_files
+            << " live_MB=" << (live_bytes >> 20)
+            << " top_level={" << top_level << "}"
+            << " applied_addr=" << last_applied_addr_.load(std::memory_order_acquire)
+            << (trimmed ? " TRIMMED" : "") << (failed ? " ERROR" : "") << "\n";
+  if (failed) return DrainResult::kError;
+  return trimmed ? DrainResult::kTrimmed : DrainResult::kOk;
+}
+
+void CorfuDBStorage::resetStateLocked() {
+  file_buffers_.clear();
+  sealed_files_.clear();
+  sealed_at_addr_.clear();
+  removed_files_.clear();
+  last_applied_addr_.store(-1, std::memory_order_release);
+  loaded_from_checkpoint_ = false;
+  trim_marker_addr_ = -1;
+}
+
+long CorfuDBStorage::appendTrimMarker(long addr) {
+  JNIEnv* env = attachThread();
+  if (!env) return -1;
+  std::string payload = std::to_string(addr);
+  return jniAppendEntry(env, ".trim", ::CorfuEntry_Op_TRIM,
+                        reinterpret_cast<unsigned char const*>(payload.data()),
+                        static_cast<int>(payload.size()));
+}
+
+void CorfuDBStorage::restoreSnapshot(checkpoint::State&& state) {
+  std::lock_guard<std::mutex> lk(mtx_);
+  file_buffers_ = std::move(state.files);
+  for (auto const& kv : state.sealed) {
+    sealed_files_.insert(kv.first);
+    if (kv.second >= 0) sealed_at_addr_[kv.first] = kv.second;
+  }
+  removed_files_ = std::move(state.removed);
+  last_applied_addr_.store(state.covered_addr, std::memory_order_release);
+  loaded_from_checkpoint_ = true;
+}
+
+bool CorfuDBStorage::seekPollView(long addr) {
+  JNIEnv* env = attachThread();
+  if (!env) return false;
+  env->CallVoidMethod(bridge_global_, mid_seekPollView_, static_cast<jlong>(addr));
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    return false;
+  }
+  return true;
+}
+
+// Constructor-time replay (PLAN-trimming.md §3.5).
+//
+// 1. Load the newest checkpoint C from the store, when there is one, and
+//    seek the poll view to C + 1. Without a store, or without a
+//    checkpoint, start at 0.
+// 2. Drain to the tail. A TRIMMED marker means the trim mark passed our
+//    start address while we were loading (two trim cycles ran); reload
+//    the newest checkpoint and try again, a bounded number of times.
+// 3. Two completeness checks, both per stream and both restart-proof:
+//    a. A checkpoint C must not be AHEAD of the log: the stream tail the
+//       sequencer reports must be >= C. Otherwise the log is an older
+//       copy than the bucket (or a fresh log), and new appends would land
+//       BELOW the poll view's position, invisible to this process forever.
+//    b. The replay must not cross a TRIM entry with X >= start. The
+//       trimmer appends TRIM(X) to the stream right before prefixTrim(X),
+//       so a process that replays from S and meets X >= S has lost part
+//       of its history: no checkpoint store, a wiped bucket, or a bucket
+//       older than the log dir. The log unit's own trim mark is not used
+//       here: it is global, so a fresh stream on a server trimmed for
+//       another stream would be refused for nothing; and the sequencer's
+//       per-stream mark is in memory only.
+void CorfuDBStorage::bootstrap(Storage* checkpoint_store, std::string const& checkpoint_dir) {
+  constexpr int kMaxAttempts = 3;
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      resetStateLocked();
+    }
+    long start = 0;  // first address this replay covers
+    if (checkpoint_store != nullptr) {
+      checkpoint::State state;
+      bool found = false;
+      Status s = checkpoint::readLatest(*checkpoint_store, checkpoint_dir, state, found);
+      if (s != Status::kSuccess) {
+        throw std::runtime_error("[corfu] bootstrap: the checkpoint store holds a LATEST "
+                                 "that cannot be read (dir " + checkpoint_dir + ")");
+      }
+      if (found) {
+        long tail = streamTail();
+        if (tail < state.covered_addr) {
+          throw std::runtime_error(
+              "[corfu] bootstrap: checkpoint C=" + std::to_string(state.covered_addr) +
+              " is ahead of the log (stream tail " + std::to_string(tail) +
+              "): the log dir is older than the bucket, or was restored empty");
+        }
+        start = state.covered_addr + 1;
+        std::cerr << "[corfu] restoring checkpoint C=" << state.covered_addr
+                  << " files=" << state.files.size()
+                  << " live_MB=" << (state.liveBytes() >> 20)
+                  << " sealed=" << state.sealed.size()
+                  << " removed=" << state.removed.size()
+                  << " stream_tail=" << tail << "\n";
+        restoreSnapshot(std::move(state));
+      }
+    }
+    if (!seekPollView(start)) {
+      throw std::runtime_error("[corfu] bootstrap: seekPollView(" + std::to_string(start) + ") failed");
+    }
+    DrainResult drained = drainInitialEntries();
+    if (drained == DrainResult::kError) {
+      throw std::runtime_error("[corfu] bootstrap: the replay from address " +
+                               std::to_string(start) + " failed with a Corfu error; refusing "
+                               "to serve a partial state");
+    }
+    if (drained == DrainResult::kTrimmed) {
+      std::cerr << "[corfu] bootstrap: replay from " << start
+                << " hit the trim mark (attempt " << attempt + 1 << " of "
+                << kMaxAttempts << "); reloading the newest checkpoint\n";
+      continue;
+    }
+    long marker = -1;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      marker = trim_marker_addr_;
+    }
+    if (marker >= start) {
+      throw std::runtime_error(
+          "[corfu] bootstrap: the stream records a trim of every entry up to address " +
+          std::to_string(marker) + " but this replay started at " + std::to_string(start) +
+          ": no checkpoint covers the trimmed prefix (checkpoint store " +
+          (checkpoint_store ? "present, dir " + checkpoint_dir : std::string("absent")) + ")");
+    }
+    return;
+  }
+  throw std::runtime_error("[corfu] bootstrap: the trim mark passed the newest checkpoint " +
+                           std::to_string(kMaxAttempts) + " times in a row");
+}
+
+void CorfuDBStorage::failStop(char const* why) {
+  long mark = trimMark();
+  std::cerr << "[corfu] FAIL-STOP: " << why
+            << " applied=" << last_applied_addr_.load(std::memory_order_acquire)
+            << " written=" << last_written_addr_.load(std::memory_order_acquire)
+            << " trim_mark=" << mark
+            << ". This process fell more than one trim cycle behind the log; "
+               "every write now fails and every read misses. Restart it.\n";
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    trimmed_out_.store(true);
+    for (auto& kv : pending_) {
+      for (auto const& batch : kv.second) {
+        if (batch->done) continue;
+        batch->result = Status::kFailure;
+        batch->done = true;
+      }
+    }
+    pending_.clear();
+    for (auto& kv : cached_batch_) {
+      if (kv.second->done) continue;
+      kv.second->result = Status::kFailure;
+      kv.second->done = true;
+    }
+    cached_batch_.clear();
+    cached_file_.clear();
+  }
+  tailer_cv_.notify_all();
+  batch_flushed_cv_.notify_all();
+}
+
+checkpoint::State CorfuDBStorage::takeSnapshot() {
+  checkpoint::State state;
+  // Exclusive gate: no local batch is between "sequenced" and "stamped"
+  // (see write_gate_). Writers queue behind us for the copy only.
+  std::unique_lock<std::shared_mutex> gate(write_gate_);
+  std::unique_lock<std::mutex> lock(mtx_);
+  if (trimmed_out_.load()) return state;
+  // Every local write is already stamped and spliced; the tailer still
+  // has to pass them so last_applied_addr_ names a prefix that contains
+  // them. Local writes are all sequenced, so this wait is the tailer's
+  // lag only, not a wait for new traffic.
+  long target = last_written_addr_.load(std::memory_order_acquire);
+  constexpr auto kWait = std::chrono::seconds(10);
+  bool reached = tailer_cv_.wait_for(lock, kWait, [&] {
+    return !running_ || trimmed_out_.load() ||
+           last_applied_addr_.load(std::memory_order_acquire) >= target;
+  });
+  if (!reached || trimmed_out_.load()) return state;
+  // Every push into pending_ happens under the shared gate, and its
+  // thread settles the batch before it lets go. An unsettled batch here
+  // is impossible; refuse rather than guess.
+  for (auto const& kv : pending_) {
+    for (auto const& batch : kv.second) {
+      if (!batch->done) {
+        std::cerr << "[corfu] takeSnapshot: unsettled batch under the gate for "
+                  << kv.first << " at " << batch->addr << "; refusing\n";
+        return state;
+      }
+    }
+  }
+  long covered = last_applied_addr_.load(std::memory_order_acquire);
+  if (covered < 0) return state;
+  state.covered_addr = covered;
+  state.files = file_buffers_;
+  for (auto const& name : sealed_files_) {
+    auto sit = sealed_at_addr_.find(name);
+    state.sealed[name] = sit == sealed_at_addr_.end() ? -1 : sit->second;
+  }
+  state.removed = removed_files_;
+  return state;
+}
+
+bool CorfuDBStorage::prefixTrim(long addr) {
+  if (addr < 0) return false;
+  JNIEnv* env = attachThread();
+  if (!env) return false;
+  // The marker goes in BEFORE the trim, so no process can observe a
+  // trimmed stream without also being able to observe the marker.
+  if (appendTrimMarker(addr) < 0) {
+    std::cerr << "[corfu] prefixTrim(" << addr << "): TRIM marker append failed; not trimming\n";
+    return false;
+  }
+  env->CallLongMethod(bridge_global_, mid_prefixTrim_, static_cast<jlong>(addr));
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    return false;
+  }
+  return true;
+}
+
+long CorfuDBStorage::trimMark() {
+  JNIEnv* env = attachThread();
+  if (!env) return -1;
+  jlong mark = env->CallLongMethod(bridge_global_, mid_trimMark_);
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    return -1;
+  }
+  return static_cast<long>(mark);
+}
+
+long CorfuDBStorage::streamTail() {
+  return globalFenceTarget();
 }
 
 void CorfuDBStorage::tailerLoop() {
@@ -507,6 +804,15 @@ void CorfuDBStorage::tailerLoop() {
       env->ExceptionDescribe();
       env->ExceptionClear();
       continue;
+    }
+    if (jbuf != nullptr && env->GetArrayLength(jbuf) == 0) {
+      // TRIMMED marker (see CorfuBridge): the next address this tailer
+      // needs is gone. Skipping it would build a state that no other
+      // process has, so stop instead. The thread exits; the destructor's
+      // join still returns because running_ is left alone.
+      env->DeleteLocalRef(jbuf);
+      failStop("tailer hit the trim mark");
+      break;
     }
     if (jbuf != nullptr) {
       int applied = applyBatchFromJava(env, jbuf);
@@ -654,9 +960,10 @@ long CorfuDBStorage::globalFenceTarget() {
 void CorfuDBStorage::waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target) {
   constexpr auto kFenceTimeout = std::chrono::seconds(10);
   bool reached = tailer_cv_.wait_for(lock, kFenceTimeout, [&] {
-    return !running_ || last_applied_addr_.load(std::memory_order_acquire) >= target;
+    return !running_ || trimmed_out_.load() ||
+           last_applied_addr_.load(std::memory_order_acquire) >= target;
   });
-  if (!reached) {
+  if (!reached && !trimmed_out_.load()) {
     std::cerr << "[corfu] fence timed out: target=" << target
               << " applied=" << last_applied_addr_.load(std::memory_order_acquire)
               << " (target is probably not on this stream)\n";
@@ -760,6 +1067,13 @@ void CorfuDBStorage::finishBatchLocked(std::string const& fileName,
 // the tailer, or writers on other files.
 Status CorfuDBStorage::submitBatch(std::string const& fileName,
                                    std::shared_ptr<Batch> const& batch) {
+  // The caller holds write_gate_ shared (taken before the batch entered
+  // pending_), so a snapshot never observes a sequenced-but-unstamped batch.
+  if (trimmed_out_.load()) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    finishBatchLocked(fileName, batch, Status::kFailure);
+    return Status::kFailure;
+  }
   JNIEnv* env = attachThread();
   long addr = -1;
   if (env) {
@@ -825,6 +1139,7 @@ Status CorfuDBStorage::awaitBatch(std::shared_ptr<Batch> const& batch) {
 // wait for the splice. read()/size() call this so they can serve
 // file_buffers_ alone — see the read() comment for why that matters.
 void CorfuDBStorage::drainForRead(std::string const& fileName) {
+  std::shared_lock<std::shared_mutex> gate(write_gate_);  // before any push
   constexpr int kMaxRounds = 64;
   for (int round = 0; round < kMaxRounds; ++round) {
     std::shared_ptr<Batch> to_submit;
@@ -851,6 +1166,7 @@ Status CorfuDBStorage::append(std::string const& fileName, unsigned char* const&
   // Synchronous single-payload append: one batch, submitted immediately.
   // submitBatch returns only after the bytes are sequenced AND spliced
   // into file_buffers_, so an append that returns kSuccess is readable.
+  std::shared_lock<std::shared_mutex> gate(write_gate_);  // before the push
   auto batch = std::make_shared<Batch>();
   {
     std::lock_guard<std::mutex> lk(mtx_);
@@ -881,6 +1197,7 @@ Status CorfuDBStorage::appendInBatch(std::string const& fileName, unsigned char*
   // sequence.
   std::shared_ptr<Batch> mine;
   std::shared_ptr<Batch> to_submit;
+  std::shared_lock<std::shared_mutex> gate(write_gate_);  // before the push
   {
     std::unique_lock<std::mutex> lock(mtx_);
     if (sealed_files_.count(fileName)) return Status::kSealed;
@@ -928,6 +1245,7 @@ Status CorfuDBStorage::appendInBatch(std::string const& fileName, unsigned char*
 
 Status CorfuDBStorage::flush(std::string const& fileName) {
   std::shared_ptr<Batch> to_submit;
+  std::shared_lock<std::shared_mutex> gate(write_gate_);  // before the push
   {
     std::lock_guard<std::mutex> lk(mtx_);
     to_submit = takeCachedBatchLocked(fileName);
@@ -959,6 +1277,7 @@ Status CorfuDBStorage::flush(std::string const& fileName) {
 // bytes that are still in cached_file_. drainForRead flushes those, so a
 // read still sees them — it just pays a JNI round-trip to do it.
 Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, size_t& size) {
+  if (trimmed_out_.load()) return Status::kNotFound;
   drainForRead(fileName);
   long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
@@ -975,6 +1294,7 @@ Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, s
 }
 
 Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) {
+  if (trimmed_out_.load()) return Status::kNotFound;
   drainForRead(fileName);
   long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
@@ -990,6 +1310,7 @@ Status CorfuDBStorage::read(std::string const& fileName, unsigned char*& data, s
 }
 
 size_t CorfuDBStorage::size(std::string fileName) {
+  if (trimmed_out_.load()) return 0;
   drainForRead(fileName);
   long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
@@ -1000,6 +1321,10 @@ size_t CorfuDBStorage::size(std::string fileName) {
 }
 
 void CorfuDBStorage::seal(std::string fileName) {
+  // One shared hold of the gate for the pre-seal flush AND the SEAL entry
+  // (write_gate_: taken before anything enters pending_).
+  std::shared_lock<std::shared_mutex> gate(write_gate_);
+  if (trimmed_out_.load()) return;
   // Pre-seal flush: drain every batched byte BEFORE the SEAL marker, and
   // wait for it to sequence, so the seal lands at a HIGHER global address
   // than our own bytes. submitBatch enforces the address rule, so a
@@ -1045,6 +1370,7 @@ void CorfuDBStorage::seal(std::string fileName) {
 }
 
 bool CorfuDBStorage::isSealed(std::string fileName) {
+  if (trimmed_out_.load()) return false;
   long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);
@@ -1052,6 +1378,8 @@ bool CorfuDBStorage::isSealed(std::string fileName) {
 }
 
 void CorfuDBStorage::remove(std::string fileName) {
+  std::shared_lock<std::shared_mutex> gate(write_gate_);
+  if (trimmed_out_.load()) return;
   JNIEnv* env = attachThread();
   if (!env) return;
   long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_REMOVE, nullptr, 0);
@@ -1089,6 +1417,7 @@ void CorfuDBStorage::remove(std::string fileName) {
 }
 
 bool CorfuDBStorage::exist(std::string fileName) {
+  if (trimmed_out_.load()) return false;
   long target = fenceTargetForCaller();
   std::unique_lock<std::mutex> lock(mtx_);
   waitForTailerLocked(lock, target);

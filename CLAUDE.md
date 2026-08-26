@@ -240,6 +240,19 @@ listener synchronously** — a dedicated dispatch thread does, because the liste
 `LRUCache` mutex that a foreground thread may hold while fencing on the tailer. Preserve that
 separation when touching `corfu_storage.cpp`.
 
+**Checkpoints and trimming** (`PLAN-trimming.md`). A process with `log_trim_enabled = true`
+runs a `LogTrimmer` (`src/db/log_trimmer.cpp`): every `log_trim_interval_ms` it takes an
+exact snapshot of the live log state at one address `C` (`CorfuDBStorage::takeSnapshot`, which
+holds `write_gate_` exclusively — every local submit path holds it shared, never twice on one
+thread), writes it to `sstable_storage` under `<sstable_dir>/checkpoint/<C>/` with `LATEST`
+written last (`src/db/checkpoint.cpp`), appends a `TRIM` entry, then `prefixTrim`s behind the
+*previous* checkpoint. Every process, trimmer or not, loads `LATEST` at open and seeks the
+stream to `C+1` (`bootstrap`), so the replay is bounded by one trim interval. `bootstrap`
+throws when the checkpoint is ahead of the log or when the replay crosses a `TRIM` entry it
+did not cover: the Corfu log dir and the bucket are one unit and must be snapshotted and
+restored together. `DB::DB` builds `sstable_storage` before `log_storage` for this reason.
+A member whose tailer falls below the trim mark fail-stops (`trimmed_out_`).
+
 ### Config
 
 One flat JSON file per DB instance, parsed by `Metadata` (`metadata.h`) via `parseJSON`, which

@@ -104,6 +104,20 @@ class Metadata {
   // sequenced in the log before it acks; see CorfuDBStorage::sync_mode_).
   bool linearizable_reads = false;
 
+  // Log trimming (PLAN-trimming.md). When log_trim_enabled is true THIS
+  // process runs a LogTrimmer: every log_trim_interval_ms it writes a
+  // checkpoint of the live log state to sstable_storage under
+  // <sstable_dir>/<checkpoint_dir>/ and trims the Corfu stream behind the
+  // previous checkpoint. One process per cluster is enough. Every process,
+  // trimmer or not, loads the newest checkpoint at open when one exists.
+  // Requires backend = corfu and a separate sstable_backend: a checkpoint
+  // written into the log being trimmed would be trimmed with it.
+  bool log_trim_enabled = false;
+  uint64_t log_trim_interval_ms = 30000;
+  uint64_t log_trim_min_entries = 100000;
+  int log_trim_keep_checkpoints = 2;
+  std::string checkpoint_dir = "checkpoint";
+
   /**
    * @brief Local Metadata, read from local config file
    *
@@ -225,6 +239,30 @@ class Metadata {
           "mutually exclusive (one demands a fence per get, the other skips "
           "it)");
     }
+
+    auto lt_it = result.find("log_trim_enabled");
+    if (lt_it != result.end()) {
+      log_trim_enabled = (lt_it->second == "true" || lt_it->second == "1");
+    }
+    if (auto it = result.find("log_trim_interval_ms"); it != result.end()) {
+      log_trim_interval_ms = std::stoull(it->second);
+    }
+    if (auto it = result.find("log_trim_min_entries"); it != result.end()) {
+      log_trim_min_entries = std::stoull(it->second);
+    }
+    if (auto it = result.find("log_trim_keep_checkpoints"); it != result.end()) {
+      log_trim_keep_checkpoints = std::stoi(it->second);
+    }
+    if (auto it = result.find("checkpoint_dir"); it != result.end() && !it->second.empty()) {
+      checkpoint_dir = it->second;
+    }
+    if (log_trim_enabled &&
+        (backend_kind != BackendKind::kCorfu || !sstable_backend_set)) {
+      throw std::runtime_error(
+          "config error: log_trim_enabled needs backend=corfu and a separate "
+          "sstable_backend (the checkpoint must not live in the log it trims)");
+    }
+    if (log_trim_keep_checkpoints < 2) log_trim_keep_checkpoints = 2;
 
     // std::cout<<shared_config_path<<std::endl;
     // std::cout << "DBpath: " << DBpath << std::endl;

@@ -1,6 +1,7 @@
 #ifndef CORFU_STORAGE_H
 #define CORFU_STORAGE_H
 #ifdef OZONEDB_ENABLE_CORFU
+#include "checkpoint.h"
 #include "storage.h"
 #include <atomic>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -38,11 +40,18 @@ namespace ozonedb {
  */
 class CorfuDBStorage : public Storage {
  public:
+  // checkpoint_store: where LogTrimmer writes checkpoints (the SSTable
+  // object store). When non-null, the constructor loads the newest
+  // checkpoint from <checkpoint_dir>/LATEST and replays only the stream
+  // entries above it. When null, it replays from address 0 -- and throws
+  // if the log was trimmed, because no replay can then be complete.
   CorfuDBStorage(std::string const& endpoint,
                  std::string const& jar_path,
                  std::string const& jvm_opts,
                  std::string const& stream_name,
-                 std::string const& db_path);
+                 std::string const& db_path,
+                 Storage* checkpoint_store = nullptr,
+                 std::string const& checkpoint_dir = "checkpoint");
   ~CorfuDBStorage();
 
   void createDirectory(std::string name) override;
@@ -76,6 +85,30 @@ class CorfuDBStorage : public Storage {
 
   long lastAppendAddressForThread() const override { return last_append_addr_; }
 
+  // --- checkpoints and trimming (PLAN-trimming.md §3) ---
+  //
+  // The exact live state at one address, for LogTrimmer. Takes write_gate_
+  // exclusively, waits until the tailer has passed this process's own last
+  // write, and copies file_buffers_ + the sealed/removed sets under mtx_.
+  // covered_addr is -1 when no exact state could be taken (tailer stalled,
+  // or the storage fail-stopped).
+  checkpoint::State takeSnapshot();
+  // Corfu prefixTrim(addr) + log-unit compaction. False on a JNI error.
+  bool prefixTrim(long addr);
+  // First untrimmed address as persisted by the log units; -1 on error.
+  long trimMark();
+  // Tail of this stream (max of the sequencer's per-stream tail and our
+  // own last write). One sequencer round-trip.
+  long streamTail();
+  // True once the tailer hit a trimmed address (it fell more than one
+  // trim cycle behind). Every write then fails and every read misses.
+  bool trimmedOut() const { return trimmed_out_.load(); }
+  long lastAppliedAddr() const { return last_applied_addr_.load(std::memory_order_acquire); }
+  bool loadedFromCheckpoint() const { return loaded_from_checkpoint_; }
+  // Detach the calling thread from the JVM. A thread that made JNI calls
+  // (LogTrimmer's) must call this before it exits.
+  void detachThread();
+
   void setRemoteAppendListener(RemoteAppendListener listener) override {
     bool cleared;
     {
@@ -105,6 +138,9 @@ class CorfuDBStorage : public Storage {
   jmethodID mid_pollBatch_ = nullptr;
   jmethodID mid_tailAddress_ = nullptr;
   jmethodID mid_gcPollView_ = nullptr;
+  jmethodID mid_prefixTrim_ = nullptr;
+  jmethodID mid_trimMark_ = nullptr;
+  jmethodID mid_seekPollView_ = nullptr;
   jmethodID mid_close_ = nullptr;
 
   // Per-file reconstructed state (populated by tailer)
@@ -163,6 +199,38 @@ class CorfuDBStorage : public Storage {
   // same rule, in applyEntryBytes for peer entries and in submitBatch for
   // our own, so a kSealed retry can never duplicate a record.
   std::unordered_map<std::string, long> sealed_at_addr_;
+
+  // The write gate. file_buffers_ is NOT a clean prefix of the stream at
+  // an arbitrary moment: the writer splices its own bytes in ahead of the
+  // tailer (reconcilePendingFrontLocked) and, between the JNI return and
+  // the stamp, a batch can be sequenced below the tailer's position but
+  // absent from file_buffers_. A checkpoint copied then would duplicate
+  // or lose bytes on replay.
+  //
+  // Every path that pushes a batch into pending_ or appends to the log
+  // (append, appendInBatch, flush, drainForRead, seal, remove) holds the
+  // gate SHARED from its entry until its stamp/splice is done. The gate
+  // must be taken BEFORE the push, not inside submitBatch: a batch queued
+  // in pending_ by a thread that is still waiting for the gate would
+  // block the stamped batch behind it (reconcile keeps enqueue order),
+  // whose writer holds the gate, which blocks the snapshot, which blocks
+  // the first thread -- a cycle that ends in a sequenced write reported
+  // as failed. takeSnapshot holds the gate EXCLUSIVE, so pending_ is
+  // empty and no batch is between "sequenced" and "stamped"; it then
+  // waits for the tailer to pass last_written_addr_ and copies under
+  // mtx_. The copy is then exactly the state at last_applied_addr_.
+  // Lock order: write_gate_ before mtx_, never the reverse; nothing
+  // holding mtx_ ever waits for the gate. Never take the gate twice on
+  // one thread (std::shared_mutex is not recursive): submitBatch and
+  // takeCachedBatchLocked assume the caller already holds it.
+  std::shared_mutex write_gate_;
+  // Set by failStop() when the tailer hit a trimmed address. Sticky.
+  std::atomic<bool> trimmed_out_{false};
+  bool loaded_from_checkpoint_ = false;
+  // Highest X carried by a TRIM entry this process applied (see
+  // CorfuEntry.Op.TRIM); -1 when none. Guarded by mtx_. bootstrap
+  // compares it with the address its replay started at.
+  long trim_marker_addr_ = -1;
 
   std::mutex mtx_;
   std::condition_variable batch_flushed_cv_;
@@ -225,7 +293,6 @@ class CorfuDBStorage : public Storage {
 
   void startJvm(std::string const& jar_path, std::string const& jvm_opts);
   JNIEnv* attachThread();
-  void detachThread();
   void loadBridge(std::string const& endpoint, std::string const& stream_name);
   long jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
                       unsigned char const* data, int length);
@@ -239,7 +306,26 @@ class CorfuDBStorage : public Storage {
   // length-prefixed entries) and apply each via applyEntryBytes.
   // Returns the number of entries successfully applied.
   int applyBatchFromJava(JNIEnv* env, jbyteArray jbuf);
-  void drainInitialEntries();
+  // Replay from the poll view's current position to the tail. kTrimmed
+  // when the view hit a trimmed address (the caller restarts from a newer
+  // checkpoint); kError on a JNI failure (the caller must not treat the
+  // partial state as complete).
+  enum class DrainResult { kOk,
+                           kTrimmed,
+                           kError };
+  DrainResult drainInitialEntries();
+  // Constructor-time replay: newest checkpoint (if a store is given), seek
+  // to covered_addr + 1, drain, then check the trim mark. Throws when the
+  // log is trimmed past what this process could load.
+  void bootstrap(Storage* checkpoint_store, std::string const& checkpoint_dir);
+  void resetStateLocked();
+  void restoreSnapshot(checkpoint::State&& state);
+  bool seekPollView(long addr);
+  // Append the TRIM entry for X. Returns its address, -1 on failure.
+  long appendTrimMarker(long addr);
+  // The tailer fell below the trim mark: mark the storage dead, settle
+  // every waiting writer with kFailure, wake every waiter.
+  void failStop(char const* why);
   void tailerLoop();
   void dispatchLoop();
   void drainDispatchQueue();
@@ -261,7 +347,8 @@ class CorfuDBStorage : public Storage {
                          std::shared_ptr<Batch> const& batch, Status result);
   // JNI submit + stamp + reconcile. Must be called with mtx_ NOT held:
   // it runs the JNI round-trip unlocked. Sets batch->done before it
-  // returns, and returns batch->result.
+  // returns, and returns batch->result. The caller holds write_gate_
+  // shared (see write_gate_).
   Status submitBatch(std::string const& fileName, std::shared_ptr<Batch> const& batch);
   // Block until `batch` is settled by whichever thread owns it, and
   // return its outcome. Takes mtx_ itself, so the caller must not hold it.

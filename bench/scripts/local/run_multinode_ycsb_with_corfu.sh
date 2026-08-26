@@ -74,6 +74,7 @@ TRIALS_SET=0
 TRIAL=""          # --trial N: exactly this trial (what a campaign driver passes)
 DURATION=""       # --duration S: forwarded to every client as --max_exec_time
 LINEARIZABLE=0    # --linearizable: strict reads, label ozonedb-corfu-linearizable
+LOG_TRIM=0        # --log-trim: writer 0 checkpoints + trims the Corfu stream
 RUN_TAG=""        # --run-tag: bench/results/local/<tag> on every host and here
 DRY_RUN=0
 
@@ -118,6 +119,11 @@ Usage: $(basename "$0") [options]
                             trust_background_tail=false, and result files
                             are labelled ozonedb-corfu-linearizable instead
                             of ozonedb-corfu. Use this, never a ycsb.yaml edit.
+  --log-trim                log trimming: global writer 0 checkpoints the
+                            Corfu stream to the bucket and trims behind the
+                            checkpoint; every writer opens from the newest
+                            checkpoint (PLAN-trimming.md). Forwarded to each
+                            client as --log-trim.
   --run-tag TAG             results dir bench/results/local/TAG on every host
                             and locally (default: timestamp). Reusing a tag
                             across invocations is safe -- trial, workload
@@ -149,6 +155,7 @@ while [[ $# -gt 0 ]]; do
   --trial)          TRIAL="$2"; shift 2 ;;
   --duration)       DURATION="$2"; shift 2 ;;
   --linearizable)   LINEARIZABLE=1; shift ;;
+  --log-trim)       LOG_TRIM=1; shift ;;
   --run-tag)        RUN_TAG="$2"; shift 2 ;;
   --dry-run)        DRY_RUN=1; shift ;;
   -h | --help)      usage; exit 0 ;;
@@ -298,8 +305,9 @@ COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG")
 [[ -n "$CLIENT_SSH_KEY" ]] && COMMON_ARGS+=(--ssh_key "$CLIENT_SSH_KEY")
 [[ -n "$DURATION"       ]] && COMMON_ARGS+=(--max_exec_time "$DURATION")
 [[ "$LINEARIZABLE" -eq 1 ]] && COMMON_ARGS+=(--linearizable)
+[[ "$LOG_TRIM" -eq 1 ]] && COMMON_ARGS+=(--log-trim)
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
 echo "=== corfu server: $CORFU_TARGET:$CORFU_PORT ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="
