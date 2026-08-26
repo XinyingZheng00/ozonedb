@@ -35,9 +35,14 @@ Status LogHandler::newTail() {
   record.add_output_file(name);
   // Ship the sealed tail's size so peer rollforward can refresh its
   // file_size map without calling storage->size(input_file) under
-  // view_mutex. We use the emitter's locally cached size, which is
-  // already >= file_size_limit (checked at :24). Heuristic-only:
-  // feeds getLatestScore(), not correctness.
+  // view_mutex. This is the emitter's own UNFENCED view size, so it
+  // undercounts peer records appended just before the seal.
+  //
+  // That makes it usable ONLY as a heuristic (getLatestScore, compaction
+  // sizing). It is not a read bound. Readers take the bound for a sealed
+  // log from a fenced storage->size() instead — see LRUCache::sealedLogSize.
+  // Using this number as the read bound is what made those peer records
+  // permanently invisible.
   if (!current_tail.empty()) {
     record.set_sealed_input_bytes(
         static_cast<int64_t>(view.getFileSize(current_tail)));
@@ -58,49 +63,71 @@ Status LogHandler::addRecord(Record const& record) {
     newTail();
   }
 
-  // Outer retry loop handles the multi-writer race where a concurrent
-  // writer rolls the log (LOGCREATE) while our append is in flight.
-  // When that happens our record lands on the now-stale tail whose
-  // view-frozen file_size won't include it — the record becomes
-  // invisible. Detect via the post-append tail check and re-issue
-  // against the new active_unit. Paper §5.2 state-independent ingest.
+  // ONE append, ONE effect point.
+  //
+  // kSealed is the only retryable status, and it is retryable precisely
+  // because it means no bytes landed: CorfuDBStorage rejects an append
+  // whose global address is above that file's SEAL, and every process
+  // drops such bytes when the tailer applies them. So re-issuing the
+  // record on the new tail cannot duplicate it.
+  //
+  // The old loop rolled the log AFTER a successful append whenever a
+  // post-append view check found the tail full or moved, and then
+  // re-appended the same record. That gave one put two effect points,
+  // and the later copy shadowed a peer's newer write for the same key.
+  // The roll now happens BEFORE the append instead. A record that lands
+  // on a tail a peer seals concurrently stays readable, because a sealed
+  // log is read to its fenced size (LRUCache::checkReadMoreLog).
+  //
+  // Any status other than kSuccess must NOT be acked: the old code
+  // treated a kFailure from appendInBatch as success, cached it, indexed
+  // it, and returned kSuccess, and it also returned kSuccess after
+  // exhausting every retry.
   constexpr int kMaxRetries = 8;
   std::string final_target;
+  Status status = Status::kFailure;
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
-    std::string target = this->active_unit;
-
-    while (this->storage->appendInBatch(target, buffer, buffer_size) == Status::kSealed) {
+    // Roll before appending when the tail is full or a peer moved it.
+    // newTail() re-checks under its own view and is a no-op when the
+    // current tail still has room. The snapshot is read lock-free —
+    // getLatestView() would deep-copy the whole View on every put.
+    if (this->active_unit.empty()) {
       newTail();
-      target = this->active_unit;
+    } else {
+      auto snap = metadata_log->latestViewSnapshot();
+      if (!snap || snap->current_log_tail != this->active_unit ||
+          snap->getFileSize(this->active_unit) >= this->file_size_limit) {
+        newTail();
+      }
     }
+    std::string target = this->active_unit;
+    if (target.empty()) break;
 
-    View view;
-    metadata_log->getLatestView(view);
-    if (view.current_log_tail == target &&
-        view.getFileSize(target) < this->file_size_limit) {
+    status = this->storage->appendInBatch(target, buffer, buffer_size);
+    if (status == Status::kSuccess) {
       final_target = target;
       break;
     }
-
-    // Tail moved or the file is full. Roll forward and retry the record
-    // on the new tail so the previous (now-orphaned) append doesn't
-    // silently lose data.
-    while (view.getFileSize(this->active_unit) >= this->file_size_limit ||
-           view.current_log_tail != this->active_unit) {
-      newTail();
-      metadata_log->getLatestView(view);
-    }
+    if (status != Status::kSealed) break;  // hard failure — do not retry
+    newTail();
   }
 
   delete[] buffer;
   buffer = nullptr;
+
+  // Never cache or index a record the log did not take. A reader that
+  // hit the index would otherwise see a write that no process can read
+  // back from the log.
+  if (status != Status::kSuccess || final_target.empty()) {
+    return Status::kFailure;
+  }
 
   // Push the just-written record into the cache + index so subsequent
   // readRecord calls short-circuit the fenced multi-file scan. Cache
   // and index co-own via shared_ptr — readers that lift the pointer
   // out of the index keep their copy alive even if compaction or a
   // peer REMOVE invalidates the cache entry concurrently.
-  if (key_index_ && !final_target.empty()) {
+  if (key_index_) {
     auto clone = std::make_shared<Record>(record);
     cache->putLogRecordSingle(final_target, clone);
     key_index_->upsert(record.key(), std::move(clone), final_target);

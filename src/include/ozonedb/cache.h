@@ -113,6 +113,25 @@ class LRUCache {
   FileMutexManager* file_mutex_manager = nullptr;
   View const* latest_view = nullptr;
 
+  // Memoized fenced size of each SEALED log file.
+  //
+  // The read bound for a sealed log used to come from the View, whose
+  // file_size for that file is whatever the rolling writer stamped into
+  // OperationRecord::sealed_input_bytes — a number that writer read from
+  // its own UNFENCED view. Peer records appended just before the seal sit
+  // above that bound and stay unreadable forever, in default mode and
+  // under linearizable_reads alike. The bound has to come from a fenced
+  // storage->size().
+  //
+  // Memoized because a sealed file never grows, so one fence per file per
+  // process is enough. Guarded by its own mutex, never by `mutex`: the
+  // storage->size() call fences on the Corfu tailer, and the tailer's
+  // listener takes `mutex` — holding it across the fence is the lock
+  // inversion that checkReadMoreLog documents.
+  std::mutex sealed_size_mtx_;
+  std::unordered_map<std::string, size_t> sealed_size_;
+  size_t sealedLogSize(std::string const& file_name);
+
   // Singleflight for concurrent block/table loads. Without these, N
   // readers that race on the same cold block each issue an S3 GET and
   // each call putSSTableRecords — double-counting current_size, leaking

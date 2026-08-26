@@ -64,7 +64,7 @@
         use_ssh_args: true
         rsync_opts: >-
           {{ rsync_excludes_bootstrap
-             + ([] if (include_git | bool) else ['--exclude=.git/']) }}
+             + ([] if (include_git | bool) else ['--exclude=.git']) }}
 
     - name: Report what landed
       ansible.builtin.raw: >-

@@ -34,6 +34,26 @@ void LRUCache::evict() {
     lru_list.pop_back();
   }
 }
+// Fenced size of a sealed log file, memoized. Never call this while
+// holding `mutex` — see the sealed_size_ comment in cache.h.
+size_t LRUCache::sealedLogSize(std::string const& file_name) {
+  {
+    std::lock_guard<std::mutex> lk(sealed_size_mtx_);
+    auto it = sealed_size_.find(file_name);
+    if (it != sealed_size_.end()) return it->second;
+  }
+  size_t fenced = log_storage_->size(file_name);
+  if (fenced == 0) {
+    // The file is not applied locally yet (or is already removed). Fall
+    // back to the View rather than memoizing a zero that would suppress
+    // every later read of this file.
+    return latest_view != nullptr ? latest_view->getFileSize(file_name) : 0;
+  }
+  std::lock_guard<std::mutex> lk(sealed_size_mtx_);
+  sealed_size_[file_name] = fenced;
+  return fenced;
+}
+
 void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, size_t& cached_offset, size_t& size) {
   // Sample cache state under a shared lock, then release before any
   // storage->size() call. Holding LRUCache::mutex across the Corfu
@@ -62,11 +82,15 @@ void LRUCache::checkReadMoreLog(std::string const& file_name, bool& read_more, s
   // tail whenever the writer uses appendInBatch: the view is refreshed on
   // a ~100ms cycle and ignores the local cached_file_ buffer. Ask storage
   // directly for the tail so the read covers not-yet-flushed bytes too.
-  // Sealed files never grow, so the view size is authoritative.
+  //
+  // A sealed file never grows, but the View is still the wrong source for
+  // its size: that number is the emitter's stale sealed_input_bytes, so
+  // peer records written just before the seal fall outside the bound and
+  // never become readable. Fence once per sealed file and memoize.
   if (is_tail) {
     size = log_storage_->size(file_name);
   } else {
-    size = latest_view->getFileSize(file_name);
+    size = sealedLogSize(file_name);
   }
   if (size <= cached_offset) {
     read_more = false;
@@ -391,6 +415,12 @@ void LRUCache::putLogRecordSingle(std::string const& file_name, std::shared_ptr<
 }
 
 void LRUCache::invalidateLogFile(std::string const& file_name) {
+  {
+    // Drop the memoized fenced size: the file is being compacted away,
+    // and a later file could reuse the name.
+    std::lock_guard<std::mutex> lk(sealed_size_mtx_);
+    sealed_size_.erase(file_name);
+  }
   std::unique_lock lock(mutex);
   auto it = file_to_entry_map.find(file_name);
   if (it == file_to_entry_map.end()) return;

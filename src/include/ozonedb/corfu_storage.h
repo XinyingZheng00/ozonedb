@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -112,17 +113,54 @@ class CorfuDBStorage : public Storage {
   // Pending batched writes (same role as AzureBlobStorage::cached_file)
   std::unordered_map<std::string, std::vector<unsigned char>> cached_file_;
 
-  // Drained bytes that have been handed to JNI but are not yet in
-  // file_buffers_. Readers splice file_buffers_ + pending_ + cached_file_
-  // so every byte is visible exactly once. The writer owns reconciliation:
-  // after JNI returns, it copies the placeholder payload into file_buffers_
-  // under mtx_ and erases the placeholder in one atomic section. The tailer
-  // does *not* touch pending_ at all — locally-originated APPEND entries
-  // are tagged with client_id_ and the tailer skips them, leaving the
-  // reconcile job to the writer. std::list is chosen so the iterator the
-  // writer saves after push_back remains valid while mtx_ is released for
-  // the JNI round-trip.
-  std::unordered_map<std::string, std::list<std::pair<long, std::vector<unsigned char>>>> pending_;
+  // One drain of a file's cached_file_ bytes, from the moment they leave
+  // cached_file_ until the moment they land in file_buffers_ (or fail).
+  //
+  // Lifetime: co-owned by shared_ptr. Every thread whose bytes went into
+  // this batch holds one, and pending_ holds one while the batch is in
+  // flight. That is deliberate — a writer must NOT hold a bare iterator
+  // into pending_, because the tailer erases pending_ entries when a peer
+  // REMOVEs the file. Erasing a shared_ptr from the list is safe under a
+  // concurrent writer, an iterator is not.
+  //
+  // `done` is the single ack point. It is set exactly once, under mtx_,
+  // by whichever of these happens first:
+  //   - reconcilePendingFrontLocked splices the payload  -> kSuccess
+  //   - the JNI submit fails                             -> kFailure
+  //   - the file was sealed at a LOWER global address    -> kSealed
+  //   - a peer REMOVE dropped the file                   -> kFailure
+  // A caller may only ack a write after `done` is true, and must return
+  // `result`, never an assumed kSuccess.
+  //
+  // `done` deliberately means "spliced into file_buffers_", not merely
+  // "sequenced". Reads serve file_buffers_ only (see read()), so waiting
+  // for the splice is what preserves read-my-writes.
+  struct Batch {
+    long addr = -1;  // global Corfu address, stamped after JNI returns
+    std::vector<unsigned char> payload;
+    bool done = false;
+    Status result = Status::kFailure;
+  };
+
+  // Batches handed to JNI but not yet spliced into file_buffers_, in
+  // enqueue order per file. reconcilePendingFrontLocked drains the
+  // leading stamped run, so file_buffers_ keeps enqueue order.
+  std::unordered_map<std::string, std::list<std::shared_ptr<Batch>>> pending_;
+
+  // The batch that currently owns the bytes sitting in cached_file_[fn].
+  // Created when the first byte enters cached_file_[fn] and moved into
+  // pending_ on drain. A thread that adds bytes takes a shared_ptr to it,
+  // so it can learn the outcome even when a different thread does the
+  // drain and the JNI submit.
+  std::unordered_map<std::string, std::shared_ptr<Batch>> cached_batch_;
+
+  // Global address of the SEAL entry for a file, once the tailer has seen
+  // it. The shared log — not local state — decides whether an APPEND
+  // belongs to a file: an APPEND sequenced ABOVE this address arrived
+  // after the seal and belongs to no file. Every process applies that
+  // same rule, in applyEntryBytes for peer entries and in submitBatch for
+  // our own, so a kSealed retry can never duplicate a record.
+  std::unordered_map<std::string, long> sealed_at_addr_;
 
   std::mutex mtx_;
   std::condition_variable batch_flushed_cv_;
@@ -204,6 +242,29 @@ class CorfuDBStorage : public Storage {
   long globalFenceTarget();
   void waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target);
   void reconcilePendingFrontLocked(std::string const& fileName);
+
+  // --- batch helpers (see struct Batch) ---
+  // All *Locked helpers require mtx_ held by the caller.
+  //
+  // The batch owning cached_file_[fileName], created on first use.
+  std::shared_ptr<Batch>& cachedBatchLocked(std::string const& fileName);
+  // Move cached_file_[fileName] into its batch and hand it back for
+  // submission. Returns null when the file has no buffered bytes.
+  std::shared_ptr<Batch> takeCachedBatchLocked(std::string const& fileName);
+  // Settle a batch that will never be spliced, and unblock the queue
+  // behind it.
+  void finishBatchLocked(std::string const& fileName,
+                         std::shared_ptr<Batch> const& batch, Status result);
+  // JNI submit + stamp + reconcile. Must be called with mtx_ NOT held:
+  // it runs the JNI round-trip unlocked. Sets batch->done before it
+  // returns, and returns batch->result.
+  Status submitBatch(std::string const& fileName, std::shared_ptr<Batch> const& batch);
+  // Block until `batch` is settled by whichever thread owns it, and
+  // return its outcome. Takes mtx_ itself, so the caller must not hold it.
+  Status awaitBatch(std::shared_ptr<Batch> const& batch);
+  // Push every not-yet-sequenced byte of one file onto the shared log and
+  // wait for the splice, so read()/size() can serve file_buffers_ alone.
+  void drainForRead(std::string const& fileName);
 
   // The calling thread's sync() token. Static thread_local (member
   // thread_local is not a thing); the instance pointer scopes it to

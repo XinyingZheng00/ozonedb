@@ -388,11 +388,16 @@ role_client() {
   # added as a submodule, and skipped when the tree arrived by rsync
   # (bench/ansible/bootstrap.yml -e include_git=false) rather than by clone,
   # where it would otherwise abort the run under `set -e`.
-  if [[ -e "$REPO_ROOT/.git" ]]; then
+  # Test for a USABLE repo, not merely for a .git entry. When the tree is
+  # pushed from a git worktree, .git is a one-line file pointing at a
+  # gitdir on the operator's laptop, so it exists here but resolves to
+  # nothing -- `git submodule update` then aborts the whole run under
+  # `set -e`. rev-parse is the check that tells the two apart.
+  if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     log "updating git submodules"
     (cd "$REPO_ROOT" && git submodule update --init --recursive)
   else
-    log "no .git in $REPO_ROOT (rsync'd tree) -- skipping submodule update"
+    log "no usable git repo in $REPO_ROOT (rsync'd tree) -- skipping submodule update"
   fi
 
   if [[ ! -d "$REPO_ROOT/vcpkg/ports" ]]; then

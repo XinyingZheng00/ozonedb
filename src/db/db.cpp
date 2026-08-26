@@ -174,7 +174,11 @@ Status DB::put(std::string const& key, std::string const& value) {
   record.set_key(key);
   record.set_value(value);
   record.set_type(kTypeValue);
-  log_handler->addRecord(record);
+  // Propagate the append status. A put that the log did not take must
+  // not report success to the client, and must not drive the compaction
+  // bookkeeping below either.
+  Status append_status = log_handler->addRecord(record);
+  if (append_status != Status::kSuccess) return append_status;
   if (this->metadata->compaction_policy == CompactionPolicy::kHoSe) {
     counter++;
     if (counter < this->compaction_per_operation) {
@@ -223,8 +227,8 @@ Status DB::remove(std::string const& key) {
   Record record;
   record.set_key(key);
   record.set_type(kTypeDeletion);
-  this->log_handler->addRecord(record);
-  return Status::kSuccess;
+  // A tombstone the log did not take is a delete that never happened.
+  return this->log_handler->addRecord(record);
 }
 
 Status DB::get(std::string const& key, std::string const*& value,

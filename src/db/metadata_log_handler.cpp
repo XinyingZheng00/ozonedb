@@ -233,7 +233,12 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       // Sealed tail size is shipped on the record by the rolling writer
       // (see log_handler.cpp:newTail). Avoids a fenced storage->size()
       // call under view_mutex. Older records without the field fall
-      // back to 0 — heuristic-only, feeds getLatestScore().
+      // back to 0.
+      //
+      // HEURISTIC ONLY — it feeds getLatestScore() and compaction sizing.
+      // It is the emitter's unfenced view size, so it undercounts peer
+      // records appended just before the seal. Readers must NOT use it as
+      // a read bound; LRUCache::sealedLogSize fences for that.
       this->latest_view.file_size[input_file] =
           record->has_sealed_input_bytes() ? record->sealed_input_bytes() : 0;
       this->latest_view.current_log_tail = output_file;
