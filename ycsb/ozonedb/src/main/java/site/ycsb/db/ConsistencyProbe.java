@@ -760,39 +760,50 @@ public final class ConsistencyProbe {
           + " --config <shared_config.json> [--flag value ...]");
       System.exit(2);
     }
-    Map<String, String> flags = parseFlags(args, 1);
-    switch (args[0]) {
-    case "write-probe":
-      writeProbe(flags);
-      break;
-    case "read-probe":
-      readProbe(flags);
-      break;
-    case "counter-worker":
-      counterWorker(flags);
-      break;
-    case "insert-probe":
-      insertProbe(flags);
-      break;
-    case "visibility-probe":
-      visibilityProbe(flags);
-      break;
-    case "put-long":
-      putLong(flags);
-      break;
-    case "get-long":
-      getLong(flags);
-      break;
-    case "hash":
-      hash(flags);
-      break;
-    default:
-      System.err.println("unknown mode: " + args[0]);
-      System.exit(2);
+    // Every exit path must call System.exit. The C++ engine's corfu
+    // threads attach to this JVM as non-daemon threads, so simply
+    // returning from main -- or letting an exception propagate out of it
+    // -- leaves the process alive with nothing to do, and consistency.py
+    // blocks in proc.wait() forever. Only the success path used to exit.
+    int code = 0;
+    try {
+      Map<String, String> flags = parseFlags(args, 1);
+      switch (args[0]) {
+      case "write-probe":
+        writeProbe(flags);
+        break;
+      case "read-probe":
+        readProbe(flags);
+        break;
+      case "counter-worker":
+        counterWorker(flags);
+        break;
+      case "insert-probe":
+        insertProbe(flags);
+        break;
+      case "visibility-probe":
+        visibilityProbe(flags);
+        break;
+      case "put-long":
+        putLong(flags);
+        break;
+      case "get-long":
+        getLong(flags);
+        break;
+      case "hash":
+        hash(flags);
+        break;
+      default:
+        System.err.println("unknown mode: " + args[0]);
+        code = 2;
+      }
+    } catch (Throwable t) {
+      t.printStackTrace();
+      code = 1;
+    } finally {
+      System.out.flush();
+      System.err.flush();
+      System.exit(code);
     }
-    // The C++ engine's corfu threads attach to this JVM as non-daemon
-    // threads, so returning from main does not end the process -- the
-    // probe would linger (and its driver block in wait()) forever.
-    System.exit(0);
   }
 }

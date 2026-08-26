@@ -62,27 +62,31 @@ public class OzoneDBClient extends DB {
 
   @Override
   public Status update(String table, String key, Map<String, ByteIterator> values) {
-    // read current value
+    // Read-modify-write. A missing current value is NOT a reason to skip
+    // the write: in a multi-writer cell the key often belongs to a peer
+    // whose record is not visible here yet. Returning NOT_FOUND dropped
+    // the update entirely and still counted a fast completed operation,
+    // so throughput read high for work that never happened.
     final Map<String, ByteIterator> result = new HashMap<>();
     byte[] currentValue = db.get(key);
-    if (currentValue == null) {
-      return Status.NOT_FOUND;
+    if (currentValue != null) {
+      deserializeValues(currentValue, null, result);
     }
-    deserializeValues(currentValue, null, result);
 
     // update
     result.putAll(values);
 
-    byte[] newValue = null;
-    int totalBytes = 0;
+    byte[] newValue;
     try {
       newValue = serializeValues(result);
-      db.put(key, newValue);
-      totalBytes = key.length() + newValue.length;
     } catch (Exception e) {
       e.printStackTrace();
+      return Status.ERROR;
     }
-    reportThroughput(totalBytes); // Report throughput after each update
+    if (!db.put(key, newValue)) {
+      return Status.ERROR;
+    }
+    reportThroughput(key.length() + newValue.length);
     return Status.OK;
   }
 

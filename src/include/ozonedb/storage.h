@@ -245,6 +245,22 @@ class FileStorage : public Storage {
   std::shared_mutex read_mtx;
   std::shared_mutex write_mtx;
 
+  // Serializes writes to one file's ofstream.
+  //
+  // getWriteStream hands the SAME ofstream to every caller for a given
+  // name, and one append is a write + flush + fsync. Two threads
+  // appending concurrently interleave their bytes inside that stream, so
+  // metadata.log ends up with two half-records spliced together and is
+  // corrupt on disk, permanently.
+  //
+  // The lock belongs here, in the backend, not in MetadataLogHandler: the
+  // contract is that the storage layer owns its own concurrency (which
+  // CorfuDBStorage does), and every caller of append/appendNoFlush/flush
+  // benefits, not just the metadata log.
+  std::mutex append_map_mtx_;
+  std::unordered_map<std::string, std::unique_ptr<std::mutex>> append_mtx_;
+  std::mutex& appendMutexFor(std::string const& name);
+
  public:
   std::ifstream* getReadStream(std::string const& name);
   std::ofstream* getWriteStream(std::string const& name);

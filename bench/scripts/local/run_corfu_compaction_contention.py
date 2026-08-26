@@ -40,6 +40,10 @@ from datetime import datetime
 import yaml
 
 from run_local_ycsb_multiproc import run_ycsb
+from load_local_ycsb_multiproc import (
+    linearizable_corfu_settings,
+    result_label,
+)
 
 # bench/scripts is one level up. ycsb_config.derive() resolves the `nodes:`
 # block into the cloudlab.hosts / corfu.endpoint / s3.endpoint keys read below,
@@ -57,7 +61,7 @@ COMMITTED_RE = re.compile(
 )
 
 
-def scrape(result_dir, writers, trial):
+def scrape(result_dir, writers, trial, engine="ozonedb-corfu"):
     """Walk the per-writer .result files for this (W, trial) and join task_ids.
 
     Returns ({task_id: earliest_needed_ns},
@@ -69,7 +73,7 @@ def scrape(result_dir, writers, trial):
     needed = {}
     committed = defaultdict(list)
     pattern = os.path.join(
-        result_dir, f"*-workloada-ozonedb-corfu_w*of{writers}_*_trial{trial}.result"
+        result_dir, f"*-workloada-{engine}_w*of{writers}_*_trial{trial}.result"
     )
     files = sorted(glob.glob(pattern))
     if not files:
@@ -115,6 +119,13 @@ def main():
     # to "a" — the experiment is workload-A specific.
     parser.add_argument("--workloads", type=str, default="a")
     parser.add_argument(
+        "--linearizable",
+        action="store_true",
+        help="Force strict reads (linearizable_reads=true, "
+             "trust_background_tail=false) into every writer config. Result "
+             "files are labelled ozonedb-corfu-linearizable.",
+    )
+    parser.add_argument(
         "--max_exec_time",
         type=int,
         default=None,
@@ -148,6 +159,12 @@ def main():
             "very few compactions"
         )
     corfu_settings.update(overrides)
+    if args.linearizable:
+        corfu_settings = linearizable_corfu_settings(corfu_settings)
+    # Derived from the EFFECTIVE settings, so a linearizable_reads set in
+    # ycsb.yaml is labelled the same way the flag is. scrape() must use
+    # this token or it globs for files the run never produced.
+    engine = result_label("ozonedb-corfu", corfu_settings)
     s3_settings = config.get("s3")
 
     W = args.num_writers
@@ -164,6 +181,7 @@ def main():
 
     print(
         f"[contention] starting: writers={W} trial={trial} run_tag={run_tag} "
+        f"engine={engine} "
         f"corfu_overrides={sorted(overrides.keys())}"
     )
 
@@ -185,7 +203,7 @@ def main():
         trial=trial,
     )
 
-    needed, committed = scrape(result_dir, W, trial)
+    needed, committed = scrape(result_dir, W, trial, engine)
     tasks = []
     for tid, t0 in needed.items():
         if tid not in committed:

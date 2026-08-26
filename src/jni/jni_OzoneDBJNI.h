@@ -26,9 +26,9 @@ JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_closeDB
 /*
  * Class:     jni_OzoneDBJNI
  * Method:    put
- * Signature: (Ljava/lang/String;[B)V
+ * Signature: (Ljava/lang/String;[B)Z
  */
-JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_put
+JNIEXPORT jboolean JNICALL Java_jni_OzoneDBJNI_put
   (JNIEnv *, jobject, jstring, jbyteArray);
 
 /*
@@ -42,9 +42,9 @@ JNIEXPORT jbyteArray JNICALL Java_jni_OzoneDBJNI_get
 /*
  * Class:     jni_OzoneDBJNI
  * Method:    remove
- * Signature: (Ljava/lang/String;)V
+ * Signature: (Ljava/lang/String;)Z
  */
-JNIEXPORT void JNICALL Java_jni_OzoneDBJNI_remove
+JNIEXPORT jboolean JNICALL Java_jni_OzoneDBJNI_remove
   (JNIEnv *, jobject, jstring);
 
 /*

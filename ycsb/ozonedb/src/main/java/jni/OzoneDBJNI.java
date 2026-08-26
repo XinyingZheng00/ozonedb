@@ -62,9 +62,11 @@ public class OzoneDBJNI {
   // Native method declaration
   public native void openDB(String configPath);
   public native void closeDB();
-  public native void put(String key, byte[] value);
+  // Returns true when the write reached the log. Callers must check it:
+  // a false return means the record was never appended.
+  public native boolean put(String key, byte[] value);
   public native byte[] get(String key);
-  public native void remove(String key);
+  public native boolean remove(String key);
   /**
    * Batch fence for strict reads (linearizable_reads): sync() takes one
    * storage fence on the calling thread; every get() until clearSync()

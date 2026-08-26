@@ -42,6 +42,18 @@ void FileStorage::createDirectory(std::string name) {
   }
 }
 
+// One mutex per file name, created on first use and never erased (the
+// write stream it guards is never erased either). append_map_mtx_ guards
+// only the map lookup, so two writers on different files never contend.
+std::mutex& FileStorage::appendMutexFor(std::string const& name) {
+  std::lock_guard<std::mutex> lk(append_map_mtx_);
+  auto it = append_mtx_.find(name);
+  if (it == append_mtx_.end()) {
+    it = append_mtx_.emplace(name, std::make_unique<std::mutex>()).first;
+  }
+  return *it->second;
+}
+
 Status FileStorage::append(std::string const& fileName, unsigned char* const& data, int length) {
   std::ofstream* output_file = getWriteStream(fileName);
   if (isSealed(fileName)) {
@@ -51,6 +63,9 @@ Status FileStorage::append(std::string const& fileName, unsigned char* const& da
     std::cerr << "Failed to open output file: " << fileName << std::endl;
     return Status::kFailure;
   }
+  // Hold the per-file lock across write + flush + fsync. Without it two
+  // threads interleave bytes inside one ofstream and the file is corrupt.
+  std::lock_guard<std::mutex> lk(appendMutexFor(fileName));
   output_file->write(reinterpret_cast<char const*>(data), length);
   output_file->flush();
   fsync(GetFileDescriptor(*output_file->rdbuf()));
@@ -69,6 +84,7 @@ Status FileStorage::appendNoFlush(std::string const& fileName, unsigned char* co
     std::cerr << "Failed to open output file: " << fileName << std::endl;
     return Status::kFailure;
   }
+  std::lock_guard<std::mutex> lk(appendMutexFor(fileName));
   output_file->write(reinterpret_cast<char const*>(data), length);
   // outputFile.flush();
   if (output_file->good()) {
@@ -83,6 +99,7 @@ Status FileStorage::flush(std::string const& fileName) {
     std::cerr << "Failed to open output file." << std::endl;
     return Status::kFailure;
   }
+  std::lock_guard<std::mutex> lk(appendMutexFor(fileName));
   output_file->flush();
   if (output_file->good()) {
     return Status::kSuccess;

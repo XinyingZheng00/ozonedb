@@ -147,13 +147,32 @@ Status S3Storage::append(std::string const& fileName, unsigned char* const& data
   // backend — S3Storage is the "regular storage" tier for SSTables per
   // paper §3.5. Implement append as "buffer + immediate flush" so any
   // legacy call site that doesn't distinguish log vs sstable still works.
+  //
+  // flushLocked MOVES the buffer out and erases the map entry, so a naive
+  // second append would PutObject only the new bytes and silently
+  // truncate everything written before it. Keep the accumulated bytes and
+  // re-put the whole object each time, which is the only way to emulate
+  // append on a store that has no append.
+  //
+  // That makes append O(object size) per call. It is correct, not fast.
+  // Do not route a log file here.
+  std::vector<unsigned char> snapshot;
   {
     std::lock_guard<std::mutex> lk(mtx_);
     if (sealed_files_.count(fileName)) return Status::kSealed;
     auto& buf = cached_file_[fileName];
     buf.insert(buf.end(), data, data + length);
+    snapshot = buf;  // flushLocked moves the buffer out
   }
-  return flushLocked(fileName);
+  Status s = flushLocked(fileName);
+  if (s != Status::kSuccess) return s;
+  // flushLocked erased the entry; restore it so the next append re-puts
+  // the whole object instead of just its own bytes.
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    cached_file_[fileName] = std::move(snapshot);
+  }
+  return Status::kSuccess;
 }
 
 Status S3Storage::appendNoFlush(std::string const& fileName, unsigned char* const& data, int length) {
