@@ -29,8 +29,13 @@ processes on one host, 1M × 1 KB load):
 The read misses are **not** a trimming effect: the control without trimming misses at the
 same rate or more, in both read modes, with no writer active. All 1,000,000 inserts returned
 OK in both loads. This is a pre-existing property of an 8-writer load on the `visibility`
-head and is out of this plan's scope. It needs its own investigation (per-partition probe:
-`/tmp/probe_partitions.sh` in the job dir reads 20k uniform keys from each writer's range).
+head and is out of this plan's scope. A per-partition probe on the control dataset (20k
+uniform keys from each load writer's 125k-key range, `--linearizable`, no writer active)
+misses 111–154 keys in every one of the eight ranges (0.55–0.77 %). The loss is spread
+evenly over writers and keys, so it is not one writer's log and not the trimmer. The next
+step for whoever picks it up: read one missing key through `corfu_smoke`-style C++ with the
+log scan and the SSTable lookup traced separately, and check the SSTable key ranges recorded
+in the COMPACT records against the keys inside the files.
 
 The first-op time includes ~7 s of JVM start, Maven classpath resolve and `initSSTMetadata`
 (70+ SSTables), which trimming does not touch. The replay itself went from 16 s to 1.6 s.
