@@ -43,6 +43,26 @@ Sweep points, spread across hosts before doubling up on a host:
 | 16 | all 8 | 2 |
 | 32 | all 8 | 4 |
 
+## Tailer catch-up (found 2026-08-25, run 1)
+
+The OzoneDB linearizable path replays the whole shared log before the first
+fenced read returns: with the 1M-record dataset a fresh writer does **0 ops for
+~45s**, then ramps to a steady ~1000 ops/sec/writer (single writer, workload a).
+Every cell restarts Corfu, so every writer pays this catch-up once. Two
+consequences, both handled:
+
+- **Cell duration.** OzoneDB cells are **180s** (catch-up may grow with writer
+  count; 180s leaves a clean steady window). Cassandra has no catch-up, so its
+  cells are **90s**.
+- **Reported number = steady-state, not the whole-run aggregate.** YCSB's
+  `Throughput(ops/sec)` is `total_ops / run_time`, which averages in the dead
+  catch-up seconds. Use `bench/scripts/extract_steady_throughput.py`: it averages
+  `current ops/sec` over the **last 60s** of each writer (past catch-up for
+  OzoneDB, steady for Cassandra) and sums across writers. This is a rate, so the
+  two systems' different cell durations are comparable. Catch-up itself is a
+  real, reportable linearizable startup cost -- note it separately, do not fold
+  it into throughput.
+
 ## Fairness rules (do not bend)
 
 1. Both systems un-replicated, same server box, same clients, same dataset,
