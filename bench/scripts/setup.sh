@@ -583,9 +583,13 @@ cassandra_yaml_set() {
 role_cassandra() {
   log "=== role: cassandra ==="
 
-  # cqlsh (schema creation, readiness probe) is python; pyyaml is for
-  # ycsb_config.py on this node.
-  apt_install curl tar python3 python3-yaml
+  # pyyaml is for ycsb_config.py on this node. The CQL client is NOT cqlsh:
+  # Cassandra 5.0's cqlsh refuses Python >= 3.12 (its driver imports asyncore,
+  # removed in 3.12) and the image ships only 3.12, so we build a venv with
+  # cassandra-driver and drive CQL through bench/scripts/cassandra_cql.py.
+  # libev-dev + build-essential + python3-dev let pip build the libev reactor,
+  # which is the one that actually connects on 3.12 (asyncio times out).
+  apt_install curl tar python3 python3-yaml python3-venv build-essential python3-dev libev-dev
 
   local version install_dir port heap new_heap
   version="${CASSANDRA_VERSION:-$(ycsb_cfg --get cassandra.version)}" || die "cassandra.version missing from ycsb.yaml"
@@ -670,12 +674,29 @@ export CASSANDRA_BIND="$bind"
 export CASSANDRA_CQL_PORT="$port"
 export MAX_HEAP_SIZE="$heap"
 export HEAP_NEWSIZE="$new_heap"
+export CASSANDRA_CQL_PYTHON="$install_dir/pyenv/bin/python"
+export CASSANDRA_CQL_HELPER="$install_dir/cassandra_cql.py"
 export PATH="\$JAVA_HOME/bin:\$CASSANDRA_HOME/bin:\$PATH"
 EOF
   log "wrote $install_dir/env.sh"
 
   install -m 0755 "$SCRIPT_DIR/cassandra_ctl.sh" "$install_dir/cassandra_ctl.sh"
-  log "installed $install_dir/cassandra_ctl.sh"
+  install -m 0644 "$SCRIPT_DIR/cassandra_cql.py" "$install_dir/cassandra_cql.py"
+  log "installed $install_dir/cassandra_ctl.sh + cassandra_cql.py"
+
+  # The CQL client venv (see the apt note above). Idempotent: reuse an existing
+  # venv that already imports the driver, else build it.
+  local venv="$install_dir/pyenv"
+  if "$venv/bin/python" -c "import cassandra.io.libevreactor" >/dev/null 2>&1; then
+    log "cassandra-driver venv already present at $venv"
+  else
+    log "building cassandra-driver venv at $venv (libev reactor)"
+    python3 -m venv "$venv"
+    "$venv/bin/pip" -q install --upgrade pip
+    "$venv/bin/pip" -q install "cassandra-driver==3.29.1"
+    "$venv/bin/python" -c "import cassandra.io.libevreactor" ||
+      die "cassandra-driver venv did not build the libev reactor (is libev-dev installed?)"
+  fi
 
   # Cassandra warns (and under load, fails mmap) below this; idempotent.
   if [[ "$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)" -lt 1048575 ]]; then

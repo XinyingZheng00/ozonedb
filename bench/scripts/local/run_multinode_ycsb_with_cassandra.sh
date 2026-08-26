@@ -36,6 +36,7 @@ export OZONEDB_HOME
 
 CONFIG="${OZONEDB_HOME}/bench/scripts/config/ycsb.yaml"
 CTL_SRC="${OZONEDB_HOME}/bench/scripts/cassandra_ctl.sh"
+CQL_SRC="${OZONEDB_HOME}/bench/scripts/cassandra_cql.py"
 
 CLIENT_HOSTS=""
 CLIENT_USER=""
@@ -158,7 +159,10 @@ SSH_OPTS=(-o BatchMode=yes -o ServerAliveInterval=30 -o StrictHostKeyChecking=ac
 CTL="$INSTALL_DIR/cassandra_ctl.sh"
 
 rsh() { ssh "${SSH_OPTS[@]}" "$SSH_USER@$1" "$2"; }
-push_ctl() { scp "${SSH_OPTS[@]}" -q "$CTL_SRC" "$SSH_USER@$1:$CTL"; }
+push_ctl() {
+  scp "${SSH_OPTS[@]}" -q "$CTL_SRC" "$SSH_USER@$1:$CTL"
+  scp "${SSH_OPTS[@]}" -q "$CQL_SRC" "$SSH_USER@$1:$INSTALL_DIR/cassandra_cql.py"
+}
 ctl_all() {
   local s
   for s in "${SERVERS[@]}"; do

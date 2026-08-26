@@ -43,6 +43,13 @@ die() {
 . "$ENV_FILE"
 : "${CASSANDRA_HOME:?}" "${CASSANDRA_BIND:?}" "${CASSANDRA_CQL_PORT:?}" "${JAVA_HOME:?}"
 
+# CQL client. cqlsh refuses Python >= 3.12 (its driver imports asyncore, gone
+# in 3.12), and the CloudLab image ships only 3.12, so setup.sh builds a venv
+# with cassandra-driver and drops cassandra_cql.py beside this script. Use it
+# when present; fall back to cqlsh otherwise (older nodes with Python <= 3.11).
+CQL_VENV_PY="${CASSANDRA_CQL_PYTHON:-$INSTALL_DIR/pyenv/bin/python}"
+CQL_HELPER="${CASSANDRA_CQL_HELPER:-$INSTALL_DIR/cassandra_cql.py}"
+
 port_open() { (exec 3<>"/dev/tcp/$CASSANDRA_BIND/$CASSANDRA_CQL_PORT") >/dev/null 2>&1; }
 
 server_pids() {
@@ -50,7 +57,22 @@ server_pids() {
   pgrep -f 'org.apache.cassandra.service.CassandraDaemon' 2>/dev/null || true
 }
 
-cql() { "$CASSANDRA_HOME/bin/cqlsh" "$CASSANDRA_BIND" "$CASSANDRA_CQL_PORT" --request-timeout=120 "$@"; }
+# Run one or more CQL statements. Prefers the venv helper; if it is absent,
+# falls back to the bundled cqlsh (which needs Python <= 3.11).
+cql() {
+  if [[ -x "$CQL_VENV_PY" && -f "$CQL_HELPER" ]]; then
+    "$CQL_VENV_PY" "$CQL_HELPER" --host "$CASSANDRA_BIND" --port "$CASSANDRA_CQL_PORT" "$@"
+  else
+    "$CASSANDRA_HOME/bin/cqlsh" "$CASSANDRA_BIND" "$CASSANDRA_CQL_PORT" --request-timeout=120 "$@"
+  fi
+}
+cql_ping() {
+  if [[ -x "$CQL_VENV_PY" && -f "$CQL_HELPER" ]]; then
+    "$CQL_VENV_PY" "$CQL_HELPER" --host "$CASSANDRA_BIND" --port "$CASSANDRA_CQL_PORT" --ping >/dev/null 2>&1
+  else
+    "$CASSANDRA_HOME/bin/cqlsh" "$CASSANDRA_BIND" "$CASSANDRA_CQL_PORT" -e "DESCRIBE CLUSTER" >/dev/null 2>&1
+  fi
+}
 
 do_status() {
   local pids
@@ -79,7 +101,7 @@ do_wait() {
   local i
   log "waiting for CQL on $CASSANDRA_BIND:$CASSANDRA_CQL_PORT"
   for i in $(seq 1 180); do
-    if port_open && cql -e "DESCRIBE CLUSTER" >/dev/null 2>&1; then
+    if port_open && cql_ping; then
       log "up after ${i}s"
       return 0
     fi
@@ -149,7 +171,11 @@ do_schema() {
   cql -e "DROP KEYSPACE IF EXISTS $keyspace;"
   cql -e "CREATE KEYSPACE $keyspace WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': $rf};"
   cql -e "CREATE TABLE $keyspace.usertable (y_id varchar PRIMARY KEY$cols);"
-  cql -e "DESCRIBE TABLE $keyspace.usertable;" | head -n 3
+  # Confirm with a plain SELECT rather than DESCRIBE: the venv helper returns
+  # driver rows, and an empty table answering at all proves the schema exists.
+  local n
+  n="$(cql -e "SELECT count(*) FROM $keyspace.usertable;" | tail -n1)"
+  log "schema ready: $keyspace.usertable count=$n"
 }
 
 do_save_load() {
