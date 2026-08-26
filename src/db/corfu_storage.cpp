@@ -351,7 +351,7 @@ bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
       std::lock_guard<std::mutex> dlk(dispatch_mtx_);
       dispatch_queue_.push_back(RemoteEvent{
           notify_op, std::move(notify_file), std::move(notify_payload),
-          std::move(listener_snapshot)});
+          std::move(listener_snapshot), addr});
     }
   }
   tailer_cv_.notify_all();
@@ -568,7 +568,7 @@ void CorfuDBStorage::dispatchLoop() {
     if (ev.listener) {
       try {
         ev.listener(ev.file_name, ev.payload.data(), ev.payload.size(),
-                    ev.op);
+                    ev.op, ev.addr);
       } catch (std::exception const& e) {
         std::cerr << "[corfu] remote-append listener threw: " << e.what()
                   << "\n";
@@ -619,13 +619,29 @@ long CorfuDBStorage::globalFenceTarget() {
   return std::max(local, static_cast<long>(global));
 }
 
+// Wait until the local tailer has applied everything up to `target`.
+//
+// BOUNDED, deliberately. The tailer advances only over its OWN stream,
+// so a target taken from a global address the stream will never contain
+// — another stream's entry, or a hole — is unreachable. An unbounded
+// wait here froze every fenced read in the process, permanently and
+// silently. A read that gives up returns stale-but-consistent local
+// state, which is the same guarantee the default (non-linearizable)
+// mode already offers.
 void CorfuDBStorage::waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target) {
-  tailer_cv_.wait(lock, [&] {
+  constexpr auto kFenceTimeout = std::chrono::seconds(10);
+  bool reached = tailer_cv_.wait_for(lock, kFenceTimeout, [&] {
     return !running_ || last_applied_addr_.load(std::memory_order_acquire) >= target;
   });
+  if (!reached) {
+    std::cerr << "[corfu] fence timed out: target=" << target
+              << " applied=" << last_applied_addr_.load(std::memory_order_acquire)
+              << " (target is probably not on this stream)\n";
+  }
 }
 
 thread_local CorfuDBStorage::FenceToken CorfuDBStorage::fence_token_;
+thread_local long CorfuDBStorage::last_append_addr_ = -1;
 
 long CorfuDBStorage::fenceTargetForCaller() {
   if (fence_token_.instance == this) return fence_token_.target;
@@ -769,6 +785,7 @@ Status CorfuDBStorage::submitBatch(std::string const& fileName,
     }
   }
   batch_flushed_cv_.notify_all();
+  if (batch->result == Status::kSuccess) last_append_addr_ = batch->addr;
   return batch->result;
 }
 
@@ -777,6 +794,7 @@ Status CorfuDBStorage::awaitBatch(std::shared_ptr<Batch> const& batch) {
   batch_flushed_cv_.wait_for(lock, std::chrono::seconds(30),
                              [&] { return batch->done; });
   if (!batch->done) return Status::kFailure;
+  if (batch->result == Status::kSuccess) last_append_addr_ = batch->addr;
   return batch->result;
 }
 
@@ -856,7 +874,10 @@ Status CorfuDBStorage::appendInBatch(std::string const& fileName, unsigned char*
       auto remaining_ms = commit_interval_ - elapsed;
       batch_flushed_cv_.wait_for(lock, std::chrono::milliseconds(remaining_ms),
                                  [&] { return mine->done; });
-      if (mine->done) return mine->result;
+      if (mine->done) {
+        if (mine->result == Status::kSuccess) last_append_addr_ = mine->addr;
+        return mine->result;
+      }
       should_flush = true;
     }
 

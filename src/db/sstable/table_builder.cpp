@@ -250,7 +250,13 @@ Status TableBuilder::finish() {
       r->offset += footer_encoding_size;
     }
   }
-  r->storage->flush(r->fileName);  // flush at last
+  // The flush is what actually transfers the object (one PutObject on
+  // S3). Discarding its status let a failed upload look like a finished
+  // SSTable: the compactor then published a COMPACT record naming a file
+  // that does not exist and deleted the inputs behind it. Keep an
+  // earlier failure if there already is one.
+  Status flush_status = r->storage->flush(r->fileName);
+  if (ok()) r->status = flush_status;
   // r->storage->seal(r->fileName);
   delete filter_block_identifier;
   delete filter_block_for_file_identifier;

@@ -7,6 +7,13 @@ namespace ozonedb {
 Status SSTableHandler::readRecordFromAllLevel(std::string const& key, std::shared_ptr<Record>& record, std::string const& offset) {
   // sstable prefix is level prefix + number
 
+  // latest_view aliases into the caller's View snapshot, which is null
+  // until MetadataLogHandler publishes the first one. lru_cache is set
+  // separately from construction. Neither is guaranteed here.
+  if (this->latest_view == nullptr || this->lru_cache == nullptr) {
+    return Status::kFailure;
+  }
+
   for (int i = 1; i <= max_level; i++) {
     std::string prefix = this->sstable_prefix + std::to_string(i);
 
@@ -29,6 +36,11 @@ Status SSTableHandler::readRecordFromAllLevel(std::string const& key, std::share
       }
       Table* table = nullptr;
       this->lru_cache->getSSTable(file_name, table);
+      // getSSTable hands back null on three paths: Table::open failed,
+      // it threw, or we were a single-flight follower whose leader
+      // failed. Skip the file rather than dereferencing null — another
+      // level may still hold the key.
+      if (table == nullptr) continue;
       Status status = table->get(key, record);
       if (status == Status::kSuccess) {
         return Status::kSuccess;

@@ -3,6 +3,7 @@
 
 #include "protobuf/record.pb.h"
 #include <cstddef>
+#include <cstdint>
 #include <list>
 #include <memory>
 #include <shared_mutex>
@@ -19,10 +20,36 @@ namespace ozonedb {
 // the index.
 class LogKeyIndex {
  public:
+  // Position of a record in the shared log's global order.
+  //
+  // `addr` is the Corfu global address of the entry that carried the
+  // record. `sub` orders records inside one entry, because a single
+  // batched APPEND carries many records and the later ones are newer.
+  //
+  // An unordered source (a local backend with no global order, or a
+  // backfill scan) uses addr = -1, which never displaces a ranked entry
+  // and is always displaced by one.
+  struct Rank {
+    long addr = -1;
+    uint32_t sub = 0;
+
+    bool operator<(Rank const& o) const {
+      if (addr != o.addr) return addr < o.addr;
+      return sub < o.sub;
+    }
+  };
+
   explicit LogKeyIndex(size_t capacity) : capacity_(capacity) {}
 
   std::shared_ptr<Record> lookup(std::string const& key);
-  void upsert(std::string const& key, std::shared_ptr<Record> rec, std::string const& source_file);
+  // Insert or replace the entry for `key`. A record whose Rank is BELOW
+  // the stored one is dropped: the index is a newest-wins cache, and
+  // the tailer can deliver a peer's older record after the local writer
+  // has already indexed a newer one for the same key. The old
+  // last-writer-by-arrival-time rule let that stale record win, and
+  // nothing ever corrected it.
+  void upsert(std::string const& key, std::shared_ptr<Record> rec,
+              std::string const& source_file, Rank rank = Rank{});
   void invalidateFile(std::string const& file);
   size_t size() const;
 
@@ -30,6 +57,7 @@ class LogKeyIndex {
   struct Entry {
     std::shared_ptr<Record> rec;
     std::string source_file;
+    Rank rank;
     std::list<std::string>::iterator lru_it;
   };
 

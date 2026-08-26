@@ -32,20 +32,30 @@ Status Table::open(Storage* storage,
                    Table*& table) {
   // read the footer
   size_t size = storage->size(fileName);//tobe changed.
+  // A missing, empty or truncated object would underflow the offset
+  // below and read from an absurd address.
+  if (size < FOOTER_BLOCK_SIZE) return Status::kFailure;
   unsigned char* footer_vector = nullptr;
   Status s = storage->read(fileName, footer_vector, size - FOOTER_BLOCK_SIZE, FOOTER_BLOCK_SIZE);
   if (s != Status::kSuccess) return s;
   // Deserialize the footer
   std::vector<google::protobuf::Message*> footer;
   s = protobuf::deserializeMessages(footer_vector, FOOTER_BLOCK_SIZE, footer, []() { return new FooterBlock(); });
-  if (s != Status::kSuccess) return s;
   delete[] footer_vector;
   footer_vector = nullptr;
+  if (s != Status::kSuccess) return s;
+  if (footer.empty()) return Status::kFailure;
   auto* footer_block = static_cast<FooterBlock*>(footer[0]);
   // read index block based on the index identifier in the footer
-  BlockData* index_block;
+  BlockData* index_block = nullptr;
   s = readBlock(storage, fileName, footer_block->index_identifier(), index_block);
-  if (s == Status::kSuccess) {
+  if (s != Status::kSuccess || index_block == nullptr) {
+    // The footer owns the index identifier; free it on the failure path
+    // too, or every failed open leaks one FooterBlock.
+    delete footer_block;
+    return s == Status::kSuccess ? Status::kFailure : s;
+  }
+  {
     Rep* rep = new Table::Rep;
     rep->storage = storage;
     rep->fileName = fileName;
@@ -142,6 +152,11 @@ Iterator* Table::blockReader(Table* table,
 }
 
 Status Table::get(std::string const& key, std::shared_ptr<Record>& record) {
+  // index_iter is built from the index block in Table::open. A Table
+  // that reached a reader without one cannot answer anything.
+  if (rep_ == nullptr || rep_->index_iter == nullptr || rep_->lru_cache == nullptr) {
+    return Status::kNotFound;
+  }
   // check file filter first
   if (rep_->filter_block_for_file_reader != nullptr && !rep_->filter_block_for_file_reader->keyMayMatch(0, key)) {
     return Status::kNotFound;

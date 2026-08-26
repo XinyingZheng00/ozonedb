@@ -130,7 +130,11 @@ Status LogHandler::addRecord(Record const& record) {
   if (key_index_) {
     auto clone = std::make_shared<Record>(record);
     cache->putLogRecordSingle(final_target, clone);
-    key_index_->upsert(record.key(), std::move(clone), final_target);
+    // Rank by the global address the log just assigned this record, so
+    // a peer record the tailer delivers later cannot displace it unless
+    // it really is newer. Backends with no global order return -1.
+    LogKeyIndex::Rank rank{this->storage->lastAppendAddressForThread(), 0};
+    key_index_->upsert(record.key(), std::move(clone), final_target, rank);
   }
   return Status::kSuccess;
 }
@@ -258,6 +262,10 @@ Status LogHandler::readRecord(std::string const& key, std::shared_ptr<Record>& r
   if (record) {
     // Backfill the index from the slow-path hit so the next lookup
     // for this key is O(1). Cache and index co-own via shared_ptr.
+    //
+    // Unranked (addr = -1): a scan result carries no global address, so
+    // it fills an empty or unranked slot but never displaces an entry
+    // that came from a known log position.
     if (key_index_ && record_file >= 0 &&
         record_file < static_cast<int>(files.size())) {
       key_index_->upsert(key, record, files[record_file]);
@@ -298,7 +306,7 @@ void LogHandler::invalidateCompactedLog(std::vector<std::string> const& files) {
 
 void LogHandler::onRemoteAppend(std::string const& file_name,
                                 unsigned char const* data, size_t len,
-                                RemoteOp op) {
+                                RemoteOp op, long addr) {
   if (!key_index_) return;
   // Reject anything outside our log prefix: SSTable writes, other
   // handlers' log streams, metadata log entries. Cheap O(n) rejection
@@ -318,13 +326,18 @@ void LogHandler::onRemoteAppend(std::string const& file_name,
                                 []() -> google::protobuf::Message* {
                                   return new Record();
                                 });
+  // One entry can carry many records. They share the entry's global
+  // address, so the position WITHIN the payload breaks the tie: a later
+  // record in the byte stream is the newer one.
+  uint32_t sub = 0;
   for (auto* msg : messages) {
     // Wrap in shared_ptr immediately so we don't have to hand-roll
     // cleanup if either the cache put or the index upsert throws.
     std::shared_ptr<Record> rec(static_cast<Record*>(msg));
     auto key = rec->key();
     cache->putLogRecordSingle(file_name, rec);
-    key_index_->upsert(std::move(key), std::move(rec), file_name);
+    key_index_->upsert(std::move(key), std::move(rec), file_name,
+                       LogKeyIndex::Rank{addr, sub++});
   }
 }
 }  // namespace ozonedb

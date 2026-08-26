@@ -74,6 +74,8 @@ class CorfuDBStorage : public Storage {
   void clearSync() override;
   bool hasSyncToken() const override { return fence_token_.instance == this; }
 
+  long lastAppendAddressForThread() const override { return last_append_addr_; }
+
   void setRemoteAppendListener(RemoteAppendListener listener) override {
     bool cleared;
     {
@@ -204,6 +206,7 @@ class CorfuDBStorage : public Storage {
     std::string file_name;
     std::vector<unsigned char> payload;
     RemoteAppendListener listener;
+    long addr = -1;
   };
   std::mutex dispatch_mtx_;
   std::condition_variable dispatch_cv_;
@@ -274,6 +277,12 @@ class CorfuDBStorage : public Storage {
     long target = -1;
   };
   static thread_local FenceToken fence_token_;
+
+  // Global address of this thread's last successful append. Set by
+  // append/appendInBatch/flush on the way out, read through
+  // lastAppendAddressForThread() by LogHandler so it can rank the
+  // record it just wrote against records the tailer delivers later.
+  static thread_local long last_append_addr_;
   // Fence target for the current fenced read: the token's target when
   // this thread holds one for this instance, else a fresh (expensive)
   // globalFenceTarget() sample.

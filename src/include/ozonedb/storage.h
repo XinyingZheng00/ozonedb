@@ -28,9 +28,14 @@ enum class Status { kSuccess,
 // requiring every reader to fence against the shared log.
 enum class RemoteOp { kAppend,
                       kRemove };
+// `addr` is the entry's position in the backend's global order (the
+// Corfu global address). It ranks the records the payload carries, so a
+// peer entry that the tailer delivers late cannot overwrite a newer
+// record in LogKeyIndex. Backends with no global order pass -1.
 using RemoteAppendListener =
     std::function<void(std::string const& file_name,
-                       unsigned char const* data, size_t len, RemoteOp op)>;
+                       unsigned char const* data, size_t len, RemoteOp op,
+                       long addr)>;
 
 /**
  * @brief Base class for all the storage classes
@@ -121,6 +126,17 @@ class Storage {
    * override. Should be called once before reads begin.
    */
   virtual void setRemoteAppendListener(RemoteAppendListener /*listener*/) {}
+
+  /**
+   * @brief Global-order position of this thread's last successful append.
+   *
+   * Valid only immediately after an append/appendInBatch/flush on the
+   * same thread returned kSuccess. Lets a caller rank the record it just
+   * wrote against records the tailer delivers later — without it, the
+   * local writer has no way to say which of two copies of a key is
+   * newer. Returns -1 on backends with no global order.
+   */
+  virtual long lastAppendAddressForThread() const { return -1; }
 
   /**
    * @brief Establish a linearization fence for the CALLING THREAD.

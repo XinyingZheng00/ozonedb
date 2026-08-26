@@ -66,8 +66,8 @@ class LogHandler {
       // don't override setRemoteAppendListener (local/Azure/S3).
       storage->setRemoteAppendListener(
           [this](std::string const& file, unsigned char const* data,
-                 size_t len, RemoteOp op) {
-            this->onRemoteAppend(file, data, len, op);
+                 size_t len, RemoteOp op, long addr) {
+            this->onRemoteAppend(file, data, len, op, addr);
           });
     }
   };
@@ -132,7 +132,7 @@ class LogHandler {
   // Ignores files outside this handler's prefix (SSTables, other
   // log streams). See Storage::setRemoteAppendListener.
   void onRemoteAppend(std::string const& file_name,
-                      unsigned char const* data, size_t len, RemoteOp op);
+                      unsigned char const* data, size_t len, RemoteOp op, long addr);
 
   // set thread pool
   void setThreadPool(ThreadPool* thread_pool) { this->thread_pool = thread_pool; }

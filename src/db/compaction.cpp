@@ -350,11 +350,15 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   if (!this->sstable_storage->exist(dest_prefix)) {
     this->sstable_storage->createDirectory(dest_prefix);
   }
+  // Set when any output SSTable fails to write. Publishing a COMPACT for
+  // a missing SSTable and then deleting the inputs destroys data, so a
+  // failed build must abandon the whole task and leave the inputs alone.
+  bool output_failed = false;
   for (int i = 0; i < records.size(); i++) {
     if (compaction->outputBuilder == nullptr ||
         (compaction->task_id->destinationlevel() == this->metadata->max_level && compaction->outputBuilder->fileSize() > this->metadata->level_file_size_limit[compaction->task_id->destinationlevel() - 1])) {
       if (compaction->outputBuilder != nullptr) {
-        compaction->outputBuilder->finish();
+        if (compaction->outputBuilder->finish() != Status::kSuccess) output_failed = true;
         key_range.second = records[i - 1]->key();
         key_ranges.push_back(key_range);
         output_file_bytes.push_back(compaction->outputBuilder->fileSize());
@@ -380,7 +384,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   }
   
   if (compaction->outputBuilder != nullptr) {
-    compaction->outputBuilder->finish();
+    if (compaction->outputBuilder->finish() != Status::kSuccess) output_failed = true;
     key_range.second = records[records.size() - 1]->key();
     // std::cout << "key range: " << key_range.first << " to " << key_range.second << std::endl;
     key_ranges.push_back(key_range);
@@ -388,7 +392,18 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     delete compaction->outputBuilder;
     compaction->outputBuilder = nullptr;
   }
-  
+
+  if (output_failed) {
+    // Abandon the task without publishing anything. The inputs stay
+    // where they are, the task claim lapses, and another writer (or this
+    // one on a later tick) retries the compaction. Any partial output
+    // object is unreferenced and gets overwritten on the retry, because
+    // the output name carries a fresh timestamp.
+    std::cerr << "[compaction] output write failed, abandoning task; inputs kept\n";
+    compaction->finished = false;
+    return Status::kFailure;
+  }
+
   OperationRecord operation_record;
   operation_record.set_op_type(OperationRecord::COMPACT);
   for (auto const& input : compaction->task_id->input_files()) {
@@ -407,17 +422,42 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   }
   this->metadata_handler->appendToMetadataLog(operation_record);
 
+  // Apply the COMPACT to our OWN view before touching the inputs.
+  //
+  // appendToMetadataLog only writes the record; the local view rolls
+  // forward later, on the periodic thread. Invalidating and removing in
+  // that window left the local view still listing the inputs while the
+  // bytes were already gone, so a concurrent default-mode get scanned a
+  // file that returned nothing and reported kFailure for a key that
+  // exists. Rolling forward here closes the window.
+  this->metadata_handler->rollForwardMetadataLog();
+
+  // Sizes must be sampled BEFORE the deletes — afterwards storage->size()
+  // reports 0 for a removed file, and on a split backend it would ask the
+  // wrong backend entirely.
+  std::vector<std::string> inputs;
+  inputs.reserve(compaction->task_id->input_files_size());
+  for (auto const& input : compaction->task_id->input_files()) {
+    inputs.push_back(input);
+  }
+  // Route to the backend that actually holds the file. `storage` is the
+  // log backend; SSTables live on `sstable_storage`, which under the
+  // shipped `sstable_backend: s3` is MinIO. Removing SSTables through
+  // the log backend left MinIO growing without bound and sent Corfu a
+  // REMOVE for a file it never held.
+  Storage* input_storage = log_level_compaction ? this->storage : this->sstable_storage;
+  int input_size = 0;
+  for (auto const& input : inputs) {
+    input_size += log_level_compaction ? static_cast<int>(input_storage->size(input))
+                                       : static_cast<int>(this->latest_view.getFileSize(input));
+  }
+
   // Drop LogKeyIndex entries and LRUCache log records for the inputs.
   // Both layers hold shared_ptr<Record>, so a reader that already
   // lifted a pointer out keeps its Record alive past this point — the
   // refcount drops to zero only after the last borrower releases.
   if (log_level_compaction && this->log_handler != nullptr) {
-    std::vector<std::string> log_inputs;
-    log_inputs.reserve(compaction->task_id->input_files_size());
-    for (auto const& input : compaction->task_id->input_files()) {
-      log_inputs.push_back(input);
-    }
-    this->log_handler->invalidateCompactedLog(log_inputs);
+    this->log_handler->invalidateCompactedLog(inputs);
   }
 
   // Step4: delete the input files from storage. MUST run after the
@@ -428,8 +468,8 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   // file_buffers_ + LRUCache records (confirmed via heaptrack as the
   // dominant sustained allocators). For local/disk backends it means
   // disk-space exhaustion across long runs.
-  for (auto const& input : compaction->task_id->input_files()) {
-    this->storage->remove(input);
+  for (auto const& input : inputs) {
+    input_storage->remove(input);
   }
   compaction->finished = true;
   std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
@@ -437,22 +477,15 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
   // `key_record` go out of scope. Any concurrent reader that lifted
   // a pointer out of LogKeyIndex / the cache keeps its Record alive
   // independently until it releases its own refcount.
-  if (log_level_compaction) {
-    if (this->event_listener != nullptr) {
-      int input_size = 0;
-      for (auto const& input : compaction->task_id->input_files()) {
-        input_size += this->storage->size(input);
-      }
+  // input_size was sampled before the deletes above — asking storage now
+  // would report 0 for every removed file.
+  if (this->event_listener != nullptr) {
+    if (log_level_compaction) {
       this->event_listener->onLogCompactionCompletion(input_size);
+    } else {
+      int source_level = getSSTLayerNumber(compaction->task_id->input_files(0));
+      this->event_listener->onSSTableCompactionCompletion(input_size, source_level);
     }
-
-  } else if (this->event_listener != nullptr) {
-    int source_level = getSSTLayerNumber(compaction->task_id->input_files(0));
-    int input_size = 0;
-    for (auto const& input : compaction->task_id->input_files()) {
-      input_size += this->latest_view.getFileSize(input);
-    }
-    this->event_listener->onSSTableCompactionCompletion(input_size, source_level);
   }
   return Status::kSuccess;
 }
