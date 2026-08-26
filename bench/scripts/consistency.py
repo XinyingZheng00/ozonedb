@@ -26,6 +26,7 @@ so it neither disturbs nor replays the benchmark stream.
 import argparse
 import bisect
 import json
+import fcntl
 import os
 import subprocess
 import sys
@@ -127,25 +128,57 @@ CLASSPATH_CACHE = os.path.join(
 )
 
 
+def _read_cached_classpath():
+    """The cached classpath string, or None when it is absent or stale."""
+    if not os.path.exists(CLASSPATH_CACHE):
+        return None
+    with open(CLASSPATH_CACHE) as f:
+        cached = f.read().strip()
+    first_jar = next(
+        (p for p in cached.split(os.pathsep) if p.endswith(".jar")), None
+    )
+    if cached and (first_jar is None or os.path.exists(first_jar)):
+        return cached
+    return None
+
+
 def _classpath(rebuild=False):
     """Persistently cached classpath. The multiproc runners re-run Maven on
     every invocation; for a 15-second probe that Maven pass dominates the
     wall time, so cache the resolved string across invocations and refresh
-    only on --rebuild (or when a cached jar has vanished)."""
-    if not rebuild and os.path.exists(CLASSPATH_CACHE):
-        with open(CLASSPATH_CACHE) as f:
-            cached = f.read().strip()
-        first_jar = next(
-            (p for p in cached.split(os.pathsep) if p.endswith(".jar")), None
-        )
-        if cached and (first_jar is None or os.path.exists(first_jar)):
+    only on --rebuild (or when a cached jar has vanished).
+
+    Guarded by a file lock. run_visibility_cross_node.sh fans out N writer
+    PROCESSES over ssh, and on the first run after a build every one of
+    them misses the cache and runs Maven at the same moment in the same
+    checkout. They then race on ycsb/core/target/, and one loses with
+    "Unable to read Checkstyle results xml: ... not \\u0" -- that writer
+    never connects, and the reader waits for a connection that never comes
+    until its accept timeout expires. The in-process memo in
+    _resolve_ycsb_classpath cannot see other processes; the lock can.
+    """
+    if not rebuild:
+        cached = _read_cached_classpath()
+        if cached:
             return cached
-    ycsb_path = os.path.join(OZONEDB_HOME, "ycsb")
-    base = _resolve_ycsb_classpath(ycsb_path, "ozonedb")
-    cp = os.pathsep.join([corfu_bridge_jar_path(), base])
-    with open(CLASSPATH_CACHE, "w") as f:
-        f.write(cp)
-    return cp
+
+    lock_path = CLASSPATH_CACHE + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        # Re-check under the lock: whoever held it before us has very
+        # likely just written the cache, and re-running Maven would
+        # reintroduce the race we are avoiding.
+        if not rebuild:
+            cached = _read_cached_classpath()
+            if cached:
+                return cached
+        ycsb_path = os.path.join(OZONEDB_HOME, "ycsb")
+        base = _resolve_ycsb_classpath(ycsb_path, "ozonedb")
+        cp = os.pathsep.join([corfu_bridge_jar_path(), base])
+        with open(CLASSPATH_CACHE, "w") as f:
+            f.write(cp)
+        return cp
 
 
 def _probe_cmd(cp, mode, flags):

@@ -78,8 +78,15 @@ nodes:
     lan: "10.10.1.1"
 
   clients:
+    # clients[0] runs the writers, clients[1] runs the isolated reader
+    # (run_visibility_cross_node.sh). With a two-node reservation the
+    # reader shares amd215 with corfu_server and MinIO: fine for the miss
+    # count, which is clock-free, but read latency there carries their
+    # noise. Put the reader on its own machine before quoting tail numbers.
     - ssh: "amd211.utah.cloudlab.us"
       lan: "10.10.1.2"
+    - ssh: "amd215.utah.cloudlab.us"
+      lan: "10.10.1.1"
 
 # ------------------------------------------------------------------ corfu --
 corfu:
