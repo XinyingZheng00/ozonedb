@@ -2,6 +2,41 @@
 
 Fix the paths that let an acked write disappear or duplicate.
 
+## 0. Status — all six phases are implemented and tested
+
+Every one of the fifteen findings is fixed, plus the six items the review
+cap cut. The work is on branch `worktree-plan-durability`.
+
+Test results on the two-node cluster (amd215 = corfu + MinIO, amd211 =
+client), 2026-08-26:
+
+| Level | Result |
+|---|---|
+| Build | `cmake --build build -j` completes; full `build.sh` chain too |
+| Unit | 26 pass, 6 skip (Corfu, no env vars), 0 fail |
+| Corfu unit | 6 pass against a live server |
+| `corfu_smoke` | PASS, 200/200 keys across reopen |
+| `corfu_multiwriter_smoke` | PASS, 200/200 keys from 2 concurrent writers |
+| Cross-node, default reads | 560 first reads, 2 missed (0.4%), p50 2.7 ms |
+| Cross-node, `--linearizable` | **0 first-read misses — read-latest holds** |
+| Workload A, 2 writers | 57,609 updates, 0 failed; 57,531 reads, 2 failed |
+
+The `CloudStorageTest.*` suite still fails without Azure credentials.
+That is by design and predates this work.
+
+Three defects were found while testing this plan, and are fixed here too:
+
+- `bench/ansible/sync.yml` shipped stale binaries. `rsync -a` keeps the
+  operator's local mtime, and when that time falls before the node's last
+  build, make skips the file. The first round of testing ran against a
+  binary that contained none of the fixes.
+- `consistency.py` ran Maven concurrently from every writer process on the
+  first run after a build, corrupting `checkstyle-result.xml` and killing
+  a writer. A file lock now guards the resolve.
+- `LogHandler::addRecord` retried a `kSealed` append against a stale view,
+  so `newTail()` re-adopted the file it was just refused on and the put
+  failed after nine attempts. It now rolls the metadata log forward first.
+
 ## 1. Purpose
 
 The `visibility` branch claims strict cross-writer visibility. A review found fifteen
