@@ -109,6 +109,14 @@ Status LogHandler::addRecord(Record const& record) {
       break;
     }
     if (status != Status::kSealed) break;  // hard failure — do not retry
+
+    // kSealed means a peer (or our own roll) closed this tail. Refresh the
+    // view from the log BEFORE picking the next one: newTail() decides
+    // from metadata_log's view, and on a stale view it re-adopts the very
+    // file we were just refused, so every retry draws the same kSealed and
+    // the put fails after exhausting the budget. Rolling forward makes
+    // current_log_tail the peer's new tail.
+    metadata_log->rollForwardMetadataLog();
     newTail();
   }
 
