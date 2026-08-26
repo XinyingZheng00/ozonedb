@@ -3,13 +3,43 @@
 Bound the log that a process replays when it joins. Move the trimmed prefix of the
 shared log into the object store as a checkpoint, then trim the Corfu stream behind it.
 
-## 0. Status — phases 0–4 implemented, cluster validation (phase 5) pending (2026-08-26)
+## 0. Status — implemented and validated on the cluster (2026-08-26)
 
 Branch: `worktree-plan-trimming`, from `visibility` at `25dab3a0`. That head already contains
 the durability fixes (`PLAN-durability.md`, merged at `ca03ba2b`) and the batched open-time
 replay.
 
-Implemented on the branch, not yet built or run on the cluster:
+Results on the 2026-08-26 cluster (amd127 = corfu + MinIO, amd160 = client, 8 writer
+processes on one host, 1M × 1 KB load):
+
+| Check | Result |
+|---|---|
+| `CheckpointTest` (FileStorage, no Corfu) | 4/4 pass |
+| `CorfuStorageTest` (live server) | 10/10 pass, incl. join, refuse-without-checkpoint, snapshot under concurrent writes, two trimmer cycles |
+| `corfu_smoke` 3000 keys, trimmer on | PASS 3000/3000 across a reopen that restored `C=5000` and replayed 1 entry |
+| `corfu_multiwriter_smoke` | PASS 1000/1000 from 2 writers |
+| Load with `--log-trim` | 4 cycles; final `C=954059`, live 61 MB, snapshot pause 16–31 ms, upload ≤ 0.5 s, trim ≤ 0.5 s |
+| Corfu disk after the load | 293 MB (stream was ~1.1 GB); bucket holds 2 checkpoints (33 MB + 62 MB) + `LATEST` |
+| **Join from the checkpoint** | restore `C=954059` (61 MB), replay **55,268 entries in 1.6 s**, first YCSB op at **9 s** |
+| Control, same load without trimming | replay **1,003,655 entries in 16 s**, first YCSB op at **23 s** |
+| Live fraction of the stream (phase 0) | 51 MB live of 1155 MB (4.4 %); `task.log` 560 KB, `metadata.log` 21 KB |
+| Workload c reads after the join, default / `--linearizable` | 0.44 % / 0.47 % NOT_FOUND |
+| Workload c reads on the control (no trimming) | **0.63 % / 0.62 % NOT_FOUND** |
+
+The read misses are **not** a trimming effect: the control without trimming misses at the
+same rate or more, in both read modes, with no writer active. All 1,000,000 inserts returned
+OK in both loads. This is a pre-existing property of an 8-writer load on the `visibility`
+head and is out of this plan's scope. It needs its own investigation (per-partition probe:
+`/tmp/probe_partitions.sh` in the job dir reads 20k uniform keys from each writer's range).
+
+The first-op time includes ~7 s of JVM start, Maven classpath resolve and `initSSTMetadata`
+(70+ SSTables), which trimming does not touch. The replay itself went from 16 s to 1.6 s.
+
+Not run: the two restore-mismatch checks of §5 (server restarted from the trimmed dir;
+bucket without the log dir). Both paths are covered by unit tests
+(`trimmed_stream_without_checkpoint_refuses_to_open`) but not by the cluster procedure yet.
+
+Implemented on the branch:
 
 | Phase | Where |
 |---|---|
