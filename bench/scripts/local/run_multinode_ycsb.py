@@ -111,6 +111,21 @@ def remote_ozonedb_home(target, ssh_key):
     return home
 
 
+def kill_remote_ycsb(target, ssh_key):
+    """SIGKILL any YCSB writer processes left on a host. Used when a cell
+    overruns its timeout: a writer stuck in the linearizable tailer catch-up
+    does 0 ops, so YCSB's between-ops maxexecutiontime never fires and the
+    process hangs forever, blocking the whole sweep. This unblocks it."""
+    cmd = ssh_base(target, ssh_key) + [
+        "pkill -9 -f site.ycsb.Client; pkill -9 -f run_local_ycsb_multiproc; true"
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        print(f"[{target}] killed remote YCSB writers (cell timeout)")
+    except Exception as e:
+        print(f"[{target}] remote kill failed: {e}")
+
+
 def stream_remote(target, ssh_key, remote_command, log_path):
     """Run a command on the remote, streaming combined output to log_path."""
     ssh_cmd = ssh_base(target, ssh_key) + [
@@ -340,6 +355,15 @@ def main():
              "mode; result files are labelled cassandra-<mode>.",
     )
     parser.add_argument(
+        "--cell_timeout",
+        type=int,
+        default=None,
+        help="Hard wall-clock cap (seconds) for this cell. If a host has not "
+             "finished by then, remote YCSB writers are killed on every host and "
+             "the sweep continues (the cell under-reports). Default: "
+             "2*max_exec_time+120 when --max_exec_time is set, else no cap.",
+    )
+    parser.add_argument(
         "--run_tag",
         help="Tag for results dir; defaults to YYYYmmdd-HHMMSS. All hosts share this tag.",
     )
@@ -454,13 +478,35 @@ def main():
             print(f"[{p['target']}] error: {e}")
             rcs[p["host"]] = -1
 
+    # Per-cell wall-clock timeout. A writer stuck in linearizable catch-up
+    # hangs forever (0 ops -> maxexecutiontime never fires), so without this
+    # one bad host blocks the entire sweep. Default: generous room over the
+    # run itself for catch-up + scp, only when a run cap is set.
+    cell_timeout = args.cell_timeout
+    if cell_timeout is None and args.max_exec_time:
+        cell_timeout = args.max_exec_time * 2 + 120
+
     wall_start = time.time()
     for p in plan:
         t = threading.Thread(target=worker, args=(p,), daemon=False)
         t.start()
         threads.append(t)
+
+    deadline = (wall_start + cell_timeout) if cell_timeout else None
     for t in threads:
-        t.join()
+        if deadline is not None:
+            t.join(timeout=max(0.0, deadline - time.time()))
+        else:
+            t.join()
+    if deadline is not None and any(t.is_alive() for t in threads):
+        print(
+            f"[orchestrator] CELL TIMEOUT after {cell_timeout}s -- killing remote "
+            f"YCSB on all hosts so the sweep can continue (this cell under-reports)"
+        )
+        for p in plan:
+            kill_remote_ycsb(p["target"], ssh_key)
+        for t in threads:
+            t.join(60)
     wall_ms = (time.time() - wall_start) * 1000.0
 
     print(f"[orchestrator] wall={wall_ms / 1000.0:.1f}s return_codes={rcs}")
