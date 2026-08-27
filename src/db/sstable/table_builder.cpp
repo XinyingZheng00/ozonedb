@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 namespace ozonedb {
-#define BLOCK_SIZE 65536  // approximate size of a block
+#define BLOCK_SIZE 4096  // approximate size of a data block (was 65536; see bench/RESULTS-cost.md)
 
 struct TableBuilder::Rep {
   Storage* storage;
