@@ -7,6 +7,9 @@
 in the projection. **Trimming:** on (`--log-trim`, one checkpoint every 30 s) unless a cell
 says `notrim`. **Metric:** steady-state ops/s, mean of the last 60 s per writer, summed.
 **Failures:** 0 failed operations in every cell. **Cells:** 37 rows, all `rc=0`.
+**Correction (2026-08-27):** every OzoneDB workload-a cell lost 1 to 4 of its 8 writers
+to a native crash that the runner did not report; the workload-a sums are survivor sums.
+Found in the 4 KiB re-run, fixed in `96b9265d`. See "A crash in every workload-a cell".
 
 Artifacts, all under `bench/`:
 
@@ -31,9 +34,12 @@ Artifacts, all under `bench/`:
    10 TB (h = 0.03). Storage, compaction PUTs and checkpoint PUTs together stay under
    $300 up to 10 TB. A row cache, or blocks of 4 KB, is the engine change that moves the
    curve. Without one, the "cheap object store" argument rests on GET pricing, not on
-   storage pricing.
+   storage pricing. The 4 KiB re-run below (`cost-20260828-4k`) measures that change:
+   `h` 1.05x to 19x higher, but compaction GETs 13.6x higher until compaction reads
+   ranges instead of blocks.
 3. **OzoneDB clients need 35x the CPU per operation of Cassandra clients.** Workload a:
-   2.16 ms per op (median, 8 writers) against 0.061 ms. Every OzoneDB process tails the
+   2.16 ms per op (median, 8 writers, survivor writers of the crash below) against
+   0.061 ms; 1.37 ms on the 4 KiB build with the crash fix (600 s, 8/8 writers). Every OzoneDB process tails the
    whole shared log and runs compaction, so the per-op client CPU grows with the
    aggregate write rate: 0.85 ms at 2 writers, 1.09 ms at 4, 1.58 ms at 8. At 10,000 ops/s
    that is 8 `m6i.xlarge` clients ($1,120) against one `c6i.large` ($62).
@@ -123,7 +129,10 @@ give 0.069 and 0.0.
 | Cassandra quorum, 10 GB | c | 44,213 | | | 0.060 ms | 0.11 ms | 16 % |
 
 The trimmer adds 1.4e-5 PUTs per op on workload a (4.7e-5 against 3.3e-5) and changes
-throughput by 2 % or less.
+throughput by 2 % or less. **OzoneDB workload-a rows are sums over the writers that
+survived the crash described in the 4 KiB section:** 7/8 at 512 MB, 5/8 at 64 MB, 8 MB
+and 1 MB, 4/8 at 128 KB, 6/8 with trimming off, 8/8 linearizable, 7/8 and 8/8 at 10 GB.
+Workload c and Cassandra rows are complete (8/8).
 
 ## Server scaling, workload a, 512 MB cache
 
@@ -174,6 +183,159 @@ crossover at 17.8 TB. Stated assumptions:
 3. The hot set is scale-free: `h` depends on `c / D` only. Checked at 1 GB and 10 GB
    (difference at most 0.06 at equal ratio).
 4. The log tier is flat in D with trimming. Checked at 1 GB (187 MiB) and 10 GB (171 MiB).
+
+## Re-run with 4 KiB blocks (campaign `cost-20260828-4k`, engine commit `dd0f195e`)
+
+**Date:** 2026-08-27. **Change:** `BLOCK_SIZE` 65536 to 4096 in
+`src/db/sstable/table_builder.cpp:16`, the SlateDB and LevelDB default. Everything else is
+the same as `cost-20260827`: same cluster, same 8 clients, `build.sh` on every client, a
+fresh 1 GB load with trimming, the 600 s workload-c sweep at the five cache sizes, then
+a/c cells at 512 MB and 8 MB (120 s and 600 s). The 600 s workload-a cells ran on the
+build with the crash fix `96b9265d` (see "A crash in every workload-a cell"). The
+Cassandra rows are those of `cost-20260827`. All cells `rc=0`; the two 600 s workload-a
+cells count 1 and 6 failed reads in 1.6 M operations (a key in a file removed under the
+reader, the documented transient miss of the non-linearizable path).
+
+Artifacts, under `bench/`: `results-cost-20260828-4k.tsv` (15 rows),
+`results-cost-20260828-4k-projection.tsv` (compaction GETs as measured),
+`results-cost-20260828-4k-projection-rangeread.tsv` (compaction GETs set to zero, see
+below), `results-cost-20260828-4k.png`.
+
+### Cache sweep, workload c, 8 writers, 600 s cells: 64 KiB against 4 KiB
+
+| Cache per client | c / D | `h` 64 KiB | `h` 4 KiB | Gain | Simulated gain | ops/s 64 KiB | ops/s 4 KiB | Client CPU per op 64 / 4 | Server CPU per op 64 / 4 |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 512 MB | 52.4 % | 0.645 | 0.675 | 1.05x | 1.12x | 10,575 | 14,350 | 0.34 / 0.25 ms | 0.56 / 0.42 ms |
+| 64 MB | 6.55 % | 0.232 | 0.341 | 1.47x | 1.47x | 6,126 | 8,086 | 0.55 / 0.37 ms | 1.03 / 0.74 ms |
+| 8 MB | 0.82 % | 0.101 | 0.215 | 2.13x | 1.88x | 5,286 | 7,057 | 0.61 / 0.42 ms | 1.20 / 0.87 ms |
+| 1 MB | 0.10 % | 0.012 | 0.141 | 11.3x | 3.3x | 5,059 | 6,419 | 0.62 / 0.46 ms | 1.31 / 0.96 ms |
+| 128 KB | 0.013 % | 0.002 | 0.032 | 19x | 9x | 4,982 | 5,858 | 0.63 / 0.50 ms | 1.35 / 1.06 ms |
+
+"Simulated gain" is the ratio of LRU hit rates for 4-record and 64-record blocks in a
+zipfian (0.99) simulation over 1M hashed keys, at the same cache ratio. The middle of the
+curve matches the simulation. The small caches gain more than simulated because the
+measured 64 KiB curve was below the simulation there (a 1 MB cache holds 16 blocks of
+64 KiB and 256 blocks of 4 KiB). Read throughput rose 18 to 36 % at every size, and the
+client CPU per read fell 21 to 27 %: a miss now parses 4 records instead of 64. Peak RSS
+per client rose 10 %. `g` stays 0.993 GETs per miss.
+
+### Load, compaction and the 4 KiB penalty
+
+| | 64 KiB | 4 KiB |
+|---|--:|--:|
+| Load, 8 writers, 1M x 1 KB | 9,417 puts/s, 120 s | 8,054 puts/s, 147 s |
+| GETs per put (compaction input reads) | 0.015 | **0.205** |
+| PUTs per put | 4.7e-5 | 4.4e-5 |
+| Client CPU per put | 0.86 ms | 0.91 ms |
+| Server CPU per put | 0.32 ms | 0.56 ms |
+| SSTables after the load (bucket) | 203 + 942 MiB | 204 + 953 MiB |
+| Trimmed log, checkpoints, objects | 187 MiB, 4, 22 | 188 MiB, 4, 20 |
+
+Compaction reads every input file through `Table::getAll`
+(`src/db/sstable/table_reader.cpp`), which calls `readBlock` once per block, and
+`readBlock` (`src/db/sstable/block_handler.cpp:88`) issues one `storage->read` per call.
+Sixteen times more blocks means 13.6x more GETs per put. The index grew 16x in entries
+(about 1 % of the bucket) and the table-open cost did not change (5 GETs per join).
+
+### Workload a and 120 s cells
+
+| Cell | Workload | Duration | ops/s 64 KiB | ops/s 4 KiB | GETs per op 64 / 4 | Client CPU per op 64 / 4 | Server CPU per op 64 / 4 |
+|---|---|--:|--:|--:|--:|--:|--:|
+| 512 MB | a | 120 s | 2,960 | 2,605 | 0.38 / 0.76 | 1.58 / 1.53 ms | 1.21 / 1.36 ms |
+| 8 MB | a | 120 s | 2,543 | 2,528 | 0.64 / 0.80 | 2.47 / 1.54 ms | 2.14 / 1.40 ms |
+| 512 MB | c | 120 s | 10,830 | 10,218 | 0.38 / 0.50 | 0.39 / 0.41 ms | 0.56 / 0.62 ms |
+| 8 MB | c | 120 s | 5,398 | 7,003 | 0.89 / 0.76 | 0.71 / 0.52 ms | 1.17 / 0.85 ms |
+| 512 MB | a | 600 s, fix `96b9265d` | none | 2,708 (8/8) | - / 0.65 | - / 1.17 ms | - / 1.26 ms |
+| 8 MB | a | 600 s, fix `96b9265d` | none | 2,566 (8/8) | - / 0.79 | - / 1.21 ms | - / 1.37 ms |
+
+Two caveats apply to 120 s cells with 4 KiB blocks. First, a 4 KiB miss brings 4 records
+into the cache, a 64 KiB miss brings 64, so a 512 MB cache fills 16x slower: the 512 MB
+120 s cells are still warm-up (`h` 0.475 against 0.675 at 600 s). Second, under workload a
+the last-60 s GET rate includes the compaction reads, so "GETs per op" on workload a is
+reads plus compaction, not `g x (1 - h)`. The client CPU per op on workload a, the number
+the projection uses, is 1.37 ms, the median of the four 4 KiB workload-a cells (2.16 ms in
+the 64 KiB cells, whose survivors ran with fewer peers). Per writer, the 600 s cells give
+339 and 321 ops/s at 8/8 writers; the 64 KiB 120 s survivors averaged 329 (512 MB, 7/8)
+and 291 (8 MB, 5/8) over their runs, so the block size does not change workload-a
+throughput by more than the crash noise. Peak RSS per client reached 3.9 GB at 512 MB
+(2.8 GB in the 64 KiB 120 s cell): retired Tables of removed files are kept 30 s.
+
+### Projection with the 4 KiB curve: 10,000 ops/s, 50 % reads, RF=3 (USD per month)
+
+| | 1 GB | 1 TB | 10 TB | Crossover vs Cassandra on EBS |
+|---|--:|--:|--:|--:|
+| Cassandra, NVMe / EBS | 1,565 / 2,402 | 1,565 / 2,402 | 12,587 / 4,742 | |
+| OzoneDB 64 KiB, 16 GB cache (`cost-20260827`) | 3,693 | 6,247 | 7,053 | 17.8 TB |
+| OzoneDB 4 KiB, compaction GETs as measured (0.205 per put) | 4,092 | 6,308 | 7,070 | 17.8 TB |
+| OzoneDB 4 KiB, compaction GETs at the 64 KiB value (0.032) | 3,182 | 5,399 | 6,160 | 14.7 TB |
+| OzoneDB 4 KiB, compaction range reads (0 per put) | 3,014 | 5,231 | 5,993 | 14.7 TB |
+
+Lines at 10 TB, 16 GB cache: `h` 0.031 to 0.157; S3 GETs $5,045 (64 KiB) to $5,482
+(4 KiB, measured) to $4,404 (4 KiB, range reads); clients 8 to 5 ($1,120 to $700) from the
+lower client CPU per op. Log tier ($614), storage ($270) and PUTs ($5) do not change. The
+4 KiB block curve is worth about $1,060 per month at 10 TB ($640 in GETs, $420 in
+clients), and it is realised only when compaction stops reading one block per GET: as
+measured, compaction GETs ($1,078 at 10 TB) cancel the read saving.
+
+### A crash in every workload-a cell, found and fixed
+
+The first 600 s workload-a cell on the 4 KiB build finished with 1 of 8 writers. The
+other seven died at 130 s with `SIGSEGV` at address 0 in
+`ozonedb::LRUCache::readDataBlocks` (JVM `hs_err_pid*.log` on every client), right after
+an L2 compaction commit, several hosts in the same second. `/usr/bin/time` and the
+multiproc runner return 0 after a JVM abort, so the orchestrator saw `rc=0` on 8/8 hosts.
+The crash reports on the clients date back to the 64 KiB campaign: every OzoneDB
+workload-a cell of `cost-20260827` (08:10 to 08:52 UTC), the 8-host scaling cell (18:46)
+and the 10 GB 10 MB cell lost writers, all with the same frame. Workload c never
+compacts and never crashed; the linearizable cell did not crash either.
+
+| Cell, workload a | 64 KiB writers finished | 4 KiB writers finished |
+|---|--:|--:|
+| 512 MB, 120 s | 7/8 | 8/8 |
+| 64 MB / 8 MB / 1 MB / 128 KB, 120 s | 5/8, 5/8, 5/8, 4/8 | - / 8/8 / - / - |
+| 512 MB, trimming off / linearizable, 120 s | 6/8, 8/8 | - |
+| 512 MB, 2 / 4 / 8 hosts (scaling), 120 s | 2/2, 4/4, 7/8 | - |
+| 10 GB, 10 MB / 1.25 MB, 120 s | 7/8, 8/8 | - |
+| 512 MB / 8 MB, 600 s, before the fix | - | 1/8, 1/8 |
+| 512 MB / 8 MB, 600 s, with the fix | - | 8/8, 8/8 |
+
+Cause (`src/db/cache.cpp`): `invalidateLogFile`, run when the tailer applies a peer
+compaction's REMOVE, deleted the file's `Table*` and erased its cache entry while a reader
+could be inside `Table::get` on that object; `getSSTable` hands out raw pointers and the
+reader holds no lock across the block read. The reader's entry lookup in `readDataBlocks`
+then failed, `table` became null, and `blockReader` dereferenced it. Fix (`96b9265d`):
+removed Tables are retired for 30 s instead of deleted, `readDataBlocks` falls back to the
+caller's Table and treats a missing Table or a failed block read as a failed fetch
+through the existing cleanup path, and `LRUCache::get` uses lookups only. With the fix the
+600 s cells finish 8/8, the fallback path logs 8 and 27 removed-file misses per cell, and
+YCSB counts 1 and 6 failed reads.
+
+What it changes in the numbers above: the workload-a sums of `cost-20260827` are survivor
+sums, and the survivors ran with fewer peers (per-writer throughput rises as writers drop:
+609 / 447 / 329 ops/s at 2 / 4 / 8 hosts). The client CPU per op of finding 3 (2.16 ms) is
+a survivor median. The 4 KiB 120 s cells and the 600 s cells with the fix are complete.
+The workload-c sweep, the loads, the Cassandra cells and every coefficient except the
+workload-a client CPU are unaffected. The 64 KiB workload-a cells were not re-run with the
+fix: that needs a 64 KiB rebuild and a fresh load (about 40 minutes), and the block size is
+a compile-time constant; a config key for it would let both sizes run from one build.
+
+### Conclusions of the re-run
+
+1. **4 KiB blocks are a net win on the read path.** `h` gains 1.5 to 2x at 1 to 7 % cache
+   ratio and 11 to 19x below 0.1 %, read throughput gains 18 to 36 %, client CPU per read
+   falls a quarter. The zipfian simulation predicted the shape.
+2. **Compaction must read ranges, not blocks.** `Table::getAll` reads the whole file, so it
+   must fetch the data section in one range read (or in a few MiB-sized reads) and slice
+   blocks from memory, as SlateDB does with `blocks_to_fetch: 256` on its compaction
+   iterator. Compaction already holds the full table in memory, so the buffer adds no new
+   peak. Expected: GETs per put near zero, load puts/s back to the 64 KiB rate, projection
+   $5,993 at 10 TB, crossover 14.7 TB. The change is not yet made.
+3. **`h` still tracks the capacity fraction.** With 4 KiB blocks the model reaches 0.157
+   at a 16 GB cache on 10 TB. Cache bytes (a local-disk tier) and key-range read affinity
+   remain the levers at scale; the block size alone does not reach `h >= 0.99`.
+4. **Runner exit codes hide native crashes.** A JVM abort leaves `rc=0` at every layer.
+   The extractor must count writers with an `[OVERALL]` block per cell and flag cells
+   with fewer than the configured number (not yet done).
 
 ## Method notes and caveats
 

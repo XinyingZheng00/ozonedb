@@ -11,6 +11,16 @@ per op of Cassandra, OzoneDB with trimming turns cheaper than Cassandra RF=3 onl
 at `35f5cb90` with `worktree-cassandra-bench` (`5518b2b4`) merged in, so one tree holds
 the trimmed engine and the Cassandra baseline. The Cassandra branch alone is 16 commits
 behind `visibility` and must not be used for this experiment.
+**Re-run 2026-08-27 with 4 KiB blocks** (engine commit `dd0f195e`, campaign
+`cost-20260828-4k`, section "Re-run with 4 KiB blocks" of `RESULTS-cost.md`): `h` rose
+to 0.675 / 0.341 / 0.215 / 0.141 / 0.032 at the five cache ratios (1.05x to 19x), read
+throughput +18 to 36 %, client CPU per read -25 %; but compaction GETs per put rose from
+0.015 to 0.205 because `Table::getAll` reads one block per GET. The projection is
+unchanged at 10 TB ($7,070) until compaction reads ranges ($5,993, crossover 14.7 TB).
+That engine change is the next step. The re-run also found that every workload-a cell
+of `cost-20260827` had lost 1 to 4 of 8 writers to a native crash (`readDataBlocks` on a
+file removed under the reader; runner still `rc=0`); fixed in `96b9265d`, the 600 s
+workload-a cells now finish 8/8. The 64 KiB workload-a sums are survivor sums.
 
 ## Goal
 
