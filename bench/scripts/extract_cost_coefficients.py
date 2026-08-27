@@ -224,6 +224,7 @@ def parse_pidstat(path, pid_class, default_interval=10.0):
     last_t = {}
     cols = None
     t0, t1 = None, None
+    samples = 0
     with open(path, errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -237,22 +238,41 @@ def parse_pidstat(path, pid_class, default_interval=10.0):
             parts = line.split()
             if len(parts) < len(cols) - 1:
                 continue
+            # `pidstat -h -H` prints epoch seconds in the Time column. Without
+            # -H (older sysstat) it prints a clock time, possibly with AM/PM as
+            # an extra token; then every row counts as one default interval.
+            if len(parts) == len(cols) + 1 and parts[1] in ("AM", "PM"):
+                parts = [parts[0] + parts[1]] + parts[2:]
             row = dict(zip(cols, parts))
             try:
-                t = float(row.get("Time", "nan"))
                 pid = int(row.get("PID", "-1"))
                 pct = float(row.get("%CPU", "0"))
                 rss = float(row.get("RSS", "0"))
             except ValueError:
                 continue
-            t0 = t if t0 is None else min(t0, t)
-            t1 = t if t1 is None else max(t1, t)
-            interval = (t - last_t[pid]) if pid in last_t and t > last_t[pid] else default_interval
-            last_t[pid] = t
+            try:
+                t = float(row.get("Time", "nan"))
+                if t != t:
+                    raise ValueError
+            except ValueError:
+                t = None
+            samples += 1
+            if t is not None:
+                t0 = t if t0 is None else min(t0, t)
+                t1 = t if t1 is None else max(t1, t)
+                interval = (t - last_t[pid]) if pid in last_t and t > last_t[pid] else default_interval
+                last_t[pid] = t
+            else:
+                interval = default_interval
             cls = pid_class.get(pid, "other")
             cpu_s[cls] += pct * interval / 100.0
             rss_kb[cls] = max(rss_kb[cls], rss)
-    elapsed = (t1 - t0 + default_interval) if (t0 is not None and t1 is not None) else None
+    if t0 is not None and t1 is not None:
+        elapsed = t1 - t0 + default_interval
+    elif samples:
+        elapsed = samples / max(1, len({p for p in last_t} or {0})) * default_interval
+    else:
+        elapsed = None
     return cpu_s, rss_kb, elapsed
 
 

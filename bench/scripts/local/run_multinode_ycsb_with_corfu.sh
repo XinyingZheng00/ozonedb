@@ -252,8 +252,20 @@ port_open() {
   corfu_sh "bash -c '(exec 3<>/dev/tcp/$1/$2) >/dev/null 2>&1'" >/dev/null 2>&1
 }
 
+# The SSTable bucket must be restored together with the log (PLAN-trimming.md
+# §5): the log references SSTables by name, and with --log-trim the checkpoint
+# in the bucket must match the trim mark in the log dir. A cell's compactions
+# and checkpoints change the bucket, so the next cell would otherwise open a
+# restored log against a bucket that is ahead of it (bootstrap throws) or that
+# lost files the log still names. load_corfu_dataset.sh writes the snapshot to
+# /mnt/corfu/load-bucket; when it is absent (a log-only snapshot from before
+# this) the bucket is left as is, which is only safe without --log-trim.
+S3_BUCKET="$(cfg --get s3.bucket 2>/dev/null || echo ozonedb-ycsb)"
+MC_ALIAS="${MC_ALIAS:-ozonedb-local}"
+
 start_corfu() {
   echo "[corfu] starting on $CORFU_TARGET ($CORFU_BIND_HOST:$CORFU_PORT)"
+  corfu_sh "if [ -d /mnt/corfu/load-bucket ]; then mc mirror --overwrite --remove --quiet /mnt/corfu/load-bucket $MC_ALIAS/$S3_BUCKET >/dev/null && echo '[corfu] bucket restored from /mnt/corfu/load-bucket'; else echo '[corfu] WARNING: no /mnt/corfu/load-bucket snapshot; bucket left as is'; fi"
   # Trailing & must apply only to nohup, not to the whole chain — otherwise
   # ssh holds stdout open on a foregrounded subshell and hangs.
   corfu_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $CORFU_BIND_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
@@ -266,7 +278,10 @@ stop_corfu() {
   # bin/corfu_server execs java, so the live cmdline matches the main class,
   # not the wrapper name. SIGKILL directly — we wipe /mnt/corfu/run_batch
   # next start, so graceful shutdown buys nothing.
-  corfu_sh "pkill -KILL -f 'org.corfudb.infrastructure.CorfuServer' 2>/dev/null || true; pkill -KILL -f '\-a $CORFU_BIND_HOST $CORFU_PORT' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
+  # [C]orfuServer / [-]a: the patterns must not match the remote shell that
+  # runs these pkills, or the shell is SIGKILLed with the server and ssh
+  # exits 255 before the rest of the line runs.
+  corfu_sh "pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' 2>/dev/null || true; pkill -KILL -f '[-]a $CORFU_BIND_HOST $CORFU_PORT' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
   for _ in $(seq 1 30); do
     if ! port_open "$CORFU_BIND_HOST" "$CORFU_PORT"; then
       echo "[corfu] down"

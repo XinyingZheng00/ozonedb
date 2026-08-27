@@ -90,14 +90,27 @@ port_open() { corfu_sh "bash -c '(exec 3<>/dev/tcp/$CORFU_BIND/$CORFU_PORT) >/de
 
 stop_corfu() {
   echo "[corfu] stop on $CORFU_SSH"
-  corfu_sh "pkill -KILL -f 'org.corfudb.infrastructure.CorfuServer' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
+  # [C]orfuServer: the pattern must not match the remote shell that runs this
+  # pkill, or the shell is SIGKILLed with the server and ssh exits 255.
+  corfu_sh "pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' 2>/dev/null || true; command -v fuser >/dev/null && fuser -k -9 ${CORFU_PORT}/tcp 2>/dev/null || true"
   local i
   for i in $(seq 1 30); do port_open || { echo "[corfu] down"; return 0; }; sleep 1; done
   echo "[corfu] ERROR: still reachable after SIGKILL" >&2; return 1
 }
 
+# The SSTable bucket and the log dir are one unit (PLAN-trimming.md §5): the
+# log references SSTables by name, and with --log-trim the checkpoint in the
+# bucket must match the trim mark in the log. So the load starts from an EMPTY
+# bucket, and the snapshot copies the bucket to /mnt/corfu/load-bucket next
+# to /mnt/corfu/load. run_multinode_ycsb_with_corfu.sh restores both before
+# every cell. Ported from the cas branch (commit 5cacc48b).
+S3_BUCKET="$(cfg --get s3.bucket 2>/dev/null || echo ozonedb-ycsb)"
+MC_ALIAS="${MC_ALIAS:-ozonedb-local}"
+BUCKET_SNAPSHOT="$CORFU_DATA/load-bucket"
+
 start_fresh_corfu() {
-  echo "[corfu] start FRESH (empty run_batch) on $CORFU_BIND:$CORFU_PORT"
+  echo "[corfu] start FRESH (empty run_batch, empty bucket $S3_BUCKET) on $CORFU_BIND:$CORFU_PORT"
+  corfu_sh "mc rm -r --force --quiet $MC_ALIAS/$S3_BUCKET >/dev/null 2>&1 || true; mc ls $MC_ALIAS/$S3_BUCKET >/dev/null 2>&1 || mc mb $MC_ALIAS/$S3_BUCKET; echo \"[bucket] \$(mc du $MC_ALIAS/$S3_BUCKET | tail -1)\""
   corfu_sh "cd $CORFU_DIR && rm -rf $CORFU_DATA/run_batch && mkdir -p $CORFU_DATA/run_batch && ( setsid nohup env CORFUDB_HEAP=$CORFU_HEAP JAVA_ARGS=-Xmx120g ./bin/corfu_server -l $CORFU_DATA/run_batch -s -a $CORFU_BIND $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
   local i
   for i in $(seq 1 120); do port_open && { echo "[corfu] up"; sleep 10; return 0; }; sleep 1; done
@@ -105,8 +118,9 @@ start_fresh_corfu() {
 }
 
 snapshot() {
-  echo "[corfu] snapshot run_batch -> load"
+  echo "[corfu] snapshot run_batch -> load, bucket -> $BUCKET_SNAPSHOT"
   corfu_sh "rm -rf $CORFU_DATA/load && cp -r $CORFU_DATA/run_batch $CORFU_DATA/load && du -sh $CORFU_DATA/load"
+  corfu_sh "rm -rf $BUCKET_SNAPSHOT && mkdir -p $BUCKET_SNAPSHOT && mc mirror --overwrite --quiet $MC_ALIAS/$S3_BUCKET $BUCKET_SNAPSHOT >/dev/null && echo \"[bucket] snapshot: \$(du -sh $BUCKET_SNAPSHOT | cut -f1) (\$(find $BUCKET_SNAPSHOT -type f | wc -l) objects); checkpoint/: \$(du -sh $BUCKET_SNAPSHOT/*/checkpoint 2>/dev/null | cut -f1 || echo none)\""
 }
 
 # Server sample around the load (bench/PLAN-cost.md phase 1: write
@@ -140,11 +154,11 @@ LOAD_CMD="cd \$OZONEDB_HOME && python3 bench/scripts/local/load_local_ycsb_multi
 
 echo "=== corfu load: server=$CORFU_SSH ($CORFU_BIND:$CORFU_PORT) load_host=$LOAD_HOST writers=$WRITERS log_trim=$LOG_TRIM record_cnt=${RECORD_CNT:-yaml} ==="
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "[dry-run] stop corfu; wipe run_batch; start corfu -l $CORFU_DATA/run_batch"
+  echo "[dry-run] stop corfu; wipe run_batch; empty bucket $MC_ALIAS/$S3_BUCKET; start corfu -l $CORFU_DATA/run_batch"
   echo "[dry-run] server sample start: cell=$SAMPLE_CELL on $CORFU_SSH -> $SAMPLE_LOCAL"
   echo "[dry-run] $LOAD_HOST: bash -lc '$LOAD_CMD'"
   echo "[dry-run] server sample stop"
-  echo "[dry-run] stop corfu; cp -r $CORFU_DATA/run_batch -> $CORFU_DATA/load"
+  echo "[dry-run] stop corfu; cp -r $CORFU_DATA/run_batch -> $CORFU_DATA/load; mc mirror bucket -> $BUCKET_SNAPSHOT"
   exit 0
 fi
 

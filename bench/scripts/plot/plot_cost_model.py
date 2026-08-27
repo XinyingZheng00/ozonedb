@@ -18,7 +18,7 @@ The model (bench/PLAN-cost.md, "The model"), per month:
                           ceil(ops / (ops_node_C * util)))
   OzoneDB(D)   = p_seq + log_units * (p_logunit + L * p_disk)
                + sO * D * p_s3
-               + R * (1 - h(c / D)) * g * p_get * S
+               + (R * (1 - h(c / D)) * g + W * get_per_write) * p_get * S
                + W * put_per_write * p_put * S
                + k * (S / T_trim) * p_put
                + clients_O * p_client_O
@@ -50,7 +50,7 @@ DEFAULT_SPACE = {"sC": 1.05, "sO": 1.10, "L_gb": 0.30, "L0_kb_per_put": 1.1,
                  "trim_interval_s": 30, "wa": 1.2}
 # Pre-measurement estimates for the per-op coefficients, used only when the
 # TSV has no row that provides them.
-DEFAULT_COEF = {"g": 1.0, "put_per_write": 1.0 / 60000, "k": 12.0,
+DEFAULT_COEF = {"g": 1.0, "put_per_write": 1.0 / 60000, "get_per_write": 0.015, "k": 12.0,
                 "cpu_s_per_op_O": 0.0012, "cpu_s_per_op_C": 0.0003,
                 "ops_node_C": 20000.0}
 
@@ -110,8 +110,21 @@ class Coefficients:
             self.src[name] = "ASSUMED"
             return default
 
+        # g from the read-only workload: under a write workload the GET
+        # counter also holds compaction input reads, which are the separate
+        # per-write term below.
         self.g = pick("g", [fnum(r["get_per_miss"]) for r in ozone
-                            if fnum(r["cache_misses"]) and fnum(r["cache_misses"]) > 100], DEFAULT_COEF["g"])
+                            if r["workload"] == h_workload
+                            and fnum(r["cache_misses"]) and fnum(r["cache_misses"]) > 100], DEFAULT_COEF["g"])
+        # Compaction GETs per write: the load is write-only, so its GETs are
+        # all compaction input reads (about 0.015 per put on the 1 GB load).
+        loads = [r for r in rows if r["label"].startswith("ozonedb-corfu") and r["workload"] == "load"]
+        gpw = []
+        for r in loads:
+            g_, h_, w_ = fnum(r["s3_get"]), fnum(r["s3_head"]) or 0.0, fnum(r["writes"])
+            if g_ is not None and w_ and w_ > 0:
+                gpw.append((g_ + h_) / w_)
+        self.get_per_write = pick("get_per_write", gpw, DEFAULT_COEF["get_per_write"])
         # Compaction PUTs per write, checkpoint objects excluded.
         ppw = []
         for r in ozone:
@@ -164,7 +177,8 @@ class Coefficients:
 
     def report(self):
         print("coefficients:")
-        for name, val in (("g", self.g), ("put_per_write", self.put_per_write), ("k", self.k),
+        for name, val in (("g", self.g), ("get_per_write", self.get_per_write),
+                          ("put_per_write", self.put_per_write), ("k", self.k),
                           ("cpu_s_per_op_O", self.cpu_O), ("cpu_s_per_op_C", self.cpu_C),
                           ("ops_node_C", self.ops_node_C)):
             print(f"  {name:16} {val:<14.6g} {self.src[name]}")
@@ -230,7 +244,7 @@ class Model:
         log_tier = seq + pr["log_units"] * (logunit + log_gb * st["gp3_usd_gb_month"])
         bulk = sp["sO"] * d_gb * st["s3_standard_usd_gb_month"]
         h = self.c.h(cache_gb * GB / d_bytes)
-        gets = self.R * (1.0 - h) * self.c.g * self.S
+        gets = (self.R * (1.0 - h) * self.c.g + self.W * self.c.get_per_write) * self.S
         puts = self.W * self.c.put_per_write * self.S
         ckpt = self.c.k * (self.S / sp["trim_interval_s"]) if trimming else 0.0
         req = (gets * st["s3_get_usd_per_million"] + (puts + ckpt) * st["s3_put_usd_per_million"]) / 1e6

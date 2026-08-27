@@ -230,7 +230,8 @@ do_compact() {
   "$CASSANDRA_HOME/bin/nodetool" compact "$keyspace"
   local i
   for i in $(seq 1 1800); do
-    if "$CASSANDRA_HOME/bin/nodetool" compactionstats 2>/dev/null | grep -q 'pending tasks: 0'; then
+    # Cassandra 5 prints a table ("pending tasks     0"); 4 printed "pending tasks: 0".
+    if "$CASSANDRA_HOME/bin/nodetool" compactionstats 2>/dev/null | grep -qE '^pending tasks[: ]+0( |$)'; then
       log "no compaction pending after ${i}s"
       return 0
     fi

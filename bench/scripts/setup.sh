@@ -558,7 +558,10 @@ WantedBy=multi-user.target
 EOF
 
   sudo systemctl daemon-reload
-  sudo systemctl enable --now minio
+  # restart, not `enable --now`: a running minio keeps its old environment
+  # (the metrics auth setting above) until it is restarted.
+  sudo systemctl enable minio >/dev/null 2>&1 || true
+  sudo systemctl restart minio
 
   log "waiting for minio on 127.0.0.1:$MINIO_PORT"
   local i

@@ -69,7 +69,9 @@ snapshot() {
     fi
   done
   if command -v mc >/dev/null 2>&1 && [[ -n "$BUCKET" ]]; then
-    mc du --json --depth 2 "$MC_ALIAS/$BUCKET" 2>/dev/null | sed 's/^/mcdu /'
+    # depth 3 reaches <bucket>/<sstable_dir>/checkpoint, the prefix the
+    # extractor splits out of the bucket total.
+    mc du --json --depth 3 "$MC_ALIAS/$BUCKET" 2>/dev/null | sed 's/^/mcdu /'
   fi
   local c
   for c in corfu minio cassandra; do
@@ -96,8 +98,9 @@ start() {
     log "pidstat missing (apt install sysstat): server CPU not recorded"
     return 0
   fi
-  # -h: one line per process per interval, time as seconds since the epoch.
-  (setsid nohup pidstat -h -u -r -p "$all" "$INTERVAL" >"$dir/$cell.pidstat.txt" 2>&1 </dev/null &
+  # -h: one line per process per interval; -H: the time column in seconds
+  # since the epoch (sysstat 12.6 prints a clock time otherwise).
+  (setsid nohup pidstat -h -H -u -r -p "$all" "$INTERVAL" >"$dir/$cell.pidstat.txt" 2>&1 </dev/null &
    echo $! >"$dir/$cell.pidstat.pid")
   log "start cell=$cell pids=$all pidstat every ${INTERVAL}s"
 }
