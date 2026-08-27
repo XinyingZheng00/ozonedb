@@ -23,19 +23,87 @@ processes on one host, 1M × 1 KB load):
 | **Join from the checkpoint** | restore `C=954059` (61 MB), replay **55,268 entries in 1.6 s**, first YCSB op at **9 s** |
 | Control, same load without trimming | replay **1,003,655 entries in 16 s**, first YCSB op at **23 s** |
 | Live fraction of the stream (phase 0) | 51 MB live of 1155 MB (4.4 %); `task.log` 560 KB, `metadata.log` 21 KB |
-| Workload c reads after the join, default / `--linearizable` | 0.44 % / 0.47 % NOT_FOUND |
-| Workload c reads on the control (no trimming) | **0.63 % / 0.62 % NOT_FOUND** |
+| Workload c reads after the join, default / `--linearizable` | 0.44 % / 0.47 % NOT_FOUND (before the read-miss fix below) |
+| Workload c reads on the control (no trimming) | **0.63 % / 0.62 % NOT_FOUND** (before the fix; 0 after) |
+
+### Read misses: diagnosed and fixed (2026-08-26, later the same day)
 
 The read misses are **not** a trimming effect: the control without trimming misses at the
-same rate or more, in both read modes, with no writer active. All 1,000,000 inserts returned
-OK in both loads. This is a pre-existing property of an 8-writer load on the `visibility`
-head and is out of this plan's scope. A per-partition probe on the control dataset (20k
-uniform keys from each load writer's 125k-key range, `--linearizable`, no writer active)
-misses 111–154 keys in every one of the eight ranges (0.55–0.77 %). The loss is spread
-evenly over writers and keys, so it is not one writer's log and not the trimmer. The next
-step for whoever picks it up: read one missing key through `corfu_smoke`-style C++ with the
-log scan and the SSTable lookup traced separately, and check the SSTable key ranges recorded
-in the COMPACT records against the keys inside the files.
+same rate or more, in both read modes, with no writer active. A per-partition probe on the
+control dataset (20k uniform keys from each load writer's 125k-key range) misses 111–154
+keys in every one of the eight ranges (0.55–0.77 %), so it is not one writer's log.
+
+"All inserts returned OK" meant nothing: `OzoneDBClient.insert` ignored the return value of
+`db.put` (fixed: a refused put is now `Status.ERROR`). The load logs, which capture the JNI
+`Failed to put key-value pair` line, show **zero** refused puts. So every lost record was
+acked.
+
+**Cause 1 — the ack outran the seal (data loss).** `CorfuDBStorage::submitBatch` spliced a
+batch into `file_buffers_` and acked it right after the JNI append returned, checking
+`sealed_at_addr_` as the local tailer knew it at that moment. A peer's `SEAL(F)` at address
+`S` that the tailer had not applied yet is invisible, so an append at `addr > S` was acked.
+Every other process applies `S` first and drops that append (`applyEntryBytes`); the
+compactor, another process seven times out of eight, reads `F` without it and its `REMOVE`
+makes the loss permanent. `corfu_stream_stats` (new, `tests/corfu_stream_stats.cpp`) on the
+control's Corfu log: **7,407 appends (8.5 MB) sequenced above their file's seal and dropped
+by every peer** — 0.74 % of 1M puts, ×7/8 ≈ 6,500 lost, against the 0.62 % measured miss.
+
+**Cause 2 — the compaction election reads arrival order (duplicate work, diverging Views).**
+The same self-splice put every file buffer in *arrival* order, not address order: own bytes
+were spliced at submit time, a peer's earlier record arrived later via the tailer.
+`TaskLogHandler::isFirstWriterForTask` judges "first claim in `task.log`", so every
+claimant saw its own claim first. Control load: task `datalog/1+2` was executed by three
+writers, `datalog/27+28` by six; 83 `COMPACT` records for 23 real tasks, 60 of them never
+applicable in address order. Each process applied *its own* duplicate first, so the Views
+diverged per process and second-level compactions deleted SSTables from the bucket that
+other Views still referenced. `MetadataLogHandler` applies a `COMPACT` only when its first
+input is at the front of the level's deque, otherwise it buffers it silently — so one
+never-executed task blocks every later `COMPACT` on that level (seen at full scale in the
+first fix attempt: task `datalog/1+2` claimed by all eight writers, executed by none, all
+fifteen later `COMPACT`s buffered, 87 % NOT_FOUND). Dead-task reclaim cannot rescue that:
+`task_heartbeat_threshold = 10000000` (× 100 ms ≈ 11 days).
+
+**Fix (`src/db/corfu_storage.cpp`).** The tailer is now the *only* writer of
+`file_buffers_`, own entries included, in address order; `submitBatch` publishes
+`last_written_addr_`, waits until the tailer passed the batch's address, and reads the
+outcome (spliced → `kSuccess`, dropped above a seal → `kSealed`, tailer stalled → `kFailure`,
+never an assumed success). One rule fixes both causes: the seal decision is made with
+complete knowledge, and `task.log` / `metadata.log` / every data log are byte-identical in
+every process, so the election and the rollforward agree everywhere. The checkpoint
+snapshot becomes trivially exact. Regression test:
+`CorfuStorageTest.ack_never_outruns_a_peer_seal`. Compaction now logs
+`records_in / unique / inputs_skipped` per task (conservation check: on an insert-only load
+`records_in == unique`), and `LogHandler::addRecord` logs a refused append.
+
+**Cost.** A put now waits for the tailer to pass its own address: one more Corfu round
+trip. Single-threaded YCSB writers went from ~1,000 to ~350 puts/s each (average wait
+2.2 ms, 8 writers on one host). The fast path can be restored without giving up the
+guarantee by asking the **sequencer** the seal question at token time: Corfu's
+`StreamsView.append(payload, TxResolutionInfo, …)` aborts a token when a conflict key was
+written after a snapshot address (`SequencerServer.txnCanCommit`, `TX_ABORT_CONFLICT`);
+appends would carry `seal(F)` as a read key and `SEAL` entries as a write key, with
+`TX_ABORT_SEQ_TRIM/OVERFLOW` falling back to the tailer wait. That keeps the writer from
+splicing early only for the *data* path; `task.log` and `metadata.log` would still need
+address-ordered application. Follow-up, not done here.
+
+**Results after the fix** (same cell: amd127 corfu + MinIO, 8 writers on amd160, 1M × 1 KB,
+no trimming; the control is the run before the fix on the same cell):
+
+| | Control (before) | Ack waits for the tailer (after) |
+|---|---|---|
+| Puts refused (`Failed to put`) | 0 | 0 |
+| Appends above a seal in the stream (`corfu_stream_stats`) | **7,407 acked, dropped by peers** | 101, all reported `kSealed` and retried |
+| Compaction tasks / `COMPACT` records / applied in address order | 23 / 83 / 23 (60 duplicates) | 24 / 24 / 24 |
+| Executors per task | 1–6 | exactly 1 |
+| `records_in == unique` for every compaction | (not logged) | yes, no skipped input |
+| Workload c NOT_FOUND, default / `--linearizable` | 0.63 % / 0.62 % | **0 / 52,926 and 0 / 52,559** |
+| Reader live set after replay | 51 MB | 28 MB |
+| Put throughput per single-threaded writer | ~1,000/s | ~350/s (ack wait avg 2.1 ms, max 0.17 s) |
+| `CorfuStorageTest` / smoke | 10/10 | 11/11 (+`ack_never_outruns_a_peer_seal`), both smokes PASS |
+
+Left as is, documented: `MetadataLogHandler` still buffers a `COMPACT` whose input is not
+at the level's front with no log line, and a task whose owner dies mid-compaction blocks
+its level until the (effectively disabled) dead-task reclaim fires.
 
 The first-op time includes ~7 s of JVM start, Maven classpath resolve and `initSSTMetadata`
 (70+ SSTables), which trimming does not touch. The replay itself went from 16 s to 1.6 s.
@@ -120,10 +188,12 @@ Facts from the code that shape the design:
   plus the sealed logs that compaction did not consume yet.
 - `metadata.log` and `task.log` are append-only forever. They are small (about 100 records
   per 1M puts for the metadata log). Their growth is a follow-up, not a blocker (§4, phase 6).
-- The local writer self-applies its own bytes into `file_buffers_` **before** the tailer
-  reaches them (`submitBatch`, `src/db/corfu_storage.cpp:761`, and
-  `reconcilePendingFrontLocked`, `:707`). The tailer skips APPEND entries with our `client_id` (`:272`). So `file_buffers_`
-  is not always a clean prefix of the stream. §3.3 handles this.
+- *(Superseded, see §0 "Read misses".)* The local writer used to self-apply its own bytes
+  into `file_buffers_` **before** the tailer reached them, and the tailer skipped APPEND
+  entries with our `client_id`. So `file_buffers_` was not always a clean prefix of the
+  stream, and §3.3 was written to handle that. Since the read-miss fix the tailer applies
+  own entries too, in address order, and `submitBatch` waits for it; `file_buffers_` under
+  `mtx_` is always exactly the state at `last_applied_addr_`.
 - `DB::DB` builds `log_storage` before `sstable_storage` (`src/db/db.cpp:65-68`). The Corfu
   constructor drains the stream at once. The join path needs the object store first, so
   that order changes (§3.5).
@@ -215,7 +285,9 @@ Why the copy is the state at exactly `C`: the tailer applies each entry under `m
 stores `last_applied_addr_` under the same lock, so every remote entry `<= C` is applied and
 none above it. Every local entry has an address `<= last_written_addr_ <= C` and is
 reconciled. `cached_file_` (bytes not yet flushed to Corfu) is excluded: those bytes are not
-in the log and will land above `C`.
+in the log and will land above `C`. *(Since the read-miss fix the tailer applies local
+entries as well, so the "reconciled" clause is trivially true and the gate only keeps the
+snapshot from being starved by a stream of own appends.)*
 
 Cost: writers pause for the copy once per trim interval. The copy is a `memcpy` of the live
 files, about 50–150 MB, so the pause is tens of milliseconds. Phase 5 measures it.

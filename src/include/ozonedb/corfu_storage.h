@@ -104,6 +104,12 @@ class CorfuDBStorage : public Storage {
   // trim cycle behind). Every write then fails and every read misses.
   bool trimmedOut() const { return trimmed_out_.load(); }
   long lastAppliedAddr() const { return last_applied_addr_.load(std::memory_order_acquire); }
+  // Peer APPENDs this process dropped because they were sequenced above
+  // their file's SEAL (applyEntryBytes). Every process drops the same
+  // ones. The writer that produced such an entry acked it if its tailer
+  // had not applied the SEAL yet — see submitBatch's ack rule.
+  uint64_t droppedAboveSeal() const { return dropped_above_seal_.load(std::memory_order_relaxed); }
+  uint64_t droppedAboveSealBytes() const { return dropped_above_seal_bytes_.load(std::memory_order_relaxed); }
   bool loadedFromCheckpoint() const { return loaded_from_checkpoint_; }
   // Detach the calling thread from the JVM. A thread that made JNI calls
   // (LogTrimmer's) must call this before it exits.
@@ -163,26 +169,29 @@ class CorfuDBStorage : public Storage {
   //
   // `done` is the single ack point. It is set exactly once, under mtx_,
   // by whichever of these happens first:
-  //   - reconcilePendingFrontLocked splices the payload  -> kSuccess
+  //   - the tailer applied the entry at its address     -> kSuccess
   //   - the JNI submit fails                             -> kFailure
   //   - the file was sealed at a LOWER global address    -> kSealed
   //   - a peer REMOVE dropped the file                   -> kFailure
+  //   - the tailer did not reach the address in time     -> kFailure
   // A caller may only ack a write after `done` is true, and must return
   // `result`, never an assumed kSuccess.
   //
-  // `done` deliberately means "spliced into file_buffers_", not merely
-  // "sequenced". Reads serve file_buffers_ only (see read()), so waiting
-  // for the splice is what preserves read-my-writes.
+  // `done` deliberately means "applied to file_buffers_ by the tailer",
+  // not merely "sequenced". Reads serve file_buffers_ only (see read()),
+  // so waiting for the apply is what preserves read-my-writes; and the
+  // tailer being the only writer of file_buffers_ (own entries included,
+  // see applyEntryBytes) is what keeps every process's copy of a file in
+  // the same, address, order.
   struct Batch {
-    long addr = -1;  // global Corfu address, stamped after JNI returns
+    long addr = -1;  // global Corfu address, stamped once the outcome is known
     std::vector<unsigned char> payload;
     bool done = false;
     Status result = Status::kFailure;
   };
 
-  // Batches handed to JNI but not yet spliced into file_buffers_, in
-  // enqueue order per file. reconcilePendingFrontLocked drains the
-  // leading stamped run, so file_buffers_ keeps enqueue order.
+  // Batches handed to JNI whose outcome is not known yet, per file. Only
+  // used to settle in-flight batches when the file is REMOVEd under them.
   std::unordered_map<std::string, std::list<std::shared_ptr<Batch>>> pending_;
 
   // The batch that currently owns the bytes sitting in cached_file_[fn].
@@ -193,36 +202,30 @@ class CorfuDBStorage : public Storage {
   std::unordered_map<std::string, std::shared_ptr<Batch>> cached_batch_;
 
   // Global address of the SEAL entry for a file, once the tailer has seen
-  // it. The shared log — not local state — decides whether an APPEND
-  // belongs to a file: an APPEND sequenced ABOVE this address arrived
-  // after the seal and belongs to no file. Every process applies that
-  // same rule, in applyEntryBytes for peer entries and in submitBatch for
-  // our own, so a kSealed retry can never duplicate a record.
+  // it (or we appended it). The shared log — not local state — decides
+  // whether an APPEND belongs to a file: an APPEND sequenced ABOVE this
+  // address arrived after the seal and belongs to no file. The tailer
+  // applies that rule to every entry, own ones included, in address
+  // order (applyEntryBytes); submitBatch reads the result after the
+  // tailer passed its address, so a kSealed retry can never duplicate a
+  // record and an acked record is never one that peers dropped.
   std::unordered_map<std::string, long> sealed_at_addr_;
 
-  // The write gate. file_buffers_ is NOT a clean prefix of the stream at
-  // an arbitrary moment: the writer splices its own bytes in ahead of the
-  // tailer (reconcilePendingFrontLocked) and, between the JNI return and
-  // the stamp, a batch can be sequenced below the tailer's position but
-  // absent from file_buffers_. A checkpoint copied then would duplicate
-  // or lose bytes on replay.
+  // The write gate. Since the tailer is the only writer of file_buffers_
+  // and applies in address order, file_buffers_ under mtx_ is always
+  // exactly the state at last_applied_addr_. The gate keeps local submit
+  // paths out while takeSnapshot waits for the tailer to pass
+  // last_written_addr_ and copies, so the snapshot cannot be starved by
+  // a stream of own appends that keep moving that mark.
   //
   // Every path that pushes a batch into pending_ or appends to the log
   // (append, appendInBatch, flush, drainForRead, seal, remove) holds the
-  // gate SHARED from its entry until its stamp/splice is done. The gate
-  // must be taken BEFORE the push, not inside submitBatch: a batch queued
-  // in pending_ by a thread that is still waiting for the gate would
-  // block the stamped batch behind it (reconcile keeps enqueue order),
-  // whose writer holds the gate, which blocks the snapshot, which blocks
-  // the first thread -- a cycle that ends in a sequenced write reported
-  // as failed. takeSnapshot holds the gate EXCLUSIVE, so pending_ is
-  // empty and no batch is between "sequenced" and "stamped"; it then
-  // waits for the tailer to pass last_written_addr_ and copies under
-  // mtx_. The copy is then exactly the state at last_applied_addr_.
-  // Lock order: write_gate_ before mtx_, never the reverse; nothing
-  // holding mtx_ ever waits for the gate. Never take the gate twice on
-  // one thread (std::shared_mutex is not recursive): submitBatch and
-  // takeCachedBatchLocked assume the caller already holds it.
+  // gate SHARED from its entry until its outcome is known; takeSnapshot
+  // holds it EXCLUSIVE. Lock order: write_gate_ before mtx_, never the
+  // reverse; nothing holding mtx_ ever waits for the gate. Never take the
+  // gate twice on one thread (std::shared_mutex is not recursive):
+  // submitBatch and takeCachedBatchLocked assume the caller already holds
+  // it.
   std::shared_mutex write_gate_;
   // Set by failStop() when the tailer hit a trimmed address. Sticky.
   std::atomic<bool> trimmed_out_{false};
@@ -240,10 +243,21 @@ class CorfuDBStorage : public Storage {
   std::atomic<long> last_applied_addr_{-1};
   std::atomic<long> last_written_addr_{-1};
 
+  // Ack-wait diagnostics (see submitBatch): how long acks waited for the
+  // tailer, and how many batches turned out to sit above a SEAL that was
+  // learned only during that wait. Each of those was an acked-then-lost
+  // record before the wait existed. Printed once at teardown.
+  std::atomic<uint64_t> ack_wait_batches_{0};
+  std::atomic<uint64_t> ack_wait_us_total_{0};
+  std::atomic<uint64_t> ack_wait_us_max_{0};
+  std::atomic<uint64_t> sealed_after_wait_{0};
+  std::atomic<uint64_t> dropped_above_seal_{0};
+  std::atomic<uint64_t> dropped_above_seal_bytes_{0};
+
   // Randomly-generated id that tags every APPEND this process writes to
-  // the shared stream. The tailer uses it to distinguish our own entries
-  // (which the writer already self-applied into file_buffers_) from peer
-  // entries (which the tailer must apply).
+  // the shared stream. The tailer applies own and peer entries alike; the
+  // id only decides whether the remote-append listener is notified (own
+  // records were already indexed by the writer path).
   uint64_t client_id_ = 0;
 
   std::thread tailer_thread_;
@@ -331,7 +345,8 @@ class CorfuDBStorage : public Storage {
   void drainDispatchQueue();
   long globalFenceTarget();
   void waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target);
-  void reconcilePendingFrontLocked(std::string const& fileName);
+  // True when a SEAL for fileName is known at an address below addr.
+  bool sealedBelowLocked(std::string const& fileName, long addr) const;
 
   // --- batch helpers (see struct Batch) ---
   // All *Locked helpers require mtx_ held by the caller.
@@ -345,10 +360,11 @@ class CorfuDBStorage : public Storage {
   // behind it.
   void finishBatchLocked(std::string const& fileName,
                          std::shared_ptr<Batch> const& batch, Status result);
-  // JNI submit + stamp + reconcile. Must be called with mtx_ NOT held:
-  // it runs the JNI round-trip unlocked. Sets batch->done before it
-  // returns, and returns batch->result. The caller holds write_gate_
-  // shared (see write_gate_).
+  // JNI submit, then wait until the tailer has passed the new address
+  // and read the outcome. Must be called with mtx_ NOT held: it runs the
+  // JNI round-trip unlocked. Sets batch->done before it returns, and
+  // returns batch->result. The caller holds write_gate_ shared (see
+  // write_gate_).
   Status submitBatch(std::string const& fileName, std::shared_ptr<Batch> const& batch);
   // Block until `batch` is settled by whichever thread owns it, and
   // return its outcome. Takes mtx_ itself, so the caller must not hold it.

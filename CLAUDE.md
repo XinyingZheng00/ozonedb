@@ -233,9 +233,15 @@ side is commented out in `db.cpp`, so lookups always miss.
 ### CorfuDB backend
 
 All files are packed into one Corfu stream; each entry is a `CorfuEntry` protobuf
-{`file_name`, `op` (APPEND/SEAL/REMOVE), `payload`, `client_id`}. A background tailer reconstructs
-per-file buffers; `client_id` lets it skip entries this process already self-applied. Reads fence on
-the writer's last-known address for read-my-writes. **The tailer never invokes the remote-append
+{`file_name`, `op` (APPEND/SEAL/REMOVE/TRIM), `payload`, `client_id`}. A background tailer
+reconstructs per-file buffers and is the **only** writer of those buffers, own entries included,
+so every process holds each file in address order. An append is acked only after the tailer
+passed its address (`submitBatch`): that is where the seal rule (an APPEND sequenced above its
+file's SEAL belongs to no file) is decided, and it is what makes the task-log election
+("first claim in `task.log`") the same in every process. Acking before that point lost ~0.7 %
+of an 8-writer load and let several writers execute the same compaction. `client_id` only
+decides whether the remote-append listener fires (own records are indexed by the writer path).
+Reads fence on the writer's last-known address for read-my-writes. **The tailer never invokes the remote-append
 listener synchronously** — a dedicated dispatch thread does, because the listener takes the
 `LRUCache` mutex that a foreground thread may hold while fencing on the tailer. Preserve that
 separation when touching `corfu_storage.cpp`.

@@ -267,6 +267,13 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     }
   }
 
+  // Conservation accounting, printed with the "Compacting" line below.
+  // Every input record either lands in the output or is superseded by a
+  // later record for the same key, so records_in - unique is the number
+  // of overwritten keys; on an insert-only load it must be 0. A skipped
+  // input is a whole file whose records are NOT in the output.
+  size_t records_in = 0;
+  int inputs_skipped = 0;
   for (auto const& input : compaction->task_id->input_files()) {
     // read from log level
 
@@ -287,6 +294,9 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       // and continue — the rollforward will reconcile.
       if (read_status != Status::kSuccess || buffer == nullptr) {
         delete[] buffer;
+        ++inputs_skipped;
+        std::cerr << "[compaction] input " << input << " unreadable (status="
+                  << static_cast<int>(read_status) << "), skipped\n";
         continue;
       }
       std::vector<google::protobuf::Message*> messages;
@@ -295,6 +305,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       });
       delete[] buffer;
       buffer = nullptr;
+      records_in += messages.size();
       for (auto* msg : messages) {
         // Take ownership of the freshly-parsed Record. Subsequent
         // same-key writes overwrite the entry; the prior shared_ptr
@@ -312,6 +323,7 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       auto records_tmp = table->getAll();
 
       file_lock.unlock();
+      records_in += records_tmp.size();
       // print the range of records_tmp
       std::string key_start = records_tmp.begin()->first;
       std::string key_end = records_tmp.begin()->first;
@@ -472,7 +484,10 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
     input_storage->remove(input);
   }
   compaction->finished = true;
-  std::cout << std::this_thread::get_id() << ":" << log_string << std::endl;
+  std::cout << std::this_thread::get_id() << ":" << log_string
+            << " [records_in=" << records_in << " unique=" << records.size()
+            << " inputs_skipped=" << inputs_skipped
+            << " outputs=" << output_files.size() << "]" << std::endl;
   // Records are shared_ptr-owned — they release as `records` and
   // `key_record` go out of scope. Any concurrent reader that lifted
   // a pointer out of LogKeyIndex / the cache keeps its Record alive

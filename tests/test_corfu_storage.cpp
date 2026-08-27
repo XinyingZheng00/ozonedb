@@ -158,6 +158,66 @@ TEST(CorfuStorageTest, remove_clears_file) {
   delete storage;
 }
 
+// Regression for the multi-writer read miss: an append that a peer's SEAL
+// outran must not be acked. Writer A appends in a tight loop while B seals
+// the same file a few milliseconds in. Whatever A got kSuccess for must be
+// exactly what B (and everyone else) holds for the file — no more, no
+// less. Before the ack waited for the tailer, A acked appends that were
+// sequenced above B's SEAL whenever A's tailer had not applied the SEAL
+// yet, and every other process dropped those bytes.
+TEST(CorfuStorageTest, ack_never_outruns_a_peer_seal) {
+  SKIP_IF_NO_CORFU();
+  std::string stream = CorfuStorageEnv::uniqueStream("corfu_seal_race");
+  CorfuDBStorage* a = makeStorage(stream);
+  CorfuDBStorage* b = makeStorage(stream);
+  int rounds_with_seal_refusal = 0;
+  for (int round = 0; round < 20; ++round) {
+    std::string file = "f" + std::to_string(round);
+    std::vector<unsigned char> acked;
+    std::thread sealer([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(3 + round % 5));
+      b->seal(file);
+    });
+    for (int i = 0; i < 400; ++i) {
+      std::vector<unsigned char> p(16, static_cast<unsigned char>(i));
+      Status s = a->appendInBatch(file, p.data(), static_cast<int>(p.size()));
+      if (s == Status::kSuccess) {
+        acked.insert(acked.end(), p.begin(), p.end());
+        continue;
+      }
+      ASSERT_EQ(Status::kSealed, s) << "round " << round << " append #" << i;
+      ++rounds_with_seal_refusal;
+      break;
+    }
+    sealer.join();
+
+    b->sync();
+    unsigned char* data = nullptr;
+    size_t size = 0;
+    std::vector<unsigned char> seen;
+    if (b->read(file, data, size) == Status::kSuccess) seen.assign(data, data + size);
+    delete[] data;
+    b->clearSync();
+    EXPECT_EQ(acked.size(), seen.size()) << "round " << round;
+    EXPECT_EQ(acked, seen) << "round " << round;
+
+    // A's own copy agrees with the peer's.
+    a->sync();
+    data = nullptr;
+    size = 0;
+    std::vector<unsigned char> own;
+    if (a->read(file, data, size) == Status::kSuccess) own.assign(data, data + size);
+    delete[] data;
+    a->clearSync();
+    EXPECT_EQ(acked, own) << "round " << round;
+  }
+  // The seal must have cut A off in most rounds, or the race was not
+  // exercised.
+  EXPECT_GE(rounds_with_seal_refusal, 10);
+  delete b;
+  delete a;
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoints and trimming (PLAN-trimming.md). These trim the shared test
 // server's log, so they sit at the end of the file: a later test on a

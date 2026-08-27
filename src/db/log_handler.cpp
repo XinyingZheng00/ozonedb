@@ -3,6 +3,7 @@
 #include "helper.h"
 #include <google/protobuf/message.h>
 #include <future>
+#include <iostream>
 #include <mutex>
 #include <regex>
 #include <unordered_map>
@@ -85,8 +86,11 @@ Status LogHandler::addRecord(Record const& record) {
   // exhausting every retry.
   constexpr int kMaxRetries = 8;
   std::string final_target;
+  std::string last_target;
+  int attempts = 0;
   Status status = Status::kFailure;
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
+    ++attempts;
     // Roll before appending when the tail is full or a peer moved it.
     // newTail() re-checks under its own view and is a no-op when the
     // current tail still has room. The snapshot is read lock-free —
@@ -102,6 +106,7 @@ Status LogHandler::addRecord(Record const& record) {
     }
     std::string target = this->active_unit;
     if (target.empty()) break;
+    last_target = target;
 
     status = this->storage->appendInBatch(target, buffer, buffer_size);
     if (status == Status::kSuccess) {
@@ -127,6 +132,9 @@ Status LogHandler::addRecord(Record const& record) {
   // hit the index would otherwise see a write that no process can read
   // back from the log.
   if (status != Status::kSuccess || final_target.empty()) {
+    std::cerr << "[log] addRecord: append not taken (status="
+              << static_cast<int>(status) << " target=" << last_target
+              << " attempts=" << attempts << ")\n";
     return Status::kFailure;
   }
 

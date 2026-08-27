@@ -100,7 +100,12 @@ public class OzoneDBClient extends DB {
     } catch (Exception e) {
       e.printStackTrace();
     }
-    db.put(key, value);
+    // A put the log did not take must NOT count as OK. This used to
+    // ignore the return value, so a load reported Return=OK for every
+    // record no matter what the store did with it.
+    if (!db.put(key, value)) {
+      return Status.ERROR;
+    }
     int totalBytes = key.getBytes(StandardCharsets.UTF_8).length + value.length;
     reportThroughput(totalBytes); // Report throughput after each insert
     return Status.OK;
@@ -108,8 +113,7 @@ public class OzoneDBClient extends DB {
 
   @Override
   public Status delete(String table, String key) {
-    db.remove(key);
-    return Status.OK;
+    return db.remove(key) ? Status.OK : Status.ERROR;
   }
 
   @Override

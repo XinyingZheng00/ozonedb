@@ -108,6 +108,14 @@ CorfuDBStorage::~CorfuDBStorage() {
   // observe running_=false to exit.
   dispatch_cv_.notify_all();
   if (dispatch_thread_.joinable()) dispatch_thread_.join();
+  {
+    uint64_t const n = ack_wait_batches_.load(std::memory_order_relaxed);
+    std::cerr << "[corfu] ack-wait: batches=" << n << " avg_us="
+              << (n ? ack_wait_us_total_.load(std::memory_order_relaxed) / n : 0)
+              << " max_us=" << ack_wait_us_max_.load(std::memory_order_relaxed)
+              << " sealed_after_wait=" << sealed_after_wait_.load(std::memory_order_relaxed)
+              << "\n";
+  }
   JNIEnv* env = attachThread();
   if (env && bridge_global_ && mid_close_) {
     env->CallVoidMethod(bridge_global_, mid_close_);
@@ -260,8 +268,8 @@ bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
   // creates a deadlock cycle with any foreground op that holds
   // LRUCache::mutex while fencing on this tailer via storage->size().
   // The dispatch thread runs the listener off the tailer's critical
-  // path. Local APPENDs are skipped: the writer path already updates
-  // any listener-visible index itself.
+  // path. Local APPENDs are applied but not dispatched: the writer path
+  // already updates any listener-visible index itself.
   bool notify = false;
   RemoteOp notify_op = RemoteOp::kAppend;
   std::string notify_file;
@@ -272,26 +280,44 @@ bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
     std::string const& fn = entry.file_name();
     switch (entry.op()) {
       case ::CorfuEntry_Op_APPEND: {
-        // Skip locally-originated APPENDs: the writer thread already copied
-        // (or will copy) the bytes into file_buffers_ itself as part of the
-        // post-JNI reconcile step. Applying them here would double-count
-        // the bytes until the writer's own reconcile erases the placeholder.
-        if (entry.has_client_id() && entry.client_id() == client_id_) {
-          break;
-        }
+        // The tailer is the ONLY writer of file_buffers_, for our own
+        // APPENDs as much as for peers'. Own entries used to be skipped
+        // here because the writer thread spliced its bytes itself, right
+        // after the JNI append returned. That put every file buffer in
+        // ARRIVAL order rather than address order, and the two differ
+        // whenever a peer's earlier entry reaches the tailer after our
+        // later one was spliced. Two things broke on that: the seal rule
+        // below was applied to own entries against a sealed_at_addr_ that
+        // could not yet contain a peer SEAL sequenced just before (the
+        // writer acked bytes every peer dropped), and the task-log election
+        // read "first claim in the file" as "my claim" in every claimant
+        // at once (duplicate compactions, diverging Views). Applying own
+        // entries here, in address order, makes file_buffers_ the same
+        // byte sequence in every process; submitBatch just waits for the
+        // tailer to pass its address and reads the outcome.
+        bool const own = entry.has_client_id() && entry.client_id() == client_id_;
         // An APPEND sequenced ABOVE this file's SEAL arrived after the
         // seal closed the file. It belongs to no file. Every process
-        // applies this same rule — and the writer applies it to its own
-        // append in submitBatch — so the bytes are unreadable everywhere
+        // applies this same rule, so the bytes are unreadable everywhere
         // and the writer's kSealed retry cannot duplicate the record.
         {
           auto sit = sealed_at_addr_.find(fn);
-          if (sit != sealed_at_addr_.end() && sit->second < addr) break;
+          if (sit != sealed_at_addr_.end() && sit->second < addr) {
+            dropped_above_seal_.fetch_add(1, std::memory_order_relaxed);
+            dropped_above_seal_bytes_.fetch_add(entry.payload().size(), std::memory_order_relaxed);
+            break;
+          }
         }
+        // A straggler behind a REMOVE must not resurrect the file. Names
+        // are never reused (log numbers grow, SSTable names carry a
+        // timestamp), so an APPEND after the REMOVE is always stale.
+        if (removed_files_.count(fn)) break;
         auto& buf = file_buffers_[fn];
         auto const& payload = entry.payload();
         buf.insert(buf.end(), payload.begin(), payload.end());
-        if (remote_listener_) {
+        // Own entries are not dispatched: the writer path already fed the
+        // key index and the record cache with the record it appended.
+        if (remote_listener_ && !own) {
           notify = true;
           notify_op = RemoteOp::kAppend;
           notify_file = fn;
@@ -514,6 +540,8 @@ CorfuDBStorage::DrainResult CorfuDBStorage::drainInitialEntries() {
             << " live_MB=" << (live_bytes >> 20)
             << " top_level={" << top_level << "}"
             << " applied_addr=" << last_applied_addr_.load(std::memory_order_acquire)
+            << " dropped_above_seal=" << dropped_above_seal_.load(std::memory_order_relaxed)
+            << " (" << (dropped_above_seal_bytes_.load(std::memory_order_relaxed) >> 10) << " KB)"
             << (trimmed ? " TRIMMED" : "") << (failed ? " ERROR" : "") << "\n";
   if (failed) return DrainResult::kError;
   return trimmed ? DrainResult::kTrimmed : DrainResult::kOk;
@@ -1001,29 +1029,9 @@ void CorfuDBStorage::createDirectory(std::string /*name*/) {
   // No-op: Corfu has no directory concept.
 }
 
-// Helper: drain the leading stamped (addr != -1) run of pending_[fn]
-// into file_buffers_[fn]. Called with mtx_ held. This preserves enqueue
-// order in file_buffers_: a writer whose JNI returned out of order will
-// stamp its batch but leave the splice to the earliest-enqueued writer
-// once that writer's JNI returns.
-//
-// The splice is the ack point. A batch is marked done+kSuccess here and
-// only here, because read() serves file_buffers_ alone — a batch that is
-// sequenced but not yet spliced is not yet readable, so acking it early
-// would break read-my-writes.
-void CorfuDBStorage::reconcilePendingFrontLocked(std::string const& fileName) {
-  auto pit = pending_.find(fileName);
-  if (pit == pending_.end()) return;
-  auto& lst = pit->second;
-  while (!lst.empty() && lst.front()->addr != -1) {
-    auto batch = lst.front();
-    auto& buf = file_buffers_[fileName];
-    buf.insert(buf.end(), batch->payload.begin(), batch->payload.end());
-    lst.pop_front();
-    batch->result = Status::kSuccess;
-    batch->done = true;
-  }
-  if (lst.empty()) pending_.erase(pit);
+bool CorfuDBStorage::sealedBelowLocked(std::string const& fileName, long addr) const {
+  auto sit = sealed_at_addr_.find(fileName);
+  return sit != sealed_at_addr_.end() && sit->second < addr;
 }
 
 std::shared_ptr<CorfuDBStorage::Batch>& CorfuDBStorage::cachedBatchLocked(std::string const& fileName) {
@@ -1042,9 +1050,7 @@ std::shared_ptr<CorfuDBStorage::Batch> CorfuDBStorage::takeCachedBatchLocked(std
   return batch;
 }
 
-// Settle a batch that will never be spliced. Dropping it from pending_
-// also unblocks any stamped batches queued behind it, so reconcile runs
-// again before we return.
+// Settle a batch with its final outcome and drop it from pending_.
 void CorfuDBStorage::finishBatchLocked(std::string const& fileName,
                                        std::shared_ptr<Batch> const& batch,
                                        Status result) {
@@ -1054,21 +1060,18 @@ void CorfuDBStorage::finishBatchLocked(std::string const& fileName,
   auto pit = pending_.find(fileName);
   if (pit != pending_.end()) {
     pit->second.remove(batch);
-    if (pit->second.empty()) {
-      pending_.erase(pit);
-    } else {
-      reconcilePendingFrontLocked(fileName);
-    }
+    if (pit->second.empty()) pending_.erase(pit);
   }
 }
 
-// JNI submit, then stamp and reconcile under mtx_. mtx_ must NOT be held
-// on entry: the JNI round-trip runs unlocked so it does not block readers,
-// the tailer, or writers on other files.
+// JNI submit, then wait for the tailer to pass the new address and read
+// the outcome under mtx_. mtx_ must NOT be held on entry: the JNI
+// round-trip runs unlocked so it does not block readers, the tailer, or
+// writers on other files.
 Status CorfuDBStorage::submitBatch(std::string const& fileName,
                                    std::shared_ptr<Batch> const& batch) {
   // The caller holds write_gate_ shared (taken before the batch entered
-  // pending_), so a snapshot never observes a sequenced-but-unstamped batch.
+  // pending_); see the write_gate_ comment in the header.
   if (trimmed_out_.load()) {
     std::lock_guard<std::mutex> lk(mtx_);
     finishBatchLocked(fileName, batch, Status::kFailure);
@@ -1090,34 +1093,75 @@ Status CorfuDBStorage::submitBatch(std::string const& fileName,
     } else if (addr < 0) {
       finishBatchLocked(fileName, batch, Status::kFailure);
     } else {
-      batch->addr = addr;
+      // Publish the address first so every fence on this process
+      // covers these bytes from here on.
       long prev = last_written_addr_.load(std::memory_order_acquire);
       while (addr > prev &&
              !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
       }
-      auto sit = sealed_at_addr_.find(fileName);
-      if (sit != sealed_at_addr_.end() && sit->second < addr) {
+
+      // ACK RULE. The tailer applies this entry like any peer's, in
+      // address order (applyEntryBytes): spliced into file_buffers_, or
+      // dropped when a SEAL of fileName was sequenced below addr. So the
+      // outcome is known exactly when the tailer has passed addr, and
+      // not before — a peer SEAL at S < addr that the tailer has not
+      // reached yet is invisible here. The old code spliced and acked
+      // right after the JNI return on that partial knowledge; every
+      // other process, applying S first, dropped the bytes, and the next
+      // compaction of fileName by a peer removed the record for good —
+      // 7,407 acked-then-dropped records in a 1M-record 8-writer load,
+      // the ~0.6 % read miss. The wait is the tailer's lag, the same
+      // wait every fenced read already pays.
+      bool const seal_known_before = sealedBelowLocked(fileName, addr);
+      auto const wait_start = std::chrono::steady_clock::now();
+      waitForTailerLocked(lock, addr);
+      auto const wait_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - wait_start)
+              .count());
+      ack_wait_batches_.fetch_add(1, std::memory_order_relaxed);
+      ack_wait_us_total_.fetch_add(wait_us, std::memory_order_relaxed);
+      uint64_t prev_max = ack_wait_us_max_.load(std::memory_order_relaxed);
+      while (wait_us > prev_max &&
+             !ack_wait_us_max_.compare_exchange_weak(prev_max, wait_us, std::memory_order_relaxed)) {
+      }
+      bool const reached =
+          last_applied_addr_.load(std::memory_order_acquire) >= addr;
+
+      if (batch->done) {
+        // A peer REMOVE settled this batch during the wait.
+      } else if (sealedBelowLocked(fileName, addr)) {
         // Sequenced after the file's SEAL. These bytes belong to no
         // file, and no process will ever read them. Report kSealed so
         // the caller retries on the new tail — a retry cannot duplicate,
-        // because this copy is unreadable everywhere.
+        // because this copy is unreadable everywhere. A known seal is
+        // decisive whether or not the tailer reached addr.
+        if (!seal_known_before) {
+          sealed_after_wait_.fetch_add(1, std::memory_order_relaxed);
+          std::cerr << "[corfu] submitBatch: SEAL of " << fileName << " at "
+                    << sealed_at_addr_[fileName] << " learned while waiting for addr "
+                    << addr << " (" << batch->payload.size()
+                    << " bytes); retried on the new tail\n";
+        }
         finishBatchLocked(fileName, batch, Status::kSealed);
+      } else if (trimmed_out_.load() || !reached) {
+        // Without the tailer at addr the outcome is unknown, and an ack
+        // that may be wrong is worse than a failed put: the caller sees
+        // kFailure and does not retry, so nothing is duplicated even if
+        // the bytes do become visible later.
+        std::cerr << "[corfu] submitBatch: tailer did not reach addr " << addr
+                  << " for " << fileName << " (applied "
+                  << last_applied_addr_.load(std::memory_order_acquire)
+                  << "); append not acked\n";
+        finishBatchLocked(fileName, batch, Status::kFailure);
       } else if (removed_files_.count(fileName)) {
         finishBatchLocked(fileName, batch, Status::kFailure);
       } else {
-        reconcilePendingFrontLocked(fileName);
-        // Not spliced yet means an earlier batch on this file is still
-        // in flight. Wait for its writer to stamp, so `done` keeps its
-        // meaning: the bytes are readable through file_buffers_.
-        if (!batch->done) {
-          batch_flushed_cv_.wait_for(lock, std::chrono::seconds(30),
-                                     [&] { return batch->done; });
-          if (!batch->done) {
-            std::cerr << "[corfu] submitBatch: splice timed out for " << fileName
-                      << " at addr " << addr << "\n";
-            finishBatchLocked(fileName, batch, Status::kFailure);
-          }
-        }
+        // The tailer spliced the bytes at addr: readable through
+        // file_buffers_ in this process and, in the same order, in every
+        // other one.
+        batch->addr = addr;
+        finishBatchLocked(fileName, batch, Status::kSuccess);
       }
     }
   }
@@ -1359,8 +1403,9 @@ void CorfuDBStorage::seal(std::string fileName) {
            !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
     }
     sealed_files_.insert(fileName);
-    // Record the seal address locally too. Our own tailer skips entries
-    // carrying our client_id, so it will never apply this SEAL for us.
+    // Record the seal address right away, before the tailer reaches this
+    // SEAL: own appends still in flight are judged against it as soon as
+    // the tailer passes their address.
     auto sit = sealed_at_addr_.find(fileName);
     if (sit == sealed_at_addr_.end() || addr < sit->second) {
       sealed_at_addr_[fileName] = addr;

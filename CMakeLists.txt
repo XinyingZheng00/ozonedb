@@ -239,6 +239,12 @@ if (OZONEDB_ENABLE_CORFU)
     add_executable(corfu_multiwriter_smoke tests/corfu_multiwriter_smoke.cpp)
     target_include_directories(corfu_multiwriter_smoke PRIVATE ${JNI_INCLUDE_DIRS})
     target_link_libraries(corfu_multiwriter_smoke OzoneDB ${JNI_LIBRARIES})
+
+    # Read-only stream diagnostic (dropped-above-seal appends, metadata.log
+    # rollforward simulation). See tests/corfu_stream_stats.cpp.
+    add_executable(corfu_stream_stats tests/corfu_stream_stats.cpp)
+    target_include_directories(corfu_stream_stats PRIVATE ${JNI_INCLUDE_DIRS})
+    target_link_libraries(corfu_stream_stats OzoneDB ${JNI_LIBRARIES})
 endif()
 
 target_link_libraries(runUnitTests 
