@@ -75,6 +75,8 @@ TRIAL=""          # --trial N: exactly this trial (what a campaign driver passes
 DURATION=""       # --duration S: forwarded to every client as --max_exec_time
 LINEARIZABLE=0    # --linearizable: strict reads, label ozonedb-corfu-linearizable
 LOG_TRIM=0        # --log-trim: writer 0 checkpoints + trims the Corfu stream
+LRU_CACHE_BYTES=""  # --lru-cache-bytes N: per-process block cache, label -lru64m
+RECORD_CNT=""     # --record-cnt N: dataset size, forwarded as --record_cnt
 RUN_TAG=""        # --run-tag: bench/results/local/<tag> on every host and here
 DRY_RUN=0
 
@@ -124,6 +126,12 @@ Usage: $(basename "$0") [options]
                             checkpoint; every writer opens from the newest
                             checkpoint (PLAN-trimming.md). Forwarded to each
                             client as --log-trim.
+  --lru-cache-bytes N       per-process SSTable block cache in bytes, written
+                            into every writer's generated shared_config and
+                            appended to the result label (-lru64m). The
+                            cache sweep of bench/PLAN-cost.md phase 2.
+  --record-cnt N            dataset size in records, forwarded to every
+                            client as --record_cnt (must match the load).
   --run-tag TAG             results dir bench/results/local/TAG on every host
                             and locally (default: timestamp). Reusing a tag
                             across invocations is safe -- trial, workload
@@ -156,6 +164,8 @@ while [[ $# -gt 0 ]]; do
   --duration)       DURATION="$2"; shift 2 ;;
   --linearizable)   LINEARIZABLE=1; shift ;;
   --log-trim)       LOG_TRIM=1; shift ;;
+  --lru-cache-bytes) LRU_CACHE_BYTES="$2"; shift 2 ;;
+  --record-cnt)     RECORD_CNT="$2"; shift 2 ;;
   --run-tag)        RUN_TAG="$2"; shift 2 ;;
   --dry-run)        DRY_RUN=1; shift ;;
   -h | --help)      usage; exit 0 ;;
@@ -197,6 +207,14 @@ if [[ -n "$DURATION" ]] && ! [[ "$DURATION" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ -n "$RUN_TAG" ]] && ! [[ "$RUN_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "--run-tag is a directory name and must match [A-Za-z0-9._-]+ (got: $RUN_TAG)" >&2
+  exit 1
+fi
+if [[ -n "$LRU_CACHE_BYTES" ]] && ! [[ "$LRU_CACHE_BYTES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--lru-cache-bytes must be a positive integer (got: $LRU_CACHE_BYTES)" >&2
+  exit 1
+fi
+if [[ -n "$RECORD_CNT" ]] && ! [[ "$RECORD_CNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--record-cnt must be a positive integer (got: $RECORD_CNT)" >&2
   exit 1
 fi
 
@@ -306,8 +324,10 @@ COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG")
 [[ -n "$DURATION"       ]] && COMMON_ARGS+=(--max_exec_time "$DURATION")
 [[ "$LINEARIZABLE" -eq 1 ]] && COMMON_ARGS+=(--linearizable)
 [[ "$LOG_TRIM" -eq 1 ]] && COMMON_ARGS+=(--log-trim)
+[[ -n "$LRU_CACHE_BYTES" ]] && COMMON_ARGS+=(--lru-cache-bytes "$LRU_CACHE_BYTES")
+[[ -n "$RECORD_CNT"      ]] && COMMON_ARGS+=(--record_cnt "$RECORD_CNT")
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
 echo "=== corfu server: $CORFU_TARGET:$CORFU_PORT ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="

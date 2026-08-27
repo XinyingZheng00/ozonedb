@@ -1,0 +1,45 @@
+{
+  "_comment": "List prices for bench/scripts/plot/plot_cost_model.py (bench/PLAN-cost.md). Approximate on-demand, us-east-1, 730 h/month. Re-read every price before the paper goes out and update as_of.",
+  "as_of": "2026-08-26",
+  "region": "us-east-1",
+  "hours_per_month": 730,
+  "seconds_per_month": 2630000,
+  "instances": {
+    "c6i.large":   {"usd_month": 62,   "vcpu": 2,  "ram_gb": 4},
+    "m6i.xlarge":  {"usd_month": 140,  "vcpu": 4,  "ram_gb": 16},
+    "r6i.xlarge":  {"usd_month": 184,  "vcpu": 4,  "ram_gb": 32},
+    "i4i.2xlarge": {"usd_month": 501,  "vcpu": 8,  "ram_gb": 64,  "nvme_gb": 1875},
+    "i4i.4xlarge": {"usd_month": 1002, "vcpu": 16, "ram_gb": 128, "nvme_gb": 3750}
+  },
+  "storage": {
+    "gp3_usd_gb_month": 0.08,
+    "gp3_max_volume_gb": 16384,
+    "s3_standard_usd_gb_month": 0.023,
+    "s3_get_usd_per_million": 0.40,
+    "s3_put_usd_per_million": 5.00
+  },
+  "roles": {
+    "sequencer": "c6i.large",
+    "logunit": "r6i.xlarge",
+    "ozonedb_client": "m6i.xlarge",
+    "cassandra_client": "c6i.large",
+    "cassandra_node_nvme": "i4i.2xlarge",
+    "cassandra_node_ebs": "m6i.xlarge",
+    "cassandra_ebs_gb_per_node": 8000
+  },
+  "projection": {
+    "_comment": "Offered load and layout the figure is drawn for. Client and server node counts follow from the measured CPU per op at target_util.",
+    "ops_per_s": 10000,
+    "read_fraction": 0.5,
+    "rf": 3,
+    "log_units": 3,
+    "min_cassandra_nodes": 3,
+    "disk_fill": 0.7,
+    "target_util": 0.7,
+    "min_clients": 1,
+    "cache_gb_low": 4,
+    "cache_gb_high": 16,
+    "d_min_gb": 1,
+    "d_max_gb": 100000
+  }
+}

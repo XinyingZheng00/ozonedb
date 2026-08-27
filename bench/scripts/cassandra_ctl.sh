@@ -11,7 +11,13 @@
 #                                   DROP + CREATE the YCSB keyspace/table (server must be up)
 #   cassandra_ctl.sh save-load      stop + copy data -> data.load   (after the load phase)
 #   cassandra_ctl.sh restore-load   stop + copy data.load -> data   (before every run trial)
+#   cassandra_ctl.sh space [KS]     bytes on disk: nodetool tablestats (server up) + du -sk
+#   cassandra_ctl.sh compact [KS]   nodetool compact, then wait until no compaction is pending
 #   cassandra_ctl.sh cqlsh ...      cqlsh against this node
+#
+# space / compact are the phase 1 measurements of bench/PLAN-cost.md: `space`
+# before `compact` is the transient peak, after it is the steady footprint
+# (sC, the Cassandra bytes on disk per logical byte).
 #
 # save-load / restore-load are the Corfu /mnt/corfu/{load,run_batch} pattern:
 # every run trial starts from the identical, drained on-disk state the load
@@ -195,9 +201,47 @@ do_restore_load() {
   cp -a "$LOAD_DIR" "$DATA_DIR"
 }
 
+# Bytes on disk. Two views: what Cassandra counts as live SSTable bytes
+# (tablestats; needs the server), and what the filesystem holds (du; the
+# commit log and obsolete SSTables included -- what a node actually needs).
+do_space() {
+  local keyspace="${1:-ycsb}"
+  if port_open; then
+    log "nodetool tablestats $keyspace"
+    "$CASSANDRA_HOME/bin/nodetool" tablestats "$keyspace" |
+      grep -E 'Table:|Space used|SSTable count|Compression ratio|Number of partitions|Bytes repaired|Bytes unrepaired' |
+      sed 's/^[[:space:]]*/[cassandra_ctl]   /'
+  else
+    log "server is down: nodetool tablestats skipped, du only"
+  fi
+  local d
+  for d in "$DATA_DIR" "$DATA_DIR/data" "$DATA_DIR/commitlog" "$LOAD_DIR"; do
+    [[ -d "$d" ]] && du -sk "$d" 2>/dev/null | awk '{printf "[cassandra_ctl] du_kb %s %s\n", $2, $1}'
+  done
+  return 0
+}
+
+# Major compaction, and wait until compactionstats reports nothing pending,
+# so the `space` that follows is the settled footprint.
+do_compact() {
+  local keyspace="${1:-ycsb}"
+  port_open || die "compact: server is not up (run: cassandra_ctl.sh start && cassandra_ctl.sh wait)"
+  log "nodetool compact $keyspace (blocks until the major compaction returns)"
+  "$CASSANDRA_HOME/bin/nodetool" compact "$keyspace"
+  local i
+  for i in $(seq 1 1800); do
+    if "$CASSANDRA_HOME/bin/nodetool" compactionstats 2>/dev/null | grep -q 'pending tasks: 0'; then
+      log "no compaction pending after ${i}s"
+      return 0
+    fi
+    sleep 1
+  done
+  die "compactionstats still reports pending tasks after 1800s"
+}
+
 verb="${1:-}"
 [[ -n "$verb" ]] || {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 shift
@@ -210,6 +254,8 @@ wipe) do_wipe ;;
 schema) do_schema "$@" ;;
 save-load) do_save_load ;;
 restore-load) do_restore_load ;;
+space) do_space "$@" ;;
+compact) do_compact "$@" ;;
 cqlsh) cql "$@" ;;
 *) die "unknown verb: $verb" ;;
 esac

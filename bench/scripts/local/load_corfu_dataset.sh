@@ -34,6 +34,8 @@ CORFU_HEAP="${CORFU_HEAP:-122880}"
 
 WRITERS=8
 LOAD_HOST=""
+LOG_TRIM=0      # --log-trim: writer 0 checkpoints + trims during the load
+RECORD_CNT=""   # --record-cnt N: dataset size (default: local.load.record_cnt)
 DRY_RUN=0
 
 usage() {
@@ -43,6 +45,12 @@ Usage: $(basename "$0") [options]
   --config PATH     ycsb.yaml (default: $CONFIG)
   --writers N       loader processes on the load host (default: $WRITERS)
   --load-host HOST  client that runs the loader (default: first cloudlab.hosts)
+  --log-trim        forward --log-trim to the loader: writer 0 checkpoints
+                    the stream to the bucket and trims behind it, so the
+                    snapshot holds one trim interval, not the whole load
+                    (bench/PLAN-cost.md phase 1). The checkpoint lives in the
+                    bucket: snapshot the bucket together with /mnt/corfu/load.
+  --record-cnt N    dataset size in records, forwarded as --record_cnt
   --corfu-dir PATH  corfu repo on the log node (default: $CORFU_DIR)
   --dry-run         print the plan; no ssh
   -h | --help
@@ -54,6 +62,8 @@ while [[ $# -gt 0 ]]; do
   --config) CONFIG="$2"; shift 2 ;;
   --writers) WRITERS="$2"; shift 2 ;;
   --load-host) LOAD_HOST="$2"; shift 2 ;;
+  --log-trim) LOG_TRIM=1; shift ;;
+  --record-cnt) RECORD_CNT="$2"; shift 2 ;;
   --corfu-dir) CORFU_DIR="$2"; shift 2 ;;
   --dry-run) DRY_RUN=1; shift ;;
   -h | --help) usage; exit 0 ;;
@@ -61,6 +71,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ "$WRITERS" =~ ^[1-9][0-9]*$ ]] || { echo "--writers must be a positive integer" >&2; exit 1; }
+if [[ -n "$RECORD_CNT" ]] && ! [[ "$RECORD_CNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--record-cnt must be a positive integer (got: $RECORD_CNT)" >&2
+  exit 1
+fi
 
 cfg() { python3 "$OZONEDB_HOME/bench/scripts/ycsb_config.py" --config "$CONFIG" "$@"; }
 SSH_USER="$(cfg --get nodes.ssh_user)"
@@ -95,20 +109,51 @@ snapshot() {
   corfu_sh "rm -rf $CORFU_DATA/load && cp -r $CORFU_DATA/run_batch $CORFU_DATA/load && du -sh $CORFU_DATA/load"
 }
 
-LOAD_CMD="cd \$OZONEDB_HOME && python3 bench/scripts/local/load_local_ycsb_multiproc.py --db_name ozonedb-corfu --num_writers $WRITERS"
+# Server sample around the load (bench/PLAN-cost.md phase 1: write
+# amplification, checkpoint bytes, log bytes). Same sampler and cell naming
+# as run_multinode_ycsb.py; the files land in bench/results/local/_server/,
+# next to the per-writer insert files, where extract_cost_coefficients.py
+# joins them as the "load" workload. Best effort: a failure here never
+# stops the load.
+SAMPLER_SRC="$OZONEDB_HOME/bench/scripts/server_sampler.sh"
+SAMPLER_REMOTE_DIR="ozonedb_server_samples/load"
+S3_PORT="$(cfg --get s3.port 2>/dev/null || echo 9000)"
+S3_BUCKET="$(cfg --get s3.bucket 2>/dev/null || echo "")"
+SAMPLE_CELL="ozonedb-corfu_workloadload_w${WRITERS}_trial0"
+SAMPLE_LOCAL="$OZONEDB_HOME/bench/results/local/_server/$(echo "$CORFU_SSH" | sed 's/^.*@//; s/[^A-Za-z0-9._-]/_/g')"
+sampler_start() {
+  scp "${SSH_OPTS[@]}" -q "$SAMPLER_SRC" "$CORFU_SSH:ozonedb_server_sampler.sh" &&
+    corfu_sh "mkdir -p $SAMPLER_REMOTE_DIR && env SAMPLER_MINIO_URL=http://127.0.0.1:$S3_PORT SAMPLER_BUCKET=$S3_BUCKET bash ozonedb_server_sampler.sh start $SAMPLER_REMOTE_DIR $SAMPLE_CELL" ||
+    echo "[sampler] WARNING: server sample not started"
+}
+sampler_stop() {
+  corfu_sh "env SAMPLER_MINIO_URL=http://127.0.0.1:$S3_PORT SAMPLER_BUCKET=$S3_BUCKET bash ozonedb_server_sampler.sh stop $SAMPLER_REMOTE_DIR $SAMPLE_CELL" || true
+  mkdir -p "$SAMPLE_LOCAL"
+  scp "${SSH_OPTS[@]}" -q "$CORFU_SSH:$SAMPLER_REMOTE_DIR/$SAMPLE_CELL.*" "$SAMPLE_LOCAL/" &&
+    echo "[sampler] server sample pulled into $SAMPLE_LOCAL" ||
+    echo "[sampler] WARNING: server sample not pulled"
+}
 
-echo "=== corfu load: server=$CORFU_SSH ($CORFU_BIND:$CORFU_PORT) load_host=$LOAD_HOST writers=$WRITERS ==="
+LOAD_CMD="cd \$OZONEDB_HOME && python3 bench/scripts/local/load_local_ycsb_multiproc.py --db_name ozonedb-corfu --num_writers $WRITERS"
+[[ "$LOG_TRIM" -eq 1 ]] && LOAD_CMD="$LOAD_CMD --log-trim"
+[[ -n "$RECORD_CNT" ]] && LOAD_CMD="$LOAD_CMD --record_cnt $RECORD_CNT"
+
+echo "=== corfu load: server=$CORFU_SSH ($CORFU_BIND:$CORFU_PORT) load_host=$LOAD_HOST writers=$WRITERS log_trim=$LOG_TRIM record_cnt=${RECORD_CNT:-yaml} ==="
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "[dry-run] stop corfu; wipe run_batch; start corfu -l $CORFU_DATA/run_batch"
+  echo "[dry-run] server sample start: cell=$SAMPLE_CELL on $CORFU_SSH -> $SAMPLE_LOCAL"
   echo "[dry-run] $LOAD_HOST: bash -lc '$LOAD_CMD'"
+  echo "[dry-run] server sample stop"
   echo "[dry-run] stop corfu; cp -r $CORFU_DATA/run_batch -> $CORFU_DATA/load"
   exit 0
 fi
 
 stop_corfu || true
 start_fresh_corfu
+sampler_start
 echo "[load:$LOAD_HOST] $LOAD_CMD"
 ssh "${SSH_OPTS[@]}" "$SSH_USER@$LOAD_HOST" "bash -lc '$LOAD_CMD'"
+sampler_stop
 stop_corfu
 snapshot
 echo "=== corfu load done; snapshot at $CORFU_DATA/load on $CORFU_SSH ==="

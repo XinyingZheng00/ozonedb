@@ -401,7 +401,9 @@ install_corfu_runtime() {
 role_client() {
   log "=== role: client ==="
 
-  apt_install cmake maven python3-pip zip pkg-config build-essential git ninja-build
+  # `time` is GNU time: load_local_ycsb_multiproc.py wraps every YCSB writer
+  # in /usr/bin/time -v so client CPU and peak RSS land in the .result file.
+  apt_install cmake maven python3-pip zip pkg-config build-essential git ninja-build time
 
   local jdk java_home
   jdk="$(ensure_jdk "$JDK_VERSION" "${JDK_FALLBACKS[@]}")"
@@ -469,7 +471,8 @@ role_client() {
 role_corfu_server() {
   log "=== role: corfu-server ==="
 
-  apt_install maven git
+  # sysstat: pidstat for bench/scripts/server_sampler.sh (server CPU per cell).
+  apt_install maven git sysstat curl
 
   # Same present-check + clone + build (with the late-reactor-failure guard)
   # the client role uses; the server additionally needs the shaded
@@ -508,6 +511,10 @@ PY
   fi
   [[ -z "$bucket" ]] && bucket="ozonedb-ycsb"
 
+  # sysstat + curl: bench/scripts/server_sampler.sh reads the MinIO metrics
+  # endpoint and runs pidstat on the minio process.
+  apt_install sysstat curl
+
   if ! command -v minio >/dev/null 2>&1; then
     log "installing minio server"
     sudo curl -fsSL -o /usr/local/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio
@@ -537,6 +544,10 @@ Wants=network-online.target
 User=$USER
 Environment=MINIO_ROOT_USER=$MINIO_USER
 Environment=MINIO_ROOT_PASSWORD=$MINIO_PASSWORD
+# /minio/v2/metrics/{cluster,bucket} without a bearer token, so
+# bench/scripts/server_sampler.sh can read the S3 request counters that the
+# cost model (bench/PLAN-cost.md) is built on. Bench LAN only.
+Environment=MINIO_PROMETHEUS_AUTH_TYPE=public
 ExecStart=/usr/local/bin/minio server $MINIO_DATA_DIR --address :$MINIO_PORT --console-address :$MINIO_CONSOLE_PORT
 Restart=always
 RestartSec=3
@@ -594,7 +605,8 @@ role_cassandra() {
   # cassandra-driver and drive CQL through bench/scripts/cassandra_cql.py.
   # libev-dev + build-essential + python3-dev let pip build the libev reactor,
   # which is the one that actually connects on 3.12 (asyncio times out).
-  apt_install curl tar python3 python3-yaml python3-venv build-essential python3-dev libev-dev
+  # sysstat: pidstat for bench/scripts/server_sampler.sh.
+  apt_install curl tar python3 python3-yaml python3-venv build-essential python3-dev libev-dev sysstat
 
   local version install_dir port heap new_heap
   version="${CASSANDRA_VERSION:-$(ycsb_cfg --get cassandra.version)}" || die "cassandra.version missing from ycsb.yaml"

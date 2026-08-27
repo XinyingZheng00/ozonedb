@@ -10,13 +10,26 @@ from datetime import datetime
 
 import yaml
 
-from load_local_ycsb_multiproc import write_aggregate
+from load_local_ycsb_multiproc import (
+    cassandra_mode_settings,
+    linearizable_corfu_settings,
+    lru_cache_corfu_settings,
+    result_label,
+    write_aggregate,
+)
 
 # bench/scripts is one level up. ycsb_config.derive() resolves the `nodes:`
 # block into the cloudlab.hosts / corfu.endpoint / s3.endpoint keys read below,
 # so those are computed in exactly one place.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _SCRIPTS_DIR)
 from ycsb_config import derive as _derive_addresses
+from ycsb_config import ConfigError, node as _cfg_node, ssh_addr as _ssh_addr
+
+# bench/scripts/server_sampler.sh, pushed to every sampled server per cell.
+SERVER_SAMPLER_SRC = os.path.join(_SCRIPTS_DIR, "server_sampler.sh")
+SERVER_SAMPLER_REMOTE = "ozonedb_server_sampler.sh"       # in $HOME on the server
+SERVER_SAMPLES_REMOTE_DIR = "ozonedb_server_samples"      # $HOME/<this>/<run_tag>/
 
 """
 Multi-node YCSB orchestrator. SSHes to each host and invokes
@@ -187,7 +200,8 @@ def host_log_name(host, log_dir):
 def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          total_writers, workloads, trial, max_exec_time=None,
                          linearizable=False, log_trim=False, db_name=None,
-                         cassandra_consistency=None):
+                         cassandra_consistency=None, lru_cache_bytes=None,
+                         record_cnt=None):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -210,9 +224,151 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--log-trim"] if log_trim else [])
             + (["--db_name", shlex.quote(db_name)] if db_name else [])
             + (["--cassandra_consistency", cassandra_consistency] if cassandra_consistency else [])
+            + (["--lru-cache-bytes", str(int(lru_cache_bytes))] if lru_cache_bytes is not None else [])
+            + (["--record_cnt", str(int(record_cnt))] if record_cnt is not None else [])
         ),
     ]
     return " && ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Server-side sampling (bench/PLAN-cost.md P0.2). The orchestrator is the
+# one place that knows the cell's label, writer count and trial, and it
+# already SSHes and scps, so the sampler is driven from here rather than
+# from the two shell wrappers. Every failure here is a warning: a cell
+# without a server sample is still a valid throughput cell.
+# --------------------------------------------------------------------------
+
+def cell_label(config, args):
+    """The result label the clients will write for this invocation, computed
+    with the same functions they use, so the server sample files carry the
+    same cell name as the per-writer result files."""
+    run_config = config["local"]["run"]
+    if args.db_name:
+        db_names = [d.strip() for d in args.db_name.split(",") if d.strip()]
+    else:
+        db_names = list(run_config.get("db_name") or [])
+    corfu = config.get("corfu")
+    if args.linearizable:
+        corfu = linearizable_corfu_settings(corfu)
+    if args.lru_cache_bytes is not None:
+        corfu = lru_cache_corfu_settings(corfu, args.lru_cache_bytes)
+    cass = config.get("cassandra")
+    if args.cassandra_consistency:
+        cass = cassandra_mode_settings(cass, args.cassandra_consistency)
+    labels = []
+    for d in db_names:
+        try:
+            labels.append(result_label(d, corfu, cass, args.lru_cache_bytes))
+        except Exception:
+            labels.append(d)
+    return "+".join(labels), db_names
+
+
+def server_sample_targets(config, db_names):
+    """SSH addresses of the stateful servers behind these backends, in order,
+    without duplicates: the Corfu node and the object-store node for
+    ozonedb-corfu (one box on the current cluster), the Cassandra nodes for
+    cassandra. Other backends have no server."""
+    out = []
+
+    def add(addr):
+        if addr and addr not in out:
+            out.append(addr)
+
+    for d in db_names:
+        if d == "ozonedb-corfu":
+            for role in ("log", "store"):
+                try:
+                    add(_ssh_addr(_cfg_node(config, role), f"nodes.{role}"))
+                except ConfigError:
+                    pass
+        elif d == "cassandra":
+            for addr in (config.get("cassandra") or {}).get("ssh_hosts") or []:
+                add(addr)
+    return out
+
+
+def sampler_env(config):
+    """Environment for server_sampler.sh: the MinIO port and bucket from the
+    s3 block, so `mc du` and the metrics scrape hit the right store."""
+    s3 = config.get("s3") or {}
+    parts = [f"SAMPLER_MINIO_URL=http://127.0.0.1:{s3.get('port', 9000)}"]
+    if s3.get("bucket"):
+        parts.append(f"SAMPLER_BUCKET={shlex.quote(str(s3['bucket']))}")
+    return " ".join(parts)
+
+
+def sampler_push(target, ssh_key):
+    cmd = [
+        "scp", "-i", ssh_key,
+        "-oStrictHostKeyChecking=no", "-oUserKnownHostsFile=/dev/null",
+        "-q", SERVER_SAMPLER_SRC, f"{target}:{SERVER_SAMPLER_REMOTE}",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"scp of server_sampler.sh failed: {proc.stderr.strip()}")
+
+
+def sampler_run(target, ssh_key, env, verb, remote_dir, cell):
+    remote = (
+        f"mkdir -p {shlex.quote(remote_dir)} && "
+        f"env {env} bash {SERVER_SAMPLER_REMOTE} {verb} {shlex.quote(remote_dir)} {shlex.quote(cell)}"
+    )
+    cmd = ssh_base(target, ssh_key) + [remote]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    msg = (proc.stderr or "").strip()
+    if msg:
+        print(f"[{target}] sampler {verb}: {msg}")
+    if proc.returncode != 0:
+        raise RuntimeError(f"server_sampler.sh {verb} exited {proc.returncode}: {msg}")
+
+
+def sampler_fetch(target, ssh_key, remote_dir, cell, local_dir):
+    os.makedirs(local_dir, exist_ok=True)
+    cmd = [
+        "scp", "-i", ssh_key,
+        "-oStrictHostKeyChecking=no", "-oUserKnownHostsFile=/dev/null",
+        "-q", f"{target}:{remote_dir}/{cell}.*", local_dir,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(f"scp of server samples failed: {proc.stderr.strip()}")
+
+
+class ServerSampling:
+    """start() before the writers launch, stop() after they exit. Samples
+    land in <local_results_root>/_server/<host>/<cell>.{before,after,pidstat}.txt."""
+
+    def __init__(self, config, ssh_user, ssh_key, run_tag, cell, local_results_root, hosts):
+        self.ssh_key = ssh_key
+        self.env = sampler_env(config)
+        self.remote_dir = f"{SERVER_SAMPLES_REMOTE_DIR}/{run_tag}"
+        self.cell = cell
+        self.local_root = os.path.join(local_results_root, "_server")
+        self.targets = [f"{ssh_user}@{h}" for h in hosts]
+        self.hosts = hosts
+        self.started = []
+
+    def start(self):
+        for host, target in zip(self.hosts, self.targets):
+            try:
+                sampler_push(target, self.ssh_key)
+                sampler_run(target, self.ssh_key, self.env, "start", self.remote_dir, self.cell)
+                self.started.append((host, target))
+                print(f"[{target}] server sample started: cell={self.cell}")
+            except Exception as e:
+                print(f"[{target}] WARNING: server sampling not started: {e}")
+
+    def stop(self):
+        for host, target in self.started:
+            try:
+                sampler_run(target, self.ssh_key, self.env, "stop", self.remote_dir, self.cell)
+                local_dir = os.path.join(self.local_root, re.sub(r"[^A-Za-z0-9._-]", "_", host))
+                sampler_fetch(target, self.ssh_key, self.remote_dir, self.cell, local_dir)
+                print(f"[{target}] server sample pulled into {local_dir}")
+            except Exception as e:
+                print(f"[{target}] WARNING: server sample incomplete: {e}")
 
 
 # `db` is the result LABEL, which may carry a read-mode suffix
@@ -362,6 +518,28 @@ def main():
              "mode; result files are labelled cassandra-<mode>.",
     )
     parser.add_argument(
+        "--lru-cache-bytes",
+        type=int,
+        default=None,
+        help="Pass-through to per-host runner (ozonedb / ozonedb-corfu): per-process "
+             "block cache in bytes; result files get a -lru64m style token.",
+    )
+    parser.add_argument(
+        "--record_cnt",
+        type=int,
+        default=None,
+        help="Pass-through to per-host runner: dataset size in records (overrides "
+             "local.run.record_cnt on every client); must match the load.",
+    )
+    parser.add_argument(
+        "--no_server_sample",
+        action="store_true",
+        help="Do not run bench/scripts/server_sampler.sh on the server node(s) "
+             "around this cell. By default the Corfu/MinIO node (ozonedb-corfu) or "
+             "the Cassandra nodes are sampled and the files land in "
+             "<results>/_server/<host>/ (bench/PLAN-cost.md P0.2).",
+    )
+    parser.add_argument(
         "--cell_timeout",
         type=int,
         default=None,
@@ -437,6 +615,12 @@ def main():
             }
         )
 
+    # Server sampling: one cell name shared with the per-writer result files.
+    label, db_names = cell_label(config, args)
+    workloads_token = (args.workloads or "yaml").replace(",", "+")
+    cell = f"{label}_workload{workloads_token}_w{total_writers}_trial{trial}"
+    sample_hosts = [] if args.no_server_sample else server_sample_targets(config, db_names)
+
     print(
         f"[orchestrator] tag={run_tag} hosts={len(hosts)} "
         f"writers_per_host={writers_per_host} total_writers={total_writers} "
@@ -444,7 +628,10 @@ def main():
         f"max_exec_time={args.max_exec_time or 'yaml'} "
         f"read_mode={'linearizable' if args.linearizable else 'default'} "
         f"db_name={args.db_name or 'yaml'} "
-        f"cassandra_consistency={args.cassandra_consistency or 'yaml'}"
+        f"cassandra_consistency={args.cassandra_consistency or 'yaml'} "
+        f"lru_cache_bytes={args.lru_cache_bytes or 'base'} "
+        f"record_cnt={args.record_cnt or 'yaml'} "
+        f"label={label} server_sample={sample_hosts or 'off'}"
     )
     for p in plan:
         print(
@@ -459,10 +646,17 @@ def main():
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
+            lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
+        if sample_hosts:
+            print(f"[orchestrator] server sample: cell={cell} on {sample_hosts}")
         print("[orchestrator] --dry_run: not launching.")
         return
+
+    sampling = ServerSampling(
+        config, ssh_user, ssh_key, run_tag, cell, local_results_root, sample_hosts
+    )
 
     remote_homes = {}
     for p in plan:
@@ -479,6 +673,7 @@ def main():
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
+            lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:
@@ -495,6 +690,7 @@ def main():
     if cell_timeout is None and args.max_exec_time:
         cell_timeout = args.max_exec_time * 2 + 120
 
+    sampling.start()
     wall_start = time.time()
     for p in plan:
         t = threading.Thread(target=worker, args=(p,), daemon=False)
@@ -517,6 +713,7 @@ def main():
         for t in threads:
             t.join(60)
     wall_ms = (time.time() - wall_start) * 1000.0
+    sampling.stop()
 
     print(f"[orchestrator] wall={wall_ms / 1000.0:.1f}s return_codes={rcs}")
     if any(rc != 0 for rc in rcs.values()):

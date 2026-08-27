@@ -20,6 +20,7 @@ from load_local_ycsb_multiproc import (
     cassandra_ycsb_props,
     linearizable_corfu_settings,
     log_trim_corfu_settings,
+    lru_cache_corfu_settings,
     partition_records,
     result_label,
     spawn_parallel,
@@ -90,11 +91,19 @@ def run_ycsb(
     linearizable=False,
     cassandra_settings=None,
     cassandra_consistency=None,
+    lru_cache_bytes=None,
 ):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
     if num_writers < 1:
         raise ValueError("num_writers must be >= 1")
+    if lru_cache_bytes is not None:
+        unsupported = [d for d in db_names if d not in ("ozonedb", "ozonedb-corfu")]
+        if unsupported:
+            raise ValueError(
+                f"--lru-cache-bytes only applies to ozonedb / ozonedb-corfu (got {unsupported})"
+            )
+        corfu_settings = lru_cache_corfu_settings(corfu_settings, lru_cache_bytes)
     if offset < 0:
         raise ValueError("offset must be >= 0")
     if trial < 1:
@@ -183,7 +192,9 @@ def run_ycsb(
                     java_bin = _java_binary()
                     # Filenames carry the read mode; db_name (paths, binding,
                     # thread sweep) does not.
-                    label = result_label(db_name, corfu_settings, cassandra_settings)
+                    label = result_label(
+                        db_name, corfu_settings, cassandra_settings, lru_cache_bytes
+                    )
 
                     for thread in thread_list:
                         print(
@@ -241,7 +252,7 @@ def run_ycsb(
                                 ycsb_props += ["-p", f"rocksdb.dir={run_data_path}"]
                             elif db_name == "ozonedb":
                                 cfg = _make_local_config_per_writer(
-                                    writer_idx, run_data_path
+                                    writer_idx, run_data_path, lru_cache_bytes
                                 )
                                 ycsb_props += ["-p", f"shared_config={cfg}"]
                             elif db_name == "ozonedb-corfu":
@@ -407,6 +418,22 @@ if __name__ == "__main__":
              "in ycsb.yaml); result files are labelled cassandra-<mode>. The analogue of "
              "--linearizable for the baseline.",
     )
+    parser.add_argument(
+        "--lru-cache-bytes",
+        type=int,
+        default=None,
+        help="ozonedb / ozonedb-corfu: per-process block cache in bytes, written as "
+             "lru_cache_bytes into every generated shared_config; result files get a "
+             "-lru64m style token (bench/PLAN-cost.md phase 2). Default: the base "
+             "config's 512 MB, no token.",
+    )
+    parser.add_argument(
+        "--record_cnt",
+        type=int,
+        default=None,
+        help="Dataset size in records (overrides local.run.record_cnt); must equal "
+             "what the load phase used. Prefer this over a ycsb.yaml edit.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -417,6 +444,8 @@ if __name__ == "__main__":
     if args.workloads:
         workload_names = [w.strip() for w in args.workloads.split(",") if w.strip()]
     record_cnts = run_config["record_cnt"]
+    if args.record_cnt is not None:
+        record_cnts = args.record_cnt
     operation_cnts = run_config["operation_cnt"]
     key_sizes = run_config["key_size"]
     db_names = run_config["db_name"]
@@ -460,7 +489,9 @@ if __name__ == "__main__":
         f"(db={db_names}, offset={offset}, total_writers={total_writers}, trial={trial}, "
         f"read_mode={'linearizable' if args.linearizable else 'default'}, "
         f"log_trim={'on' if args.log_trim else 'yaml'}, "
-        f"cassandra_consistency={args.cassandra_consistency or 'yaml'})"
+        f"cassandra_consistency={args.cassandra_consistency or 'yaml'}, "
+        f"record_cnt={record_cnts}, "
+        f"lru_cache_bytes={args.lru_cache_bytes or 'base config'})"
     )
     run_ycsb(
         workload_names,
@@ -481,4 +512,5 @@ if __name__ == "__main__":
         linearizable=args.linearizable,
         cassandra_settings=config.get("cassandra"),
         cassandra_consistency=args.cassandra_consistency,
+        lru_cache_bytes=args.lru_cache_bytes,
     )

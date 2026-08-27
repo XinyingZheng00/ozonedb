@@ -1,9 +1,10 @@
 # Plan: cost model with measured coefficients, OzoneDB (Corfu + S3) vs Cassandra (branch `worktree-plan-cost`)
 
-**Status (2026-08-26):** planned, not run. Phase 0 (instrumentation) is not implemented.
-The branch is `visibility` at `35f5cb90` with `worktree-cassandra-bench` (`5518b2b4`)
-merged in, so one tree holds the trimmed engine and the Cassandra baseline. The Cassandra
-branch alone is 16 commits behind `visibility` and must not be used for this experiment.
+**Status (2026-08-27):** phase 0 (instrumentation) is implemented and verified on a
+synthetic results directory. No cell has run on the cluster. The branch is `visibility`
+at `35f5cb90` with `worktree-cassandra-bench` (`5518b2b4`) merged in, so one tree holds
+the trimmed engine and the Cassandra baseline. The Cassandra branch alone is 16 commits
+behind `visibility` and must not be used for this experiment.
 
 ## Goal
 
@@ -114,54 +115,71 @@ the current price list before the paper goes out, and record the date.
 
 ## Phase 0. Instrumentation (code, before any cell)
 
-Each item is small. Together they make every cell record its coefficients without a manual
-step.
+Implemented 2026-08-27 on `worktree-plan-cost`. Not yet exercised on the cluster. The
+smoke cell at the top of phase 1 is where each item produces its first real output.
+Push with `sync.yml` first. Then re-run `setup.sh --role minio` on the store node (the
+metrics environment), and `setup.sh --role corfu-server` and `--role cassandra` for
+`sysstat`. Nothing in phase 0 touches C++, so no rebuild. Before the push, `touch` the
+sources if the branch changed: rsync keeps mtimes and a stale `.so` survives a branch
+switch.
 
-- [ ] **P0.1 `--lru-cache-bytes N`.** The cache size is read only from
-      `src/config/corfu/shared_config_base.json` (`lru_cache_bytes`, 512 MB). Add the flag
-      to `load_local_ycsb_multiproc.py`, `run_local_ycsb_multiproc.py`,
-      `run_multinode_ycsb.py` and `run_multinode_ycsb_with_corfu.sh`, forwarded like
-      `--log-trim`, and write `data["lru_cache_bytes"]` in `_make_corfu_config_per_writer`
-      and `_make_local_config_per_writer`. Put the value in the result label
-      (`ozonedb-corfu-lru64m`) so the cells never overwrite each other.
-- [ ] **P0.2 MinIO metrics.** Add `Environment=MINIO_PROMETHEUS_AUTH_TYPE=public` to the
-      systemd unit that `role_minio` writes in `setup.sh`. Then
-      `curl -s http://10.10.1.1:9000/minio/v2/metrics/cluster` returns
-      `minio_s3_requests_total{api=…}`, `minio_s3_traffic_received_bytes`,
-      `minio_s3_traffic_sent_bytes` and `minio_bucket_usage_total_bytes` with no token.
-      Write `bench/scripts/server_sampler.sh`: `start <tag> <cell>` records those counters
-      and `du -s` of `/mnt/corfu/run_batch`, `/tank/cassandra/data` and `/tank/minio`, and
-      starts `pidstat -h -u -r -p <server pids> 10` into a file; `stop` records the same
-      counters again and kills `pidstat`. Call it from both cluster wrappers around each
-      cell. Both wrappers already `ssh` to the server for restart or restore, so the hook
-      point exists. `sysstat` goes into the `corfu-server` and `cassandra` roles of
-      `setup.sh`.
-- [ ] **P0.3 Client CPU.** Wrap the YCSB command in `/usr/bin/time -v` in `spawn_parallel`
-      (`load_local_ycsb_multiproc.py`). `User time`, `System time` and
-      `Maximum resident set size` then land at the end of each per-writer `.result` file,
-      next to the YCSB output. Add the `time` package to the `client` role.
-- [ ] **P0.4 Cache counters.** `LRUCache::printCacheStats` prints
-      `[lru_cache] sstable hits=… misses=…`. It is called at DB close
-      (`src/db/db.cpp:202`), and every writer's stderr is already redirected into its
-      `.result` file. No code change: confirm that the line appears in a finished
-      `.result` file from the smoke cell. Only SSTable blocks count. Data-log reads come from `file_buffers_` in memory on the Corfu
-      backend and never reach S3, so this counter is the one the model needs.
-- [ ] **P0.5 Cassandra space.** `cassandra_ctl.sh space`: prints `nodetool tablestats ycsb`
-      "Space used (live)" and `du -s /tank/cassandra/data`. `cassandra_ctl.sh compact`
-      runs `nodetool compact ycsb` and waits.
-- [ ] **P0.6 Extractor.** `bench/scripts/extract_cost_coefficients.py <results_dir>`:
-      one TSV row per cell with ops (YCSB), steady ops/s, hits, misses, `h`, GET and PUT
-      deltas, S3 bytes in and out, `du` deltas, user+sys CPU and RSS per writer, trimmer
-      checkpoint count and objects from the `[trimmer]` lines, and the replay line
-      (`stream_MB`, `live_MB`, entries, seconds). Derived columns: GETs per op, GETs per
-      miss (`g`), PUTs per op, CPU-seconds per op.
-- [ ] **P0.7 Plotter.** `bench/scripts/plot/plot_cost_model.py coefficients.tsv prices.json`:
-      evaluates the model above from 1 GB to 100 TB and draws the figure described at the
-      end.
-
-Rebuild the chain (`bench/scripts/build.sh`) only if P0.4 touches C++. Everything else is
-scripts, pushed with `sync.yml`. Before the push, `touch` the sources if the branch changed:
-rsync keeps mtimes and a stale `.so` survives a branch switch.
+- [x] **P0.1 `--lru-cache-bytes N`.** Forwarded like `--log-trim` through
+      `load_local_ycsb_multiproc.py`, `run_local_ycsb_multiproc.py`,
+      `run_multinode_ycsb.py` and `run_multinode_ycsb_with_corfu.sh`.
+      `lru_cache_corfu_settings()` is the one override. `_make_corfu_config_per_writer`
+      and `_make_local_config_per_writer` write `lru_cache_bytes`. `result_label()`
+      appends `-lru64m` (`lru_label_token()`: exact powers of 1024 are short, anything
+      else is bytes). Unset means the base config and no token, so old result names do not
+      change. Also added: `--record_cnt` (`--record-cnt` on the wrappers) on the same chain
+      and on both load wrappers, for phase 5.
+- [x] **P0.2 MinIO metrics + sampler.** `setup.sh --role minio` writes
+      `MINIO_PROMETHEUS_AUTH_TYPE=public` into the unit. `sysstat` and `curl` are in the
+      `corfu-server`, `minio` and `cassandra` roles. `bench/scripts/server_sampler.sh`
+      (`start DIR CELL`, `stop DIR CELL`, `snapshot`) records the filtered
+      `/minio/v2/metrics/{cluster,bucket}` counters, `du -sk` of `/mnt/corfu/run_batch`,
+      `/mnt/corfu/load`, `/tank/minio` and `/tank/cassandra/data`, `mc du --json` of the
+      bucket, and the server pids. It runs `pidstat -h -u -r` between start and stop.
+      It is driven from `run_multinode_ycsb.py`, not from the shell wrappers. The
+      orchestrator is the one place that knows the cell's label, writer count and trial,
+      so the sample files carry the same cell name as the result files:
+      `<label>_workload<wl>_w<N>_trial<T>.{before,after,pidstat}.txt` under
+      `<results>/_server/<host>/`. It samples `nodes.log` and `nodes.store` for
+      `ozonedb-corfu`, and `nodes.cassandra` for `cassandra`. `--no_server_sample` turns it
+      off. Both load wrappers sample the same way around the load, into
+      `bench/results/local/_server/` with cell `..._workloadload_w8_trial0`.
+- [x] **P0.3 Client CPU.** `spawn_parallel` prefixes every writer with `/usr/bin/time -v`
+      when GNU time is present (`time` is in the client role). The block lands at the end
+      of each `.result` file. Without GNU time the writer runs bare and the CPU columns
+      stay empty.
+- [x] **P0.4 Cache counters.** No code change. The extractor parses
+      `[lru_cache] sstable hits=… misses=… capacity=…`. **Confirm on the smoke cell** that
+      the line is in a finished `.result` file. Only SSTable blocks count. Data-log reads
+      come from `file_buffers_` in memory on the Corfu backend and never reach S3, so this
+      counter is the one the model needs.
+- [x] **P0.5 Cassandra space.** `cassandra_ctl.sh space [KS]` prints the `tablestats`
+      space lines (server up) and `du_kb` of `data`, `data/data`, `data/commitlog` and
+      `data.load`. `cassandra_ctl.sh compact [KS]` runs `nodetool compact` and waits until
+      `compactionstats` shows no pending task.
+- [x] **P0.6 Extractor.** `bench/scripts/extract_cost_coefficients.py DIR [DIR ...]
+      [--window 60] [--record-bytes 1024] [--tsv out.tsv]`. One row per (label, workload,
+      writers, trial), 64 columns: YCSB ops, steady ops/s, cache hits, misses, `h`,
+      `cache_ratio`, MinIO GET/HEAD/PUT/LIST/DELETE deltas and bytes, `du` deltas, bucket
+      and `checkpoint/` bytes, client user and sys CPU and RSS, the replay and restore
+      lines, `join_gets` (files + manifest + LATEST), trimmer count and `ckpt_objects`
+      (files + 2 per checkpoint), ack counters, server CPU-seconds per process class,
+      `server_busy_frac`. Derived: `get_per_op`, `get_per_miss` (`g`), `put_per_op`,
+      `put_per_write`, `client_cpu_s_per_op`, `server_cpu_s_per_op`. Load files at the
+      results root are the `load` workload. Verified on a synthetic results directory
+      that uses the exact log-line formats of the engine.
+- [x] **P0.7 Plotter.** `bench/scripts/plot/plot_cost_model.py coefficients.tsv
+      bench/scripts/plot/prices.json --space space.json [--table out.tsv]`.
+      `prices.json` holds the prices (with `as_of`), the instance roles and the projection
+      parameters: 10,000 ops/s, 50 % reads, RF=3, 3 log units, 4 GB and 16 GB caches.
+      `space.json` (copy `space.example.json`) holds the phase 1 numbers that no cell row
+      carries: `sC`, `sO`, `L_gb`, `L0_kb_per_put`, `trim_interval_s`. Every coefficient is
+      printed with its source. Anything not measured is marked ASSUMED on the figure.
+      Client and server node counts follow from CPU per op at 70 % utilisation, so the
+      client term scales with load, not with D. Writes `out/cost_model.{pdf,png}`.
 
 ## Phase 1. Space (once per dataset)
 
@@ -219,9 +237,11 @@ for c in 536870912 67108864 8388608 1048576 131072; do
     --workloads "a c" --writers-list 1 --client-hosts "$HOSTS" \
     --trial 1 --duration 120 --run-tag $TAG || { echo "FAILED at lru=$c"; break; }
 done
-# controls: trimmer off, default cache, to isolate the checkpoint PUTs
+# controls: trimmer off, default cache, to isolate the checkpoint PUTs. The label does
+# not carry the trim state, so a separate tag keeps these from overwriting the trimmed
+# 512 MB cell; the extractor takes both dirs at once.
 bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --lru-cache-bytes 536870912 \
-  --workloads "a c" --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 120 --run-tag $TAG
+  --workloads "a c" --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 120 --run-tag $TAG-notrim
 ```
 
 Per cell, the extractor gives `h`, GETs per op, `g = GETs / misses`, PUTs per op, and
@@ -284,8 +304,8 @@ so use that one and run only 2 and 4.
 
 Checks the one assumption that the extrapolation rests on: `h` depends on `c/D` only.
 
-1. Set `local.load.record_cnt: 10000000` (a `ycsb.yaml` edit, synced to every client, or a
-   `--record-cnt` flag if one is added in P0.1). Load both systems as in phase 1. Expect
+1. Pass `--record-cnt 10000000` to both load wrappers and to every run cell of this
+   phase (no `ycsb.yaml` edit). Load both systems as in phase 1. Expect
    about 20 min for OzoneDB (8,395 puts/s aggregate on the fast path) and a similar time
    for Cassandra. Record every phase 1 quantity again. `sO`, `sC`, `k`, `L` must match
    the 1 GB values within 10 %. `L` in particular must not grow: it is the trimming claim.
@@ -322,8 +342,12 @@ the storage of the 1 GB dataset for a day.
 ## Extraction
 
 ```bash
-python3 bench/scripts/extract_cost_coefficients.py bench/results/local/$TAG --tsv bench/results-cost-$TAG.tsv
-python3 bench/scripts/plot/plot_cost_model.py bench/results-cost-$TAG.tsv bench/scripts/plot/prices.json
+# the tagged run cells, the trimmer-off controls, and the results root (load files + their server samples)
+python3 bench/scripts/extract_cost_coefficients.py bench/results/local/$TAG bench/results/local/$TAG-notrim \
+    bench/results/local --tsv bench/results-cost-$TAG.tsv
+cp bench/scripts/plot/space.example.json bench/scripts/plot/space.json   # fill in the phase 1 numbers
+python3 bench/scripts/plot/plot_cost_model.py bench/results-cost-$TAG.tsv bench/scripts/plot/prices.json \
+    --space bench/scripts/plot/space.json --table bench/results-cost-$TAG-projection.tsv
 ```
 
 Commit the TSV, `prices.json` (with the date the prices were read), and the figure under

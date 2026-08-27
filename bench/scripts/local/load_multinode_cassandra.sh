@@ -34,6 +34,7 @@ CQL_SRC="${OZONEDB_HOME}/bench/scripts/cassandra_cql.py"
 WRITERS=8
 LOAD_HOST=""   # default: first cloudlab.hosts entry
 CONSISTENCY="" # default: cassandra.consistency from the client's ycsb.yaml
+RECORD_CNT=""  # --record-cnt N: dataset size (default: local.load.record_cnt)
 DRY_RUN=0
 
 usage() {
@@ -46,6 +47,7 @@ Usage: $(basename "$0") [options]
   --consistency MODE   one | quorum | serial for the load itself
                        (default: the client's cassandra.consistency; quorum is
                        the sensible choice -- the dataset is the same either way)
+  --record-cnt N       dataset size in records, forwarded as --record_cnt
   --dry-run            print the plan; no ssh
   -h | --help
 EOF
@@ -57,12 +59,17 @@ while [[ $# -gt 0 ]]; do
   --writers) WRITERS="$2"; shift 2 ;;
   --load-host) LOAD_HOST="$2"; shift 2 ;;
   --consistency) CONSISTENCY="$2"; shift 2 ;;
+  --record-cnt) RECORD_CNT="$2"; shift 2 ;;
   --dry-run) DRY_RUN=1; shift ;;
   -h | --help) usage; exit 0 ;;
   *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 [[ "$WRITERS" =~ ^[1-9][0-9]*$ ]] || { echo "--writers must be a positive integer" >&2; exit 1; }
+if [[ -n "$RECORD_CNT" ]] && ! [[ "$RECORD_CNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--record-cnt must be a positive integer (got: $RECORD_CNT)" >&2
+  exit 1
+fi
 if [[ -n "$CONSISTENCY" ]] && ! [[ "$CONSISTENCY" =~ ^(one|quorum|serial)$ ]]; then
   echo "--consistency must be one|quorum|serial (got: $CONSISTENCY)" >&2
   exit 1
@@ -98,13 +105,40 @@ ctl_all() {
 
 LOAD_CMD="python3 \$OZONEDB_HOME/bench/scripts/local/load_local_ycsb_multiproc.py --db_name cassandra --num_writers $WRITERS"
 [[ -n "$CONSISTENCY" ]] && LOAD_CMD="$LOAD_CMD --cassandra_consistency $CONSISTENCY"
+[[ -n "$RECORD_CNT" ]] && LOAD_CMD="$LOAD_CMD --record_cnt $RECORD_CNT"
 
-echo "=== cassandra load: servers=(${SERVERS[*]}) load_host=$LOAD_HOST writers=$WRITERS keyspace=$KEYSPACE rf=$RF fields=$FIELDS ==="
+# Server sample around the load on the first server (bench/PLAN-cost.md
+# phase 1: server CPU and bytes on disk during the load). Same sampler and
+# cell naming as run_multinode_ycsb.py; the files land in
+# bench/results/local/_server/ next to the per-writer insert files, where
+# extract_cost_coefficients.py joins them as the "load" workload. Best effort.
+SAMPLER_SRC="$OZONEDB_HOME/bench/scripts/server_sampler.sh"
+SAMPLER_REMOTE_DIR="ozonedb_server_samples/load"
+LOAD_MODE="${CONSISTENCY:-$(cfg --get cassandra.consistency 2>/dev/null || echo quorum)}"
+SAMPLE_CELL="cassandra-${LOAD_MODE}_workloadload_w${WRITERS}_trial0"
+SAMPLE_HOST="${SERVERS[0]}"
+SAMPLE_LOCAL="$OZONEDB_HOME/bench/results/local/_server/$(echo "$SAMPLE_HOST" | sed 's/[^A-Za-z0-9._-]/_/g')"
+sampler_start() {
+  scp "${SSH_OPTS[@]}" -q "$SAMPLER_SRC" "$SSH_USER@$SAMPLE_HOST:ozonedb_server_sampler.sh" &&
+    rsh "$SAMPLE_HOST" "mkdir -p $SAMPLER_REMOTE_DIR && bash ozonedb_server_sampler.sh start $SAMPLER_REMOTE_DIR $SAMPLE_CELL" ||
+    echo "[sampler] WARNING: server sample not started"
+}
+sampler_stop() {
+  rsh "$SAMPLE_HOST" "bash ozonedb_server_sampler.sh stop $SAMPLER_REMOTE_DIR $SAMPLE_CELL" || true
+  mkdir -p "$SAMPLE_LOCAL"
+  scp "${SSH_OPTS[@]}" -q "$SSH_USER@$SAMPLE_HOST:$SAMPLER_REMOTE_DIR/$SAMPLE_CELL.*" "$SAMPLE_LOCAL/" &&
+    echo "[sampler] server sample pulled into $SAMPLE_LOCAL" ||
+    echo "[sampler] WARNING: server sample not pulled"
+}
+
+echo "=== cassandra load: servers=(${SERVERS[*]}) load_host=$LOAD_HOST writers=$WRITERS keyspace=$KEYSPACE rf=$RF fields=$FIELDS record_cnt=${RECORD_CNT:-yaml} ==="
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "[dry-run] scp $CTL_SRC -> each server:$CTL"
   echo "[dry-run] each server: $CTL wipe && $CTL start && $CTL wait"
   echo "[dry-run] ${SERVERS[0]}: $CTL schema --rf $RF --fields $FIELDS --keyspace $KEYSPACE"
+  echo "[dry-run] server sample start: cell=$SAMPLE_CELL on $SAMPLE_HOST -> $SAMPLE_LOCAL"
   echo "[dry-run] $LOAD_HOST: bash -lc '$LOAD_CMD'"
+  echo "[dry-run] server sample stop"
   echo "[dry-run] each server: $CTL save-load && $CTL start && $CTL wait"
   exit 0
 fi
@@ -116,10 +150,12 @@ ctl_all wait
 echo "[cassandra:${SERVERS[0]}] $CTL schema --rf $RF --fields $FIELDS --keyspace $KEYSPACE"
 rsh "${SERVERS[0]}" "$CTL schema --rf $RF --fields $FIELDS --keyspace $KEYSPACE"
 
+sampler_start
 echo "[load:$LOAD_HOST] $LOAD_CMD"
 # bash -lc: ~/.ozonedb.env is wired into .profile; a plain ssh command shell
 # would not see OZONEDB_HOME / JAVA_HOME (see run_multinode_ycsb.py).
 rsh "$LOAD_HOST" "bash -lc '$LOAD_CMD'"
+sampler_stop
 
 ctl_all save-load
 ctl_all start

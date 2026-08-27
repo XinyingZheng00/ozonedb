@@ -49,6 +49,7 @@ TRIALS_SET=0
 TRIAL=""
 DURATION=""
 CONSISTENCY=""   # --consistency one|quorum|serial; default: each client's cassandra.consistency
+RECORD_CNT=""    # --record-cnt N: dataset size, forwarded as --record_cnt
 RUN_TAG=""
 RESTORE=1        # --no-restore: skip restore-load (no snapshot yet, or deliberate warm state)
 DRY_RUN=0
@@ -73,6 +74,8 @@ Usage: $(basename "$0") [options]
   --consistency MODE        one | quorum | serial: forwarded to every client as
                             --cassandra_consistency; result files are labelled
                             cassandra-MODE. Default: each client's ycsb.yaml.
+  --record-cnt N            dataset size in records, forwarded to every client
+                            as --record_cnt (must match the load)
   --run-tag TAG             results dir bench/results/local/TAG everywhere (default: timestamp)
   --no-restore              do not restore the load snapshot before each trial
   --dry-run                 print the plan and the exact run_multinode_ycsb.py
@@ -93,6 +96,7 @@ while [[ $# -gt 0 ]]; do
   --trial)          TRIAL="$2"; shift 2 ;;
   --duration)       DURATION="$2"; shift 2 ;;
   --consistency)    CONSISTENCY="$2"; shift 2 ;;
+  --record-cnt)     RECORD_CNT="$2"; shift 2 ;;
   --run-tag)        RUN_TAG="$2"; shift 2 ;;
   --no-restore)     RESTORE=0; shift ;;
   --dry-run)        DRY_RUN=1; shift ;;
@@ -138,6 +142,10 @@ if [[ -n "$CONSISTENCY" ]] && ! [[ "$CONSISTENCY" =~ ^(one|quorum|serial)$ ]]; t
 fi
 if [[ -n "$RUN_TAG" ]] && ! [[ "$RUN_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "--run-tag is a directory name and must match [A-Za-z0-9._-]+ (got: $RUN_TAG)" >&2
+  exit 1
+fi
+if [[ -n "$RECORD_CNT" ]] && ! [[ "$RECORD_CNT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--record-cnt must be a positive integer (got: $RECORD_CNT)" >&2
   exit 1
 fi
 
@@ -206,8 +214,9 @@ COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG" --db_name cassandra
 [[ -n "$CLIENT_SSH_KEY" ]] && COMMON_ARGS+=(--ssh_key "$CLIENT_SSH_KEY")
 [[ -n "$DURATION"       ]] && COMMON_ARGS+=(--max_exec_time "$DURATION")
 [[ -n "$CONSISTENCY"    ]] && COMMON_ARGS+=(--cassandra_consistency "$CONSISTENCY")
+[[ -n "$RECORD_CNT"     ]] && COMMON_ARGS+=(--record_cnt "$RECORD_CNT")
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) consistency=${CONSISTENCY:-yaml} duration=${DURATION:-yaml} restore=$RESTORE run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) consistency=${CONSISTENCY:-yaml} record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} restore=$RESTORE run_tag=$OZONEDB_RUN_TAG ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="
 else

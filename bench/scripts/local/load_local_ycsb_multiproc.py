@@ -164,6 +164,47 @@ def log_trim_corfu_settings(corfu_settings):
     return s
 
 
+def lru_cache_corfu_settings(corfu_settings, lru_cache_bytes):
+    """Copy of `corfu_settings` with the per-process block cache pinned.
+
+    The cost experiment (bench/PLAN-cost.md, phase 2) sweeps the cache
+    size to reach the cache-to-dataset ratios of a 10 TB deployment on a
+    1 GB dataset. Before this the size was read only from
+    src/config/corfu/shared_config_base.json (`lru_cache_bytes`, 512 MB),
+    which would need a sync to every client per cell. One override, one
+    place, the way --log-trim and --linearizable work.
+    """
+    n = int(lru_cache_bytes)
+    if n <= 0:
+        raise ValueError(f"lru_cache_bytes must be positive (got {n})")
+    s = dict(corfu_settings or {})
+    s["lru_cache_bytes"] = n
+    return s
+
+
+def lru_label_token(lru_cache_bytes):
+    """`lru512m`, `lru64m`, `lru128k`, `lru1000b`: the cache size as a
+    filename token. Exact powers of 1024 stay short; anything else is bytes,
+    so two different sizes can never share a label."""
+    n = int(lru_cache_bytes)
+    if n % (1 << 30) == 0:
+        return f"lru{n >> 30}g"
+    if n % (1 << 20) == 0:
+        return f"lru{n >> 20}m"
+    if n % (1 << 10) == 0:
+        return f"lru{n >> 10}k"
+    return f"lru{n}b"
+
+
+def parse_lru_label_token(token):
+    """Inverse of lru_label_token: `lru64m` -> 67108864. None if not one."""
+    m = re.fullmatch(r"lru(\d+)([gmkb])", token or "")
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return n << {"g": 30, "m": 20, "k": 10, "b": 0}[unit]
+
+
 # Cassandra consistency modes -> the binding's properties. `serial` is the
 # linearizable point of the frontier: every write is a lightweight
 # transaction (Paxos) and every read is a SERIAL read. See
@@ -221,7 +262,7 @@ def cassandra_ycsb_props(cassandra_settings):
     ]
 
 
-def result_label(db_name, corfu_settings, cassandra_settings=None):
+def result_label(db_name, corfu_settings, cassandra_settings=None, lru_cache_bytes=None):
     """Engine token for result filenames: db_name plus the consistency mode.
 
     db_name itself is branched on by the runners (binding, cached-data
@@ -236,14 +277,25 @@ def result_label(db_name, corfu_settings, cassandra_settings=None):
     cassandra is labelled `cassandra-{one,quorum,serial}` ALWAYS (the
     default mode included), so every result file states its point on the
     consistency frontier.
+
+    A pinned block cache (--lru-cache-bytes, or corfu.lru_cache_bytes)
+    appends `-lru64m` after the read mode, so the cells of a cache sweep
+    never overwrite each other. Unset means the base config's size and no
+    token, so every earlier result file keeps its name.
     """
+    label = db_name
     if db_name == "ozonedb-corfu" and _truthy(
         (corfu_settings or {}).get("linearizable_reads")
     ):
-        return db_name + LINEARIZABLE_LABEL_SUFFIX
+        label += LINEARIZABLE_LABEL_SUFFIX
     if db_name == "cassandra":
         return db_name + "-" + cassandra_mode(cassandra_settings)
-    return db_name
+    if db_name in ("ozonedb", "ozonedb-corfu"):
+        if lru_cache_bytes is None:
+            lru_cache_bytes = (corfu_settings or {}).get("lru_cache_bytes")
+        if lru_cache_bytes is not None:
+            label += "-" + lru_label_token(lru_cache_bytes)
+    return label
 
 
 def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settings):
@@ -288,6 +340,10 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         for k in ("trust_background_tail", "linearizable_reads"):
             if k in corfu_settings:
                 data[k] = "true" if _truthy(corfu_settings[k]) else "false"
+        # Per-process block cache (--lru-cache-bytes). Metadata reads it
+        # with std::stoull, so an integer literal is what it expects.
+        if corfu_settings.get("lru_cache_bytes") is not None:
+            data["lru_cache_bytes"] = int(corfu_settings["lru_cache_bytes"])
         # Log trimming (PLAN-trimming.md): exactly one trimmer per cluster,
         # global writer 0. writer_idx is global (offset + local index), so
         # on a multi-host run only the first host's first writer trims.
@@ -337,7 +393,7 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
     return out_json
 
 
-def _make_local_config_per_writer(writer_idx, db_path):
+def _make_local_config_per_writer(writer_idx, db_path, lru_cache_bytes=None):
     """Write a per-writer shared_config_w{i}.json for the local-FS backend.
 
     Parallel writers must each get their own config file — otherwise they
@@ -353,6 +409,8 @@ def _make_local_config_per_writer(writer_idx, db_path):
     with open(base_json, "r") as f:
         data = json.load(f)
     data["db_path"] = db_path
+    if lru_cache_bytes is not None:
+        data["lru_cache_bytes"] = int(lru_cache_bytes)
     os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(data, f, indent=4)
@@ -374,14 +432,32 @@ def partition_records(total, num_writers):
     return parts
 
 
+def _time_wrapper():
+    """GNU time, when present: `/usr/bin/time -v` prefixes the writer command
+    so `User time`, `System time` and `Maximum resident set size` land at the
+    end of every per-writer .result file (stderr is the same file). That is
+    the client-CPU cost line of bench/PLAN-cost.md (P0.3), measured the same
+    way for every backend. Absent (macOS, or no `time` package) the writer
+    runs bare and the extractor reports the CPU columns empty.
+    """
+    if sys.platform.startswith("linux") and os.access("/usr/bin/time", os.X_OK):
+        return ["/usr/bin/time", "-v"]
+    return []
+
+
 def spawn_parallel(jobs):
     """Launch (cmd, stdout_path) pairs in parallel, return list of return codes."""
     procs = []
     fds = []
+    wrapper = _time_wrapper()
+    if not wrapper:
+        print("[spawn] /usr/bin/time not found: client CPU will not be recorded "
+              "(apt install time)")
     for cmd, out_path in jobs:
         subprocess.run(["rm", "-rf", out_path])
         f = open(out_path, "a")
         fds.append(f)
+        cmd = wrapper + list(cmd)
         print(" ".join(cmd))
         procs.append(subprocess.Popen(cmd, stdout=f, stderr=f))
     rcs = [p.wait() for p in procs]
@@ -526,11 +602,14 @@ def load_ycsb(
     corfu_settings=None,
     s3_settings=None,
     cassandra_settings=None,
+    lru_cache_bytes=None,
 ):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
     if num_writers < 1:
         raise ValueError("num_writers must be >= 1")
+    if lru_cache_bytes is not None:
+        corfu_settings = lru_cache_corfu_settings(corfu_settings, lru_cache_bytes)
 
     ycsb_path = os.path.join(ozonedb_home, "ycsb")
     result_path = os.path.join(ozonedb_home, "bench", "results/local")
@@ -580,7 +659,9 @@ def load_ycsb(
                 base_cp = _resolve_ycsb_classpath(ycsb_path, binding)
                 db_classname = YCSB_DB_CLASSNAMES[binding]
                 java_bin = _java_binary()
-                label = result_label(db_name, corfu_settings, cassandra_settings)
+                label = result_label(
+                    db_name, corfu_settings, cassandra_settings, lru_cache_bytes
+                )
 
                 for repeat_round in range(repeated):
                     print(
@@ -614,7 +695,7 @@ def load_ycsb(
                                 ]
                             elif db_name == "ozonedb":
                                 cfg = _make_local_config_per_writer(
-                                    writer_idx, per_writer_data_path
+                                    writer_idx, per_writer_data_path, lru_cache_bytes
                                 )
                                 ycsb_props += ["-p", f"shared_config={cfg}"]
                             elif db_name == "ozonedb-corfu":
@@ -757,6 +838,22 @@ if __name__ == "__main__":
         help="Cassandra only: force the consistency mode (overrides cassandra.consistency); "
              "result files are labelled cassandra-<mode>.",
     )
+    parser.add_argument(
+        "--lru-cache-bytes",
+        type=int,
+        default=None,
+        help="ozonedb / ozonedb-corfu: per-process block cache in bytes, written as "
+             "lru_cache_bytes into every generated shared_config; result files get a "
+             "-lru64m style token. Default: the base config's 512 MB, no token.",
+    )
+    parser.add_argument(
+        "--record_cnt",
+        type=int,
+        default=None,
+        help="Dataset size in records (overrides local.load.record_cnt). The run "
+             "phase must be given the same value. Prefer this over a ycsb.yaml "
+             "edit that has to be synced to every client.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -764,6 +861,8 @@ if __name__ == "__main__":
 
     load_config = config["local"]["load"]
     record_cnts = load_config["record_cnt"]
+    if args.record_cnt is not None:
+        record_cnts = [args.record_cnt]
     key_sizes = load_config["key_size"]
     db_names = load_config["db_name"]
     if args.db_name:
@@ -793,7 +892,9 @@ if __name__ == "__main__":
     os.makedirs(ycsb_data_path, exist_ok=True)
 
     print(f"Launching {num_writers} parallel writer processes"
-          f" (db={db_names}, log_trim={'on' if args.log_trim else 'yaml'})")
+          f" (db={db_names}, record_cnt={record_cnts}, "
+          f"log_trim={'on' if args.log_trim else 'yaml'}, "
+          f"lru_cache_bytes={args.lru_cache_bytes or 'base config'})")
     load_ycsb(
         record_cnts,
         key_sizes,
@@ -805,4 +906,5 @@ if __name__ == "__main__":
         corfu_settings,
         s3_settings,
         cassandra_settings=cassandra_settings,
+        lru_cache_bytes=args.lru_cache_bytes,
     )
