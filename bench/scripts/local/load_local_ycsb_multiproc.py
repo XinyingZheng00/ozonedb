@@ -42,7 +42,13 @@ YCSB_DB_CLASSNAMES = {
     "ozonedb": "site.ycsb.db.OzoneDBClient",
     "rocksdb": "site.ycsb.db.rocksdb.RocksDBClient",
     "jdbc": "site.ycsb.db.JdbcDBClient",
+    "cassandra": "site.ycsb.db.CassandraCQLClient",
 }
+
+# Backends whose state lives on a server, not in a per-writer local dir: the
+# run phase must not look for (or copy) cached_data-* dirs for these, and the
+# thread count is a real concurrency knob for them.
+SERVER_BACKENDS = ("ozonedb-corfu", "cassandra")
 
 
 def _resolve_binding(db_name):
@@ -158,8 +164,65 @@ def log_trim_corfu_settings(corfu_settings):
     return s
 
 
-def result_label(db_name, corfu_settings):
-    """Engine token for result filenames: db_name plus the read mode.
+# Cassandra consistency modes -> the binding's properties. `serial` is the
+# linearizable point of the frontier: every write is a lightweight
+# transaction (Paxos) and every read is a SERIAL read. See
+# ycsb/cassandra/README.md. This is the ONE place the mapping lives.
+CASSANDRA_MODES = {
+    "one": {"read": "ONE", "write": "ONE", "lwt": False},
+    "quorum": {"read": "QUORUM", "write": "QUORUM", "lwt": False},
+    "serial": {"read": "SERIAL", "write": "QUORUM", "lwt": True},
+}
+CASSANDRA_DEFAULT_MODE = "quorum"
+
+
+def cassandra_mode(cassandra_settings):
+    """The effective consistency mode, validated."""
+    mode = str((cassandra_settings or {}).get("consistency") or CASSANDRA_DEFAULT_MODE).lower()
+    if mode not in CASSANDRA_MODES:
+        raise ValueError(
+            f"cassandra.consistency must be one of {sorted(CASSANDRA_MODES)} (got {mode!r})"
+        )
+    return mode
+
+
+def cassandra_mode_settings(cassandra_settings, mode):
+    """Copy of `cassandra_settings` with the consistency mode forced.
+
+    The --cassandra_consistency flag lands here, the way --linearizable
+    lands in linearizable_corfu_settings(): one override, and the label
+    below is derived from the effective settings so a flag and a YAML edit
+    are labelled identically.
+    """
+    s = dict(cassandra_settings or {})
+    s["consistency"] = mode
+    cassandra_mode(s)  # validate
+    return s
+
+
+def cassandra_ycsb_props(cassandra_settings):
+    """`-p` arguments for the cassandra binding from the (derived) cassandra
+    block of ycsb.yaml. contact_points comes from ycsb_config.derive()."""
+    s = cassandra_settings or {}
+    contact_points = s.get("contact_points")
+    if not contact_points:
+        raise ValueError(
+            "cassandra.contact_points is missing -- it is derived from nodes.cassandra "
+            "(or nodes.log) by ycsb_config.derive(); is there a `cassandra:` block in ycsb.yaml?"
+        )
+    m = CASSANDRA_MODES[cassandra_mode(s)]
+    return [
+        "-p", f"hosts={contact_points}",
+        "-p", f"port={s.get('port', 9042)}",
+        "-p", f"cassandra.keyspace={s.get('keyspace', 'ycsb')}",
+        "-p", f"cassandra.readconsistencylevel={m['read']}",
+        "-p", f"cassandra.writeconsistencylevel={m['write']}",
+        "-p", f"cassandra.lwt={'true' if m['lwt'] else 'false'}",
+    ]
+
+
+def result_label(db_name, corfu_settings, cassandra_settings=None):
+    """Engine token for result filenames: db_name plus the consistency mode.
 
     db_name itself is branched on by the runners (binding, cached-data
     handling, thread sweep, scratch paths) and must not change. The read
@@ -169,11 +232,17 @@ def result_label(db_name, corfu_settings):
     ycsb.yaml, and a forgotten toggle yielded two identical "default" sweeps.
     Derived from the EFFECTIVE settings, not just the --linearizable flag,
     so the YAML route is labelled too.
+
+    cassandra is labelled `cassandra-{one,quorum,serial}` ALWAYS (the
+    default mode included), so every result file states its point on the
+    consistency frontier.
     """
     if db_name == "ozonedb-corfu" and _truthy(
         (corfu_settings or {}).get("linearizable_reads")
     ):
         return db_name + LINEARIZABLE_LABEL_SUFFIX
+    if db_name == "cassandra":
+        return db_name + "-" + cassandra_mode(cassandra_settings)
     return db_name
 
 
@@ -456,6 +525,7 @@ def load_ycsb(
     num_writers,
     corfu_settings=None,
     s3_settings=None,
+    cassandra_settings=None,
 ):
     if not ozonedb_home:
         raise EnvironmentError("OZONEDB_HOME environment variable is not set.")
@@ -501,7 +571,7 @@ def load_ycsb(
                     )
                     continue
 
-                if db_name in ("ozonedb", "ozonedb-corfu"):
+                if db_name == "ozonedb" or db_name in SERVER_BACKENDS:
                     thread_list = [str(t) for t in threads]
                 else:
                     thread_list = ["1"]
@@ -510,6 +580,7 @@ def load_ycsb(
                 base_cp = _resolve_ycsb_classpath(ycsb_path, binding)
                 db_classname = YCSB_DB_CLASSNAMES[binding]
                 java_bin = _java_binary()
+                label = result_label(db_name, corfu_settings, cassandra_settings)
 
                 for repeat_round in range(repeated):
                     print(
@@ -555,6 +626,12 @@ def load_ycsb(
                                 )
                                 ycsb_props += ["-p", f"shared_config={cfg}"]
                                 extra_cp_entries.append(corfu_bridge_jar_path())
+                            elif db_name == "cassandra":
+                                # Keyspace + table must already exist:
+                                # bench/scripts/cassandra_ctl.sh schema (the
+                                # load wrapper runs it once, before the writers,
+                                # so N processes do not race on CREATE TABLE).
+                                ycsb_props += cassandra_ycsb_props(cassandra_settings)
                             elif db_name == "sqlite":
                                 os.makedirs(per_writer_data_path, exist_ok=True)
                                 db_file = os.path.join(per_writer_data_path, "mydb.db")
@@ -606,7 +683,7 @@ def load_ycsb(
 
                             result_file = os.path.join(
                                 result_path,
-                                f"{each_key_size}-{each_record_cnt}-insert-{db_name}_w{writer_idx}of{num_writers}_t{thread}.result",
+                                f"{each_key_size}-{each_record_cnt}-insert-{label}_w{writer_idx}of{num_writers}_t{thread}.result",
                             )
                             jobs.append((cmd, result_file))
                             per_writer_files.append(result_file)
@@ -619,7 +696,7 @@ def load_ycsb(
 
                         agg_file = os.path.join(
                             result_path,
-                            f"{each_key_size}-{each_record_cnt}-insert-{db_name}_agg_w{num_writers}_t{thread}.result",
+                            f"{each_key_size}-{each_record_cnt}-insert-{label}_agg_w{num_writers}_t{thread}.result",
                         )
                         write_aggregate(
                             agg_file, per_writer_files, wall_ms, num_writers
@@ -666,6 +743,20 @@ if __name__ == "__main__":
              "its final cycle at close is what keeps the load snapshot small. "
              "Prefer this over toggling corfu.log_trim.enabled in ycsb.yaml.",
     )
+    parser.add_argument(
+        "--db_name",
+        type=str,
+        default=None,
+        help="Comma-separated backends (overrides local.load.db_name), e.g. cassandra. "
+             "Prefer this over editing ycsb.yaml on every client.",
+    )
+    parser.add_argument(
+        "--cassandra_consistency",
+        choices=sorted(CASSANDRA_MODES),
+        default=None,
+        help="Cassandra only: force the consistency mode (overrides cassandra.consistency); "
+             "result files are labelled cassandra-<mode>.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -675,6 +766,18 @@ if __name__ == "__main__":
     record_cnts = load_config["record_cnt"]
     key_sizes = load_config["key_size"]
     db_names = load_config["db_name"]
+    if args.db_name:
+        db_names = [d.strip() for d in args.db_name.split(",") if d.strip()]
+    cassandra_settings = config.get("cassandra")
+    if args.cassandra_consistency:
+        unsupported = [d for d in db_names if d != "cassandra"]
+        if unsupported:
+            raise ValueError(
+                f"--cassandra_consistency only applies to db_name cassandra (got {unsupported})"
+            )
+        cassandra_settings = cassandra_mode_settings(
+            cassandra_settings, args.cassandra_consistency
+        )
     ycsb_data_path = load_config["ycsb_data_path"]
     threads = load_config["threads"]
     repeated = load_config["repeated"]
@@ -690,7 +793,7 @@ if __name__ == "__main__":
     os.makedirs(ycsb_data_path, exist_ok=True)
 
     print(f"Launching {num_writers} parallel writer processes"
-          f" (log_trim={'on' if args.log_trim else 'yaml'})")
+          f" (db={db_names}, log_trim={'on' if args.log_trim else 'yaml'})")
     load_ycsb(
         record_cnts,
         key_sizes,
@@ -701,4 +804,5 @@ if __name__ == "__main__":
         num_writers,
         corfu_settings,
         s3_settings,
+        cassandra_settings=cassandra_settings,
     )

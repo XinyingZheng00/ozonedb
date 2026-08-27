@@ -111,6 +111,21 @@ def remote_ozonedb_home(target, ssh_key):
     return home
 
 
+def kill_remote_ycsb(target, ssh_key):
+    """SIGKILL any YCSB writer processes left on a host. Used when a cell
+    overruns its timeout: a writer stuck in the linearizable tailer catch-up
+    does 0 ops, so YCSB's between-ops maxexecutiontime never fires and the
+    process hangs forever, blocking the whole sweep. This unblocks it."""
+    cmd = ssh_base(target, ssh_key) + [
+        "pkill -9 -f site.ycsb.Client; pkill -9 -f run_local_ycsb_multiproc; true"
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        print(f"[{target}] killed remote YCSB writers (cell timeout)")
+    except Exception as e:
+        print(f"[{target}] remote kill failed: {e}")
+
+
 def stream_remote(target, ssh_key, remote_command, log_path):
     """Run a command on the remote, streaming combined output to log_path."""
     ssh_cmd = ssh_base(target, ssh_key) + [
@@ -171,7 +186,8 @@ def host_log_name(host, log_dir):
 
 def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          total_writers, workloads, trial, max_exec_time=None,
-                         linearizable=False, log_trim=False):
+                         linearizable=False, log_trim=False, db_name=None,
+                         cassandra_consistency=None):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -192,6 +208,8 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--max_exec_time", str(int(max_exec_time))] if max_exec_time else [])
             + (["--linearizable"] if linearizable else [])
             + (["--log-trim"] if log_trim else [])
+            + (["--db_name", shlex.quote(db_name)] if db_name else [])
+            + (["--cassandra_consistency", cassandra_consistency] if cassandra_consistency else [])
         ),
     ]
     return " && ".join(parts)
@@ -332,6 +350,27 @@ def main():
              "global writer 0 (first writer on the first host) runs the trimmer.",
     )
     parser.add_argument(
+        "--db_name",
+        help="Pass-through to per-host runner: comma-separated backends "
+             "(overrides local.run.db_name on every client), e.g. cassandra.",
+    )
+    parser.add_argument(
+        "--cassandra_consistency",
+        choices=["one", "quorum", "serial"],
+        default=None,
+        help="Pass-through to per-host runner (cassandra only): force the consistency "
+             "mode; result files are labelled cassandra-<mode>.",
+    )
+    parser.add_argument(
+        "--cell_timeout",
+        type=int,
+        default=None,
+        help="Hard wall-clock cap (seconds) for this cell. If a host has not "
+             "finished by then, remote YCSB writers are killed on every host and "
+             "the sweep continues (the cell under-reports). Default: "
+             "2*max_exec_time+120 when --max_exec_time is set, else no cap.",
+    )
+    parser.add_argument(
         "--run_tag",
         help="Tag for results dir; defaults to YYYYmmdd-HHMMSS. All hosts share this tag.",
     )
@@ -403,7 +442,9 @@ def main():
         f"writers_per_host={writers_per_host} total_writers={total_writers} "
         f"trial={trial} workloads={args.workloads or 'yaml'} "
         f"max_exec_time={args.max_exec_time or 'yaml'} "
-        f"read_mode={'linearizable' if args.linearizable else 'default'}"
+        f"read_mode={'linearizable' if args.linearizable else 'default'} "
+        f"db_name={args.db_name or 'yaml'} "
+        f"cassandra_consistency={args.cassandra_consistency or 'yaml'}"
     )
     for p in plan:
         print(
@@ -417,6 +458,7 @@ def main():
             total_writers, args.workloads, trial,
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
             log_trim=args.log_trim,
+            db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         print("[orchestrator] --dry_run: not launching.")
@@ -436,6 +478,7 @@ def main():
             total_writers, args.workloads, trial,
             max_exec_time=args.max_exec_time, linearizable=args.linearizable,
             log_trim=args.log_trim,
+            db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:
@@ -444,13 +487,35 @@ def main():
             print(f"[{p['target']}] error: {e}")
             rcs[p["host"]] = -1
 
+    # Per-cell wall-clock timeout. A writer stuck in linearizable catch-up
+    # hangs forever (0 ops -> maxexecutiontime never fires), so without this
+    # one bad host blocks the entire sweep. Default: generous room over the
+    # run itself for catch-up + scp, only when a run cap is set.
+    cell_timeout = args.cell_timeout
+    if cell_timeout is None and args.max_exec_time:
+        cell_timeout = args.max_exec_time * 2 + 120
+
     wall_start = time.time()
     for p in plan:
         t = threading.Thread(target=worker, args=(p,), daemon=False)
         t.start()
         threads.append(t)
+
+    deadline = (wall_start + cell_timeout) if cell_timeout else None
     for t in threads:
-        t.join()
+        if deadline is not None:
+            t.join(timeout=max(0.0, deadline - time.time()))
+        else:
+            t.join()
+    if deadline is not None and any(t.is_alive() for t in threads):
+        print(
+            f"[orchestrator] CELL TIMEOUT after {cell_timeout}s -- killing remote "
+            f"YCSB on all hosts so the sweep can continue (this cell under-reports)"
+        )
+        for p in plan:
+            kill_remote_ycsb(p["target"], ssh_key)
+        for t in threads:
+            t.join(60)
     wall_ms = (time.time() - wall_start) * 1000.0
 
     print(f"[orchestrator] wall={wall_ms / 1000.0:.1f}s return_codes={rcs}")

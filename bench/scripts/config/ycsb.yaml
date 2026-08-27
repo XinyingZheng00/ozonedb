@@ -9,6 +9,9 @@
 # Merged into local.load and local.run below via YAML merge keys (`<<:`),
 defaults: &defaults
   key_size: ["1KB"]
+  # ozonedb-corfu | cassandra | rocksdb | ozonedb | sqlite. For one sweep,
+  # pass --db_name to the runners instead of editing this (the multinode
+  # wrappers do): a YAML edit has to be synced to every client.
   db_name: ["ozonedb-corfu"]
   threads: [1] # sweep with e.g. [1, 4, 8, 16, 32, 64]
   # Must stay 1 for the run phase: run_local_ycsb_multiproc.py refuses
@@ -77,6 +80,14 @@ nodes:
     ssh: "amd127.utah.cloudlab.us"
     lan: "10.10.1.1"
 
+  # Cassandra baseline server(s) -- a LIST, one entry is the common case.
+  # Optional: when absent, `log` is used, so Cassandra takes CorfuDB's box and
+  # both systems get identical server hardware. Never run both servers at
+  # once. Add nodes (and raise cassandra.replication_factor) for an RF=3 run.
+  cassandra:
+    - ssh: "amd127.utah.cloudlab.us"
+      lan: "10.10.1.1"
+
   clients:
     - ssh: "amd160.utah.cloudlab.us"
       lan: "10.10.1.2"
@@ -134,6 +145,35 @@ s3:
   secret_key: "minioadmin"
   use_path_style: true
   sstable_dir: "sstables"
+
+# -------------------------------------------------------------- cassandra --
+# Server-based baseline for the consistency/throughput frontier.
+#   bash bench/scripts/setup.sh --role cassandra        # on each nodes.cassandra
+#   bash bench/scripts/local/load_multinode_cassandra.sh
+#   bash bench/scripts/local/run_multinode_ycsb_with_cassandra.sh --consistency serial
+# hosts / ssh_hosts / contact_points are derived from nodes: -- never set them
+# here. The binding's knobs are documented in ycsb/cassandra/README.md.
+cassandra:
+  version: "5.0.5"
+  install_dir: "/tank/cassandra"
+  port: 9042
+  keyspace: "ycsb"
+  replication_factor: 1
+  # Consistency mode: one | quorum | serial.
+  #   one     read ONE,    write ONE            (eventual)
+  #   quorum  read QUORUM, write QUORUM         (default; == one at RF=1)
+  #   serial  read SERIAL, write QUORUM + LWT   (linearizable: Paxos per write)
+  # Pass --consistency to the sweep wrapper instead of editing this: an edit
+  # has to be synced to every client, and the result label is derived from
+  # the effective mode either way (cassandra-one / -quorum / -serial).
+  consistency: "quorum"
+  # Server JVM heap (MAX_HEAP_SIZE / HEAP_NEWSIZE, which cassandra-env.sh
+  # requires as a pair). 31G keeps compressed oops; Cassandra's own default
+  # caps at 8G, which would handicap the baseline.
+  heap: "31G"
+  new_heap: "8G"
+  # Columns in usertable; must equal fieldcount in the YCSB workload template.
+  fields: 10
 
 # ------------------------------------------- compaction-contention overrides
 # Read only by run_corfu_compaction_contention.py, which merges these INTO the

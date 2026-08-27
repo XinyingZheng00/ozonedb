@@ -6,7 +6,8 @@
 #   bash bench/scripts/setup.sh --role client        # bench/YCSB machine
 #   bash bench/scripts/setup.sh --role corfu-server  # the shared-log node
 #   bash bench/scripts/setup.sh --role minio         # SSTable object store
-#   bash bench/scripts/setup.sh --role all
+#   bash bench/scripts/setup.sh --role cassandra     # baseline server (nodes.cassandra)
+#   bash bench/scripts/setup.sh --role all           # client + corfu-server + minio
 #
 # You do NOT need to source this. It writes ~/.ozonedb.env and wires a guarded
 # block into ~/.profile and ~/.bashrc, then sources that file itself for the
@@ -55,6 +56,16 @@ MINIO_USER="minioadmin"
 MINIO_PASSWORD="minioadmin"
 MINIO_PORT=9000
 MINIO_CONSOLE_PORT=9001
+# Cassandra 5.0 runs on JDK 11 or 17 only, and bin/cassandra refuses anything
+# else -- so the baseline server gets its own JDK, separate from the node's
+# JDK 25 (which CorfuDB's bytecode needs). It is only referenced from
+# $CASSANDRA_INSTALL_DIR/env.sh, never from ~/.ozonedb.env.
+CASSANDRA_JDK_VERSION="17"
+CASSANDRA_JDK_FALLBACKS=(17 11)
+CASSANDRA_INSTALL_DIR="" # default: cassandra.install_dir from ycsb.yaml
+CASSANDRA_BIND=""        # default: the nodes.cassandra[].lan that is a local address
+CASSANDRA_VERSION=""     # default: cassandra.version from ycsb.yaml
+CASSANDRA_MIRROR="https://archive.apache.org/dist/cassandra"
 
 ENV_FILE="$HOME/.ozonedb.env"
 MARK_BEGIN="# >>> ozonedb env >>>"
@@ -68,11 +79,19 @@ duplicates shell config or reinstalls what is already present.
   bash bench/scripts/setup.sh --role client        # bench/YCSB machine
   bash bench/scripts/setup.sh --role corfu-server  # the shared-log node
   bash bench/scripts/setup.sh --role minio         # SSTable object store
-  bash bench/scripts/setup.sh --role all
+  bash bench/scripts/setup.sh --role cassandra     # baseline server (nodes.cassandra)
+  bash bench/scripts/setup.sh --role all           # client + corfu-server + minio
 
 You do NOT need to source this. It writes ~/.ozonedb.env and wires a guarded
 block into ~/.profile and ~/.bashrc. Open a new shell afterwards, or run
 \`. ~/.ozonedb.env\`.
+
+The cassandra role installs the Apache tarball under cassandra.install_dir
+(ycsb.yaml), binds it to this node's nodes.cassandra lan address, and
+installs bench/scripts/cassandra_ctl.sh next to it. It does not start the
+server: bench/scripts/local/load_multinode_cassandra.sh and
+run_multinode_ycsb_with_cassandra.sh do that per phase. It is not part of
+--role all because it shares the box with corfu-server by default.
 
 JDK policy: three constraints pull in different directions, hence two knobs.
 YCSB compiles with <source>1.8</source>; corfu-bridge targets Java 11 so
@@ -82,7 +101,8 @@ CorfuDB. Both fall back through a candidate list if the exact apt package is
 unavailable.
 
 Options:
-  --role ROLE          client | corfu-server | minio | all   (repeatable, default: client)
+  --role ROLE          client | corfu-server | minio | cassandra | all
+                       (repeatable, default: client)
   --jdk N              persistent JAVA_HOME JDK major version (default: ${JDK_FALLBACKS[0]})
   --corfu-jdk N        JDK used only to build CorfuDB (default: ${CORFU_JDK_FALLBACKS[0]})
   --no-build           client: skip bench/scripts/build.sh at the end
@@ -95,6 +115,12 @@ Options:
   --tank PATH          data directory the configs point db_path at (default: $TANK_DIR)
   --minio-data PATH    minio data directory (default: $MINIO_DATA_DIR)
   --bucket NAME        minio bucket (default: s3.bucket from ycsb.yaml)
+  --cassandra-jdk N    JDK for the Cassandra server only (default: ${CASSANDRA_JDK_FALLBACKS[0]};
+                       Cassandra 5.0 accepts 11 or 17)
+  --cassandra-version V  Apache Cassandra release (default: cassandra.version from ycsb.yaml)
+  --cassandra-dir PATH install dir (default: cassandra.install_dir from ycsb.yaml)
+  --cassandra-bind ADDR  listen/rpc address (default: the nodes.cassandra lan
+                       address that belongs to this machine)
   -h | --help
 EOF
 }
@@ -148,6 +174,22 @@ while [[ $# -gt 0 ]]; do
     MINIO_BUCKET="$2"
     shift 2
     ;;
+  --cassandra-jdk)
+    CASSANDRA_JDK_VERSION="$2"
+    shift 2
+    ;;
+  --cassandra-version)
+    CASSANDRA_VERSION="$2"
+    shift 2
+    ;;
+  --cassandra-dir)
+    CASSANDRA_INSTALL_DIR="$2"
+    shift 2
+    ;;
+  --cassandra-bind)
+    CASSANDRA_BIND="$2"
+    shift 2
+    ;;
   -h | --help)
     usage
     exit 0
@@ -162,7 +204,7 @@ if [[ " ${ROLES[*]} " == *" all "* ]]; then
 fi
 for r in "${ROLES[@]}"; do
   case "$r" in
-  client | corfu-server | minio) ;;
+  client | corfu-server | minio | cassandra) ;;
   *) die "unknown role: $r" ;;
   esac
 done
@@ -525,6 +567,154 @@ EOF
   log "minio ready. Point s3.endpoint in ycsb.yaml at http://<this-host>:$MINIO_PORT"
 }
 
+# ycsb.yaml reader for the cassandra role. Everything that decides how the
+# server is configured lives in the `cassandra:` block, so a value never has
+# to be repeated on the command line.
+ycsb_cfg() {
+  python3 "$SCRIPT_DIR/ycsb_config.py" --config "$REPO_ROOT/bench/scripts/config/ycsb.yaml" "$@"
+}
+
+# Rewrite one top-level cassandra.yaml key in place, uncommenting it if the
+# stock file ships it commented out. Dies if the key is not left exactly once
+# -- an upstream layout change must fail loudly, not bind localhost.
+cassandra_yaml_set() {
+  local file="$1" key="$2" value="$3"
+  sed -i -E "s|^#? ?${key}:.*|${key}: ${value}|" "$file"
+  local n
+  n="$(grep -cE "^${key}:" "$file" || true)"
+  [[ "$n" -eq 1 ]] || die "cassandra.yaml: expected exactly one '${key}:' line after rewrite, found $n"
+}
+
+role_cassandra() {
+  log "=== role: cassandra ==="
+
+  # pyyaml is for ycsb_config.py on this node. The CQL client is NOT cqlsh:
+  # Cassandra 5.0's cqlsh refuses Python >= 3.12 (its driver imports asyncore,
+  # removed in 3.12) and the image ships only 3.12, so we build a venv with
+  # cassandra-driver and drive CQL through bench/scripts/cassandra_cql.py.
+  # libev-dev + build-essential + python3-dev let pip build the libev reactor,
+  # which is the one that actually connects on 3.12 (asyncio times out).
+  apt_install curl tar python3 python3-yaml python3-venv build-essential python3-dev libev-dev
+
+  local version install_dir port heap new_heap
+  version="${CASSANDRA_VERSION:-$(ycsb_cfg --get cassandra.version)}" || die "cassandra.version missing from ycsb.yaml"
+  install_dir="${CASSANDRA_INSTALL_DIR:-$(ycsb_cfg --get cassandra.install_dir)}" || die "cassandra.install_dir missing"
+  port="$(ycsb_cfg --get cassandra.port)"
+  heap="$(ycsb_cfg --get cassandra.heap)"
+  new_heap="$(ycsb_cfg --get cassandra.new_heap)"
+
+  # Which nodes.cassandra entry is this machine? Match its lan address against
+  # the local interfaces. Falls back to --cassandra-bind for the odd host.
+  local -a lan_addrs
+  read -r -a lan_addrs <<<"$(ycsb_cfg --list cassandra --field lan | tr '\n' ' ')"
+  [[ ${#lan_addrs[@]} -gt 0 ]] || die "nodes.cassandra (or nodes.log) resolves to no addresses"
+  local bind="$CASSANDRA_BIND" local_ips a
+  if [[ -z "$bind" ]]; then
+    local_ips=" $(hostname -I 2>/dev/null || true) "
+    for a in "${lan_addrs[@]}"; do
+      if [[ "$local_ips" == *" $a "* ]]; then
+        bind="$a"
+        break
+      fi
+    done
+  fi
+  [[ -n "$bind" ]] || die "none of nodes.cassandra's lan addresses (${lan_addrs[*]}) is on this machine. Pass --cassandra-bind ADDR."
+  local seeds=""
+  for a in "${lan_addrs[@]}"; do
+    seeds="${seeds:+$seeds,}$a:7000"
+  done
+  log "bind=$bind seeds=$seeds version=$version install_dir=$install_dir"
+
+  local jdk java_home
+  jdk="$(ensure_jdk "$CASSANDRA_JDK_VERSION" "${CASSANDRA_JDK_FALLBACKS[@]}")"
+  java_home="$(java_home_for "$jdk")"
+  log "cassandra JAVA_HOME -> $java_home (JDK $jdk)"
+
+  sudo mkdir -p "$install_dir"
+  sudo chmod 777 "$install_dir"
+
+  local home="$install_dir/apache-cassandra-$version"
+  if [[ -x "$home/bin/cassandra" ]]; then
+    log "cassandra $version already unpacked at $home"
+  else
+    local tarball="$install_dir/apache-cassandra-$version-bin.tar.gz"
+    log "downloading apache-cassandra-$version from $CASSANDRA_MIRROR"
+    curl -fsSL -o "$tarball" "$CASSANDRA_MIRROR/$version/apache-cassandra-$version-bin.tar.gz"
+    tar -xzf "$tarball" -C "$install_dir"
+    rm -f "$tarball"
+    [[ -x "$home/bin/cassandra" ]] || die "unpack did not produce $home/bin/cassandra"
+  fi
+  ln -sfn "$home" "$install_dir/current"
+
+  # Configure from the pristine file every time, so a re-run never stacks
+  # edits. The data directories all sit under $install_dir/data so that
+  # cassandra_ctl.sh can wipe/snapshot/restore one tree.
+  local conf="$home/conf/cassandra.yaml" data="$install_dir/data"
+  [[ -f "$conf.dist" ]] || cp "$conf" "$conf.dist"
+  cp "$conf.dist" "$conf"
+  cassandra_yaml_set "$conf" cluster_name "'ozonedb-bench'"
+  cassandra_yaml_set "$conf" listen_address "$bind"
+  cassandra_yaml_set "$conf" rpc_address "$bind"
+  cassandra_yaml_set "$conf" native_transport_port "$port"
+  cassandra_yaml_set "$conf" commitlog_directory "$data/commitlog"
+  cassandra_yaml_set "$conf" hints_directory "$data/hints"
+  cassandra_yaml_set "$conf" saved_caches_directory "$data/saved_caches"
+  # data_file_directories is a list; the stock file has it commented out
+  # as two lines. Replace the key line and let the ctl script own the dir.
+  sed -i -E "s|^#? ?data_file_directories:.*|data_file_directories:\n    - $data/data|" "$conf"
+  [[ "$(grep -cE '^data_file_directories:' "$conf")" -eq 1 ]] || die "cassandra.yaml: data_file_directories rewrite failed"
+  sed -i -E "s|^( *)- seeds:.*|\1- seeds: \"$seeds\"|" "$conf"
+  grep -qE "^ *- seeds: \"$seeds\"" "$conf" || die "cassandra.yaml: seeds rewrite failed"
+  mkdir -p "$data" "$install_dir/logs"
+
+  # Everything cassandra_ctl.sh needs, in one sourced file. Deliberately NOT
+  # ~/.ozonedb.env: the node's own JAVA_HOME must stay on JDK 25 for Corfu.
+  cat >"$install_dir/env.sh" <<EOF
+# Generated by bench/scripts/setup.sh --role cassandra -- do not edit.
+export JAVA_HOME="$java_home"
+export CASSANDRA_HOME="$install_dir/current"
+export CASSANDRA_CONF="$install_dir/current/conf"
+export CASSANDRA_LOG_DIR="$install_dir/logs"
+export CASSANDRA_BIND="$bind"
+export CASSANDRA_CQL_PORT="$port"
+export MAX_HEAP_SIZE="$heap"
+export HEAP_NEWSIZE="$new_heap"
+export CASSANDRA_CQL_PYTHON="$install_dir/pyenv/bin/python"
+export CASSANDRA_CQL_HELPER="$install_dir/cassandra_cql.py"
+export PATH="\$JAVA_HOME/bin:\$CASSANDRA_HOME/bin:\$PATH"
+EOF
+  log "wrote $install_dir/env.sh"
+
+  install -m 0755 "$SCRIPT_DIR/cassandra_ctl.sh" "$install_dir/cassandra_ctl.sh"
+  install -m 0644 "$SCRIPT_DIR/cassandra_cql.py" "$install_dir/cassandra_cql.py"
+  log "installed $install_dir/cassandra_ctl.sh + cassandra_cql.py"
+
+  # The CQL client venv (see the apt note above). Idempotent: reuse an existing
+  # venv that already imports the driver, else build it.
+  local venv="$install_dir/pyenv"
+  if "$venv/bin/python" -c "import cassandra.io.libevreactor" >/dev/null 2>&1; then
+    log "cassandra-driver venv already present at $venv"
+  else
+    log "building cassandra-driver venv at $venv (libev reactor)"
+    python3 -m venv "$venv"
+    "$venv/bin/pip" -q install --upgrade pip
+    "$venv/bin/pip" -q install "cassandra-driver==3.29.1"
+    "$venv/bin/python" -c "import cassandra.io.libevreactor" ||
+      die "cassandra-driver venv did not build the libev reactor (is libev-dev installed?)"
+  fi
+
+  # Cassandra warns (and under load, fails mmap) below this; idempotent.
+  if [[ "$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)" -lt 1048575 ]]; then
+    log "raising vm.max_map_count to 1048575"
+    sudo sysctl -q -w vm.max_map_count=1048575
+    echo "vm.max_map_count=1048575" | sudo tee /etc/sysctl.d/99-cassandra.conf >/dev/null
+  fi
+
+  log "cassandra $version ready (not started). Control it with:"
+  log "  $install_dir/cassandra_ctl.sh start|stop|status|wait|wipe|schema|save-load|restore-load"
+  log "or from the orchestrator: bench/scripts/local/load_multinode_cassandra.sh"
+}
+
 # -------------------------------------------------------------------- main
 
 log "repo: $REPO_ROOT"
@@ -535,6 +725,7 @@ for role in "${ROLES[@]}"; do
   client) role_client ;;
   corfu-server) role_corfu_server ;;
   minio) role_minio ;;
+  cassandra) role_cassandra ;;
   esac
 done
 
