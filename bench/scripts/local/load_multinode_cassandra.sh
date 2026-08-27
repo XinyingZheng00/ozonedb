@@ -115,7 +115,10 @@ LOAD_CMD="python3 \$OZONEDB_HOME/bench/scripts/local/load_local_ycsb_multiproc.p
 SAMPLER_SRC="$OZONEDB_HOME/bench/scripts/server_sampler.sh"
 SAMPLER_REMOTE_DIR="ozonedb_server_samples/load"
 LOAD_MODE="${CONSISTENCY:-$(cfg --get cassandra.consistency 2>/dev/null || echo quorum)}"
-SAMPLE_CELL="cassandra-${LOAD_MODE}_workloadload_w${WRITERS}_trial0"
+# Record count in the cell name, so a second dataset size never overwrites the
+# first load's server sample (see load_corfu_dataset.sh).
+SAMPLE_RC="${RECORD_CNT:-$(cd "$OZONEDB_HOME" && python3 bench/scripts/ycsb_config.py --get local.load.record_cnt | tr -d "[] " | cut -d, -f1)}"
+SAMPLE_CELL="cassandra-${LOAD_MODE}_workloadload_w${WRITERS}_rc${SAMPLE_RC}_trial0"
 SAMPLE_HOST="${SERVERS[0]}"
 SAMPLE_LOCAL="$OZONEDB_HOME/bench/results/local/_server/$(echo "$SAMPLE_HOST" | sed 's/[^A-Za-z0-9._-]/_/g')"
 sampler_start() {

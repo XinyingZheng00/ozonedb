@@ -48,8 +48,14 @@ LOAD_RE = re.compile(
     r"^(?P<ks>[^-]+)-(?P<rc>\d+)-insert-(?P<label>.+?)_w(?P<widx>\d+)of(?P<total>\d+)"
     r"_t(?P<thread>\d+)\.result$"
 )
+# `_rc<N>` is the record count of a load cell. The two load wrappers write it
+# because both dataset sizes of a campaign load into the same results root
+# and the same sample cell name: the 10 GB load of cost-20260827 overwrote
+# the 1 GB load's server sample. A sample with `_rc` matches only rows of
+# that record count; a sample without it (run cells, whose tag directory
+# already separates dataset sizes) matches any.
 SAMPLE_RE = re.compile(
-    r"^(?P<label>.+?)_workload(?P<wl>[^_]+)_w(?P<total>\d+)_trial(?P<trial>\d+)"
+    r"^(?P<label>.+?)_workload(?P<wl>[^_]+)_w(?P<total>\d+)(?:_rc(?P<rc>\d+))?_trial(?P<trial>\d+)"
     r"\.(?P<kind>before|after|pidstat|minio)\.txt$"
 )
 SERIES_RE = re.compile(r"^(\d+) (\w+)(\{[^}]*\})? ([-+0-9.eE]+)$")
@@ -338,8 +344,9 @@ def load_samples(results_dir):
         for fn in os.listdir(hdir):
             m = SAMPLE_RE.match(fn)
             if m:
+                rc = int(m.group("rc")) if m.group("rc") else None
                 cells[(m.group("label"), m.group("wl"), int(m.group("total")),
-                       m.group("trial"))][m.group("kind")] = os.path.join(hdir, fn)
+                       m.group("trial"), rc)][m.group("kind")] = os.path.join(hdir, fn)
         for key, files in cells.items():
             entry = {"host": host, "before": None, "after": None, "cpu_s": {},
                      "rss_kb": {}, "elapsed": None, "series": []}
@@ -362,14 +369,18 @@ def load_samples(results_dir):
     return out
 
 
-def samples_for(samples, label, wl, total, trial):
-    """Exact cell first; else a sample whose workload token lists this
-    workload (one orchestrator call that ran several workloads)."""
-    exact = samples.get((label, wl, total, trial))
-    if exact:
-        return exact, False
-    for (l, w, t, tr), entries in samples.items():
-        if l == label and t == total and tr == trial and wl in w.split("+"):
+def samples_for(samples, label, wl, total, trial, rc=None):
+    """Exact cell first (record-count-tagged, then untagged); else a sample
+    whose workload token lists this workload (one orchestrator call that
+    ran several workloads). A record-count-tagged sample never matches a
+    row of another record count."""
+    for key in ((label, wl, total, trial, rc), (label, wl, total, trial, None)):
+        exact = samples.get(key)
+        if exact:
+            return exact, False
+    for (l, w, t, tr, r), entries in samples.items():
+        if l == label and t == total and tr == trial and wl in w.split("+") \
+                and r in (None, rc):
             return entries, True
     return [], False
 
@@ -580,8 +591,8 @@ def collect(results_dir, window, record_bytes):
     tag = os.path.basename(os.path.normpath(results_dir))
     rows = []
     for key, writers in cells.items():
-        label, wl, total, trial, _rc = key
-        entries, shared = samples_for(samples, label, wl, total, trial)
+        label, wl, total, trial, rc = key
+        entries, shared = samples_for(samples, label, wl, total, trial, rc)
         rows.append(build_row(key, writers, entries, shared, record_bytes, window, tag))
     return rows
 

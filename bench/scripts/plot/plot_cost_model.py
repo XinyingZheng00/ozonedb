@@ -78,8 +78,9 @@ def median(xs):
 class Coefficients:
     """Everything the model needs, with a source tag per value."""
 
-    def __init__(self, rows, space, h_workload):
+    def __init__(self, rows, space, h_workload, read_fraction=0.5):
         self.src = {}
+        self.read_fraction = float(read_fraction)
         ozone = [r for r in rows if r["label"].startswith("ozonedb-corfu")
                  and "linearizable" not in r["label"] and r["workload"] != "load"]
         cass = [r for r in rows if r["label"].startswith("cassandra")]
@@ -152,10 +153,17 @@ class Coefficients:
             if n and objs:
                 ks.append(objs / n)
         self.k = pick("k", ks, DEFAULT_COEF["k"])
-        self.cpu_O = pick("cpu_s_per_op_O", [fnum(r["client_cpu_s_per_op"]) for r in ozone],
+        # Client CPU per op from the workload whose read mix matches the
+        # projection (a at 50 % reads, c above 95 %): workload a costs an
+        # OzoneDB client 2-4x the CPU of workload c (compaction, log tailing),
+        # so a median over both would answer neither question.
+        cpu_wl = "c" if self.read_fraction >= 0.95 else "a"
+        self.cpu_workload = cpu_wl
+        self.cpu_O = pick("cpu_s_per_op_O", [fnum(r["client_cpu_s_per_op"]) for r in ozone
+                                             if r["workload"] == cpu_wl],
                           DEFAULT_COEF["cpu_s_per_op_O"])
         self.cpu_C = pick("cpu_s_per_op_C", [fnum(r["client_cpu_s_per_op"]) for r in cass
-                                             if "serial" not in r["label"]],
+                                             if "serial" not in r["label"] and r["workload"] == cpu_wl],
                           DEFAULT_COEF["cpu_s_per_op_C"])
         # One Cassandra box: steady ops/s divided by the busy fraction of the
         # box (pidstat), the largest over the scaling cells.
@@ -240,6 +248,7 @@ class Model:
         nc, client_cost = self.clients(self.c.cpu_C, "cassandra_client")
         total = n * (node["usd_month"] + disk_cost) + client_cost
         return {"total": total, "nodes": n, "clients": nc,
+                "node_cost": n * (node["usd_month"] + disk_cost), "client_cost": client_cost,
                 "bound": "storage" if n == n_storage and n_storage >= n_ops else
                 ("ops" if n == n_ops else "floor")}
 
@@ -264,7 +273,11 @@ class Model:
         nc, client_cost = self.clients(self.c.cpu_O, "ozonedb_client")
         total = log_tier + bulk + req + client_cost
         return {"total": total, "log_tier": log_tier, "bulk": bulk, "requests": req,
-                "gets": gets, "puts": puts + ckpt, "h": h, "clients": nc, "log_gb": log_gb}
+                "gets": gets, "puts": puts + ckpt, "h": h, "clients": nc, "log_gb": log_gb,
+                "get_cost": gets * st["s3_get_usd_per_million"] / 1e6,
+                "put_cost": puts * st["s3_put_usd_per_million"] / 1e6,
+                "ckpt_cost": ckpt * st["s3_put_usd_per_million"] / 1e6,
+                "client_cost": client_cost}
 
 
 def grid(d_min_gb, d_max_gb, per_decade=12):
@@ -308,7 +321,8 @@ def main():
     if args.space:
         with open(args.space) as f:
             space = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
-    coef = Coefficients(rows, space, args.h_workload)
+    coef = Coefficients(rows, space, args.h_workload,
+                        read_fraction=prices["projection"].get("read_fraction", 0.5))
     coef.report()
     model = Model(coef, prices)
     pr = prices["projection"]
@@ -342,13 +356,29 @@ def main():
         if abs(math.log10(gb) - round(math.log10(gb))) > 1e-6:
             continue
         oz = model.ozonedb(d, pr["cache_gb_high"])
+        ozl = model.ozonedb(d, pr["cache_gb_low"])
+        ozt = model.ozonedb(d, pr["cache_gb_high"], trimming=False)
         cs = model.cassandra(d, "nvme")
+        cse = model.cassandra(d, "ebs")
         print(f"{fmt_gb(d):>10} {cn:>11,.0f} {ce:>11,.0f} {oh:>11,.0f} {ol:>11,.0f} {ot:>11,.0f} {oz['h']:>6.3f} {cs['nodes']:>5}")
-        lines.append((fmt_gb(d), cn, ce, oh, ol, ot, oz["h"], cs["nodes"], cs["bound"]))
+        # Totals first, then the cost lines of bench/PLAN-cost.md's projection
+        # table (all USD per month, rounded to the dollar).
+        r1 = lambda v: round(v)
+        lines.append((fmt_gb(d), r1(cn), r1(ce), r1(oh), r1(ol), r1(ot), round(oz["h"], 4), cs["nodes"], cs["bound"],
+                      r1(cs["node_cost"]), cse["nodes"], r1(cse["node_cost"]), cs["clients"], r1(cs["client_cost"]),
+                      r1(oz["log_tier"]), r1(oz["bulk"]), r1(oz["get_cost"]), round(ozl["h"], 4), r1(ozl["get_cost"]),
+                      r1(oz["put_cost"]), r1(oz["ckpt_cost"]), oz["clients"], r1(oz["client_cost"]),
+                      r1(ozt["log_tier"]), round(ozt["log_gb"], 1)))
     print(crossover_note)
     if args.table:
+        cols = ["D", "cass_nvme", "cass_ebs", "ozone_hi_cache", "ozone_lo_cache", "ozone_today", "h_hi_cache",
+                "cass_nodes", "cass_bound",
+                "cass_nvme_nodes_usd", "cass_ebs_nodes", "cass_ebs_nodes_usd", "cass_clients", "cass_clients_usd",
+                "ozone_log_tier_usd", "ozone_s3_storage_usd", "ozone_gets_hi_usd", "h_lo_cache", "ozone_gets_lo_usd",
+                "ozone_puts_compaction_usd", "ozone_puts_checkpoint_usd", "ozone_clients", "ozone_clients_usd",
+                "ozone_today_log_tier_usd", "ozone_today_log_gb"]
         with open(args.table, "w") as f:
-            f.write("D\tcass_nvme\tcass_ebs\tozone_hi_cache\tozone_lo_cache\tozone_today\th_hi_cache\tcass_nodes\tcass_bound\n")
+            f.write("\t".join(cols) + "\n")
             for ln in lines:
                 f.write("\t".join(str(x) for x in ln) + "\n")
         print(f"wrote {args.table}")

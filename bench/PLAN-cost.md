@@ -1,7 +1,13 @@
 # Plan: cost model with measured coefficients, OzoneDB (Corfu + S3) vs Cassandra (branch `worktree-plan-cost`)
 
-**Status (2026-08-27):** phase 0 (instrumentation) is implemented and verified on a
-synthetic results directory. No cell has run on the cluster. The branch is `visibility`
+**Status (2026-08-27):** phases 0 to 5 are DONE. Campaign `cost-20260827` ran on the
+cluster (amd127 + 8 clients): 37 cells, 0 failed operations. Results, coefficient and
+projection tables, the figure and the findings are in `bench/RESULTS-cost.md`
+(`results-cost-20260827*.tsv`, `results-cost-20260827.png`). Headline: `h` tracks the
+cache-to-data ratio (0.645 at 52 %, 0.01 at 0.1 %) because 64 KB blocks under hashed
+keys have no zipfian locality, so the S3 GET line dominates; with 35x the client CPU
+per op of Cassandra, OzoneDB with trimming turns cheaper than Cassandra RF=3 only above
+17.8 TB (EBS) or 5.6 TB (NVMe). Phase 6 (real S3) was not run. The branch is `visibility`
 at `35f5cb90` with `worktree-cassandra-bench` (`5518b2b4`) merged in, so one tree holds
 the trimmed engine and the Cassandra baseline. The Cassandra branch alone is 16 commits
 behind `visibility` and must not be used for this experiment.

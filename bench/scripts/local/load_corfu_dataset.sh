@@ -133,7 +133,11 @@ SAMPLER_SRC="$OZONEDB_HOME/bench/scripts/server_sampler.sh"
 SAMPLER_REMOTE_DIR="ozonedb_server_samples/load"
 S3_PORT="$(cfg --get s3.port 2>/dev/null || echo 9000)"
 S3_BUCKET="$(cfg --get s3.bucket 2>/dev/null || echo "")"
-SAMPLE_CELL="ozonedb-corfu_workloadload_w${WRITERS}_trial0"
+# The record count is part of the cell name: both dataset sizes of a campaign
+# load into the same results root, and an untagged name lets the second load
+# overwrite the first load's server sample (extract_cost_coefficients.py SAMPLE_RE).
+SAMPLE_RC="${RECORD_CNT:-$(cd "$OZONEDB_HOME" && python3 bench/scripts/ycsb_config.py --get local.load.record_cnt | tr -d "[] " | cut -d, -f1)}"
+SAMPLE_CELL="ozonedb-corfu_workloadload_w${WRITERS}_rc${SAMPLE_RC}_trial0"
 SAMPLE_LOCAL="$OZONEDB_HOME/bench/results/local/_server/$(echo "$CORFU_SSH" | sed 's/^.*@//; s/[^A-Za-z0-9._-]/_/g')"
 sampler_start() {
   scp "${SSH_OPTS[@]}" -q "$SAMPLER_SRC" "$CORFU_SSH:ozonedb_server_sampler.sh" &&
