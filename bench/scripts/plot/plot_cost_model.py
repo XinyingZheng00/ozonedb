@@ -84,18 +84,26 @@ class Coefficients:
                  and "linearizable" not in r["label"] and r["workload"] != "load"]
         cass = [r for r in rows if r["label"].startswith("cassandra")]
 
-        # h(ratio): the cache sweep, one workload.
+        # h(ratio): the cache sweep, one workload. h_steady (the last window
+        # of the run, from the MinIO request-rate series) when the cell has
+        # it, else the cumulative counter, which includes the cold start.
         pts = {}
+        n_steady = 0
         for r in ozone:
             if r["workload"] != h_workload:
                 continue
-            h, ratio = fnum(r["h"]), fnum(r["cache_ratio"])
+            h, ratio = fnum(r.get("h_steady")), fnum(r["cache_ratio"])
+            if h is not None:
+                n_steady += 1
+            else:
+                h = fnum(r["h"])
             if h is None or ratio is None or ratio <= 0:
                 continue
             pts.setdefault(ratio, []).append(h)
         self.h_points = sorted((ratio, sum(v) / len(v)) for ratio, v in pts.items())
         if self.h_points:
-            self.src["h"] = f"measured, workload {h_workload}, {len(self.h_points)} ratios"
+            self.src["h"] = (f"measured, workload {h_workload}, {len(self.h_points)} ratios "
+                             f"({n_steady} steady-state, {len(self.h_points) - n_steady} cumulative)")
         else:
             # Pessimistic straight line: every miss is a miss until the cache
             # holds the whole dataset.

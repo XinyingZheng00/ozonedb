@@ -101,12 +101,20 @@ def resolve_ssh_key(config, ssh_key_arg):
 
 
 def ssh_base(target, ssh_key):
+    # ServerAlive*: a cell's ssh session carries no data while YCSB runs
+    # (its output goes to a file on the client), and a 600 s silent TCP
+    # connection through the campus NAT was dropped -- the remote side
+    # finished, the local ssh never noticed, and the cell hung until the
+    # timeout with return_codes={}. 30 s keepalives hold the NAT entry, and
+    # a dead link now fails the session within 3 min instead of never.
     return [
         "ssh",
         "-i", ssh_key,
         "-oStrictHostKeyChecking=no",
         "-oUserKnownHostsFile=/dev/null",
         "-oLogLevel=ERROR",
+        "-oServerAliveInterval=30",
+        "-oServerAliveCountMax=6",
         target,
     ]
 

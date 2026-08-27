@@ -3,8 +3,10 @@
 # Sample the server side of one benchmark cell, ON the server node.
 #
 #   server_sampler.sh start DIR CELL   snapshot -> DIR/CELL.before.txt, then
-#                                      pidstat into DIR/CELL.pidstat.txt
-#   server_sampler.sh stop  DIR CELL   snapshot -> DIR/CELL.after.txt, kill pidstat
+#                                      pidstat into DIR/CELL.pidstat.txt and the
+#                                      MinIO counters every INTERVAL s into
+#                                      DIR/CELL.minio.txt (EPOCH metric value)
+#   server_sampler.sh stop  DIR CELL   snapshot -> DIR/CELL.after.txt, kill both
 #   server_sampler.sh snapshot         print one snapshot to stdout
 #
 # Why: the cost model of bench/PLAN-cost.md needs, per cell, the object-store
@@ -80,10 +82,27 @@ snapshot() {
   echo "loadavg $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '? ? ?')"
 }
 
+# Every INTERVAL seconds: the request and traffic counters with an epoch
+# prefix, one metric per line, into DIR/CELL.minio.txt. The before/after
+# snapshots give the cell total; this series gives the steady-state rate over
+# the last window of the run, which is what a cold block cache needs (the
+# cumulative hit counter mostly measures warm-up in a 120 s cell).
+metrics_poll() {
+  local t out
+  while :; do
+    t="$(date +%s)"
+    out="$(curl -sf --max-time 5 "$MINIO_URL/minio/v2/metrics/cluster" 2>/dev/null | grep -E '^minio_s3_(requests_total|traffic_sent_bytes|traffic_received_bytes)')" || out=""
+    [[ -n "$out" ]] && printf '%s\n' "$out" | sed "s/^/$t /"
+    sleep "$INTERVAL"
+  done
+}
+
 start() {
   local dir="$1" cell="$2"
   mkdir -p "$dir"
   snapshot >"$dir/$cell.before.txt"
+  (setsid nohup bash "$0" poll >"$dir/$cell.minio.txt" 2>/dev/null </dev/null &
+   echo $! >"$dir/$cell.minio.pid")
   local all=""
   local c p
   for c in corfu minio cassandra; do
@@ -107,11 +126,14 @@ start() {
 
 stop() {
   local dir="$1" cell="$2"
-  if [[ -f "$dir/$cell.pidstat.pid" ]]; then
-    pkill -TERM -P "$(cat "$dir/$cell.pidstat.pid")" 2>/dev/null || true
-    kill -TERM "$(cat "$dir/$cell.pidstat.pid")" 2>/dev/null || true
-    rm -f "$dir/$cell.pidstat.pid"
-  fi
+  local f
+  for f in "$dir/$cell.pidstat.pid" "$dir/$cell.minio.pid"; do
+    if [[ -f "$f" ]]; then
+      pkill -TERM -P "$(cat "$f")" 2>/dev/null || true
+      kill -TERM "$(cat "$f")" 2>/dev/null || true
+      rm -f "$f"
+    fi
+  done
   snapshot >"$dir/$cell.after.txt"
   log "stop cell=$cell"
 }
@@ -121,5 +143,6 @@ case "$verb" in
 start) [[ $# -eq 3 ]] || { echo "usage: $0 start DIR CELL" >&2; exit 2; }; start "$2" "$3" ;;
 stop) [[ $# -eq 3 ]] || { echo "usage: $0 stop DIR CELL" >&2; exit 2; }; stop "$2" "$3" ;;
 snapshot) snapshot ;;
+poll) metrics_poll ;;
 *) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

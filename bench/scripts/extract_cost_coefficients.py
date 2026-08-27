@@ -50,8 +50,9 @@ LOAD_RE = re.compile(
 )
 SAMPLE_RE = re.compile(
     r"^(?P<label>.+?)_workload(?P<wl>[^_]+)_w(?P<total>\d+)_trial(?P<trial>\d+)"
-    r"\.(?P<kind>before|after|pidstat)\.txt$"
+    r"\.(?P<kind>before|after|pidstat|minio)\.txt$"
 )
+SERIES_RE = re.compile(r"^(\d+) (\w+)(\{[^}]*\})? ([-+0-9.eE]+)$")
 
 YCSB_RE = re.compile(r"^\[([A-Z\-]+)\],\s*([^,]+?),\s*(.+?)\s*$")
 CACHE_RE = re.compile(
@@ -276,6 +277,53 @@ def parse_pidstat(path, pid_class, default_interval=10.0):
     return cpu_s, rss_kb, elapsed
 
 
+def parse_series(path):
+    """DIR/CELL.minio.txt -> sorted [(t, {"get","put","in","out"})], cumulative."""
+    by_t = {}
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = SERIES_RE.match(line.strip())
+            if not m:
+                continue
+            t, name, labels, val = int(m.group(1)), m.group(2), m.group(3) or "", float(m.group(4))
+            d = by_t.setdefault(t, {"get": 0.0, "put": 0.0, "in": 0.0, "out": 0.0})
+            if name == "minio_s3_requests_total":
+                api = dict(LABEL_RE.findall(labels)).get("api", "").lower()
+                if api in GET_APIS or api in HEAD_APIS:
+                    d["get"] += val
+                elif api in PUT_APIS or api in LIST_APIS:
+                    d["put"] += val
+            elif name == "minio_s3_traffic_received_bytes":
+                d["in"] += val
+            elif name == "minio_s3_traffic_sent_bytes":
+                d["out"] += val
+    return sorted(by_t.items())
+
+
+def steady_rates(series, window):
+    """Request rates over the last `window` seconds of activity: the window
+    ends at the last sample whose counters moved, so the idle tail between
+    the writers' exit and the sampler's stop is not averaged in."""
+    if len(series) < 2:
+        return None
+    end = None
+    for (t0, a), (t1, b) in zip(series, series[1:]):
+        if b["get"] > a["get"] or b["put"] > a["put"]:
+            end = (t1, b)
+    if end is None:
+        return None
+    t_end, s_end = end
+    start = None
+    for t, s in series:
+        if t >= t_end - window:
+            start = (t, s)
+            break
+    if start is None or start[0] >= t_end:
+        return None
+    dt = float(t_end - start[0])
+    return {k: (s_end[k] - start[1][k]) / dt for k in ("get", "put", "in", "out")} | {"seconds": dt}
+
+
 def load_samples(results_dir):
     """{(label, wl, total, trial): [per-host dict]} from _server/*/."""
     root = os.path.join(results_dir, "_server")
@@ -294,11 +342,13 @@ def load_samples(results_dir):
                        m.group("trial"))][m.group("kind")] = os.path.join(hdir, fn)
         for key, files in cells.items():
             entry = {"host": host, "before": None, "after": None, "cpu_s": {},
-                     "rss_kb": {}, "elapsed": None}
+                     "rss_kb": {}, "elapsed": None, "series": []}
             if "before" in files:
                 entry["before"] = parse_snapshot(files["before"])
             if "after" in files:
                 entry["after"] = parse_snapshot(files["after"])
+            if "minio" in files:
+                entry["series"] = parse_series(files["minio"])
             if "pidstat" in files:
                 pid_class = {}
                 src = entry["before"] or entry["after"]
@@ -330,7 +380,7 @@ def api_sum(snap, apis):
     return sum(v for k, v in snap["api"].items() if k in apis)
 
 
-def build_row(key, writers, samples, shared, record_bytes):
+def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
     label, wl, total, trial, rc = key
     have = len(writers)
     ws = list(writers.values())
@@ -354,6 +404,7 @@ def build_row(key, writers, samples, shared, record_bytes):
         notes.append(f"missing_writers={total - have}")
 
     row = {
+        "tag": tag,
         "label": label, "workload": wl, "writers": total, "have": have, "trial": trial,
         "record_cnt": rc, "dataset_bytes": rc * record_bytes if rc else "",
         "ops": int(ops), "reads": int(reads), "writes": int(writes), "failed": int(failed),
@@ -373,8 +424,11 @@ def build_row(key, writers, samples, shared, record_bytes):
     cpu = defaultdict(float)
     nproc, elapsed = None, None
     have_counters = False
+    rates = None
     for e in samples:
         b, a = e["before"], e["after"]
+        if e["series"] and rates is None:
+            rates = steady_rates(e["series"], window)
         if b and a and not (b["errors"] and a["errors"]):
             have_counters = True
             for cls, apis in (("get", GET_APIS), ("head", HEAD_APIS), ("put", PUT_APIS),
@@ -411,7 +465,25 @@ def build_row(key, writers, samples, shared, record_bytes):
 
     get_class = agg["get"] + agg["head"]
     put_class = agg["put"] + agg["list"]
+    # Steady state: the request rate over the last window of activity against
+    # the steady ops/s of the same window. h_steady assumes every miss costs
+    # g GETs (g from the cumulative counters of this cell) and charges all
+    # GETs to reads, so it is exact for a read-only workload and slightly
+    # pessimistic under writes (compaction input reads count as misses).
+    steady_sum = sum(steady) if steady else 0.0
+    g_cum = get_class / sum(misses) if (have_counters and misses and sum(misses)) else None
+    read_frac = reads / ops if ops else 0.0
+    get_per_op_steady = (rates["get"] / steady_sum) if (rates and steady_sum) else None
+    h_steady = None
+    if get_per_op_steady is not None and g_cum and read_frac > 0:
+        h_steady = max(0.0, min(1.0, 1.0 - get_per_op_steady / (g_cum * read_frac)))
     row.update({
+        "s3_get_rate_steady": round(rates["get"], 2) if rates else "",
+        "s3_put_rate_steady": round(rates["put"], 3) if rates else "",
+        "s3_bytes_out_rate_steady": round(rates["out"]) if rates else "",
+        "steady_window_s": round(rates["seconds"]) if rates else "",
+        "get_per_op_steady": round(get_per_op_steady, 5) if get_per_op_steady is not None else "",
+        "h_steady": round(h_steady, 5) if h_steady is not None else "",
         "s3_get": int(agg["get"]) if have_counters else "",
         "s3_head": int(agg["head"]) if have_counters else "",
         "s3_put": int(agg["put"]) if have_counters else "",
@@ -459,18 +531,23 @@ def build_row(key, writers, samples, shared, record_bytes):
         "server_cpu_s_per_op": round(sum(cpu.values()) / ops, 7) if cpu and ops else "",
         "server_nproc": nproc or "",
         "server_elapsed_s": round(elapsed) if elapsed else "",
-        "server_busy_frac": round(sum(cpu.values()) / (elapsed * nproc), 4) if cpu and elapsed and nproc else "",
+        # Busy fraction over the writers' run window, not the sampler's
+        # elapsed time: a cell whose orchestrator overran (ssh hang) has a
+        # long idle tail in the sample that would dilute the fraction.
+        "server_busy_frac": round(sum(cpu.values()) / ((row.get("run_s") or elapsed) * nproc), 4) if cpu and (row.get("run_s") or elapsed) and nproc else "",
         "notes": ";".join(notes),
     })
     return row
 
 
 COLUMNS = [
-    "label", "workload", "writers", "have", "trial", "record_cnt", "dataset_bytes",
+    "tag", "label", "workload", "writers", "have", "trial", "record_cnt", "dataset_bytes",
     "ops", "reads", "writes", "failed", "run_s", "steady_ops_s",
     "cache_hits", "cache_misses", "h", "cache_capacity", "cache_ratio",
     "s3_get", "s3_head", "s3_put", "s3_list", "s3_delete", "s3_other",
     "s3_bytes_in", "s3_bytes_out", "get_per_op", "get_per_miss", "put_per_op", "put_per_write",
+    "s3_get_rate_steady", "s3_put_rate_steady", "s3_bytes_out_rate_steady", "steady_window_s",
+    "get_per_op_steady", "h_steady",
     "du_corfu_kb", "du_corfu_delta_kb", "du_minio_kb", "du_minio_delta_kb",
     "du_cassandra_kb", "du_cassandra_delta_kb", "bucket_bytes", "checkpoint_bytes",
     "client_user_s", "client_sys_s", "client_cpu_s_per_op", "client_rss_max_kb",
@@ -500,11 +577,12 @@ def collect(results_dir, window, record_bytes):
             key = (m.group("label"), "load", int(m.group("total")), "0", int(m.group("rc")))
             cells[key][int(m.group("widx"))] = parse_writer(full, window)
     samples = load_samples(results_dir)
+    tag = os.path.basename(os.path.normpath(results_dir))
     rows = []
     for key, writers in cells.items():
         label, wl, total, trial, _rc = key
         entries, shared = samples_for(samples, label, wl, total, trial)
-        rows.append(build_row(key, writers, entries, shared, record_bytes))
+        rows.append(build_row(key, writers, entries, shared, record_bytes, window, tag))
     return rows
 
 
@@ -522,16 +600,16 @@ def main():
         if not os.path.isdir(d):
             sys.exit(f"no such dir: {d}")
         rows.extend(collect(d, args.window, args.record_bytes))
-    rows.sort(key=lambda r: (r["label"], r["workload"], r["writers"], r["trial"]))
+    rows.sort(key=lambda r: (r["label"], r["workload"], r["writers"], r["trial"], r["tag"]))
 
-    hdr = (f"{'label':34} {'wl':4} {'w':3} {'have':4} {'steady':9} {'h':8} {'ratio':10} "
-           f"{'get/op':8} {'g':7} {'put/op':9} {'cpu_s/op':10} {'srv_s/op':10} {'ckpt':5} {'join':5} notes")
+    hdr = (f"{'tag':22} {'label':34} {'wl':4} {'w':3} {'have':4} {'steady':9} {'h':8} {'h_stdy':8} {'ratio':10} "
+           f"{'get/op':8} {'get/op_s':8} {'g':7} {'put/op':9} {'cpu_s/op':10} {'srv_s/op':10} {'ckpt':5} {'join':5} notes")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
-        print(f"{r['label']:34} {r['workload']:4} {r['writers']:3} {r['have']:4} "
-              f"{str(r['steady_ops_s']):9} {str(r['h']):8} {str(r['cache_ratio']):10} "
-              f"{str(r['get_per_op']):8} {str(r['get_per_miss']):7} {str(r['put_per_op']):9} "
+        print(f"{r['tag'][:22]:22} {r['label']:34} {r['workload']:4} {r['writers']:3} {r['have']:4} "
+              f"{str(r['steady_ops_s']):9} {str(r['h']):8} {str(r['h_steady']):8} {str(r['cache_ratio']):10} "
+              f"{str(r['get_per_op']):8} {str(r['get_per_op_steady']):8} {str(r['get_per_miss']):7} {str(r['put_per_op']):9} "
               f"{str(r['client_cpu_s_per_op']):10} {str(r['server_cpu_s_per_op']):10} "
               f"{str(r['ckpt_count']):5} {str(r['join_gets']):5} {r['notes']}")
 
