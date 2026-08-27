@@ -3,6 +3,7 @@ import argparse
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -137,8 +138,11 @@ def kill_remote_ycsb(target, ssh_key):
     overruns its timeout: a writer stuck in the linearizable tailer catch-up
     does 0 ops, so YCSB's between-ops maxexecutiontime never fires and the
     process hangs forever, blocking the whole sweep. This unblocks it."""
+    # The bracket trick keeps the pattern from matching the remote shell
+    # that runs this very command (its argv holds the pattern text), which
+    # otherwise dies at the first pkill and never reaches the second.
     cmd = ssh_base(target, ssh_key) + [
-        "pkill -9 -f site.ycsb.Client; pkill -9 -f run_local_ycsb_multiproc; true"
+        "pkill -9 -f '[s]ite.ycsb.Client'; pkill -9 -f '[r]un_local_ycsb_multiproc'; true"
     ]
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -697,6 +701,22 @@ def main():
     cell_timeout = args.cell_timeout
     if cell_timeout is None and args.max_exec_time:
         cell_timeout = args.max_exec_time * 2 + 120
+
+    # A SIGTERM (the shell wrapper's trap, a killed campaign chain) must not
+    # leave the writers running on the clients: they would sit on a stopped
+    # Corfu until the next cell's preflight finds them.
+    def on_term(signum, frame):
+        print(f"[orchestrator] signal {signum}: killing remote YCSB on all hosts")
+        for p in plan:
+            kill_remote_ycsb(p["target"], ssh_key)
+        try:
+            sampling.stop()
+        except Exception:
+            pass
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
 
     sampling.start()
     wall_start = time.time()

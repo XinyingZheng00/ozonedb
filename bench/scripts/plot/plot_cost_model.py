@@ -88,22 +88,27 @@ class Coefficients:
         # of the run, from the MinIO request-rate series) when the cell has
         # it, else the cumulative counter, which includes the cold start.
         pts = {}
-        n_steady = 0
+        n_steady = n_cum = 0
         for r in ozone:
             if r["workload"] != h_workload:
                 continue
             h, ratio = fnum(r.get("h_steady")), fnum(r["cache_ratio"])
-            if h is not None:
-                n_steady += 1
-            else:
+            steady = h is not None
+            if not steady:
                 h = fnum(r["h"])
             if h is None or ratio is None or ratio <= 0:
                 continue
-            pts.setdefault(ratio, []).append(h)
-        self.h_points = sorted((ratio, sum(v) / len(v)) for ratio, v in pts.items())
+            if steady:
+                n_steady += 1
+            else:
+                n_cum += 1
+            pts.setdefault(ratio, []).append((fnum(r.get("run_s")) or 0.0, h))
+        # One point per ratio: the longest cell. A 120 s cell's last window is
+        # still warming a 512 MB cache; the 600 s sweep is the converged value.
+        self.h_points = sorted((ratio, max(v)[1]) for ratio, v in pts.items())
         if self.h_points:
             self.src["h"] = (f"measured, workload {h_workload}, {len(self.h_points)} ratios "
-                             f"({n_steady} steady-state, {len(self.h_points) - n_steady} cumulative)")
+                             f"from {n_steady + n_cum} cells ({n_steady} steady-state, {n_cum} cumulative)")
         else:
             # Pessimistic straight line: every miss is a miss until the cache
             # holds the whole dataset.
