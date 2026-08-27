@@ -42,8 +42,9 @@ CorfuDBStorage::CorfuDBStorage(std::string const& endpoint,
                                std::string const& stream_name,
                                std::string const& db_path,
                                Storage* checkpoint_store,
-                               std::string const& checkpoint_dir)
-    : Storage(db_path) {
+                               std::string const& checkpoint_dir,
+                               bool fast_ack)
+    : Storage(db_path), fast_ack_(fast_ack) {
   {
     std::random_device rd;
     std::mt19937_64 rng(rd());
@@ -110,6 +111,16 @@ CorfuDBStorage::~CorfuDBStorage() {
   if (dispatch_thread_.joinable()) dispatch_thread_.join();
   {
     uint64_t const n = ack_wait_batches_.load(std::memory_order_relaxed);
+    std::cerr << "[corfu] ack: fast=" << fast_acks_.load(std::memory_order_relaxed)
+              << " slow=" << n
+              << " conflict=" << conflict_aborts_.load(std::memory_order_relaxed)
+              << " spurious=" << spurious_conflicts_.load(std::memory_order_relaxed)
+              << " slow_by_cause(newseq=" << slow_path_newseq_.load(std::memory_order_relaxed)
+              << " overflow=" << slow_path_overflow_.load(std::memory_order_relaxed)
+              << " trim=" << slow_path_trim_.load(std::memory_order_relaxed)
+              << " stalled=" << slow_path_stalled_.load(std::memory_order_relaxed)
+              << " other=" << slow_path_other_.load(std::memory_order_relaxed)
+              << ") fast_ack=" << (fast_ack_ ? "on" : "off") << "\n";
     std::cerr << "[corfu] ack-wait: batches=" << n << " avg_us="
               << (n ? ack_wait_us_total_.load(std::memory_order_relaxed) / n : 0)
               << " max_us=" << ack_wait_us_max_.load(std::memory_order_relaxed)
@@ -208,6 +219,8 @@ void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& 
   env->DeleteLocalRef(local_bridge);
 
   mid_append_ = env->GetMethodID(bridge_class_global_, "append", "([B)J");
+  mid_appendChecked_ = env->GetMethodID(bridge_class_global_, "appendChecked", "([BJ[B[B)[J");
+  mid_globalTail_ = env->GetMethodID(bridge_class_global_, "globalTail", "()J");
   mid_pollNext_ = env->GetMethodID(bridge_class_global_, "pollNext", "(J)[B");
   mid_pollBatch_ = env->GetMethodID(bridge_class_global_, "pollBatch", "(JI)[B");
   mid_tailAddress_ = env->GetMethodID(bridge_class_global_, "tailAddress", "()J");
@@ -216,15 +229,15 @@ void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& 
   mid_trimMark_ = env->GetMethodID(bridge_class_global_, "trimMark", "()J");
   mid_seekPollView_ = env->GetMethodID(bridge_class_global_, "seekPollView", "(J)V");
   mid_close_ = env->GetMethodID(bridge_class_global_, "close", "()V");
-  if (!mid_append_ || !mid_pollNext_ || !mid_pollBatch_ || !mid_tailAddress_ ||
-      !mid_gcPollView_ || !mid_prefixTrim_ || !mid_trimMark_ ||
-      !mid_seekPollView_ || !mid_close_) {
+  if (!mid_append_ || !mid_appendChecked_ || !mid_globalTail_ || !mid_pollNext_ ||
+      !mid_pollBatch_ || !mid_tailAddress_ || !mid_gcPollView_ || !mid_prefixTrim_ ||
+      !mid_trimMark_ || !mid_seekPollView_ || !mid_close_) {
     throw std::runtime_error("CorfuBridge method lookup failed");
   }
 }
 
-long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
-                                    unsigned char const* data, int length) {
+std::string CorfuDBStorage::serializeEntry(std::string const& file_name, int op,
+                                           unsigned char const* data, int length) const {
   ::CorfuEntry entry;
   entry.set_file_name(file_name);
   entry.set_op(static_cast<::CorfuEntry_Op>(op));
@@ -234,7 +247,12 @@ long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, i
   }
   std::string serialized;
   entry.SerializeToString(&serialized);
+  return serialized;
+}
 
+long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
+                                    unsigned char const* data, int length) {
+  std::string serialized = serializeEntry(file_name, op, data, length);
   jbyteArray jbuf = env->NewByteArray(static_cast<jsize>(serialized.size()));
   env->SetByteArrayRegion(jbuf, 0, static_cast<jsize>(serialized.size()),
                           reinterpret_cast<jbyte const*>(serialized.data()));
@@ -246,6 +264,91 @@ long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, i
     return -1;
   }
   return static_cast<long>(addr);
+}
+
+CorfuDBStorage::CheckedAppend CorfuDBStorage::jniAppendChecked(
+    JNIEnv* env, std::string const& file_name, int op,
+    unsigned char const* data, int length,
+    long snapshot, bool read_key, bool write_key) {
+  CheckedAppend out;
+  std::string serialized = serializeEntry(file_name, op, data, length);
+  jbyteArray jbuf = env->NewByteArray(static_cast<jsize>(serialized.size()));
+  env->SetByteArrayRegion(jbuf, 0, static_cast<jsize>(serialized.size()),
+                          reinterpret_cast<jbyte const*>(serialized.data()));
+  jbyteArray jkey = env->NewByteArray(static_cast<jsize>(file_name.size()));
+  env->SetByteArrayRegion(jkey, 0, static_cast<jsize>(file_name.size()),
+                          reinterpret_cast<jbyte const*>(file_name.data()));
+  jobject res = env->CallObjectMethod(bridge_global_, mid_appendChecked_, jbuf,
+                                      static_cast<jlong>(snapshot),
+                                      read_key ? jkey : nullptr,
+                                      write_key ? jkey : nullptr);
+  env->DeleteLocalRef(jbuf);
+  env->DeleteLocalRef(jkey);
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    if (res) env->DeleteLocalRef(res);
+    out.abort = kAbortOther;
+    return out;
+  }
+  if (!res) {
+    out.abort = kAbortOther;
+    return out;
+  }
+  jlong pair[2] = {-1, -1};
+  env->GetLongArrayRegion(static_cast<jlongArray>(res), 0, 2, pair);
+  env->DeleteLocalRef(res);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    out.abort = kAbortOther;
+    return out;
+  }
+  if (pair[0] >= 0) {
+    out.addr = static_cast<long>(pair[0]);
+  } else {
+    out.abort = static_cast<long>(pair[0]);
+    out.offending = static_cast<long>(pair[1]);
+  }
+  return out;
+}
+
+long CorfuDBStorage::jniGlobalTail(JNIEnv* env) {
+  jlong tail = env->CallLongMethod(bridge_global_, mid_globalTail_);
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    return -1;
+  }
+  return static_cast<long>(tail);
+}
+
+// SEAL and REMOVE must reach the sequencer's conflict cache, or a peer's
+// fast path (submitBatchFast) is blind to them. The snapshot only has to
+// pass the sequencer's sanity checks (epoch, trim mark, bootstrap tail,
+// cache eviction mark); the tailer's position normally does, and the
+// global tail always does.
+long CorfuDBStorage::jniAppendKeyed(JNIEnv* env, std::string const& file_name, int op) {
+  long snapshot = last_applied_addr_.load(std::memory_order_acquire);
+  long last_abort = 0;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    CheckedAppend r = jniAppendChecked(env, file_name, op, nullptr, 0, snapshot,
+                                       /*read_key=*/false, /*write_key=*/true);
+    if (r.addr >= 0) return r.addr;
+    last_abort = r.abort;
+    snapshot = jniGlobalTail(env);
+    if (snapshot < 0) break;
+  }
+  std::cerr << "[corfu] keyed op " << op << " of " << file_name
+            << " refused by the sequencer (abort=" << last_abort
+            << "); not appended\n";
+  return -1;
+}
+
+void CorfuDBStorage::publishWrittenAddr(long addr) {
+  long prev = last_written_addr_.load(std::memory_order_acquire);
+  while (addr > prev &&
+         !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
+  }
 }
 
 bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
@@ -987,15 +1090,21 @@ long CorfuDBStorage::globalFenceTarget() {
 // mode already offers.
 void CorfuDBStorage::waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target) {
   constexpr auto kFenceTimeout = std::chrono::seconds(10);
-  bool reached = tailer_cv_.wait_for(lock, kFenceTimeout, [&] {
-    return !running_ || trimmed_out_.load() ||
-           last_applied_addr_.load(std::memory_order_acquire) >= target;
-  });
+  bool reached = waitForTailerLocked(lock, target, kFenceTimeout);
   if (!reached && !trimmed_out_.load()) {
     std::cerr << "[corfu] fence timed out: target=" << target
               << " applied=" << last_applied_addr_.load(std::memory_order_acquire)
               << " (target is probably not on this stream)\n";
   }
+}
+
+bool CorfuDBStorage::waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target,
+                                         std::chrono::milliseconds timeout) {
+  tailer_cv_.wait_for(lock, timeout, [&] {
+    return !running_ || trimmed_out_.load() ||
+           last_applied_addr_.load(std::memory_order_acquire) >= target;
+  });
+  return last_applied_addr_.load(std::memory_order_acquire) >= target;
 }
 
 thread_local CorfuDBStorage::FenceToken CorfuDBStorage::fence_token_;
@@ -1064,10 +1173,114 @@ void CorfuDBStorage::finishBatchLocked(std::string const& fileName,
   }
 }
 
+// FAST PATH (PLAN-trimming.md §0, "fast path"). The slow path below waits
+// for the tailer to pass the batch's address because that is the first
+// moment it knows whether a SEAL of fileName was sequenced BELOW the
+// address. The sequencer can answer that at token time: the token request
+// carries key(fileName) in its read set at snapshot S = last_applied_addr_,
+// and every SEAL / REMOVE carries the same key in its write set
+// (jniAppendKeyed), recorded by the sequencer when their token is issued.
+// A granted token at addr therefore proves that no SEAL / REMOVE of
+// fileName was tokened in (S, addr]. The tailer applied every entry <= S
+// before S was published (applyEntryBytes stores last_applied_addr_ last,
+// under mtx_), so sealed_at_addr_ / removed_files_ decide the rest
+// exactly. The bytes at addr belong to fileName in every process, and the
+// batch is acked before the tailer reaches addr: one token + one write,
+// the same cost as before the ack rule. The tailer still applies the
+// entry, in address order, as the only writer of file_buffers_; reads
+// fence on last_written_addr_, so read-my-writes is unchanged.
+//
+// A refused token has no address: nothing lands. TX_ABORT_CONFLICT names
+// the address T at which the key was last written. Waiting for the tailer
+// to reach T then shows either the SEAL / REMOVE (kSealed / kFailure, the
+// caller retries on the new tail) or nothing at all — the key's write
+// became a hole, its writer retried above T — in which case the append is
+// retried with a fresh snapshot. Any other refusal (a snapshot the
+// sequencer cannot vouch for: stale epoch, below the tail at sequencer
+// bootstrap, below the conflict cache's eviction mark or the trim mark)
+// sends the batch to the slow path, which is always correct.
+bool CorfuDBStorage::submitBatchFast(JNIEnv* env, std::string const& fileName,
+                                     std::shared_ptr<Batch> const& batch) {
+  constexpr int kAttempts = 3;
+  constexpr auto kConflictWait = std::chrono::seconds(1);
+  for (int attempt = 0; attempt < kAttempts; ++attempt) {
+    long snapshot;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (batch->done) return true;  // a peer REMOVE settled it
+      if (sealed_at_addr_.count(fileName)) {
+        // The seal is known (own or peer). An append would only land
+        // above it and be dropped everywhere: refuse it here.
+        finishBatchLocked(fileName, batch, Status::kSealed);
+        return true;
+      }
+      if (removed_files_.count(fileName)) {
+        finishBatchLocked(fileName, batch, Status::kFailure);
+        return true;
+      }
+      snapshot = last_applied_addr_.load(std::memory_order_acquire);
+    }
+
+    CheckedAppend r = jniAppendChecked(env, fileName, ::CorfuEntry_Op_APPEND,
+                                       batch->payload.data(),
+                                       static_cast<int>(batch->payload.size()),
+                                       snapshot, /*read_key=*/true, /*write_key=*/false);
+    if (r.addr >= 0) {
+      publishWrittenAddr(r.addr);
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (batch->done) return true;  // a peer REMOVE settled it meanwhile
+      if (removed_files_.count(fileName)) {
+        finishBatchLocked(fileName, batch, Status::kFailure);
+        return true;
+      }
+      batch->addr = r.addr;
+      finishBatchLocked(fileName, batch, Status::kSuccess);
+      fast_acks_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+
+    if (r.abort != kAbortConflict) {
+      switch (r.abort) {
+        case kAbortNewSequencer: slow_path_newseq_.fetch_add(1, std::memory_order_relaxed); break;
+        case kAbortSeqOverflow: slow_path_overflow_.fetch_add(1, std::memory_order_relaxed); break;
+        case kAbortSeqTrim: slow_path_trim_.fetch_add(1, std::memory_order_relaxed); break;
+        default: slow_path_other_.fetch_add(1, std::memory_order_relaxed); break;
+      }
+      return false;
+    }
+
+    conflict_aborts_.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock<std::mutex> lock(mtx_);
+    bool reached = true;
+    if (r.offending >= 0) reached = waitForTailerLocked(lock, r.offending, kConflictWait);
+    if (batch->done) return true;
+    if (sealed_at_addr_.count(fileName)) {
+      finishBatchLocked(fileName, batch, Status::kSealed);
+      return true;
+    }
+    if (removed_files_.count(fileName)) {
+      finishBatchLocked(fileName, batch, Status::kFailure);
+      return true;
+    }
+    if (!reached) {
+      // The tailer did not get to T. The slow path's own append moves
+      // the tailer past it, so let that path decide.
+      slow_path_stalled_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    // The tailer passed T and fileName is neither sealed nor removed:
+    // the key's write at T never landed. Retry with a fresh snapshot.
+    spurious_conflicts_.fetch_add(1, std::memory_order_relaxed);
+  }
+  slow_path_other_.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
+
 // JNI submit, then wait for the tailer to pass the new address and read
 // the outcome under mtx_. mtx_ must NOT be held on entry: the JNI
 // round-trip runs unlocked so it does not block readers, the tailer, or
-// writers on other files.
+// writers on other files. The fast path (submitBatchFast) runs first when
+// enabled; what follows it is the slow path.
 Status CorfuDBStorage::submitBatch(std::string const& fileName,
                                    std::shared_ptr<Batch> const& batch) {
   // The caller holds write_gate_ shared (taken before the batch entered
@@ -1078,6 +1291,16 @@ Status CorfuDBStorage::submitBatch(std::string const& fileName,
     return Status::kFailure;
   }
   JNIEnv* env = attachThread();
+  if (env && fast_ack_ && submitBatchFast(env, fileName, batch)) {
+    batch_flushed_cv_.notify_all();
+    if (batch->result == Status::kSuccess) last_append_addr_ = batch->addr;
+    return batch->result;
+  }
+
+  // SLOW PATH: a plain token, then wait for the tailer to pass the new
+  // address and read the outcome. Taken when the fast path is off, or
+  // when the sequencer could not answer for the snapshot (right after a
+  // sequencer restart, a trim, or a conflict-cache eviction).
   long addr = -1;
   if (env) {
     addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
@@ -1095,10 +1318,7 @@ Status CorfuDBStorage::submitBatch(std::string const& fileName,
     } else {
       // Publish the address first so every fence on this process
       // covers these bytes from here on.
-      long prev = last_written_addr_.load(std::memory_order_acquire);
-      while (addr > prev &&
-             !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
-      }
+      publishWrittenAddr(addr);
 
       // ACK RULE. The tailer applies this entry like any peer's, in
       // address order (applyEntryBytes): spliced into file_buffers_, or
@@ -1394,14 +1614,14 @@ void CorfuDBStorage::seal(std::string fileName) {
 
   JNIEnv* env = attachThread();
   if (!env) return;
-  long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_SEAL, nullptr, 0);
+  // Keyed: the sequencer records key(fileName) at this address, which is
+  // what lets every writer's fast path (submitBatchFast) see the seal at
+  // token time. A SEAL without the key would be invisible to it.
+  long addr = jniAppendKeyed(env, fileName, ::CorfuEntry_Op_SEAL);
   if (addr < 0) return;
   {
     std::lock_guard<std::mutex> lk(mtx_);
-    long prev = last_written_addr_.load(std::memory_order_acquire);
-    while (addr > prev &&
-           !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
-    }
+    publishWrittenAddr(addr);
     sealed_files_.insert(fileName);
     // Record the seal address right away, before the tailer reaches this
     // SEAL: own appends still in flight are judged against it as soon as
@@ -1427,12 +1647,11 @@ void CorfuDBStorage::remove(std::string fileName) {
   if (trimmed_out_.load()) return;
   JNIEnv* env = attachThread();
   if (!env) return;
-  long addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_REMOVE, nullptr, 0);
+  // Keyed for the same reason as the SEAL in seal(): a peer's fast path
+  // must see the REMOVE at token time.
+  long addr = jniAppendKeyed(env, fileName, ::CorfuEntry_Op_REMOVE);
   if (addr < 0) return;
-  long prev = last_written_addr_.load(std::memory_order_acquire);
-  while (addr > prev &&
-         !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
-  }
+  publishWrittenAddr(addr);
   std::lock_guard<std::mutex> lk(mtx_);
   file_buffers_.erase(fileName);
   sealed_files_.erase(fileName);

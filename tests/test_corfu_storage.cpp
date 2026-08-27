@@ -218,6 +218,65 @@ TEST(CorfuStorageTest, ack_never_outruns_a_peer_seal) {
   delete a;
 }
 
+namespace {
+std::vector<unsigned char> readAllFenced(CorfuDBStorage* s, std::string const& file) {
+  s->sync();
+  unsigned char* data = nullptr;
+  size_t size = 0;
+  std::vector<unsigned char> out;
+  if (s->read(file, data, size) == Status::kSuccess) out.assign(data, data + size);
+  delete[] data;
+  s->clearSync();
+  return out;
+}
+}  // namespace
+
+// The fast path (PLAN-trimming.md §0): a data append is acked on the
+// sequencer's answer, not after the tailer applied it, because its token
+// request carries the file's conflict key. Checks that the fast path is
+// taken on a warm stream, that a peer's SEAL turns the next append into
+// kSealed with no bytes landing (the sequencer refused the token, or the
+// seal was already known locally), that a second file keeps flowing fast,
+// and that both processes read exactly the acked bytes.
+TEST(CorfuStorageTest, fast_ack_taken_and_refused_by_a_peer_seal) {
+  SKIP_IF_NO_CORFU();
+  std::string stream = CorfuStorageEnv::uniqueStream("corfu_fast_ack");
+  CorfuDBStorage* a = makeStorage(stream);
+  CorfuDBStorage* b = makeStorage(stream);
+  std::vector<unsigned char> acked;
+  auto put = [&](std::string const& file, int i) {
+    std::vector<unsigned char> p(16, static_cast<unsigned char>(i));
+    Status s = a->appendInBatch(file, p.data(), static_cast<int>(p.size()));
+    if (s == Status::kSuccess && file == "f") acked.insert(acked.end(), p.begin(), p.end());
+    return s;
+  };
+  // Warm-up: the first appends of a fresh stream may take the slow path
+  // (a snapshot below the tail at sequencer bootstrap).
+  for (int i = 0; i < 5; ++i) ASSERT_EQ(Status::kSuccess, put("f", i));
+  uint64_t const fast_before = a->fastAcks();
+  for (int i = 5; i < 50; ++i) ASSERT_EQ(Status::kSuccess, put("f", i));
+  EXPECT_GE(a->fastAcks() - fast_before, 40u) << "fast path not taken on a warm stream";
+  EXPECT_EQ(0u, a->spuriousConflicts());
+
+  b->seal("f");
+  std::vector<unsigned char> p(16, 0xEE);
+  EXPECT_EQ(Status::kSealed, a->appendInBatch("f", p.data(), static_cast<int>(p.size())));
+  EXPECT_EQ(Status::kSealed, a->appendInBatch("f", p.data(), static_cast<int>(p.size())));
+
+  uint64_t const fast_mid = a->fastAcks();
+  for (int i = 0; i < 20; ++i) ASSERT_EQ(Status::kSuccess, put("g", i));
+  EXPECT_GE(a->fastAcks() - fast_mid, 18u) << "fast path lost after a peer seal";
+
+  EXPECT_EQ(acked, readAllFenced(b, "f"));
+  EXPECT_EQ(acked, readAllFenced(a, "f"));
+  EXPECT_EQ(50u * 16u, acked.size());
+  EXPECT_EQ(20u * 16u, readAllFenced(b, "g").size());
+  EXPECT_EQ(0u, a->droppedAboveSeal()) << "a refused token must never land";
+  EXPECT_EQ(0u, b->droppedAboveSeal());
+  delete b;
+  delete a;
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoints and trimming (PLAN-trimming.md). These trim the shared test
 // server's log, so they sit at the end of the file: a later test on a

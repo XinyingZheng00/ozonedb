@@ -45,13 +45,19 @@ class CorfuDBStorage : public Storage {
   // checkpoint from <checkpoint_dir>/LATEST and replays only the stream
   // entries above it. When null, it replays from address 0 -- and throws
   // if the log was trimmed, because no replay can then be complete.
+  // fast_ack: ack a data append as soon as the sequencer granted its
+  // token (see submitBatchFast) instead of after the tailer applied it.
+  // Off only for A/B measurement; SEAL and REMOVE entries carry their
+  // conflict key either way, so a process with the fast path off never
+  // blinds a peer that has it on.
   CorfuDBStorage(std::string const& endpoint,
                  std::string const& jar_path,
                  std::string const& jvm_opts,
                  std::string const& stream_name,
                  std::string const& db_path,
                  Storage* checkpoint_store = nullptr,
-                 std::string const& checkpoint_dir = "checkpoint");
+                 std::string const& checkpoint_dir = "checkpoint",
+                 bool fast_ack = true);
   ~CorfuDBStorage();
 
   void createDirectory(std::string name) override;
@@ -110,6 +116,15 @@ class CorfuDBStorage : public Storage {
   // had not applied the SEAL yet — see submitBatch's ack rule.
   uint64_t droppedAboveSeal() const { return dropped_above_seal_.load(std::memory_order_relaxed); }
   uint64_t droppedAboveSealBytes() const { return dropped_above_seal_bytes_.load(std::memory_order_relaxed); }
+  // Ack-path counters (see submitBatchFast). fast: acked on the
+  // sequencer's answer; slow: acked after the tailer wait; conflict: the
+  // sequencer refused a token because the file's key was written above
+  // the snapshot; spurious: a refusal that named an address holding no
+  // SEAL/REMOVE of the file (the key's write became a hole).
+  uint64_t fastAcks() const { return fast_acks_.load(std::memory_order_relaxed); }
+  uint64_t slowAcks() const { return ack_wait_batches_.load(std::memory_order_relaxed); }
+  uint64_t conflictAborts() const { return conflict_aborts_.load(std::memory_order_relaxed); }
+  uint64_t spuriousConflicts() const { return spurious_conflicts_.load(std::memory_order_relaxed); }
   bool loadedFromCheckpoint() const { return loaded_from_checkpoint_; }
   // Detach the calling thread from the JVM. A thread that made JNI calls
   // (LogTrimmer's) must call this before it exits.
@@ -140,6 +155,8 @@ class CorfuDBStorage : public Storage {
   jobject bridge_global_ = nullptr;
   jclass bridge_class_global_ = nullptr;
   jmethodID mid_append_ = nullptr;
+  jmethodID mid_appendChecked_ = nullptr;
+  jmethodID mid_globalTail_ = nullptr;
   jmethodID mid_pollNext_ = nullptr;
   jmethodID mid_pollBatch_ = nullptr;
   jmethodID mid_tailAddress_ = nullptr;
@@ -169,6 +186,8 @@ class CorfuDBStorage : public Storage {
   //
   // `done` is the single ack point. It is set exactly once, under mtx_,
   // by whichever of these happens first:
+  //   - the sequencer granted the token with the file's
+  //     conflict key in the read set (submitBatchFast)   -> kSuccess
   //   - the tailer applied the entry at its address     -> kSuccess
   //   - the JNI submit fails                             -> kFailure
   //   - the file was sealed at a LOWER global address    -> kSealed
@@ -177,12 +196,14 @@ class CorfuDBStorage : public Storage {
   // A caller may only ack a write after `done` is true, and must return
   // `result`, never an assumed kSuccess.
   //
-  // `done` deliberately means "applied to file_buffers_ by the tailer",
-  // not merely "sequenced". Reads serve file_buffers_ only (see read()),
-  // so waiting for the apply is what preserves read-my-writes; and the
-  // tailer being the only writer of file_buffers_ (own entries included,
-  // see applyEntryBytes) is what keeps every process's copy of a file in
-  // the same, address, order.
+  // `done` means "the bytes at addr belong to fileName in every process":
+  // either the sequencer proved it at token time (fast path) or the
+  // tailer applied the entry and reported it (slow path). It never means
+  // "sequenced, outcome assumed". The tailer stays the only writer of
+  // file_buffers_ (own entries included, see applyEntryBytes), which is
+  // what keeps every process's copy of a file in the same, address,
+  // order; and reads fence on last_written_addr_ (globalFenceTarget), so
+  // an acked write is visible to the reads that follow it either way.
   struct Batch {
     long addr = -1;  // global Corfu address, stamped once the outcome is known
     std::vector<unsigned char> payload;
@@ -253,6 +274,17 @@ class CorfuDBStorage : public Storage {
   std::atomic<uint64_t> sealed_after_wait_{0};
   std::atomic<uint64_t> dropped_above_seal_{0};
   std::atomic<uint64_t> dropped_above_seal_bytes_{0};
+  // Fast-path counters (submitBatchFast). slow_path_* count the sequencer
+  // answers that sent a batch to the tailer wait, by abort type.
+  bool fast_ack_ = true;
+  std::atomic<uint64_t> fast_acks_{0};
+  std::atomic<uint64_t> conflict_aborts_{0};
+  std::atomic<uint64_t> spurious_conflicts_{0};
+  std::atomic<uint64_t> slow_path_newseq_{0};
+  std::atomic<uint64_t> slow_path_overflow_{0};
+  std::atomic<uint64_t> slow_path_trim_{0};
+  std::atomic<uint64_t> slow_path_other_{0};
+  std::atomic<uint64_t> slow_path_stalled_{0};
 
   // Randomly-generated id that tags every APPEND this process writes to
   // the shared stream. The tailer applies own and peer entries alike; the
@@ -308,8 +340,41 @@ class CorfuDBStorage : public Storage {
   void startJvm(std::string const& jar_path, std::string const& jvm_opts);
   JNIEnv* attachThread();
   void loadBridge(std::string const& endpoint, std::string const& stream_name);
+  // One CorfuEntry, serialized. Shared by both append flavours.
+  std::string serializeEntry(std::string const& file_name, int op,
+                             unsigned char const* data, int length) const;
+  // Plain append: token without conflict keys. The outcome of an APPEND
+  // sent this way is known only once the tailer passed its address.
   long jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
                       unsigned char const* data, int length);
+  // Outcome of CorfuBridge.appendChecked. addr >= 0 on success; else
+  // abort holds one of the kAbort* codes (mirrors CorfuBridge.ABORT_*)
+  // and offending the conflicting address for kAbortConflict, -1 otherwise.
+  struct CheckedAppend {
+    long addr = -1;
+    long abort = 0;
+    long offending = -1;
+  };
+  static constexpr long kAbortConflict = -2;
+  static constexpr long kAbortNewSequencer = -3;
+  static constexpr long kAbortSeqOverflow = -4;
+  static constexpr long kAbortSeqTrim = -5;
+  static constexpr long kAbortOther = -6;
+  // The conflict key of a file: its name. Names are never reused.
+  // read_key puts it in the read set at `snapshot`; write_key puts it in
+  // the write set. See CorfuBridge.appendChecked.
+  CheckedAppend jniAppendChecked(JNIEnv* env, std::string const& file_name, int op,
+                                 unsigned char const* data, int length,
+                                 long snapshot, bool read_key, bool write_key);
+  // Global log tail, -1 on a JNI error. One sequencer round trip.
+  long jniGlobalTail(JNIEnv* env);
+  // Append a payload-less entry (SEAL, REMOVE) with the file's key in the
+  // write set, so the sequencer records it. Retries a refused snapshot
+  // with the global tail. Returns the address, -1 when the sequencer
+  // refused every attempt (the entry was NOT appended).
+  long jniAppendKeyed(JNIEnv* env, std::string const& file_name, int op);
+  // Raise last_written_addr_ to addr (monotonic).
+  void publishWrittenAddr(long addr);
   bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
   // Core apply logic, takes already-JNI-extracted bytes. Shared by
   // applyEntryFromJava (single-entry path, no longer on any hot path)
@@ -345,6 +410,9 @@ class CorfuDBStorage : public Storage {
   void drainDispatchQueue();
   long globalFenceTarget();
   void waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target);
+  // Same wait with an explicit bound; true when the tailer reached target.
+  bool waitForTailerLocked(std::unique_lock<std::mutex>& lock, long target,
+                           std::chrono::milliseconds timeout);
   // True when a SEAL for fileName is known at an address below addr.
   bool sealedBelowLocked(std::string const& fileName, long addr) const;
 
@@ -366,6 +434,12 @@ class CorfuDBStorage : public Storage {
   // returns batch->result. The caller holds write_gate_ shared (see
   // write_gate_).
   Status submitBatch(std::string const& fileName, std::shared_ptr<Batch> const& batch);
+  // The fast path of submitBatch: keyed append, acked on the sequencer's
+  // answer. True when the batch is settled (batch->done); false when the
+  // sequencer could not answer and submitBatch must take the slow path.
+  // Same locking contract as submitBatch.
+  bool submitBatchFast(JNIEnv* env, std::string const& fileName,
+                       std::shared_ptr<Batch> const& batch);
   // Block until `batch` is settled by whichever thread owns it, and
   // return its outcome. Takes mtx_ itself, so the caller must not hold it.
   Status awaitBatch(std::shared_ptr<Batch> const& batch);

@@ -72,10 +72,14 @@
     # forces a full rebuild after a sync that changed something, which
     # costs about a minute on a 32-core node -- cheap next to debugging a
     # binary that does not contain the change you just pushed.
+    # Sources only. Touching ozonedb-jni-maven/*/target too made the compiled
+    # CorfuBridge.class newer than CorfuBridge.java, so Maven skipped the
+    # recompile and the shaded jar kept the old class while the C++ side
+    # was rebuilt against the new one (NoSuchMethodError at load).
     - name: Refresh source mtimes so make rebuilds what changed
       ansible.builtin.raw: >-
         bash -lc 'cd {{ repo_dest | quote }} &&
-        find src tests ozonedb-jni-maven CMakeLists.txt -type f -exec touch {} + 2>/dev/null; true'
+        find src tests ozonedb-jni-maven CMakeLists.txt -type f -not -path "*/target/*" -exec touch {} + 2>/dev/null; true'
       when: sync_result is changed
       changed_when: false
       tags: [sync]

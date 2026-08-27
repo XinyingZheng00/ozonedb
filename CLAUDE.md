@@ -235,12 +235,22 @@ side is commented out in `db.cpp`, so lookups always miss.
 All files are packed into one Corfu stream; each entry is a `CorfuEntry` protobuf
 {`file_name`, `op` (APPEND/SEAL/REMOVE/TRIM), `payload`, `client_id`}. A background tailer
 reconstructs per-file buffers and is the **only** writer of those buffers, own entries included,
-so every process holds each file in address order. An append is acked only after the tailer
-passed its address (`submitBatch`): that is where the seal rule (an APPEND sequenced above its
-file's SEAL belongs to no file) is decided, and it is what makes the task-log election
-("first claim in `task.log`") the same in every process. Acking before that point lost ~0.7 %
-of an 8-writer load and let several writers execute the same compaction. `client_id` only
-decides whether the remote-append listener fires (own records are indexed by the writer path).
+so every process holds each file in address order, which is what makes the task-log election
+("first claim in `task.log`") the same in every process. An append is acked only once its
+outcome is **proven**, never assumed: the seal rule (an APPEND sequenced above its file's SEAL
+belongs to no file) is decided either by the sequencer at token time or by the tailer.
+`submitBatchFast` sends the file name as a Corfu conflict key in the token request's read set
+at snapshot `last_applied_addr_`; every `SEAL`/`REMOVE` carries the same key in its write set
+(`jniAppendKeyed`), so a granted token proves no seal sits between the snapshot and the new
+address and the put returns without waiting for the tailer. A refused token has no address.
+When the sequencer cannot vouch for the snapshot (right after a sequencer restart or a trim)
+the slow path takes a plain token and waits for the tailer to pass it (`waitForTailerLocked`).
+Acking on the writer's partial knowledge lost ~0.7 % of an 8-writer load and let several
+writers execute the same compaction. **Never append a `SEAL` or `REMOVE` without the key**,
+and never mix builds that predate the key in one cell: a keyless seal is invisible to every
+peer's fast path. `corfu_fast_ack = false` selects the slow path for every append (A/B only).
+`client_id` only decides whether the remote-append listener fires (own records are indexed by
+the writer path).
 Reads fence on the writer's last-known address for read-my-writes. **The tailer never invokes the remote-append
 listener synchronously** — a dedicated dispatch thread does, because the listener takes the
 `LRUCache` mutex that a foreground thread may hold while fencing on the tailer. Preserve that

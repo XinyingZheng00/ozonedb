@@ -75,31 +75,49 @@ snapshot becomes trivially exact. Regression test:
 `records_in / unique / inputs_skipped` per task (conservation check: on an insert-only load
 `records_in == unique`), and `LogHandler::addRecord` logs a refused append.
 
-**Cost.** A put now waits for the tailer to pass its own address: one more Corfu round
-trip. Single-threaded YCSB writers went from ~1,000 to ~350 puts/s each (average wait
-2.2 ms, 8 writers on one host). The fast path can be restored without giving up the
-guarantee by asking the **sequencer** the seal question at token time: Corfu's
-`StreamsView.append(payload, TxResolutionInfo, …)` aborts a token when a conflict key was
-written after a snapshot address (`SequencerServer.txnCanCommit`, `TX_ABORT_CONFLICT`);
-appends would carry `seal(F)` as a read key and `SEAL` entries as a write key, with
-`TX_ABORT_SEQ_TRIM/OVERFLOW` falling back to the tailer wait. That keeps the writer from
-splicing early only for the *data* path; `task.log` and `metadata.log` would still need
-address-ordered application. Follow-up, not done here.
+**Cost of the tailer wait, and the fast path restored.** With the ack tied to the tailer a
+put paid one more Corfu round trip: single-threaded YCSB writers went from ~1,000 to ~350
+puts/s each (average wait 2.2 ms, 8 writers on one host). The wait existed for one question
+only — *was a `SEAL`/`REMOVE` of this file sequenced between what my tailer applied and my
+new address?* — and the **sequencer** can answer it at token time. Corfu's
+`StreamsView.append(payload, TxResolutionInfo, stream)` sends a read set and a write set
+with the token request; `SequencerServer.txnCanCommit` refuses the token
+(`TX_ABORT_CONFLICT`, naming the offending address) when a read key was written at an
+address `>` the snapshot, and write keys are recorded at token issue (verified on the pinned
+commit `8f144d4`). `CorfuDBStorage::submitBatchFast` therefore sends the file name as a read
+key at snapshot `S = last_applied_addr_`, and `seal()`/`remove()` send it as a write key
+(`jniAppendKeyed`, `CorfuBridge.appendChecked`). A granted token at `addr` proves no
+`SEAL`/`REMOVE` of the file in `(S, addr]`; the tailer applied every entry `<= S`, so
+`sealed_at_addr_`/`removed_files_` decide the rest exactly, and the put returns after the
+token and the log-unit write — the pre-fix cost. A refused token has no address, so nothing
+lands: the append is reported `kSealed` once the tailer reaches the offending address (a
+refusal that names an address holding no seal — the key's write became a hole — is retried
+with a fresh snapshot; `spurious=0` in every run so far). The other refusals
+(`TX_ABORT_NEWSEQ` after a sequencer restart, `SEQ_OVERFLOW` after a conflict-cache
+eviction, `SEQ_TRIM` below the trim mark) send the batch to the slow path — a plain token
+plus the tailer wait, unchanged. The tailer stays the only writer of `file_buffers_`, in
+address order, so `task.log`/`metadata.log` and the election are untouched; reads still
+fence on `last_written_addr_`, so read-my-writes is unchanged. Two rules follow: **every
+`SEAL`/`REMOVE` carries the key** regardless of `corfu_fast_ack` (a keyless seal is
+invisible to every peer's fast path), and a cell must not mix builds that predate the key.
+`corfu_fast_ack = false` selects the slow path for every append (A/B only). Counters are
+printed at teardown: `[corfu] ack: fast=… slow=… conflict=… spurious=… slow_by_cause(…)`.
+Regression test: `CorfuStorageTest.fast_ack_taken_and_refused_by_a_peer_seal`.
 
 **Results after the fix** (same cell: amd127 corfu + MinIO, 8 writers on amd160, 1M × 1 KB,
 no trimming; the control is the run before the fix on the same cell):
 
-| | Control (before) | Ack waits for the tailer (after) |
-|---|---|---|
-| Puts refused (`Failed to put`) | 0 | 0 |
-| Appends above a seal in the stream (`corfu_stream_stats`) | **7,407 acked, dropped by peers** | 101, all reported `kSealed` and retried |
-| Compaction tasks / `COMPACT` records / applied in address order | 23 / 83 / 23 (60 duplicates) | 24 / 24 / 24 |
-| Executors per task | 1–6 | exactly 1 |
-| `records_in == unique` for every compaction | (not logged) | yes, no skipped input |
-| Workload c NOT_FOUND, default / `--linearizable` | 0.63 % / 0.62 % | **0 / 52,926 and 0 / 52,559** |
-| Reader live set after replay | 51 MB | 28 MB |
-| Put throughput per single-threaded writer | ~1,000/s | ~350/s (ack wait avg 2.1 ms, max 0.17 s) |
-| `CorfuStorageTest` / smoke | 10/10 | 11/11 (+`ack_never_outruns_a_peer_seal`), both smokes PASS |
+| | Control (before) | Ack waits for the tailer | Sequencer-keyed fast ack (current) |
+|---|---|---|---|
+| Puts refused (`Failed to put`) | 0 | 0 | 0 |
+| Appends above a seal in the stream (`corfu_stream_stats`) | **7,407 acked, dropped by peers** | 101, all reported `kSealed` and retried | **0** — 25–31 refusals per writer at token time, none landed |
+| Compaction tasks / `COMPACT` records / applied in address order | 23 / 83 / 23 (60 duplicates) | 24 / 24 / 24 | 24 / 24 / 24 |
+| Executors per task | 1–6 | exactly 1 | exactly 1 |
+| `records_in == unique` for every compaction | (not logged) | yes, no skipped input | yes, no skipped input |
+| Workload c NOT_FOUND, default / `--linearizable` | 0.63 % / 0.62 % | **0 / 52,926 and 0 / 52,559** | **0 / 53,143 and 0 / 53,271** |
+| Reader live set after replay | 51 MB | 28 MB | — |
+| Put throughput per single-threaded writer | ~1,000/s | ~350/s (ack wait avg 2.1 ms, max 0.17 s) | **~1,090/s** (fast=125k, slow=0, spurious=0 per writer; aggregate 8,395/s) |
+| `CorfuStorageTest` / smoke | 10/10 | 11/11 (+`ack_never_outruns_a_peer_seal`), both smokes PASS | 12/12 (+`fast_ack_taken_and_refused_by_a_peer_seal`), both smokes PASS |
 
 Left as is, documented: `MetadataLogHandler` still buffers a `COMPACT` whose input is not
 at the level's front with no log line, and a task whose owner dies mid-compaction blocks

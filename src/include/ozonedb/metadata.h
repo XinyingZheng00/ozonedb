@@ -36,6 +36,10 @@ class Metadata {
   std::string corfu_jar_path;
   std::string corfu_jvm_opts;
   std::string corfu_stream_name = "ozonedb";
+  // Ack a Corfu data append on the sequencer's answer (the fast path of
+  // CorfuDBStorage::submitBatch). "false" / "0" makes every append wait
+  // for the tailer instead; only for A/B measurement.
+  bool corfu_fast_ack = true;
 
   // Optional separate backend for SSTable storage. When unset, SSTables
   // share the main backend (backward-compat with all existing configs).
@@ -167,6 +171,10 @@ class Metadata {
       if (opts_it != result.end()) corfu_jvm_opts = opts_it->second;
       auto stream_it = result.find("corfu_stream_name");
       if (stream_it != result.end()) corfu_stream_name = stream_it->second;
+      auto fast_it = result.find("corfu_fast_ack");
+      if (fast_it != result.end()) {
+        corfu_fast_ack = !(fast_it->second == "false" || fast_it->second == "0");
+      }
     }
 
     // Optional SSTable-specific backend. See paper §3.5 — SSTables don't

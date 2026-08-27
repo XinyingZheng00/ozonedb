@@ -2,13 +2,18 @@ package site.ycsb.db.corfu;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import org.corfudb.protocols.wireprotocol.ILogData;
 import org.corfudb.protocols.wireprotocol.Token;
+import org.corfudb.protocols.wireprotocol.TxResolutionInfo;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuRuntime.CorfuRuntimeParameters;
+import org.corfudb.runtime.exceptions.TransactionAbortedException;
 import org.corfudb.runtime.exceptions.TrimmedException;
 import org.corfudb.runtime.view.stream.IStreamView;
 
@@ -16,8 +21,9 @@ import org.corfudb.runtime.view.stream.IStreamView;
  * Thin JNI-facing wrapper around CorfuRuntime + IStreamView.
  *
  * OzoneDB's C++ CorfuDBStorage loads this class via an embedded JVM and
- * drives Corfu through just five methods: the constructor, {@link #append},
- * {@link #pollNext}, {@link #tailAddress}, and {@link #close}. Keeping the
+ * drives Corfu through a small set of methods: the constructor,
+ * {@link #append} / {@link #appendChecked}, {@link #pollBatch},
+ * {@link #tailAddress}, the trim helpers, and {@link #close}. Keeping the
  * surface area tight minimizes JNI method lookups and simplifies lifetime
  * management on the C++ side.
  *
@@ -117,6 +123,92 @@ public class CorfuBridge {
       pollSignal.notifyAll();
     }
     return addr;
+  }
+
+  // Abort codes returned in {@code appendChecked()[0]}. All negative, so
+  // none can be mistaken for a log address. Mirrored by
+  // CorfuDBStorage::CheckedAppend on the C++ side.
+  public static final long ABORT_CONFLICT = -2;
+  public static final long ABORT_NEW_SEQUENCER = -3;
+  public static final long ABORT_SEQ_OVERFLOW = -4;
+  public static final long ABORT_SEQ_TRIM = -5;
+  public static final long ABORT_OTHER = -6;
+
+  /**
+   * Append whose token request carries conflict keys, so the sequencer
+   * answers "was this file sealed since my snapshot?" at token time
+   * (PLAN-trimming.md §0, the fast put path).
+   *
+   * {@code readKey} goes into the read set at snapshot {@code snapshotAddr}:
+   * the sequencer refuses the token ({@link #ABORT_CONFLICT}) when that
+   * key was written at an address ABOVE the snapshot
+   * ({@code SequencerServer.txnCanCommit}). {@code writeKey} goes into the
+   * write set: the sequencer records it at the token's address, at token
+   * issue. A refused append gets no address and nothing lands in the log.
+   * Either key may be null. The other abort types mean the sequencer
+   * cannot answer for this snapshot (stale epoch or a snapshot below the
+   * tail at sequencer bootstrap, below the conflict cache's eviction
+   * mark, or below the trim mark); the caller then falls back to the
+   * tailer wait.
+   *
+   * @return {@code {address, -1}} on success; {@code {ABORT_*, x}} on an
+   *         abort, where x is the offending address (the last address at
+   *         which the read key was written) for ABORT_CONFLICT and -1
+   *         otherwise.
+   */
+  public long[] appendChecked(byte[] payload, long snapshotAddr, byte[] readKey, byte[] writeKey) {
+    Map<UUID, Set<byte[]>> readSet = readKey == null
+        ? Collections.<UUID, Set<byte[]>>emptyMap()
+        : Collections.singletonMap(streamId, Collections.singleton(readKey));
+    Map<UUID, Set<byte[]>> writeSet = writeKey == null
+        ? Collections.<UUID, Set<byte[]>>emptyMap()
+        : Collections.singletonMap(streamId, Collections.singleton(writeKey));
+    long epoch = runtime.getLayoutView().getLayout().getEpoch();
+    TxResolutionInfo info = new TxResolutionInfo(UUID.randomUUID(),
+        new Token(epoch, snapshotAddr), readSet, writeSet);
+    try {
+      long addr = runtime.getStreamsView().append(payload, info, streamId);
+      synchronized (pollSignal) {
+        appendSeq++;
+        pollSignal.notifyAll();
+      }
+      return new long[] {addr, -1};
+    } catch (TransactionAbortedException e) {
+      long code;
+      if (e.getAbortCause() == null) {
+        code = ABORT_OTHER;
+      } else {
+        switch (e.getAbortCause()) {
+          case CONFLICT:
+            code = ABORT_CONFLICT;
+            break;
+          case NEW_SEQUENCER:
+            code = ABORT_NEW_SEQUENCER;
+            break;
+          case SEQUENCER_OVERFLOW:
+            code = ABORT_SEQ_OVERFLOW;
+            break;
+          case SEQUENCER_TRIM:
+            code = ABORT_SEQ_TRIM;
+            break;
+          default:
+            code = ABORT_OTHER;
+        }
+      }
+      Long offending = e.getOffendingAddress();
+      return new long[] {code, offending == null ? -1 : offending};
+    }
+  }
+
+  /**
+   * @return the global log tail. One sequencer round trip. Used as the
+   *         snapshot of a write-key-only append (SEAL, REMOVE) when the
+   *         tailer's position was refused: the current tail passes every
+   *         sequencer check except a stale epoch, which the runtime
+   *         refreshes on its own.
+   */
+  public long globalTail() {
+    return runtime.getSequencerView().query().getSequence();
   }
 
   private long appendSeqSnapshot() {
