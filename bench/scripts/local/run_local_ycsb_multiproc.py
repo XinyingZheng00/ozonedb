@@ -18,6 +18,8 @@ from load_local_ycsb_multiproc import (
     YCSB_DB_CLASSNAMES,
     cassandra_mode_settings,
     cassandra_ycsb_props,
+    CORFU_CLIENTS,
+    corfu_client_corfu_settings,
     linearizable_corfu_settings,
     log_trim_corfu_settings,
     lru_cache_corfu_settings,
@@ -404,6 +406,15 @@ if __name__ == "__main__":
              "Prefer this over toggling corfu.log_trim.enabled in ycsb.yaml.",
     )
     parser.add_argument(
+        "--corfu-client",
+        choices=CORFU_CLIENTS,
+        default=None,
+        help="ozonedb-corfu only: which Corfu client every writer runs, written as "
+             "corfu_client into each generated shared_config. jni = the embedded JVM + "
+             "CorfuBridge (default), native = the C++ client (PLAN-native-corfu.md); "
+             "native result files get a -native token. Prefer this over a ycsb.yaml edit.",
+    )
+    parser.add_argument(
         "--db_name",
         type=str,
         default=None,
@@ -472,6 +483,8 @@ if __name__ == "__main__":
     corfu_settings = config.get("corfu")
     if args.log_trim:
         corfu_settings = log_trim_corfu_settings(corfu_settings)
+    if args.corfu_client:
+        corfu_settings = corfu_client_corfu_settings(corfu_settings, args.corfu_client)
     s3_settings = config.get("s3")
     max_exec_time = (
         args.max_exec_time
@@ -489,6 +502,7 @@ if __name__ == "__main__":
         f"(db={db_names}, offset={offset}, total_writers={total_writers}, trial={trial}, "
         f"read_mode={'linearizable' if args.linearizable else 'default'}, "
         f"log_trim={'on' if args.log_trim else 'yaml'}, "
+        f"corfu_client={args.corfu_client or 'yaml'}, "
         f"cassandra_consistency={args.cassandra_consistency or 'yaml'}, "
         f"record_cnt={record_cnts}, "
         f"lru_cache_bytes={args.lru_cache_bytes or 'base config'})"

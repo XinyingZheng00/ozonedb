@@ -4,12 +4,45 @@ Replace the embedded JVM and `CorfuBridge.java` with a C++ Corfu client that spe
 Corfu protobuf protocol over TCP. The put path then crosses one JNI boundary (YCSB to
 OzoneDB) instead of three, and the tailer applies peer entries with no Java code.
 
-## 0. Status — plan only (2026-08-27)
+## 0. Status — code written, not yet built on a node (2026-08-27)
 
-Written after the cost campaign `cost-20260827` (`bench/RESULTS-cost.md`). Nothing is
-implemented. Base the work on `visibility` at `35f5cb90` or later, in a new worktree
-`worktree-native-corfu`. The plan does not depend on `worktree-plan-cost`, but phase 5
-reuses its extractor and its result tables.
+Written after the cost campaign `cost-20260827` (`bench/RESULTS-cost.md`). Branch
+`worktree-native-corfu` (worktree `.claude/worktrees/native-corfu`), cut from
+`worktree-plan-cost` at `79cbc054` so that phase 5 has the cost extractor and the result
+tables.
+
+Done on the laptop, without a Corfu server:
+
+| Phase | Item | State |
+|---|---|---|
+| 0 | `CorfuClient` seam, `JniCorfuClient`, `applyEntry(addr, data, len)`, `corfu_client` + four tuning keys in `Metadata`, `codecType(NONE)` in `CorfuBridge`, `pollNext` dropped | written |
+| 0 | profile (perf + async-profiler), codec NONE reload | **needs the cluster** |
+| 1 | transport, layout, codec, `corfu_native_probe`, 11 unit tests in `tests/test_corfu_codec.cpp` | written, unit tests pass on the laptop against Homebrew protobuf 34.1 |
+| 1 | golden frames from `tcpdump`, proto diff against commit `8f144d4` | **needs the cluster** (the laptop CorfuDB clone is at `05e0ba5`, see `src/corfu_proto/README.md`) |
+| 2 | sequential reader with the hole policy, `kTrimmed`, `seek`; `corfu_stream_stats --client` with an FNV digest of the top-level files | written |
+| 3 | writer (`TK_MULTI_STREAM`, `TK_TX`, overwrite retry, abort mapping, wake channel), `CORFU_TEST_CLIENT`, `cross_client_jni_and_native_share_a_stream` | written |
+| 4 | `prefixTrim` (sequencer, log unit, compact, trim mark), reconnect + re-handshake + layout refresh on a dead socket, `wrong_epoch` refresh | written; the restart and `ss -K` tests are **not** written |
+| 5 | `--corfu-client jni|native` on the loader, the runner, the orchestrator and both shell wrappers; label `ozonedb-corfu-native` | written |
+| 5 | cells, `RESULTS-cost.md`, default flip | **needs the cluster** |
+
+What was checked on the laptop: the six native sources, the probe and the codec tests
+compile and link (clang 17, protobuf 34.1, OpenSSL 3), and `corfu_storage.cpp`,
+`corfu_client_jni.cpp`, `log_trimmer.cpp`, `checkpoint.cpp`, both test files and
+`corfu_stream_stats.cpp` pass `-fsyntax-only` with stubbed Azure headers. The project
+build (`bench/scripts/build.sh`) did not run yet: vcpkg's protobuf is 4.25.1, and the CMake
+`protobuf_generate_cpp(... IMPORT_DIRS ...)` call for `src/corfu_proto` is unverified.
+
+Deviations from the design below: `CheckedAppend` keeps the three-field
+`{addr, abort, offending}` shape of the old code instead of `{addr, offending}`;
+`Poll` has a fourth value `kError`; the writer lives in `native_corfu_client.cpp` and the
+typed RPC layer with the retry policy is `corfu_rpc.{h,cpp}` (no `corfu_writer` file);
+headers are under `src/include/ozonedb/corfu/`; the CMake option is `OZONEDB_CORFU_NATIVE`
+(default ON) rather than `OZONEDB_CORFU_JNI`; the writer emits `PAYLOAD_CODEC = 0`, as the
+Java runtime does with codec NONE.
+
+Next: on a node, `bash bench/scripts/build.sh` with `-DOZONEDB_ENABLE_CORFU=ON`, then
+`./corfu_native_probe <lan>:9090 ozonedb-ycsb` against `/mnt/corfu/load` (phase-1 gate),
+then `CORFU_TEST_CLIENT=native ./runUnitTests --gtest_filter='CorfuStorageTest.*'`.
 
 ## 1. Purpose
 
@@ -526,12 +559,12 @@ Exit criteria:
 |---|---|
 | `src/include/ozonedb/corfu_client.h` (new) | the interface (§4.1) |
 | `src/db/corfu_client_jni.cpp` (new) | the JVM code moved out of `corfu_storage.cpp` |
-| `src/db/corfu/corfu_transport.{h,cpp}` (new) | frames, handshake, keepalive, reconnect |
-| `src/db/corfu/corfu_layout.{h,cpp}` (new) | layout fetch and validation |
-| `src/db/corfu/corfu_codec.{h,cpp}` (new) | `LogData`, UUIDs, stream id |
-| `src/db/corfu/corfu_writer.{h,cpp}` (new) | tokens, writes, trim |
-| `src/db/corfu/corfu_reader.{h,cpp}` (new) | sequential tailer, holes, seek |
-| `src/db/corfu/native_corfu_client.{h,cpp}` (new) | `CorfuClient` over the four above |
+| `src/include/ozonedb/corfu/corfu_transport.h`, `src/db/corfu/corfu_transport.cpp` (new) | frames, handshake, keepalive, reconnect |
+| `src/include/ozonedb/corfu/corfu_layout.h`, `src/db/corfu/corfu_layout.cpp` (new) | layout fetch and validation |
+| `src/include/ozonedb/corfu/corfu_codec.h`, `src/db/corfu/corfu_codec.cpp` (new) | `LogData`, UUIDs, stream id |
+| `src/include/ozonedb/corfu/corfu_rpc.h`, `src/db/corfu/corfu_rpc.cpp` (new) | typed RPCs (token, write, read, trim) with the retry policy of §4.2 |
+| `src/include/ozonedb/corfu/corfu_reader.h`, `src/db/corfu/corfu_reader.cpp` (new) | sequential tailer, holes, seek |
+| `src/db/corfu/native_corfu_client.cpp` (new) | `CorfuClient` over the four above, plus the writer (§4.4) |
 | `src/corfu_proto/**` (new) | vendored protos with the commit hash |
 | `src/db/corfu_storage.{cpp,h}` | use `CorfuClient`, `applyEntry(addr, data, len)` |
 | `src/include/ozonedb/metadata.h` | five keys (§4.7) |

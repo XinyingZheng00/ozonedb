@@ -2,6 +2,7 @@
 #define CORFU_STORAGE_H
 #ifdef OZONEDB_ENABLE_CORFU
 #include "checkpoint.h"
+#include "corfu_client.h"
 #include "storage.h"
 #include <atomic>
 #include <chrono>
@@ -18,7 +19,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include <jni.h>
 
 namespace ozonedb {
 
@@ -29,9 +29,11 @@ namespace ozonedb {
  * Corfu stream. Each log entry is a CorfuEntry protobuf carrying a filename,
  * an opcode (APPEND / SEAL / REMOVE) and a payload.
  *
- * The C++ process bridges into CorfuDB via an embedded JVM and a thin Java
- * wrapper class (site.ycsb.db.corfu.CorfuBridge) whose fat jar is on the
- * JVM classpath.
+ * The process reaches Corfu through a CorfuClient (corfu_client.h): either
+ * the embedded JVM + site.ycsb.db.corfu.CorfuBridge (corfu_client = jni) or
+ * the C++ client in src/db/corfu/ (corfu_client = native). Everything
+ * below the seam -- locks, batches, the ack rule, the tailer -- is the
+ * same for both.
  *
  * A background tailer thread continually polls new entries and reconstructs
  * per-file buffers plus a sealed-files set. Reads wait for the tailer to
@@ -50,6 +52,13 @@ class CorfuDBStorage : public Storage {
   // Off only for A/B measurement; SEAL and REMOVE entries carry their
   // conflict key either way, so a process with the fast path off never
   // blinds a peer that has it on.
+  CorfuDBStorage(CorfuClientOptions const& client_options,
+                 std::string const& db_path,
+                 Storage* checkpoint_store = nullptr,
+                 std::string const& checkpoint_dir = "checkpoint",
+                 bool fast_ack = true);
+  // The pre-seam signature: the JNI client with these jar and JVM
+  // options. Kept for the tests and the smoke binaries.
   CorfuDBStorage(std::string const& endpoint,
                  std::string const& jar_path,
                  std::string const& jvm_opts,
@@ -126,9 +135,12 @@ class CorfuDBStorage : public Storage {
   uint64_t conflictAborts() const { return conflict_aborts_.load(std::memory_order_relaxed); }
   uint64_t spuriousConflicts() const { return spurious_conflicts_.load(std::memory_order_relaxed); }
   bool loadedFromCheckpoint() const { return loaded_from_checkpoint_; }
-  // Detach the calling thread from the JVM. A thread that made JNI calls
-  // (LogTrimmer's) must call this before it exits.
+  // Release the calling thread's client resources (the JVM attachment
+  // under the JNI client). A thread that drove this storage (LogTrimmer's)
+  // must call this before it exits.
   void detachThread();
+  // The client name this storage runs on ("jni" or "native").
+  std::string const& clientName() const { return client_name_; }
 
   void setRemoteAppendListener(RemoteAppendListener listener) override {
     bool cleared;
@@ -149,22 +161,10 @@ class CorfuDBStorage : public Storage {
   bool sync_mode_ = true;
 
  private:
-  // JVM / JNI handles
-  JavaVM* jvm_ = nullptr;
-  bool owns_jvm_ = false;
-  jobject bridge_global_ = nullptr;
-  jclass bridge_class_global_ = nullptr;
-  jmethodID mid_append_ = nullptr;
-  jmethodID mid_appendChecked_ = nullptr;
-  jmethodID mid_globalTail_ = nullptr;
-  jmethodID mid_pollNext_ = nullptr;
-  jmethodID mid_pollBatch_ = nullptr;
-  jmethodID mid_tailAddress_ = nullptr;
-  jmethodID mid_gcPollView_ = nullptr;
-  jmethodID mid_prefixTrim_ = nullptr;
-  jmethodID mid_trimMark_ = nullptr;
-  jmethodID mid_seekPollView_ = nullptr;
-  jmethodID mid_close_ = nullptr;
+  // The Corfu client (corfu_client.h). Owned; every thread calls it
+  // directly, the client serializes what its runtime needs.
+  std::unique_ptr<CorfuClient> client_;
+  std::string client_name_;
 
   // Per-file reconstructed state (populated by tailer)
   std::unordered_map<std::string, std::vector<unsigned char>> file_buffers_;
@@ -337,58 +337,42 @@ class CorfuDBStorage : public Storage {
   bool dispatch_in_flight_ = false;
   std::thread dispatch_thread_;
 
-  void startJvm(std::string const& jar_path, std::string const& jvm_opts);
-  JNIEnv* attachThread();
-  void loadBridge(std::string const& endpoint, std::string const& stream_name);
   // One CorfuEntry, serialized. Shared by both append flavours.
   std::string serializeEntry(std::string const& file_name, int op,
                              unsigned char const* data, int length) const;
   // Plain append: token without conflict keys. The outcome of an APPEND
   // sent this way is known only once the tailer passed its address.
-  long jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
-                      unsigned char const* data, int length);
-  // Outcome of CorfuBridge.appendChecked. addr >= 0 on success; else
-  // abort holds one of the kAbort* codes (mirrors CorfuBridge.ABORT_*)
-  // and offending the conflicting address for kAbortConflict, -1 otherwise.
-  struct CheckedAppend {
-    long addr = -1;
-    long abort = 0;
-    long offending = -1;
-  };
-  static constexpr long kAbortConflict = -2;
-  static constexpr long kAbortNewSequencer = -3;
-  static constexpr long kAbortSeqOverflow = -4;
-  static constexpr long kAbortSeqTrim = -5;
-  static constexpr long kAbortOther = -6;
+  long appendEntry(std::string const& file_name, int op,
+                   unsigned char const* data, int length);
+  // Outcome of CorfuClient::appendChecked (see corfu_client.h).
+  using CheckedAppend = CorfuClient::CheckedAppend;
+  static constexpr long kAbortConflict = CorfuClient::kAbortConflict;
+  static constexpr long kAbortNewSequencer = CorfuClient::kAbortNewSequencer;
+  static constexpr long kAbortSeqOverflow = CorfuClient::kAbortSeqOverflow;
+  static constexpr long kAbortSeqTrim = CorfuClient::kAbortSeqTrim;
+  static constexpr long kAbortOther = CorfuClient::kAbortOther;
   // The conflict key of a file: its name. Names are never reused.
   // read_key puts it in the read set at `snapshot`; write_key puts it in
-  // the write set. See CorfuBridge.appendChecked.
-  CheckedAppend jniAppendChecked(JNIEnv* env, std::string const& file_name, int op,
-                                 unsigned char const* data, int length,
-                                 long snapshot, bool read_key, bool write_key);
-  // Global log tail, -1 on a JNI error. One sequencer round trip.
-  long jniGlobalTail(JNIEnv* env);
+  // the write set. See CorfuClient::appendChecked.
+  CheckedAppend appendChecked(std::string const& file_name, int op,
+                              unsigned char const* data, int length,
+                              long snapshot, bool read_key, bool write_key);
   // Append a payload-less entry (SEAL, REMOVE) with the file's key in the
   // write set, so the sequencer records it. Retries a refused snapshot
   // with the global tail. Returns the address, -1 when the sequencer
   // refused every attempt (the entry was NOT appended).
-  long jniAppendKeyed(JNIEnv* env, std::string const& file_name, int op);
+  long appendKeyed(std::string const& file_name, int op);
   // Raise last_written_addr_ to addr (monotonic).
   void publishWrittenAddr(long addr);
-  bool applyEntryFromJava(JNIEnv* env, jbyteArray jbuf);
-  // Core apply logic, takes already-JNI-extracted bytes. Shared by
-  // applyEntryFromJava (single-entry path, no longer on any hot path)
-  // and applyBatchFromJava (pollBatch path, used by both the open-time
-  // replay and the steady-state tailer).
-  bool applyEntryBytes(unsigned char const* data, size_t len);
-  // Parse a pollBatch-formatted byte array (big-endian count +
-  // length-prefixed entries) and apply each via applyEntryBytes.
-  // Returns the number of entries successfully applied.
-  int applyBatchFromJava(JNIEnv* env, jbyteArray jbuf);
+  // Apply one stream entry (the CorfuEntry bytes at global address addr)
+  // to the local state. Called from the client's poll sink, on the
+  // tailer thread (steady state) or the constructor's thread (replay).
+  // The only writer of file_buffers_, in address order.
+  bool applyEntry(long addr, unsigned char const* data, size_t len);
   // Replay from the poll view's current position to the tail. kTrimmed
   // when the view hit a trimmed address (the caller restarts from a newer
-  // checkpoint); kError on a JNI failure (the caller must not treat the
-  // partial state as complete).
+  // checkpoint); kError on a client failure (the caller must not treat
+  // the partial state as complete).
   enum class DrainResult { kOk,
                            kTrimmed,
                            kError };
@@ -428,9 +412,9 @@ class CorfuDBStorage : public Storage {
   // behind it.
   void finishBatchLocked(std::string const& fileName,
                          std::shared_ptr<Batch> const& batch, Status result);
-  // JNI submit, then wait until the tailer has passed the new address
+  // Client submit, then wait until the tailer has passed the new address
   // and read the outcome. Must be called with mtx_ NOT held: it runs the
-  // JNI round-trip unlocked. Sets batch->done before it returns, and
+  // Corfu round-trip unlocked. Sets batch->done before it returns, and
   // returns batch->result. The caller holds write_gate_ shared (see
   // write_gate_).
   Status submitBatch(std::string const& fileName, std::shared_ptr<Batch> const& batch);
@@ -438,7 +422,7 @@ class CorfuDBStorage : public Storage {
   // answer. True when the batch is settled (batch->done); false when the
   // sequencer could not answer and submitBatch must take the slow path.
   // Same locking contract as submitBatch.
-  bool submitBatchFast(JNIEnv* env, std::string const& fileName,
+  bool submitBatchFast(std::string const& fileName,
                        std::shared_ptr<Batch> const& batch);
   // Block until `batch` is settled by whichever thread owns it, and
   // return its outcome. Takes mtx_ itself, so the caller must not hold it.

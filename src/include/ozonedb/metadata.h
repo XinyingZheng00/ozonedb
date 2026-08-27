@@ -40,6 +40,16 @@ class Metadata {
   // CorfuDBStorage::submitBatch). "false" / "0" makes every append wait
   // for the tailer instead; only for A/B measurement.
   bool corfu_fast_ack = true;
+  // Which Corfu client drives the stream (PLAN-native-corfu.md §4.7):
+  // "jni" = the embedded JVM + CorfuBridge.java, "native" = the C++
+  // client in src/db/corfu/. The A/B switch for every measurement.
+  std::string corfu_client = "jni";
+  // Native client tuning. Defaults mirror the Java runtime as the bridge
+  // configures it. Ignored by the JNI client.
+  int corfu_read_batch = 1000;             // addresses per ReadLogRequest
+  int corfu_idle_poll_ms = 5;              // wait between stream-tail queries
+  int corfu_hole_fill_timeout_ms = 10000;  // EMPTY address -> HOLE write
+  int corfu_request_timeout_ms = 5000;     // per RPC
 
   // Optional separate backend for SSTable storage. When unset, SSTables
   // share the main backend (backward-compat with all existing configs).
@@ -174,6 +184,26 @@ class Metadata {
       auto fast_it = result.find("corfu_fast_ack");
       if (fast_it != result.end()) {
         corfu_fast_ack = !(fast_it->second == "false" || fast_it->second == "0");
+      }
+      if (auto it = result.find("corfu_client"); it != result.end()) {
+        corfu_client = it->second;
+        if (corfu_client != "jni" && corfu_client != "native") {
+          throw std::runtime_error("config error: corfu_client must be \"jni\" or \"native\", got \"" +
+                                   corfu_client + "\"");
+        }
+      }
+      if (auto it = result.find("corfu_read_batch"); it != result.end()) {
+        corfu_read_batch = std::stoi(it->second);
+        if (corfu_read_batch < 1) throw std::runtime_error("config error: corfu_read_batch must be >= 1");
+      }
+      if (auto it = result.find("corfu_idle_poll_ms"); it != result.end()) {
+        corfu_idle_poll_ms = std::stoi(it->second);
+      }
+      if (auto it = result.find("corfu_hole_fill_timeout_ms"); it != result.end()) {
+        corfu_hole_fill_timeout_ms = std::stoi(it->second);
+      }
+      if (auto it = result.find("corfu_request_timeout_ms"); it != result.end()) {
+        corfu_request_timeout_ms = std::stoi(it->second);
       }
     }
 

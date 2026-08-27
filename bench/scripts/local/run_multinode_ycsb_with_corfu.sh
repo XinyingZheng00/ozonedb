@@ -76,6 +76,7 @@ DURATION=""       # --duration S: forwarded to every client as --max_exec_time
 LINEARIZABLE=0    # --linearizable: strict reads, label ozonedb-corfu-linearizable
 LOG_TRIM=0        # --log-trim: writer 0 checkpoints + trims the Corfu stream
 LRU_CACHE_BYTES=""  # --lru-cache-bytes N: per-process block cache, label -lru64m
+CORFU_CLIENT=""   # --corfu-client jni|native: the Corfu client, label -native
 RECORD_CNT=""     # --record-cnt N: dataset size, forwarded as --record_cnt
 RUN_TAG=""        # --run-tag: bench/results/local/<tag> on every host and here
 DRY_RUN=0
@@ -121,6 +122,10 @@ Usage: $(basename "$0") [options]
                             trust_background_tail=false, and result files
                             are labelled ozonedb-corfu-linearizable instead
                             of ozonedb-corfu. Use this, never a ycsb.yaml edit.
+  --corfu-client jni|native the Corfu client every writer runs: jni (the
+                            embedded JVM + CorfuBridge, default) or native
+                            (the C++ client, PLAN-native-corfu.md). native
+                            result files are labelled ozonedb-corfu-native.
   --log-trim                log trimming: global writer 0 checkpoints the
                             Corfu stream to the bucket and trims behind the
                             checkpoint; every writer opens from the newest
@@ -165,6 +170,7 @@ while [[ $# -gt 0 ]]; do
   --linearizable)   LINEARIZABLE=1; shift ;;
   --log-trim)       LOG_TRIM=1; shift ;;
   --lru-cache-bytes) LRU_CACHE_BYTES="$2"; shift 2 ;;
+  --corfu-client)   CORFU_CLIENT="$2"; shift 2 ;;
   --record-cnt)     RECORD_CNT="$2"; shift 2 ;;
   --run-tag)        RUN_TAG="$2"; shift 2 ;;
   --dry-run)        DRY_RUN=1; shift ;;
@@ -341,8 +347,9 @@ COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG")
 [[ "$LOG_TRIM" -eq 1 ]] && COMMON_ARGS+=(--log-trim)
 [[ -n "$LRU_CACHE_BYTES" ]] && COMMON_ARGS+=(--lru-cache-bytes "$LRU_CACHE_BYTES")
 [[ -n "$RECORD_CNT"      ]] && COMMON_ARGS+=(--record_cnt "$RECORD_CNT")
+[[ -n "$CORFU_CLIENT"    ]] && COMMON_ARGS+=(--corfu-client "$CORFU_CLIENT")
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} record_cnt=${RECORD_CNT:-yaml} corfu_client=${CORFU_CLIENT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
 echo "=== corfu server: $CORFU_TARGET:$CORFU_PORT ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="

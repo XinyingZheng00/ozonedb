@@ -1,7 +1,12 @@
 // Read-only diagnostic for one OzoneDB Corfu stream.
 //
 // Usage:
-//   corfu_stream_stats <corfu-endpoint> <corfu-bridge.jar> <stream-name>
+//   corfu_stream_stats <corfu-endpoint> <corfu-bridge.jar> <stream-name> [--client jni|native]
+//
+// --client selects the CorfuClient (default jni). The differential test of
+// PLAN-native-corfu.md phase 2 runs it once per client on the same stream
+// and compares the replay line, [stats] applied_addr, the entry counts and
+// the file digest below.
 //
 // Replays the stream through CorfuDBStorage (which prints the replay line,
 // including how many peer APPENDs were dropped because a SEAL preceded
@@ -45,13 +50,43 @@ std::string joinInputs(OperationRecord const& r) {
 
 int main(int argc, char** argv) {
   if (argc < 4) {
-    std::cerr << "Usage: " << argv[0] << " <endpoint> <bridge-jar> <stream>\n";
+    std::cerr << "Usage: " << argv[0] << " <endpoint> <bridge-jar> <stream> [--client jni|native]\n";
     return 1;
   }
-  CorfuDBStorage storage(argv[1], argv[2], "-Xmx4g", argv[3], "/tmp/corfu_stream_stats/");
-  std::cout << "[stats] applied_addr=" << storage.lastAppliedAddr()
+  CorfuClientOptions options;
+  options.endpoint = argv[1];
+  options.jar_path = argv[2];
+  options.jvm_opts = "-Xmx4g";
+  options.stream_name = argv[3];
+  for (int i = 4; i + 1 < argc; i += 2) {
+    if (std::string(argv[i]) == "--client") options.client = argv[i + 1];
+    else {
+      std::cerr << "unknown flag " << argv[i] << "\n";
+      return 1;
+    }
+  }
+  CorfuDBStorage storage(options, "/tmp/corfu_stream_stats/");
+  std::cout << "[stats] client=" << storage.clientName()
+            << " applied_addr=" << storage.lastAppliedAddr()
             << " dropped_above_seal=" << storage.droppedAboveSeal()
             << " dropped_above_seal_KB=" << (storage.droppedAboveSealBytes() >> 10) << "\n";
+  // A digest of every live file, for the phase-2 differential test: the
+  // two clients must print the same line for the same stream.
+  {
+    unsigned char* all = nullptr;
+    size_t all_size = 0;
+    uint64_t digest = 1469598103934665603ULL;  // FNV-1a over metadata.log + task.log
+    size_t total = 0;
+    for (char const* name : {"metadata.log", "task.log"}) {
+      all = nullptr;
+      all_size = 0;
+      if (storage.read(name, all, all_size) != Status::kSuccess || all == nullptr) continue;
+      for (size_t i = 0; i < all_size; ++i) digest = (digest ^ all[i]) * 1099511628211ULL;
+      total += all_size;
+      delete[] all;
+    }
+    std::cout << "[stats] top_level_bytes=" << total << " fnv1a=" << std::hex << digest << std::dec << "\n";
+  }
 
   unsigned char* buf = nullptr;
   size_t size = 0;

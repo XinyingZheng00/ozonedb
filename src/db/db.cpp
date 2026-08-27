@@ -34,10 +34,20 @@ Storage* makeStorage(BackendKind kind, Metadata const& md, bool for_sstables,
           md.DBpath);
     case BackendKind::kCorfu:
 #ifdef OZONEDB_ENABLE_CORFU
-      return new CorfuDBStorage(md.corfu_endpoint, md.corfu_jar_path,
-                                md.corfu_jvm_opts, md.corfu_stream_name,
-                                md.DBpath, checkpoint_store, md.checkpoint_dir,
+    {
+      CorfuClientOptions co;
+      co.endpoint = md.corfu_endpoint;
+      co.stream_name = md.corfu_stream_name;
+      co.client = md.corfu_client;
+      co.jar_path = md.corfu_jar_path;
+      co.jvm_opts = md.corfu_jvm_opts;
+      co.read_batch = md.corfu_read_batch;
+      co.idle_poll_ms = md.corfu_idle_poll_ms;
+      co.hole_fill_timeout_ms = md.corfu_hole_fill_timeout_ms;
+      co.request_timeout_ms = md.corfu_request_timeout_ms;
+      return new CorfuDBStorage(co, md.DBpath, checkpoint_store, md.checkpoint_dir,
                                 md.corfu_fast_ack);
+    }
 #else
       throw std::runtime_error(
           "OzoneDB was built without CorfuDB support (rebuild with "

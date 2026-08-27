@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
+import org.corfudb.common.compression.Codec;
 import org.corfudb.protocols.wireprotocol.ILogData;
 import org.corfudb.protocols.wireprotocol.Token;
 import org.corfudb.protocols.wireprotocol.TxResolutionInfo;
@@ -27,8 +28,13 @@ import org.corfudb.runtime.view.stream.IStreamView;
  * surface area tight minimizes JNI method lookups and simplifies lifetime
  * management on the C++ side.
  *
- * Payload format returned by {@link #pollNext}: 8 bytes of big-endian global
- * log address followed by the raw entry bytes the C++ side appended.
+ * Entry format inside a {@link #pollBatch} batch: 8 bytes of big-endian
+ * global log address followed by the raw entry bytes the C++ side appended.
+ *
+ * The bridge is one of two implementations of the C++ CorfuClient seam
+ * (src/include/ozonedb/corfu_client.h); the other is the native C++ client
+ * (PLAN-native-corfu.md). Entries written here must stay readable by that
+ * client: raw file-name conflict keys, and payload codec NONE.
  *
  * Corfu's Java API has drifted across releases; this file targets the
  * 0.3.x line. Adjust imports / method calls if upgrading.
@@ -66,7 +72,7 @@ public class CorfuBridge {
   private final Object pollSignal = new Object();
   private long appendSeq = 0;  // guarded by pollSignal
 
-  // Returned by pollNext/pollBatch when the poll view's next address is
+  // Returned by pollBatch when the poll view's next address is
   // below the log's trim mark (Corfu throws TrimmedException). A null
   // return keeps its meaning (timeout, nothing new); a ZERO-LENGTH array
   // is the marker. The C++ side restarts from a newer checkpoint during
@@ -97,11 +103,18 @@ public class CorfuBridge {
     // Override with -Dozonedb.corfu.streamBatchSize / .bulkReadSize.
     int streamBatchSize = Integer.getInteger("ozonedb.corfu.streamBatchSize", 1000);
     int bulkReadSize = Integer.getInteger("ozonedb.corfu.bulkReadSize", 1000);
+    // Payload codec NONE. The runtime default is ZSTD
+    // (CorfuRuntimeParameters.codecType): every entry was compressed once
+    // at append and decompressed by every tailer, on every process, for
+    // a payload that is already an OzoneDB record. The native C++ client
+    // reads codec NONE only, so both clients must write it. Datasets
+    // loaded before this change hold ZSTD entries and must be reloaded.
     CorfuRuntimeParameters params = CorfuRuntimeParameters.builder()
         .cacheDisabled(false)
         .maxCacheEntries(500_000L)
         .streamBatchSize(streamBatchSize)
         .bulkReadSize(bulkReadSize)
+        .codecType(Codec.Type.NONE)
         .build();
     this.runtime = CorfuRuntime.fromParameters(params)
         .parseConfigurationString(endpoint)
@@ -237,53 +250,13 @@ public class CorfuBridge {
   }
 
   /**
-   * Blocking-ish read of the next entry in the stream.
-   *
-   * @param timeoutMs maximum time to wait before returning {@code null}
-   * @return {@code null} on timeout; otherwise a byte[] whose first 8 bytes
-   *         are the entry's global log address (big-endian) and whose
-   *         remaining bytes are the raw payload appended by a writer.
-   */
-  public byte[] pollNext(long timeoutMs) {
-    long deadline = System.currentTimeMillis() + timeoutMs;
-    while (!closed) {
-      long seq = appendSeqSnapshot();
-      ILogData data;
-      try {
-        data = pollView.next();
-      } catch (TrimmedException e) {
-        return TRIMMED;
-      }
-      if (data != null) {
-        long addr = data.getGlobalAddress();
-        Object raw = data.getPayload(runtime);
-        if (!(raw instanceof byte[])) {
-          // A non-byte[] entry means something other than CorfuBridge wrote
-          // to this stream; skip it to stay robust against mixed clients.
-          continue;
-        }
-        byte[] payload = (byte[]) raw;
-        ByteBuffer buf = ByteBuffer.allocate(8 + payload.length);
-        buf.putLong(addr);
-        buf.put(payload);
-        return buf.array();
-      }
-      if (System.currentTimeMillis() >= deadline) return null;
-      if (!awaitAppendOrTick(seq)) return null;
-    }
-    return null;
-  }
-
-  /**
-   * Batched variant of pollNext. Fetches up to {@code maxEntries}
-   * entries in a single JNI round-trip, amortizing the cross-language
-   * and pollView.next() fixed overhead across many log entries. Under
-   * warm-cache steady state this gives the tailer roughly a 10–50x
-   * higher entry-apply rate than per-call pollNext.
+   * Fetches up to {@code maxEntries} entries in a single JNI round-trip,
+   * amortizing the cross-language and pollView.next() fixed overhead
+   * across many log entries.
    *
    * Wire format (big-endian, mirrors Java DataOutputStream):
    *   int32  count
-   *   count × (int32 entryLen, entryLen bytes same-as-pollNext-payload)
+   *   count × (int32 entryLen, int64 globalAddress, raw entry bytes)
    *
    * @return {@code null} if no entries were available before
    *         {@code timeoutMs} elapsed; otherwise a length-prefixed
@@ -401,8 +374,8 @@ public class CorfuBridge {
   }
 
   /**
-   * Position the poll view so that the next {@link #pollNext} /
-   * {@link #pollBatch} returns the first entry of this stream at or above
+   * Position the poll view so that the next {@link #pollBatch} returns
+   * the first entry of this stream at or above
    * {@code addr}. A joiner that restored checkpoint C calls this with C+1.
    * Seeking at or above the trim mark is what keeps a fresh view from
    * throwing {@code TrimmedException} on its first read.

@@ -36,6 +36,7 @@ WRITERS=8
 LOAD_HOST=""
 LOG_TRIM=0      # --log-trim: writer 0 checkpoints + trims during the load
 RECORD_CNT=""   # --record-cnt N: dataset size (default: local.load.record_cnt)
+CORFU_CLIENT="" # --corfu-client jni|native: the Corfu client of the loader
 DRY_RUN=0
 
 usage() {
@@ -51,6 +52,8 @@ Usage: $(basename "$0") [options]
                     (bench/PLAN-cost.md phase 1). The checkpoint lives in the
                     bucket: snapshot the bucket together with /mnt/corfu/load.
   --record-cnt N    dataset size in records, forwarded as --record_cnt
+  --corfu-client C  forward --corfu-client jni|native to the loader (the
+                    C++ client is `native`, PLAN-native-corfu.md)
   --corfu-dir PATH  corfu repo on the log node (default: $CORFU_DIR)
   --dry-run         print the plan; no ssh
   -h | --help
@@ -64,6 +67,7 @@ while [[ $# -gt 0 ]]; do
   --load-host) LOAD_HOST="$2"; shift 2 ;;
   --log-trim) LOG_TRIM=1; shift ;;
   --record-cnt) RECORD_CNT="$2"; shift 2 ;;
+  --corfu-client) CORFU_CLIENT="$2"; shift 2 ;;
   --corfu-dir) CORFU_DIR="$2"; shift 2 ;;
   --dry-run) DRY_RUN=1; shift ;;
   -h | --help) usage; exit 0 ;;
@@ -155,8 +159,9 @@ sampler_stop() {
 LOAD_CMD="cd \$OZONEDB_HOME && python3 bench/scripts/local/load_local_ycsb_multiproc.py --db_name ozonedb-corfu --num_writers $WRITERS"
 [[ "$LOG_TRIM" -eq 1 ]] && LOAD_CMD="$LOAD_CMD --log-trim"
 [[ -n "$RECORD_CNT" ]] && LOAD_CMD="$LOAD_CMD --record_cnt $RECORD_CNT"
+[[ -n "$CORFU_CLIENT" ]] && LOAD_CMD="$LOAD_CMD --corfu-client $CORFU_CLIENT"
 
-echo "=== corfu load: server=$CORFU_SSH ($CORFU_BIND:$CORFU_PORT) load_host=$LOAD_HOST writers=$WRITERS log_trim=$LOG_TRIM record_cnt=${RECORD_CNT:-yaml} ==="
+echo "=== corfu load: server=$CORFU_SSH ($CORFU_BIND:$CORFU_PORT) load_host=$LOAD_HOST writers=$WRITERS log_trim=$LOG_TRIM record_cnt=${RECORD_CNT:-yaml} corfu_client=${CORFU_CLIENT:-yaml} ==="
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "[dry-run] stop corfu; wipe run_batch; empty bucket $MC_ALIAS/$S3_BUCKET; start corfu -l $CORFU_DATA/run_batch"
   echo "[dry-run] server sample start: cell=$SAMPLE_CELL on $CORFU_SSH -> $SAMPLE_LOCAL"

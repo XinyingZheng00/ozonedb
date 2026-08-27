@@ -13,6 +13,8 @@ import yaml
 
 from load_local_ycsb_multiproc import (
     cassandra_mode_settings,
+    CORFU_CLIENTS,
+    corfu_client_corfu_settings,
     linearizable_corfu_settings,
     lru_cache_corfu_settings,
     result_label,
@@ -213,7 +215,7 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          total_writers, workloads, trial, max_exec_time=None,
                          linearizable=False, log_trim=False, db_name=None,
                          cassandra_consistency=None, lru_cache_bytes=None,
-                         record_cnt=None):
+                         record_cnt=None, corfu_client=None):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -238,6 +240,7 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--cassandra_consistency", cassandra_consistency] if cassandra_consistency else [])
             + (["--lru-cache-bytes", str(int(lru_cache_bytes))] if lru_cache_bytes is not None else [])
             + (["--record_cnt", str(int(record_cnt))] if record_cnt is not None else [])
+            + (["--corfu-client", corfu_client] if corfu_client else [])
         ),
     ]
     return " && ".join(parts)
@@ -265,6 +268,8 @@ def cell_label(config, args):
         corfu = linearizable_corfu_settings(corfu)
     if args.lru_cache_bytes is not None:
         corfu = lru_cache_corfu_settings(corfu, args.lru_cache_bytes)
+    if args.corfu_client:
+        corfu = corfu_client_corfu_settings(corfu, args.corfu_client)
     cass = config.get("cassandra")
     if args.cassandra_consistency:
         cass = cassandra_mode_settings(cass, args.cassandra_consistency)
@@ -544,6 +549,14 @@ def main():
              "local.run.record_cnt on every client); must match the load.",
     )
     parser.add_argument(
+        "--corfu-client",
+        choices=CORFU_CLIENTS,
+        default=None,
+        help="Pass-through to per-host runner (ozonedb-corfu only): jni (embedded JVM + "
+             "CorfuBridge, default) or native (the C++ client); native result files "
+             "are labelled ozonedb-corfu-native.",
+    )
+    parser.add_argument(
         "--no_server_sample",
         action="store_true",
         help="Do not run bench/scripts/server_sampler.sh on the server node(s) "
@@ -643,6 +656,7 @@ def main():
         f"cassandra_consistency={args.cassandra_consistency or 'yaml'} "
         f"lru_cache_bytes={args.lru_cache_bytes or 'base'} "
         f"record_cnt={args.record_cnt or 'yaml'} "
+        f"corfu_client={args.corfu_client or 'yaml'} "
         f"label={label} server_sample={sample_hosts or 'off'}"
     )
     for p in plan:
@@ -659,6 +673,7 @@ def main():
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
+            corfu_client=args.corfu_client,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         if sample_hosts:
@@ -686,6 +701,7 @@ def main():
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
+            corfu_client=args.corfu_client,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

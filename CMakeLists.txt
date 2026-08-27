@@ -34,6 +34,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Optional backends
 option(OZONEDB_ENABLE_CORFU "Build the CorfuDB storage backend (requires JDK + Maven)" OFF)
+option(OZONEDB_CORFU_NATIVE "With OZONEDB_ENABLE_CORFU: also build the native C++ Corfu client (corfu_client=native)" ON)
 option(OZONEDB_ENABLE_S3 "Build the S3/MinIO/R2 storage backend (requires aws-sdk-cpp)" ON)
 
 # libozonedb.so, the shim the YCSB binding's jni.OzoneDBJNI loads. Previously
@@ -98,6 +99,31 @@ protobuf_generate_cpp(
     PROTOC_OUT_DIR ${PROTO_GEN_ROOT}/protobuf
 )
 
+# The CorfuDB wire protocol, vendored under src/corfu_proto (see its
+# README). Generated into build/generated/corfu_proto/ keeping the
+# service/ subdirectory, because the files import each other by that
+# relative path; sources include "service/corfu_message.pb.h".
+set(CORFU_PROTO_SRCS "")
+set(CORFU_PROTO_HDRS "")
+if (OZONEDB_ENABLE_CORFU AND OZONEDB_CORFU_NATIVE)
+    set(CORFU_PROTO_ROOT ${PROJECT_SOURCE_DIR}/src/corfu_proto)
+    file(MAKE_DIRECTORY ${PROTO_GEN_ROOT}/corfu_proto/service)
+    protobuf_generate_cpp(
+        CORFU_PROTO_SRCS CORFU_PROTO_HDRS
+        ${CORFU_PROTO_ROOT}/rpc_common.proto
+        ${CORFU_PROTO_ROOT}/log_data.proto
+        ${CORFU_PROTO_ROOT}/tx_resolution.proto
+        ${CORFU_PROTO_ROOT}/server_errors.proto
+        ${CORFU_PROTO_ROOT}/service/base.proto
+        ${CORFU_PROTO_ROOT}/service/layout.proto
+        ${CORFU_PROTO_ROOT}/service/sequencer.proto
+        ${CORFU_PROTO_ROOT}/service/log_unit.proto
+        ${CORFU_PROTO_ROOT}/service/corfu_message.proto
+        IMPORT_DIRS ${CORFU_PROTO_ROOT}
+        PROTOC_OUT_DIR ${PROTO_GEN_ROOT}/corfu_proto
+    )
+endif()
+
 # Library Target
 set(OZONEDB_SOURCES
     src/db/compaction.cpp
@@ -126,7 +152,22 @@ set(OZONEDB_SOURCES
     ${PROTO_SRCS} ${PROTO_HDRS}
 )
 if (OZONEDB_ENABLE_CORFU)
-    list(APPEND OZONEDB_SOURCES src/db/corfu_storage.cpp src/db/log_trimmer.cpp)
+    list(APPEND OZONEDB_SOURCES
+        src/db/corfu_storage.cpp
+        src/db/corfu_client_jni.cpp
+        src/db/log_trimmer.cpp
+    )
+    if (OZONEDB_CORFU_NATIVE)
+        list(APPEND OZONEDB_SOURCES
+            src/db/corfu/corfu_codec.cpp
+            src/db/corfu/corfu_transport.cpp
+            src/db/corfu/corfu_layout.cpp
+            src/db/corfu/corfu_rpc.cpp
+            src/db/corfu/corfu_reader.cpp
+            src/db/corfu/native_corfu_client.cpp
+            ${CORFU_PROTO_SRCS}
+        )
+    endif()
 endif()
 if (OZONEDB_ENABLE_S3)
     list(APPEND OZONEDB_SOURCES src/db/s3_storage.cpp)
@@ -156,6 +197,13 @@ target_link_libraries(OzoneDB
 if (OZONEDB_ENABLE_S3)
     target_compile_definitions(OzoneDB PUBLIC OZONEDB_ENABLE_S3)
     target_link_libraries(OzoneDB ${AWSSDK_LINK_LIBRARIES})
+endif()
+
+if (OZONEDB_ENABLE_CORFU AND OZONEDB_CORFU_NATIVE)
+    # corfu_client.h declares makeNativeCorfuClient under this macro, and
+    # the generated Corfu protos are included as "service/xxx.pb.h".
+    target_compile_definitions(OzoneDB PUBLIC OZONEDB_CORFU_NATIVE)
+    target_include_directories(OzoneDB PUBLIC ${PROTO_GEN_ROOT}/corfu_proto)
 endif()
 
 if (OZONEDB_ENABLE_CORFU)
@@ -225,6 +273,9 @@ set(OZONEDB_TEST_SOURCES
 )
 if (OZONEDB_ENABLE_CORFU)
     list(APPEND OZONEDB_TEST_SOURCES tests/test_corfu_storage.cpp)
+    if (OZONEDB_CORFU_NATIVE)
+        list(APPEND OZONEDB_TEST_SOURCES tests/test_corfu_codec.cpp)
+    endif()
 endif()
 add_executable(runUnitTests ${OZONEDB_TEST_SOURCES})
 if (OZONEDB_ENABLE_CORFU)
@@ -245,6 +296,14 @@ if (OZONEDB_ENABLE_CORFU)
     add_executable(corfu_stream_stats tests/corfu_stream_stats.cpp)
     target_include_directories(corfu_stream_stats PRIVATE ${JNI_INCLUDE_DIRS})
     target_link_libraries(corfu_stream_stats OzoneDB ${JNI_LIBRARIES})
+
+    if (OZONEDB_CORFU_NATIVE)
+        # Phase-1 probe of the native client: layout, tails, trim mark and
+        # a histogram of the log by DataType and stream membership. See
+        # tests/corfu_native_probe.cpp.
+        add_executable(corfu_native_probe tests/corfu_native_probe.cpp)
+        target_link_libraries(corfu_native_probe OzoneDB)
+    endif()
 endif()
 
 target_link_libraries(runUnitTests 
