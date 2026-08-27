@@ -4,7 +4,9 @@
 #include "sstable/table_reader.h"
 #include "storage.h"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <list>
 #include <memory>
@@ -140,6 +142,18 @@ class LRUCache {
   std::unordered_map<std::string, std::shared_future<void>> block_inflight_;
   std::unordered_map<std::string, std::shared_future<void>> table_inflight_;
 
+  // Tables of removed files, kept alive for a grace period. getSSTable
+  // hands out raw Table* and Table::get runs on them without holding
+  // `mutex`, so invalidateLogFile (a peer compaction's REMOVE, applied
+  // by the tailer) must not delete the object under a reader in
+  // flight: that was a use-after-free whose visible symptom was a null
+  // `table` in readDataBlocks (SIGSEGV, one crash per compaction that
+  // removed a file being read). A read finishes in milliseconds; the
+  // grace period is seconds. Entries older than kRetiredTableGraceMs
+  // are freed on the next invalidateLogFile and in the destructor.
+  static constexpr int64_t kRetiredTableGraceMs = 30000;
+  std::deque<std::pair<std::chrono::steady_clock::time_point, Table*>> retired_tables_;
+
   // Steady-state counters for diagnosing cache behavior. Printed at
   // LRUCache destruction. A healthy zipfian workload should show
   // hits >> misses once the hot set fits in `capacity`.
@@ -178,6 +192,9 @@ class LRUCache {
         delete entry.second.table;
       }
     }
+    for (auto& retired : retired_tables_) {
+      delete retired.second;
+    }
   }
   // only for testing
   std::unordered_map<std::string, CacheEntry> getCacheMap() {
@@ -193,7 +210,13 @@ class LRUCache {
   void readDataLog(std::string const& file_name, size_t cached_offset, size_t size);
   void getSSTable(std::string const& file_name, Table*& table);
   void needReadBlock(std::string const& file_name, bool& read_more, std::string const& index_value);
-  void readDataBlocks(std::string const& file_name, std::string const& index_value);
+  // caller_table: the Table the caller is already reading through
+  // (Table::get passes `this`). Used when the file's cache entry has
+  // no Table* — populated by the compaction write-through before any
+  // reader opened the file, or erased by a REMOVE applied between
+  // needReadBlock and this call. A block that cannot be read is a
+  // miss (get() then returns no record), never a crash.
+  void readDataBlocks(std::string const& file_name, std::string const& index_value, Table* caller_table = nullptr);
 
   // SSTable variant — returns a shared_ptr so the Record stays alive
   // past a concurrent evict(). Updates LRU order on hit.

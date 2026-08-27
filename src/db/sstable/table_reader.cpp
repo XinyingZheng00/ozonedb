@@ -175,7 +175,7 @@ Status Table::get(std::string const& key, std::shared_ptr<Record>& record) {
       bool read_more = true;
       this->rep_->lru_cache->needReadBlock(rep_->fileName, read_more, identifier_value);
       if (read_more) {
-        this->rep_->lru_cache->readDataBlocks(rep_->fileName, identifier_value);
+        this->rep_->lru_cache->readDataBlocks(rep_->fileName, identifier_value, this);
       }
       this->rep_->lru_cache->get(rep_->fileName, key, record, identifier_value);
       if (record) {

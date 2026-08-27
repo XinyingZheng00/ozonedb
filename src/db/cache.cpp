@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 
 namespace ozonedb {
 // Function to move a key to the front of the LRU list
@@ -228,7 +229,7 @@ void LRUCache::needReadBlock(std::string const& file_name, bool& read_more, std:
   }
 }
 
-void LRUCache::readDataBlocks(std::string const& file_name, std::string const& index_value) {
+void LRUCache::readDataBlocks(std::string const& file_name, std::string const& index_value, Table* caller_table) {
   // Singleflight on (file, block). Without this, concurrent readers on
   // a cold block each S3-GET it AND each call putSSTableRecords —
   // double-counting current_size, leaking prior records maps, and
@@ -320,10 +321,23 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
   } guard{cleanup};
 
   try {
+    // No Table* in the entry: the compaction write-through created the
+    // entry before any reader opened the file, or a REMOVE erased it
+    // between needReadBlock and here. Fall back to the caller's Table;
+    // without one the block is unreadable and this is a miss.
+    if (table == nullptr) table = caller_table;
+    if (table == nullptr) {
+      throw std::runtime_error("readDataBlocks: no Table for " + file_name);
+    }
     {
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(file_name);
       std::shared_lock<std::shared_mutex> file_lock(file_mutex);
       iter = table->blockReader(table, index_value);
+    }
+    // blockReader returns null when the storage read fails, which is
+    // what a GET on a just-removed object looks like.
+    if (iter == nullptr) {
+      throw std::runtime_error("readDataBlocks: block read failed for " + file_name);
     }
     iter->seekToFirst();
     records_tmp = new std::unordered_map<std::string, std::shared_ptr<Record>>();
@@ -349,10 +363,17 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
 // alive past a concurrent evict() that drops the block.
 void LRUCache::get(std::string const& file_name, std::string const& key, std::shared_ptr<Record>& record, std::string const& index_value) {
   std::unique_lock<std::shared_mutex> lock(mutex);
-  auto& records = file_to_entry_map[file_name].block_records[index_value];
+  // Lookups only, no operator[]: after a failed readDataBlocks (file
+  // removed under the reader) the block is absent, and creating an
+  // entry with a null records map here would crash the next reader.
+  record = nullptr;
+  auto file_it = file_to_entry_map.find(file_name);
+  if (file_it == file_to_entry_map.end()) return;
+  auto block_it = file_it->second.block_records.find(index_value);
+  if (block_it == file_it->second.block_records.end() || block_it->second == nullptr) return;
   updateLRU(file_name, index_value);
-  auto record_it = records->find(key);
-  record = (record_it != records->end()) ? record_it->second : nullptr;
+  auto record_it = block_it->second->find(key);
+  if (record_it != block_it->second->end()) record = record_it->second;
 }
 
 // Log variant — returns a shared_ptr copy so the Record is kept alive
@@ -438,8 +459,18 @@ void LRUCache::invalidateLogFile(std::string const& file_name) {
       current_size -= size_it->second;
     }
   }
-  if (it->second.table != nullptr) delete it->second.table;
+  // Never delete the Table here: a reader that took the raw Table* from
+  // getSSTable may be inside Table::get on it right now (the reader
+  // holds no lock across the block read). Retire it and free it after
+  // the grace period, see retired_tables_ in cache.h.
+  auto const now = std::chrono::steady_clock::now();
+  if (it->second.table != nullptr) retired_tables_.emplace_back(now, it->second.table);
   file_to_entry_map.erase(it);
+  while (!retired_tables_.empty() &&
+         std::chrono::duration_cast<std::chrono::milliseconds>(now - retired_tables_.front().first).count() > kRetiredTableGraceMs) {
+    delete retired_tables_.front().second;
+    retired_tables_.pop_front();
+  }
 }
 
 void LRUCache::snapshotLogFileRecords(std::string const& file_name,
