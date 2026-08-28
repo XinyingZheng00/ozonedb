@@ -218,7 +218,8 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          record_cnt=None, cache_warm=False,
                          cache_warm_max_level=None, cache_warm_max_fraction=None,
                          disk_cache_bytes=None, disk_cache_dir=None,
-                         disk_cache_keep_pages=False):
+                         disk_cache_keep_pages=False, disk_cache_mode=None,
+                         disk_cache_entry_bytes=None, disk_cache_admission=None):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -251,6 +252,9 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--disk-cache-bytes", str(int(disk_cache_bytes))] if disk_cache_bytes is not None else [])
             + (["--disk-cache-dir", shlex.quote(disk_cache_dir)] if disk_cache_dir else [])
             + (["--disk-cache-keep-pages"] if disk_cache_keep_pages else [])
+            + (["--disk-cache-mode", disk_cache_mode] if disk_cache_mode else [])
+            + (["--disk-cache-entry-bytes", str(int(disk_cache_entry_bytes))] if disk_cache_entry_bytes is not None else [])
+            + (["--disk-cache-admission", disk_cache_admission] if disk_cache_admission else [])
         ),
     ]
     return " && ".join(parts)
@@ -283,7 +287,9 @@ def cell_label(config, args):
             corfu, args.cache_warm_max_level, args.cache_warm_max_fraction
         )
     if args.disk_cache_bytes is not None:
-        corfu = disk_cache_corfu_settings(corfu, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages)
+        corfu = disk_cache_corfu_settings(corfu, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages,
+                                          mode=args.disk_cache_mode, entry_bytes=args.disk_cache_entry_bytes,
+                                          admission=args.disk_cache_admission)
     cass = config.get("cassandra")
     if args.cassandra_consistency:
         cass = cassandra_mode_settings(cass, args.cassandra_consistency)
@@ -561,6 +567,15 @@ def main():
     parser.add_argument("--disk-cache-keep-pages", action="store_true",
                         help="Pass-through to per-host runner: do not drop the page cache "
                              "after tier reads (A/B of the SSD cost)")
+    parser.add_argument("--disk-cache-mode", choices=("file", "chunk"), default=None,
+                        help="Pass-through to per-host runner: tier entry unit, whole SSTables "
+                             "(file, the default) or disk_cache_entry_bytes chunks; label -ch<entry>")
+    parser.add_argument("--disk-cache-entry-bytes", type=int, default=None,
+                        help="Pass-through to per-host runner: chunk size in chunk mode "
+                             "(power of two >= 4096, engine default 65536)")
+    parser.add_argument("--disk-cache-admission", choices=("always", "frequency"), default=None,
+                        help="Pass-through to per-host runner: always (evict to fit, the default) "
+                             "or frequency (TinyLFU contest for non-free budget); label -adm")
     parser.add_argument(
         "--db_name",
         help="Pass-through to per-host runner: comma-separated backends "
@@ -709,6 +724,9 @@ def main():
             cache_warm_max_fraction=args.cache_warm_max_fraction,
             disk_cache_bytes=args.disk_cache_bytes, disk_cache_dir=args.disk_cache_dir,
             disk_cache_keep_pages=args.disk_cache_keep_pages,
+            disk_cache_mode=args.disk_cache_mode,
+            disk_cache_entry_bytes=args.disk_cache_entry_bytes,
+            disk_cache_admission=args.disk_cache_admission,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         if sample_hosts:
@@ -740,6 +758,9 @@ def main():
             cache_warm_max_fraction=args.cache_warm_max_fraction,
             disk_cache_bytes=args.disk_cache_bytes, disk_cache_dir=args.disk_cache_dir,
             disk_cache_keep_pages=args.disk_cache_keep_pages,
+            disk_cache_mode=args.disk_cache_mode,
+            disk_cache_entry_bytes=args.disk_cache_entry_bytes,
+            disk_cache_admission=args.disk_cache_admission,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

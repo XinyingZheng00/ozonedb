@@ -82,6 +82,9 @@ CACHE_WARM_MAX_FRACTION=""  # --cache-warm-max-fraction F (engine default 0.25),
 DISK_CACHE_BYTES=""      # --disk-cache-bytes N: disk-cache tier capacity per writer, label -dc<size>
 DISK_CACHE_DIR=""        # --disk-cache-dir DIR: root of the per-writer tier dirs (default /tank/cache)
 DISK_CACHE_KEEP_PAGES=0  # --disk-cache-keep-pages: keep the page cache after tier reads, label -kp
+DISK_CACHE_MODE=""         # --disk-cache-mode file|chunk: tier entry unit, label -ch<entry>
+DISK_CACHE_ENTRY_BYTES=""  # --disk-cache-entry-bytes N: chunk size in chunk mode
+DISK_CACHE_ADMISSION=""    # --disk-cache-admission always|frequency: label -adm
 RECORD_CNT=""     # --record-cnt N: dataset size, forwarded as --record_cnt
 RUN_TAG=""        # --run-tag: bench/results/local/<tag> on every host and here
 DRY_RUN=0
@@ -151,6 +154,10 @@ Usage: $(basename "$0") [options]
   --disk-cache-bytes N     Disk-cache tier capacity per writer (bytes); label token -dc<size>
   --disk-cache-dir DIR     Root of the per-writer tier dirs (default /tank/cache)
   --disk-cache-keep-pages  Keep the page cache after tier reads (label -kp)
+  --disk-cache-mode M      Tier entry unit: file (default) or chunk; label -ch<entry>
+  --disk-cache-entry-bytes N
+                            Chunk size in chunk mode (power of two >= 4096, default 65536)
+  --disk-cache-admission A always (default) or frequency (TinyLFU); label -adm
   --record-cnt N            dataset size in records, forwarded to every
                             client as --record_cnt (must match the load).
   --run-tag TAG             results dir bench/results/local/TAG on every host
@@ -192,6 +199,9 @@ while [[ $# -gt 0 ]]; do
   --disk-cache-bytes) DISK_CACHE_BYTES="$2"; shift 2 ;;
   --disk-cache-dir) DISK_CACHE_DIR="$2"; shift 2 ;;
   --disk-cache-keep-pages) DISK_CACHE_KEEP_PAGES=1; shift ;;
+  --disk-cache-mode) DISK_CACHE_MODE="$2"; shift 2 ;;
+  --disk-cache-entry-bytes) DISK_CACHE_ENTRY_BYTES="$2"; shift 2 ;;
+  --disk-cache-admission) DISK_CACHE_ADMISSION="$2"; shift 2 ;;
   --record-cnt)     RECORD_CNT="$2"; shift 2 ;;
   --run-tag)        RUN_TAG="$2"; shift 2 ;;
   --dry-run)        DRY_RUN=1; shift ;;
@@ -239,6 +249,15 @@ fi
 if [[ -n "$LRU_CACHE_BYTES" ]] && ! [[ "$LRU_CACHE_BYTES" =~ ^[1-9][0-9]*$ ]]; then
   echo "--lru-cache-bytes must be a positive integer (got: $LRU_CACHE_BYTES)" >&2
   exit 1
+fi
+if [[ -n "$DISK_CACHE_MODE" && "$DISK_CACHE_MODE" != file && "$DISK_CACHE_MODE" != chunk ]]; then
+  echo "--disk-cache-mode must be file or chunk (got: $DISK_CACHE_MODE)" >&2; exit 2
+fi
+if [[ -n "$DISK_CACHE_ADMISSION" && "$DISK_CACHE_ADMISSION" != always && "$DISK_CACHE_ADMISSION" != frequency ]]; then
+  echo "--disk-cache-admission must be always or frequency (got: $DISK_CACHE_ADMISSION)" >&2; exit 2
+fi
+if [[ -n "$DISK_CACHE_ENTRY_BYTES" ]] && ! [[ "$DISK_CACHE_ENTRY_BYTES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--disk-cache-entry-bytes must be a positive integer (got: $DISK_CACHE_ENTRY_BYTES)" >&2; exit 2
 fi
 if [[ -n "$DISK_CACHE_BYTES" ]] && ! [[ "$DISK_CACHE_BYTES" =~ ^[1-9][0-9]*$ ]]; then
   echo "--disk-cache-bytes must be a positive integer (got: $DISK_CACHE_BYTES)" >&2
@@ -384,9 +403,12 @@ COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG")
 [[ -n "$DISK_CACHE_BYTES" ]] && COMMON_ARGS+=(--disk-cache-bytes "$DISK_CACHE_BYTES")
 [[ -n "$DISK_CACHE_BYTES" && -n "$DISK_CACHE_DIR" ]] && COMMON_ARGS+=(--disk-cache-dir "$DISK_CACHE_DIR")
 [[ -n "$DISK_CACHE_BYTES" && "$DISK_CACHE_KEEP_PAGES" -eq 1 ]] && COMMON_ARGS+=(--disk-cache-keep-pages)
+[[ -n "$DISK_CACHE_BYTES" && -n "$DISK_CACHE_MODE" ]] && COMMON_ARGS+=(--disk-cache-mode "$DISK_CACHE_MODE")
+[[ -n "$DISK_CACHE_BYTES" && -n "$DISK_CACHE_ENTRY_BYTES" ]] && COMMON_ARGS+=(--disk-cache-entry-bytes "$DISK_CACHE_ENTRY_BYTES")
+[[ -n "$DISK_CACHE_BYTES" && -n "$DISK_CACHE_ADMISSION" ]] && COMMON_ARGS+=(--disk-cache-admission "$DISK_CACHE_ADMISSION")
 [[ -n "$RECORD_CNT"      ]] && COMMON_ARGS+=(--record_cnt "$RECORD_CNT")
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} cache_warm=$CACHE_WARM disk_cache_bytes=${DISK_CACHE_BYTES:-off} record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} cache_warm=$CACHE_WARM disk_cache_bytes=${DISK_CACHE_BYTES:-off} disk_cache_mode=${DISK_CACHE_MODE:-file} disk_cache_admission=${DISK_CACHE_ADMISSION:-always} record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
 echo "=== corfu server: $CORFU_TARGET:$CORFU_PORT ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="

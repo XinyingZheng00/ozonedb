@@ -49,6 +49,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 
 import matplotlib
@@ -88,10 +89,20 @@ def median(xs):
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
+def tier_variant(label):
+    """`ozonedb-corfu-lru8m-dc512m-ch64k-adm-kp` -> `ch64k-adm`: the tokens after
+    `-dc<size>`, without `-kp` (the page-cache A/B is not a variant). `` for a
+    round-1 label and for a label without a tier."""
+    m = re.search(r"-dc\d+[gmkb](.*)$", label)
+    if not m:
+        return ""
+    return "-".join(t for t in m.group(1).strip("-").split("-") if t and t != "kp")
+
+
 class Coefficients:
     """Everything the model needs, with a source tag per value."""
 
-    def __init__(self, rows, space, h_workload, read_fraction=0.5):
+    def __init__(self, rows, space, h_workload, read_fraction=0.5, tier_variant_filter=""):
         self.src = {}
         self.read_fraction = float(read_fraction)
         ozone = [r for r in rows if r["label"].startswith("ozonedb-corfu")
@@ -105,7 +116,14 @@ class Coefficients:
         # after the backing PUT) and the checkpoint objects. Anything derived
         # from the S3 request rate -- h_steady, g, the client CPU per op -- is
         # taken from the S3-path cells only.
-        tier = [r for r in ozone if fnum(r.get("disk_capacity"))]
+        # Only one disk-cache variant may feed the tier coefficients: round-1
+        # file-mode rows and round-2 chunk/admission rows measure different
+        # engines, so mixing their ratios would interpolate across two curves
+        # (bench/PLAN-disk-cache-2.md, Task 6).
+        tier = [r for r in ozone if fnum(r.get("disk_capacity"))
+                and tier_variant(r["label"]) == tier_variant_filter]
+        if not tier and any(fnum(r.get("disk_capacity")) for r in ozone):
+            print(f"no disk-cache rows for --tier-variant '{tier_variant_filter}'")
         ozone_s3 = [r for r in ozone if not fnum(r.get("disk_capacity"))]
         cass = [r for r in rows if r["label"].startswith("cassandra")]
 
@@ -260,12 +278,13 @@ class Coefficients:
                 fpts[ratio] = (cap, f)
         self.fill_points = sorted((ratio, f) for ratio, (_, f) in fpts.items())
         if self.disk_h_points and full_cpu is not None and self.fill_points:
+            variant = f", variant '{tier_variant_filter}'"
             self.src["h_disk"] = (f"measured, workload {h_workload}, "
-                                  f"{len(self.disk_h_points)} tier ratios")
+                                  f"{len(self.disk_h_points)} tier ratios" + variant)
             self.cpu_O_disk = fnum(full_cpu.get("client_cpu_s_per_op")) or self.cpu_O
-            self.src["cpu_s_per_op_O_disk"] = f"measured ({full_cpu['label']}, workload {cpu_wl})"
+            self.src["cpu_s_per_op_O_disk"] = f"measured ({full_cpu['label']}, workload {cpu_wl})" + variant
             self.src["fill_get_per_op"] = (f"measured, workload {cpu_wl}, "
-                                           f"{len(self.fill_points)} tier ratios")
+                                           f"{len(self.fill_points)} tier ratios" + variant)
         else:
             # No tier cells: the tier hits nothing, fills nothing and costs the
             # baseline CPU, so the disk_gb line is priced but changes nothing else.
@@ -471,6 +490,9 @@ def main():
     ap.add_argument("--h-workload", default="c", help="workload whose cache sweep gives h (default c)")
     ap.add_argument("--out-dir", default=OUT_DIR)
     ap.add_argument("--table", help="write the projection table as TSV")
+    ap.add_argument("--tier-variant", default="",
+                    help="which disk-cache variant's rows feed the tier coefficients: the label tokens after -dc<size>, "
+                         "e.g. ch64k-adm (default: the round-1 file-mode rows, whose labels carry no variant tokens)")
     args = ap.parse_args()
 
     rows = load_rows(args.coefficients_tsv)
@@ -481,7 +503,8 @@ def main():
         with open(args.space) as f:
             space = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
     coef = Coefficients(rows, space, args.h_workload,
-                        read_fraction=prices["projection"].get("read_fraction", 0.5))
+                        read_fraction=prices["projection"].get("read_fraction", 0.5),
+                        tier_variant_filter=args.tier_variant)
     coef.report()
     model = Model(coef, prices)
     pr = prices["projection"]

@@ -430,6 +430,12 @@ if __name__ == "__main__":
                         help="Root of the per-writer disk-cache dirs (default /tank/cache, the SSD mounted by setup_disk_cache.sh)")
     parser.add_argument("--disk-cache-keep-pages", action="store_true",
                         help="Do not drop the page cache after tier reads (A/B of the SSD cost)")
+    parser.add_argument("--disk-cache-mode", choices=("file", "chunk"), default=None,
+                        help="Tier entry unit: whole SSTables (file, the default) or disk_cache_entry_bytes chunks; label -ch<entry>")
+    parser.add_argument("--disk-cache-entry-bytes", type=int, default=None,
+                        help="Chunk size in chunk mode (power of two >= 4096, engine default 65536)")
+    parser.add_argument("--disk-cache-admission", choices=("always", "frequency"), default=None,
+                        help="always: evict to fit (default); frequency: TinyLFU contest for non-free budget; label -adm")
     parser.add_argument(
         "--db_name",
         type=str,
@@ -504,7 +510,9 @@ if __name__ == "__main__":
             corfu_settings, args.cache_warm_max_level, args.cache_warm_max_fraction
         )
     if args.disk_cache_bytes is not None:
-        corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages)
+        corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages,
+                                                   mode=args.disk_cache_mode, entry_bytes=args.disk_cache_entry_bytes,
+                                                   admission=args.disk_cache_admission)
     s3_settings = config.get("s3")
     max_exec_time = (
         args.max_exec_time

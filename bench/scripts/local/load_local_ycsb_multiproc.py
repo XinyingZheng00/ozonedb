@@ -239,10 +239,13 @@ def lru_label_token(lru_cache_bytes):
     return "lru" + size_label_token(lru_cache_bytes)
 
 
-def disk_cache_corfu_settings(corfu_settings, disk_cache_bytes, disk_cache_dir=None, keep_pages=False):
-    """`--disk-cache-bytes N [--disk-cache-dir DIR] [--disk-cache-keep-pages]`
-    as corfu settings. Every writer gets `<DIR>/w{i}/`, wiped before each
-    phase (bench/PLAN-disk-cache.md, Task 8)."""
+def disk_cache_corfu_settings(corfu_settings, disk_cache_bytes, disk_cache_dir=None, keep_pages=False,
+                              mode=None, entry_bytes=None, admission=None):
+    """`--disk-cache-bytes N [--disk-cache-dir DIR] [--disk-cache-keep-pages]
+    [--disk-cache-mode file|chunk] [--disk-cache-entry-bytes N]
+    [--disk-cache-admission always|frequency]` as corfu settings. Every writer
+    gets `<DIR>/w{i}/`, wiped before each phase (bench/PLAN-disk-cache.md, Task 8;
+    the round-2 keys are bench/PLAN-disk-cache-2.md, Task 6)."""
     n = int(disk_cache_bytes)
     if n <= 0:
         raise ValueError("--disk-cache-bytes must be a positive byte count")
@@ -250,15 +253,34 @@ def disk_cache_corfu_settings(corfu_settings, disk_cache_bytes, disk_cache_dir=N
     s["disk_cache_bytes"] = n
     s["disk_cache_dir"] = disk_cache_dir or s.get("disk_cache_dir") or DEFAULT_DISK_CACHE_DIR
     s["disk_cache_drop_pages"] = not keep_pages
+    if mode is not None:
+        if mode not in ("file", "chunk"):
+            raise ValueError("--disk-cache-mode must be file or chunk")
+        s["disk_cache_mode"] = mode
+    if entry_bytes is not None:
+        e = int(entry_bytes)
+        if e < 4096 or e & (e - 1):
+            raise ValueError("--disk-cache-entry-bytes must be a power of two of at least 4096")
+        s["disk_cache_entry_bytes"] = e
+    if admission is not None:
+        if admission not in ("always", "frequency"):
+            raise ValueError("--disk-cache-admission must be always or frequency")
+        s["disk_cache_admission"] = admission
     return s
 
 
 def disk_cache_label_token(corfu_settings):
-    """`-dc512m`, `-dc2g-kp` (page cache kept), or `` when the tier is off."""
+    """`-dc512m`, `-dc512m-ch64k-adm`, `-dc2g-kp`: the capacity, then `-ch<entry>`
+    in chunk mode, `-adm` under frequency admission, `-kp` when the page cache
+    is kept. `` when the tier is off."""
     s = corfu_settings or {}
     if not s.get("disk_cache_bytes"):
         return ""
     token = "-dc" + size_label_token(s["disk_cache_bytes"])
+    if s.get("disk_cache_mode") == "chunk":
+        token += "-ch" + size_label_token(s.get("disk_cache_entry_bytes") or 65536)
+    if s.get("disk_cache_admission") == "frequency":
+        token += "-adm"
     if not _truthy(s.get("disk_cache_drop_pages", True)):
         token += "-kp"
     return token
@@ -472,8 +494,12 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
             data["disk_cache_dir"] = dc_dir
             data["disk_cache_bytes"] = dc_bytes
             data["disk_cache_drop_pages"] = "true" if _truthy(corfu_settings.get("disk_cache_drop_pages", True)) else "false"
+            for k in ("disk_cache_mode", "disk_cache_entry_bytes", "disk_cache_admission", "disk_cache_admit_window"):
+                if corfu_settings.get(k) is not None:
+                    data[k] = str(corfu_settings[k])
         else:
-            for key in ("disk_cache_dir", "disk_cache_bytes", "disk_cache_drop_pages", "disk_cache_chunk_bytes", "disk_cache_fill_queue"):
+            for key in ("disk_cache_dir", "disk_cache_bytes", "disk_cache_drop_pages", "disk_cache_chunk_bytes", "disk_cache_fill_queue",
+                        "disk_cache_mode", "disk_cache_entry_bytes", "disk_cache_admission", "disk_cache_admit_window"):
                 data.pop(key, None)
         # Log trimming (PLAN-trimming.md): exactly one trimmer per cluster,
         # global writer 0. writer_idx is global (offset + local index), so
@@ -979,6 +1005,12 @@ if __name__ == "__main__":
                         help=f"Root of the per-writer disk-cache dirs (default {DEFAULT_DISK_CACHE_DIR}, the SSD mounted by setup_disk_cache.sh)")
     parser.add_argument("--disk-cache-keep-pages", action="store_true",
                         help="Do not drop the page cache after tier reads (A/B of the SSD cost)")
+    parser.add_argument("--disk-cache-mode", choices=("file", "chunk"), default=None,
+                        help="Tier entry unit: whole SSTables (file, the default) or disk_cache_entry_bytes chunks; label -ch<entry>")
+    parser.add_argument("--disk-cache-entry-bytes", type=int, default=None,
+                        help="Chunk size in chunk mode (power of two >= 4096, engine default 65536)")
+    parser.add_argument("--disk-cache-admission", choices=("always", "frequency"), default=None,
+                        help="always: evict to fit (default); frequency: TinyLFU contest for non-free budget; label -adm")
     parser.add_argument(
         "--db_name",
         type=str,
@@ -1048,7 +1080,9 @@ if __name__ == "__main__":
             corfu_settings, args.cache_warm_max_level, args.cache_warm_max_fraction
         )
     if args.disk_cache_bytes is not None:
-        corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages)
+        corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages,
+                                                   mode=args.disk_cache_mode, entry_bytes=args.disk_cache_entry_bytes,
+                                                   admission=args.disk_cache_admission)
     s3_settings = config.get("s3")
     os.makedirs(ycsb_data_path, exist_ok=True)
 

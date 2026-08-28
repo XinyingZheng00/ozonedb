@@ -89,6 +89,12 @@ DISK_RE = re.compile(
     r" writethrough_files=(?P<writethrough_files>\d+) evictions=(?P<evictions>\d+)"
     r" evicted_bytes=(?P<evicted_bytes>\d+) invalidated=(?P<invalidated>\d+) files=(?P<files>\d+)"
     r" bytes=(?P<bytes>\d+) capacity=(?P<capacity>\d+)"
+    # Round-2 tail (bench/PLAN-disk-cache-2.md). Optional, so the round-1
+    # result files still parse; the groups then come back None and read as
+    # 0 / "file" below.
+    r"(?: fetch_bytes=(?P<fetch_bytes>\d+) admit_rejected=(?P<admit_rejected>\d+)"
+    r" entries=(?P<entries>\d+) mode=(?P<mode>\w+) entry_bytes=(?P<entry_bytes>\d+)"
+    r" punch_failed=(?P<punch_failed>\d+))?"
 )
 LEVEL_COLUMNS = ("l1", "l2", "l3", "l4plus")
 
@@ -194,7 +200,8 @@ def parse_writer(path, window):
                 continue
             m = DISK_RE.search(line)
             if m:
-                w["disk"] = {k: int(v) for k, v in m.groupdict().items()}
+                w["disk"] = {k: (v or "file") if k == "mode" else (int(v) if v is not None else 0)
+                             for k, v in m.groupdict().items()}
                 continue
             m = REPLAY_RE.search(line)
             if m:
@@ -531,7 +538,7 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
     # cells run without disk_cache_dir, so every disk_* column stays "".
     disks = [w["disk"] for w in ws if w["disk"]]
     if disks:
-        disk_sums = {k: sum(d[k] for d in disks) for k in disks[0]}
+        disk_sums = {k: sum(d[k] for d in disks) for k in disks[0] if k != "mode"}
         disk_denom = disk_sums["hits"] + disk_sums["misses"]
         disk_h = round(disk_sums["hits"] / disk_denom, 5) if disk_denom else ""
         h_val = row["h"]
@@ -560,6 +567,16 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
             "disk_bytes": disk_sums["bytes"],
             "disk_capacity": disk_sums["capacity"],
             "disk_ratio": round(disks[0]["capacity"] / (rc * record_bytes), 7) if rc else "",
+            "disk_fetch_bytes": disk_sums["fetch_bytes"],
+            # bytes pulled from the backing per byte the workload asked for:
+            # ~100 for the round-1 partial tier, the chunk-to-block ratio in chunk mode
+            "disk_amp": round(disk_sums["fetch_bytes"] / disk_sums["miss_bytes"], 2) if disk_sums["miss_bytes"] else "",
+            "disk_admit_rejected": disk_sums["admit_rejected"],
+            "disk_entries": disk_sums["entries"],
+            "disk_mode": disks[0]["mode"],
+            "disk_entry_bytes": disks[0]["entry_bytes"],
+            "disk_punch_failed": disk_sums["punch_failed"],
+            "disk_evicted_bytes": disk_sums["evicted_bytes"],  # parsed in round 1, never a column
             "h_total": h_total,
         })
     # Server samples: request deltas, bytes, du, bucket, CPU.
@@ -701,6 +718,8 @@ COLUMNS = [
     "disk_fill_failed", "disk_fill_dropped", "disk_passthrough",
     "disk_evictions", "disk_invalidated", "disk_files", "disk_bytes", "disk_capacity",
     "disk_ratio", "h_total",
+    "disk_fetch_bytes", "disk_amp", "disk_admit_rejected", "disk_entries",
+    "disk_mode", "disk_entry_bytes", "disk_punch_failed", "disk_evicted_bytes",
     "hits_l1", "hits_l2", "hits_l3", "hits_l4plus",
     "misses_l1", "misses_l2", "misses_l3", "misses_l4plus",
     "cache_dead_files", "cache_dead_blocks", "cache_dead_bytes", "cache_retired_tables",
