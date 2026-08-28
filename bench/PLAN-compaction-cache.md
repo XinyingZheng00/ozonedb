@@ -5,7 +5,9 @@
 on a fresh View snapshot), `5c98526e` (runner pass-through `--cache-warm-max-level` /
 `--cache-warm-max-fraction`), `1127b7cc` (bucket restore force-copies `LATEST`),
 `41fd65a0` (loader sample name), `4facdec7` (affinity for log-input compactions),
-`f987cd54` (counters before start count as disabled). Campaigns `cost-20260828-cache` and
+`f987cd54` (counters before start count as disabled), `fc9f0d5c` (default-mode `get`
+retries against a fresh view when a listed file could not be read; `-cache3` cells read 0
+failed). Campaigns `cost-20260828-cache` and
 `-cache2`, write-up in the section "Compaction-aware block cache" of `RESULTS-cost.md`,
 rows in `results-cost-20260828-cache.tsv`. Results against the goal at 512 MB, workload a,
 600 s: `h` 0.18 to 0.40 (goal 0.5), GETs per op 0.54 to 0.40 (goal 0.25), throughput +7 %

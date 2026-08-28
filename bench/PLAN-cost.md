@@ -27,7 +27,8 @@ blocks only, compaction outputs are cold in every process but their builder, and
 SSTables' blocks are never dropped; next: per-level miss counters, drop blocks on SSTable
 REMOVE, warm outputs in the peers with one range read each, planned in
 `PLAN-compaction-cache.md`. **That change is done (2026-08-28**, commits `9ddaf573` to
-`f987cd54`, campaigns `cost-20260828-cache` and `-cache2`, section "Compaction-aware block
+`f987cd54`, NOT_FOUND retry `fc9f0d5c`, campaigns `cost-20260828-cache`, `-cache2` and
+`-cache3` (0 failed reads after the retry), section "Compaction-aware block
 cache" of `RESULTS-cost.md`): the drop alone changes nothing; warming the L1 outputs takes
 the L1 hit rate from 0.22 to 0.89 and `h` from 0.18 to 0.35 (GETs per op -20 %), L2
 outputs too (level 2, 50 % budget) `h` 0.40 and GETs per op -27 %, throughput +7 %, at

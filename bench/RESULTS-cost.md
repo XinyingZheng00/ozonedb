@@ -460,7 +460,7 @@ the crossover from 17.8 TB to 14.7 TB. Figure: `results-cost-20260829-rr.png`.
    compaction output in the peers with one range read per output (the read path that
    compaction now uses); count misses per level to size the effect first.
 
-## Compaction-aware block cache (campaigns `cost-20260828-cache` and `-cache2`, engine commits `9ddaf573` to `f987cd54`)
+## Compaction-aware block cache (campaigns `cost-20260828-cache`, `-cache2` and `-cache3`, engine commits `9ddaf573` to `fc9f0d5c`)
 
 The change planned in `PLAN-compaction-cache.md`, in three parts. C: block-cache hits and
 misses per SSTable level, dead blocks (files no longer in the View), warm counters, printed
@@ -474,7 +474,8 @@ budget rule (`cache_warm_max_fraction` of the cache, default 0.25) and an affini
 (`cache_warm_min_input_blocks`, default 1). Same cluster and settings as the range-read
 campaign: 4 KiB blocks, trimming on, a fresh 1 GB load, 600 s cells with 8 writers. Rows in
 `results-cost-20260828-cache.tsv` (`-cache-long` = the first build, `-cache2-long` = the
-build with the affinity fix `4facdec7`).
+build with the affinity fix `4facdec7`, `-cache3-long` = the build with the NOT_FOUND
+retry `fc9f0d5c`).
 
 ### Load
 
@@ -496,9 +497,10 @@ fresh snapshot. Run cells refresh it per get and were not affected.
 | Warm on, affinity fix (defaults) | 2,857 | 0.348 | 273,200 / 33,701 | 126,561 / 715,517 | 0.434 / 0.409 | 105 / 1.01M / 0.20 | 1.13 ms | 1.03 ms | 4.00 GB |
 | **Warm on, affinity fix, level 2, 50 %** | **2,912** | **0.403** | 275,436 / 37,386 | 194,835 / 660,020 | **0.397 / 0.373** | 154 / 2.02M / 0.15 | 1.14 ms | 1.01 ms | 4.18 GB |
 
-Every cell finished 8/8 with 0 to 7 NOT_FOUND reads (the documented transient miss), GETs
-per miss 0.99, `dead_blocks` 0 to 2 (a reader that published a block of a file removed
-under it) and every retired `Table*` freed. `h` here is per block lookup; a workload-a read
+Every cell finished 8/8 with 0 to 7 NOT_FOUND reads (the visibility window closed by
+`fc9f0d5c`, below; the `-cache3-long` re-runs read 0), GETs per miss 0.99, `dead_blocks`
+0 to 2 (a reader that published a block of a file removed under it) and every retired
+`Table*` freed. `h` here is per block lookup; a workload-a read
 probes about 1.3 levels, so the extractor's `h_steady` (one lookup per read) understates it
 and is not quoted.
 
@@ -545,7 +547,7 @@ compaction), against the range-read control's 14,331 / 0.679 / 0.319. The read p
 not change; the 2 % throughput gap is inside the run-to-run spread of the three controls
 (14,350 / 14,331 / 14,011).
 
-### Two bugs found on the way
+### Three bugs found on the way
 
 The bucket restore between cells (`mc mirror --overwrite --remove`) kept a cell's
 `checkpoint/LATEST` (same 8 bytes, newer mtime) while removing the checkpoint it named,
@@ -553,6 +555,20 @@ so every writer of the next cell died at open ("a LATEST that cannot be read"); 
 cells were lost before the restore force-copied every `LATEST` (`1127b7cc`). The loader
 wrapper named its server sample after the plain label, so the `--cache-warm` load
 overwrote the range-read load's sample (`41fd65a0`; the sample files were renamed by hand).
+
+The 1 to 7 NOT_FOUND reads per 0.8 M in the workload-a cells were not an accepted miss.
+The crash fix `96b9265d` made a removed file a failed fetch instead of a null dereference,
+but a default-mode `get` then returned NOT_FOUND for a key that a peer's compaction had
+moved between the View snapshot and the block read. Fix (`fc9f0d5c`): `LRUCache` counts
+read failures (a log record that cannot be read, a table that cannot be opened, a block
+read that throws), and `DB::get` in default mode re-reads the counter after the scan. If
+it moved and no record was found, the get calls `syncView()` and scans again, up to five
+attempts. The strict path already retried on a metadata-log size change and is unchanged.
+Verification (`cost-20260828-cache3-long`, 600 s, 8 writers): 512 MB, warm on, level 2,
+50 %: 2,894 ops/s, `h` 0.404, 0.397 GETs per op, 154 files warmed, **0 failed** (against
+2,912 / 0.403 / 0.397 / 154 before the fix). 8 MB, warm on: 2,600 ops/s, `h` 0.010,
+0.657 GETs per op, **0 failed** (against 2,591 / 0.010 / 0.657). The retry costs nothing
+measurable: the counter moves only when a file is removed under a reader.
 
 ### Projection
 
