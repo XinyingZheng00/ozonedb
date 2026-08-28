@@ -214,7 +214,8 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          total_writers, workloads, trial, max_exec_time=None,
                          linearizable=False, log_trim=False, db_name=None,
                          cassandra_consistency=None, lru_cache_bytes=None,
-                         record_cnt=None, cache_warm=False):
+                         record_cnt=None, cache_warm=False,
+                         cache_warm_max_level=None, cache_warm_max_fraction=None):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -236,6 +237,10 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--linearizable"] if linearizable else [])
             + (["--log-trim"] if log_trim else [])
             + (["--cache-warm"] if cache_warm else [])
+            + (["--cache-warm-max-level", str(int(cache_warm_max_level))]
+               if cache_warm and cache_warm_max_level is not None else [])
+            + (["--cache-warm-max-fraction", str(float(cache_warm_max_fraction))]
+               if cache_warm and cache_warm_max_fraction is not None else [])
             + (["--db_name", shlex.quote(db_name)] if db_name else [])
             + (["--cassandra_consistency", cassandra_consistency] if cassandra_consistency else [])
             + (["--lru-cache-bytes", str(int(lru_cache_bytes))] if lru_cache_bytes is not None else [])
@@ -268,7 +273,9 @@ def cell_label(config, args):
     if args.lru_cache_bytes is not None:
         corfu = lru_cache_corfu_settings(corfu, args.lru_cache_bytes)
     if args.cache_warm:
-        corfu = cache_warm_corfu_settings(corfu)
+        corfu = cache_warm_corfu_settings(
+            corfu, args.cache_warm_max_level, args.cache_warm_max_fraction
+        )
     cass = config.get("cassandra")
     if args.cassandra_consistency:
         cass = cassandra_mode_settings(cass, args.cassandra_consistency)
@@ -528,6 +535,16 @@ def main():
              "outputs into every writer's block cache; result files get a -warm token.",
     )
     parser.add_argument(
+        "--cache-warm-max-level", type=int, default=None,
+        help="Pass-through with --cache-warm: warm outputs of levels up to N "
+             "(engine default 1); label token -wlN.",
+    )
+    parser.add_argument(
+        "--cache-warm-max-fraction", type=float, default=None,
+        help="Pass-through with --cache-warm: output bytes at most this fraction of "
+             "lru_cache_bytes (engine default 0.25); label token -wf<percent>.",
+    )
+    parser.add_argument(
         "--db_name",
         help="Pass-through to per-host runner: comma-separated backends "
              "(overrides local.run.db_name on every client), e.g. cassandra.",
@@ -670,7 +687,8 @@ def main():
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
-            cache_warm=args.cache_warm,
+            cache_warm=args.cache_warm, cache_warm_max_level=args.cache_warm_max_level,
+            cache_warm_max_fraction=args.cache_warm_max_fraction,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         if sample_hosts:
@@ -698,7 +716,8 @@ def main():
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
-            cache_warm=args.cache_warm,
+            cache_warm=args.cache_warm, cache_warm_max_level=args.cache_warm_max_level,
+            cache_warm_max_fraction=args.cache_warm_max_fraction,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

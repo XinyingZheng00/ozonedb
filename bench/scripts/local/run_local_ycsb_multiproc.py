@@ -413,6 +413,16 @@ if __name__ == "__main__":
              "files get a -warm token.",
     )
     parser.add_argument(
+        "--cache-warm-max-level", type=int, default=None,
+        help="With --cache-warm: warm outputs of levels up to N (engine default 1); "
+             "label token -wlN.",
+    )
+    parser.add_argument(
+        "--cache-warm-max-fraction", type=float, default=None,
+        help="With --cache-warm: warm an output only if its bytes are at most this "
+             "fraction of lru_cache_bytes (engine default 0.25); label token -wf<percent>.",
+    )
+    parser.add_argument(
         "--db_name",
         type=str,
         default=None,
@@ -482,7 +492,9 @@ if __name__ == "__main__":
     if args.log_trim:
         corfu_settings = log_trim_corfu_settings(corfu_settings)
     if args.cache_warm:
-        corfu_settings = cache_warm_corfu_settings(corfu_settings)
+        corfu_settings = cache_warm_corfu_settings(
+            corfu_settings, args.cache_warm_max_level, args.cache_warm_max_fraction
+        )
     s3_settings = config.get("s3")
     max_exec_time = (
         args.max_exec_time

@@ -182,18 +182,38 @@ def lru_cache_corfu_settings(corfu_settings, lru_cache_bytes):
     return s
 
 
-def cache_warm_corfu_settings(corfu_settings):
+def cache_warm_corfu_settings(corfu_settings, max_level=None, max_fraction=None):
     """Copy of `corfu_settings` with the compaction-aware block cache on.
 
     bench/PLAN-compaction-cache.md part B: every generated shared_config
-    gets cache_warm_enabled=true (the other cache_warm_* keys keep the
-    engine defaults) and result files get a `-warm` token, so the A/B
-    cells of one tag never overwrite each other. One override, one place,
-    the way --log-trim and --lru-cache-bytes work.
+    gets cache_warm_enabled=true and result files get a `-warm` token, so
+    the A/B cells of one tag never overwrite each other. The two policy
+    knobs the campaign sweeps ride along when given (cache_warm_max_level,
+    cache_warm_max_fraction; the engine defaults are 1 and 0.25) and add
+    `-wl<N>` / `-wf<percent>` to the token. One override, one place, the
+    way --log-trim and --lru-cache-bytes work.
     """
     s = dict(corfu_settings or {})
     s["cache_warm"] = True
+    if max_level is not None:
+        s["cache_warm_max_level"] = int(max_level)
+    if max_fraction is not None:
+        s["cache_warm_max_fraction"] = float(max_fraction)
     return s
+
+
+def cache_warm_label_token(corfu_settings):
+    """`-warm`, `-warm-wl2`, `-warm-wl2-wf50`: the warm policy as a
+    filename token; empty when the warm is off."""
+    s = corfu_settings or {}
+    if not _truthy(s.get("cache_warm")):
+        return ""
+    token = "-warm"
+    if s.get("cache_warm_max_level") is not None:
+        token += f"-wl{int(s['cache_warm_max_level'])}"
+    if s.get("cache_warm_max_fraction") is not None:
+        token += f"-wf{int(round(100 * float(s['cache_warm_max_fraction'])))}"
+    return token
 
 
 def lru_label_token(lru_cache_bytes):
@@ -309,9 +329,9 @@ def result_label(db_name, corfu_settings, cassandra_settings=None, lru_cache_byt
             lru_cache_bytes = (corfu_settings or {}).get("lru_cache_bytes")
         if lru_cache_bytes is not None:
             label += "-" + lru_label_token(lru_cache_bytes)
-        # Warm outputs on (--cache-warm, or corfu.cache_warm): `-warm`.
-        if _truthy((corfu_settings or {}).get("cache_warm")):
-            label += "-warm"
+        # Warm outputs on (--cache-warm, or corfu.cache_warm): `-warm`,
+        # plus the policy knobs when they differ from the engine defaults.
+        label += cache_warm_label_token(corfu_settings)
     return label
 
 
@@ -367,6 +387,9 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
             data["cache_warm_enabled"] = (
                 "true" if _truthy(corfu_settings["cache_warm"]) else "false"
             )
+        for k in ("cache_warm_max_level", "cache_warm_max_fraction", "cache_warm_min_input_blocks"):
+            if corfu_settings.get(k) is not None:
+                data[k] = str(corfu_settings[k])
         # Log trimming (PLAN-trimming.md): exactly one trimmer per cluster,
         # global writer 0. writer_idx is global (offset + local index), so
         # on a multi-host run only the first host's first writer trims.
@@ -856,6 +879,16 @@ if __name__ == "__main__":
              "files get a -warm token.",
     )
     parser.add_argument(
+        "--cache-warm-max-level", type=int, default=None,
+        help="With --cache-warm: warm outputs of levels up to N (engine default 1); "
+             "label token -wlN.",
+    )
+    parser.add_argument(
+        "--cache-warm-max-fraction", type=float, default=None,
+        help="With --cache-warm: warm an output only if its bytes are at most this "
+             "fraction of lru_cache_bytes (engine default 0.25); label token -wf<percent>.",
+    )
+    parser.add_argument(
         "--db_name",
         type=str,
         default=None,
@@ -920,7 +953,9 @@ if __name__ == "__main__":
     if args.log_trim:
         corfu_settings = log_trim_corfu_settings(corfu_settings)
     if args.cache_warm:
-        corfu_settings = cache_warm_corfu_settings(corfu_settings)
+        corfu_settings = cache_warm_corfu_settings(
+            corfu_settings, args.cache_warm_max_level, args.cache_warm_max_fraction
+        )
     s3_settings = config.get("s3")
     os.makedirs(ycsb_data_path, exist_ok=True)
 
