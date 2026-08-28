@@ -3,6 +3,7 @@
 
   plot_cost_model.py coefficients.tsv prices.json [--space space.json]
                      [--out-dir DIR] [--table out.tsv] [--h-workload c]
+                     [--cpu-workload a] [--tier-variant ch64k-adm]
 
 coefficients.tsv is what extract_cost_coefficients.py writes. prices.json
 holds the list prices, the instance roles and the projection parameters.
@@ -102,7 +103,8 @@ def tier_variant(label):
 class Coefficients:
     """Everything the model needs, with a source tag per value."""
 
-    def __init__(self, rows, space, h_workload, read_fraction=0.5, tier_variant_filter=""):
+    def __init__(self, rows, space, h_workload, read_fraction=0.5, tier_variant_filter="",
+                 cpu_workload=None):
         self.src = {}
         self.read_fraction = float(read_fraction)
         ozone = [r for r in rows if r["label"].startswith("ozonedb-corfu")
@@ -204,8 +206,11 @@ class Coefficients:
         # Client CPU per op from the workload whose read mix matches the
         # projection (a at 50 % reads, c above 95 %): workload a costs an
         # OzoneDB client 2-4x the CPU of workload c (compaction, log tailing),
-        # so a median over both would answer neither question.
-        cpu_wl = "c" if self.read_fraction >= 0.95 else "a"
+        # so a median over both would answer neither question. --cpu-workload
+        # overrides the rule for a corpus whose workloads carry another name
+        # (the key-space zipfian cells are `az` and `cz`; PLAN-cost-2.md
+        # Task 0b), so that corpus is read with --h-workload cz --cpu-workload az.
+        cpu_wl = cpu_workload or ("c" if self.read_fraction >= 0.95 else "a")
         self.cpu_workload = cpu_wl
         self.cpu_O = pick("cpu_s_per_op_O", [fnum(r["client_cpu_s_per_op"]) for r in ozone_s3
                                              if r["workload"] == cpu_wl],
@@ -488,6 +493,10 @@ def main():
     ap.add_argument("prices_json")
     ap.add_argument("--space", help="space.json with sC, sO, L_gb, L0_kb_per_put, trim_interval_s")
     ap.add_argument("--h-workload", default="c", help="workload whose cache sweep gives h (default c)")
+    ap.add_argument("--cpu-workload", default=None,
+                    help="workload whose cells give the client CPU per op and the tier fill rate "
+                         "(default: c when projection.read_fraction >= 0.95, else a); "
+                         "the key-space zipfian corpus uses --h-workload cz --cpu-workload az")
     ap.add_argument("--out-dir", default=OUT_DIR)
     ap.add_argument("--table", help="write the projection table as TSV")
     ap.add_argument("--tier-variant", default="",
@@ -504,7 +513,8 @@ def main():
             space = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
     coef = Coefficients(rows, space, args.h_workload,
                         read_fraction=prices["projection"].get("read_fraction", 0.5),
-                        tier_variant_filter=args.tier_variant)
+                        tier_variant_filter=args.tier_variant,
+                        cpu_workload=args.cpu_workload)
     coef.report()
     model = Model(coef, prices)
     pr = prices["projection"]
