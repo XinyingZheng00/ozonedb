@@ -225,6 +225,7 @@ set(OZONEDB_TEST_SOURCES
     tests/test_checkpoint.cpp
     tests/test_cache.cpp
     tests/test_disk_cache_storage.cpp
+    tests/test_frequency_sketch.cpp
 )
 if (OZONEDB_ENABLE_CORFU)
     list(APPEND OZONEDB_TEST_SOURCES tests/test_corfu_storage.cpp)
