@@ -2,6 +2,48 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status (2026-08-28):** DONE, built and measured. Tasks 1 to 8 complete on branch
+`worktree-disk-cache-2` (cut from the `worktree-plan-cost` tip, whose own worktree was
+locked by another session). Campaign **`disk2-20260828`**, 10 cells, 8 clients, 600 s each,
+one trial; rows in `results-disk2-20260828.tsv`, projection in
+`results-disk2-20260828-projection.tsv`, write-up in the section "Disk-cache tier, round 2"
+of `RESULTS-cost.md`.
+
+The goal is met. At a 512 MB budget on workload a the tier went from a 5 % loss against no
+tier (2,469 against 2,608 ops/s) to a 6 % gain (2,760), and on workload c from 8,744 to
+11,308 ops/s at 0.32 ms of client CPU per op against 1.22 ms. **Chunk entries are what did
+it**: alone they cut the amplification from about 100 to 14.9 and the fill GETs per op to 0.
+**Admission alone did not help the file tier** (amplification 98.3, 212x capacity of fill
+bytes, +3 % throughput) because it gates whether a transfer happens, never how large it is;
+in chunk mode it cuts eviction churn 4.5-fold and adds 12 % throughput. The full 2 GB tier
+did not regress (48,276 against 46,741 ops/s). Nine of the plan's twelve goals hold; the
+three misses are `evicted_bytes` at 64 KiB entries (8.3x capacity against a 2x goal, though
+16 KiB entries meet it at 1.9x), both file-mode-plus-admission fill goals, and
+`disk_fill_failed` (see below).
+
+**Projection, better than this plan predicted.** "What the projection will say" below expected
+the tier to become "about neutral at 10 TB" and the break-even to move from 5.9 TB to about
+10 TB. Measured: the tier is cheaper at **every** decade from 1 GB to 100 TB, so the
+break-even is gone. 10 TB: $5,992 to $5,515 (-8 %), where round 1 was +9 %. 100 TB: $9,007 to
+$8,359 (-7 %). What moved is `disk_h` at a ratio of 0.262, from 0.137 to 0.290.
+
+**Defaults flipped** (Task 8, Step 3): all three conditions held, so `disk_cache_mode` is now
+`chunk` and `disk_cache_admission` is now `frequency` in both `DiskCacheStorage::Options` and
+`Metadata`. `disk_cache_corfu_settings` now always writes both keys when the tier is on, so a
+plain `--disk-cache-bytes` run is labelled `-dc512m-ch64k-adm`. `disk_cache_entry_bytes`
+**stays 65536** even though the single 16 KiB cell beat 64 KiB on throughput, amplification,
+SSD churn, egress and CPU: 16 KiB was measured at one tier ratio only, and the projection needs
+three. A three-ratio `ch16k-adm` campaign is the first follow-up.
+
+**One defect found in this plan.** Task 7 asserts `disk_fill_failed = 0` in every cell, but
+Task 2 Step 5 accepts that a file-mode admission refusal at publish time is counted twice.
+`publishPartFile` returning false makes `fillOne` count a failed fill, so the two file-mode
+admission cells report 2,104 and 2,436 "failures" that are refusals. The counter is wrong, not
+the engine; all eight chunk-mode cells report 0. `failed` and `disk_punch_failed` are 0
+everywhere, so `FALLOC_FL_PUNCH_HOLE` works on the nodes' ZFS `/tank`.
+
+---
+
 **Goal:** Make a disk-cache tier that is smaller than the dataset stop losing to no tier at all, by two changes to `DiskCacheStorage`: TinyLFU admission control, and chunk entries in place of whole-file entries.
 
 **Architecture:** `DiskCacheStorage` (`src/db/disk_cache_storage.cpp`) gains a frequency sketch that every cacheable read records, and an admission decision that a fill or a write-through must win before it takes budget from a resident entry. A second mode, `chunk`, stores fixed-size chunks of each SSTable in one sparse local file, fetches the chunks that cover a missed range on the caller's thread, and evicts chunk by chunk with a CLOCK hand and `fallocate(PUNCH_HOLE)`. The bench chain, the extractor and the cost model learn the new switches, and one campaign measures both changes against the round-1 cells.

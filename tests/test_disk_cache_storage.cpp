@@ -709,9 +709,9 @@ TEST(DiskCacheStorageTest, MetadataParsesTheDiskCacheKeys) {
     EXPECT_TRUE(md.disk_cache_drop_pages);
     EXPECT_EQ(md.disk_cache_chunk_bytes, 67108864ull);
     EXPECT_EQ(md.disk_cache_fill_queue, 256ull);
-    EXPECT_EQ(md.disk_cache_mode, "file");
+    EXPECT_EQ(md.disk_cache_mode, "chunk");
     EXPECT_EQ(md.disk_cache_entry_bytes, 65536ull);
-    EXPECT_EQ(md.disk_cache_admission, "always");
+    EXPECT_EQ(md.disk_cache_admission, "frequency");
     EXPECT_EQ(md.disk_cache_admit_window, 0ull);
   }
   EXPECT_THROW(Metadata(write(base + ",\n\"disk_cache_dir\": \"/tank/cache/w0\"")),

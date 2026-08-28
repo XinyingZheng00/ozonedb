@@ -254,17 +254,53 @@ backing PUT, `remove`/`invalidate` drop the local copy, and the budget `disk_cac
 by file-level LRU. Config keys (`Metadata`): `disk_cache_dir` (empty = off, and it throws without
 `sstable_backend`), `disk_cache_bytes` (required with the dir), `disk_cache_chunk_bytes` (64 MiB),
 `disk_cache_drop_pages` (default true — `posix_fadvise(DONTNEED)` after a tier read, so the
-measurement is the SSD and not the page cache), `disk_cache_fill_queue` (256). `DB::closeDB` prints
+measurement is the SSD and not the page cache), `disk_cache_fill_queue` (256).
+
+**Round 2** (`PLAN-disk-cache-2.md`) adds four keys and flips two defaults, because the whole-file
+tier above moved ~100 bytes per byte read and lost to no tier at all below the dataset size.
+`disk_cache_mode` (**default `chunk`**, was `file`): in `chunk` the entry is a
+`disk_cache_entry_bytes` piece of an SSTable, not the whole file — one sparse local file per
+SSTable plus one state byte per chunk, a miss fetches the chunk-aligned covering range in **one**
+GET on the caller's thread (there is no fill worker: the fill *is* the demand read), and eviction
+is per chunk through a CLOCK hand and `fallocate(PUNCH_HOLE|KEEP_SIZE)`. `disk_cache_entry_bytes`
+(65536, a power of two ≥ 4096) sizes that chunk. `disk_cache_admission` (**default `frequency`**,
+was `always`): `frequency` is TinyLFU (`frequency_sketch.h`, count-min, four rows of 8-bit
+counters halved every `disk_cache_admit_window` samples — 0 = 8× the entries the budget holds) —
+budget that is *not free* is taken only when the candidate's estimated frequency beats the
+victim's, so a full tier stops churning; free budget is never contested, and a write-through has
+no read history so it takes free budget only. `disk_cache_chunk_bytes` applies to `file` mode
+only. Reconcile in `chunk` mode starts cold (which chunks of a leftover sparse file hold data is
+not recorded), and a whole-file read is served locally only when every chunk is present.
+`DB::closeDB` prints
 a `[disk_cache] hits=… misses=… fills=… fill_gets=… evictions=… invalidated=… files=… capacity=…`
 line after `[lru_cache]`. An unusable `disk_cache_dir` is fatal, not degraded: the constructor
 throws `std::runtime_error` when the directory cannot be created or fails a write probe, and
 `DB::DB` propagates it. The bench path is `--disk-cache-bytes` / `--disk-cache-dir` /
 `--disk-cache-keep-pages` on `run_multinode_ycsb_with_corfu.sh`, per writer, label token
-`-dc<size>[-kp]` — a flag, never a `ycsb.yaml` edit. The runner refuses a tier root that is on
+`-dc<size>[-ch<entry>][-adm][-kp]` — a flag, never a `ycsb.yaml` edit. Round 2 adds
+`--disk-cache-mode file|chunk`, `--disk-cache-entry-bytes N` and
+`--disk-cache-admission always|frequency` on all three runner layers;
+`disk_cache_corfu_settings` **always** writes the mode and the admission policy when the tier is
+on, so a plain `--disk-cache-bytes` run is labelled `-dc512m-ch64k-adm` and a round-1 cell has to
+name `--disk-cache-mode file --disk-cache-admission always` to get back `-dc512m`. The extractor
+appends `disk_fetch_bytes` / `disk_amp` (= `fetch_bytes/miss_bytes`, the amplification) /
+`disk_admit_rejected` / `disk_entries` / `disk_mode` / `disk_entry_bytes` / `disk_punch_failed`,
+and its `DISK_RE` tail is optional so round-1 result files still parse. `plot_cost_model.py
+--tier-variant` picks which variant's rows feed the tier coefficients (`` = round-1 file mode,
+`ch64k-adm` = round 2); never mix two variants in one curve. The runner refuses a tier root that is on
 the root filesystem *or* is not itself a mount point (`OZONEDB_DISK_CACHE_ANY_FS=1` overrides),
 because `/tank` is its own filesystem and an unmounted SSD would otherwise land the tier there.
 Measured in `RESULTS-cost.md`, "Disk-cache tier": a tier that holds the dataset removes the
 object store from the read path; a smaller one thrashes, because the unit is a whole SSTable.
+Round 2 fixes that thrash ("Disk-cache tier, round 2", campaign `disk2-20260828`): at a 512 MB
+budget chunk entries alone cut the amplification from ~100 to 14.9 and the fill GETs per op to 0,
+and with admission on gave 11,308 ops/s against the file tier's 8,744 at 0.32 ms of client CPU per
+op against 1.22 ms; workload a went from a 5 % *loss* against no tier to a 6 % gain; the full 2 GB
+tier did not regress. The projection now has the tier cheaper at every decade from 1 GB to 100 TB,
+so round 1's 5.9 TB break-even is gone. Admission *alone* does not help the file tier — it gates
+whether a transfer happens, never how big it is. A single 16 KiB cell beat 64 KiB on every column
+but `disk_h`; the default stays 65536 because only `ch64k-adm` was measured at three tier ratios,
+which is what the projection needs.
 
 ### CorfuDB backend
 

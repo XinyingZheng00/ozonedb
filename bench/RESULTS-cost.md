@@ -816,6 +816,249 @@ ASSUMED); it is not a second copy of the baseline, because a few medians -- `put
 5. **Price the instance-store variant.** An `i4i.4xlarge` client carries 3.75 TB of NVMe
    with no separate volume line; the model has only the gp3 form today.
 
+## Disk-cache tier, round 2: admission control and chunk entries (campaign `disk2-20260828`)
+
+The change planned in `PLAN-disk-cache-2.md`, which attacks result 2 of the round above:
+the round-1 tier moved 100 bytes for every byte the workload asked for, because a miss on
+one 4 KiB block queued a fill of the whole 121 MB SSTable. Two mechanisms, measured
+separately and together:
+
+1. **TinyLFU admission** (`disk_cache_admission = frequency`). A count-min sketch of four
+   rows of 8-bit counters records every cacheable read. A candidate that needs budget which
+   is not free is admitted only when its estimated frequency is strictly above the
+   frequency of the eviction victim. Free budget is always taken. A compaction output has
+   no read history, so a write-through takes free budget only.
+2. **Chunk entries** (`disk_cache_mode = chunk`, `disk_cache_entry_bytes`). The tier keeps
+   one sparse local file per SSTable and one state byte per chunk. A ranged read that
+   misses fetches the chunk-aligned covering range in one GET, returns the requested slice,
+   and writes the absent chunks at their own offsets. There is no fill worker: the fill is
+   the demand read. Eviction is per chunk, through a CLOCK hand and
+   `fallocate(PUNCH_HOLE | KEEP_SIZE)`.
+
+Load, layout and cluster as in the round above: 4 KiB blocks, compaction range reads,
+trimming on, a fresh 1 GB load (1 M records), 600 s cells, 8 writers on 8 clients, MinIO on
+the log node, RAM block cache 8 MB. Rows in `results-disk2-20260828.tsv`. Every cell
+finished 8/8 with 0 failed reads and 0 failed hole punches on ZFS.
+
+`disk_amp` below is `fetch_bytes / miss_bytes`: bytes pulled from the object store per byte
+the workload asked for. Capacity is the sum over the 8 writers, so a 512 MB tier per writer
+is 4.29 GB of capacity, and "x cap" divides by that.
+
+### Workload c, 600 s, 8 writers
+
+| Cell | Tier | ops/s | `disk_h` | GETs per op | Fill GETs per op | `disk_amp` | Evicted | Egress, steady | Client CPU per op |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| RAM 8 MB, no tier (`cost-20260828-4k`) | — | 7,057 | — | 0.760 | — | — | — | 26 MB/s | 0.42 ms |
+| round 1, `dc256m` (file) | 256 MB | 6,646 | 0.137 | 0.666 | 0.0066 | ~100 | — | 2,025 MB/s | 1.56 ms |
+| round 1, `dc512m` (file) | 512 MB | 8,744 | 0.384 | 0.475 | 0.0051 | ~100 | — | 2,061 MB/s | 1.22 ms |
+| round 1, `dc2g` (file) | 2 GB | 46,741 | 0.9994 | 0.00052 | 0.00001 | — | — | 0 MB/s | 0.12 ms |
+| `dc512m-adm` (file + admission) | 512 MB | 9,036 | 0.395 | 0.466 | 0.0049 | 98.3 | 907 GB (211x cap) | 2,024 MB/s | 1.18 ms |
+| `dc512m-ch64k` (chunk, no admission) | 512 MB | 10,107 | 0.476 | 0.398 | **0** | 14.9 | 162 GB (37.7x cap) | 295 MB/s | 0.39 ms |
+| **`dc512m-ch64k-adm`** | **512 MB** | **11,308** | **0.510** | **0.373** | **0** | **15.0** | 35.6 GB (8.3x cap) | **311 MB/s** | **0.32 ms** |
+| `dc512m-ch16k-adm` | 512 MB | **12,008** | 0.492 | 0.386 | **0** | **4.7** | **8.1 GB (1.9x cap)** | **106 MB/s** | **0.30 ms** |
+| `dc512m-ch256k-adm` | 512 MB | 9,760 | 0.485 | 0.392 | **0** | 55.5 | 136 GB (31.6x cap) | 1,054 MB/s | 0.41 ms |
+| `dc256m-ch64k-adm` | 256 MB | 8,776 | 0.290 | 0.540 | **0** | 14.8 | 34.5 GB (16.1x cap) | 348 MB/s | 0.39 ms |
+| `dc2g-ch64k-adm` | 2 GB | 48,276 | 0.993 | 0.00508 | **0** | 12.7 | 0 GB | 0 MB/s | 0.12 ms |
+
+### Workload a, 600 s, 8 writers
+
+| Cell | Tier | ops/s | `disk_h` | GETs per op | `disk_amp` | Evicted | Egress, steady | Client CPU per op |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| RAM 8 MB, no tier (`cost-20260829-rr`) | — | 2,608 | — | 0.658 | — | — | 10 MB/s | 1.18 ms |
+| round 1, `dc512m` (file) | 512 MB | 2,469 | 0.321 | 0.471 | ~100 | — | 2,109 MB/s | 4.21 ms |
+| round 1, `dc2g` (file) | 2 GB | 3,702 | 0.9966 | 0.00281 | — | — | 21 MB/s | 0.94 ms |
+| `dc512m-adm` (file + admission) | 512 MB | 2,609 | 0.361 | 0.441 | 319.0 | 914 GB (213x cap) | 2,086 MB/s | 4.06 ms |
+| **`dc512m-ch64k-adm`** | **512 MB** | **2,760** | 0.311 | 0.454 | **12.1** | **8.6 GB (2.0x cap)** | **98 MB/s** | **1.18 ms** |
+| `dc2g-ch64k-adm` | 2 GB | 3,479 | 0.789 | 0.139 | 9.2 | 0 GB | 21 MB/s | 1.00 ms |
+
+### Against the plan's goal table
+
+| Cell | Metric | Goal | Measured | Met |
+|---|---|---|--:|:--|
+| c 512 MB, chunk 64 KiB + admission | Egress, steady | <= 400 MB/s | 311 MB/s | yes |
+| c 512 MB, chunk 64 KiB + admission | `disk_fill_gets_per_op` | 0 | 0 | yes |
+| c 512 MB, chunk 64 KiB + admission | `evicted_bytes` | <= 2x capacity | 8.3x capacity | **no** |
+| c 512 MB, chunk 64 KiB + admission | `disk_h` | >= 0.40 | 0.510 | yes |
+| c 512 MB, chunk 64 KiB + admission | Client CPU per op | <= 0.42 ms | 0.32 ms | yes |
+| c 512 MB, chunk 64 KiB + admission | ops/s | >= 9,000 | 11,308 | yes |
+| c 512 MB, file + admission | `disk_fill_gets_per_op` | <= 0.0005 | 0.0049 | **no** |
+| c 512 MB, file + admission | Fill bytes | <= 3x capacity | 212x capacity | **no** |
+| a 512 MB, chunk 64 KiB + admission | ops/s | >= 2,700 | 2,760 | yes |
+| a 512 MB, chunk 64 KiB + admission | Client CPU per op | <= 1.2 ms | 1.18 ms | yes |
+| c 2 GB, chunk 64 KiB + admission | ops/s | >= 44,000 | 48,276 | yes |
+| every cell | `failed`, `disk_punch_failed` | 0 | 0 | yes |
+| every cell | `disk_fill_failed` | 0 | 0, except the two file + admission cells | **no** |
+
+Nine of the twelve goals hold. The three that miss are all explained below, and one of them
+is a defect in the plan's own counter, not in the engine.
+
+### Findings
+
+**Admission alone does not repair the file tier.** On workload c the file tier with
+admission refused 16,045 fills and still moved 910 GB, 212 times its capacity, against
+round 1's 1,198 GB. The amplification stayed at 98.3 and the client CPU at 1.18 ms, both
+within noise of round 1. Throughput rose 3 %, from 8,744 to 9,036. The reason is that
+admission gates *whether* a transfer happens, never *how large* it is: a whole-file entry
+is 121 MB whether or not the sketch approves it, and under uniform keys the sketch approves
+about one candidate in three, because a count-min estimate of two equally hot files is a
+tie only most of the time. On workload a the same cell was worse still, with an
+amplification of 319, because compaction keeps invalidating files that the tier then
+re-fetches whole.
+
+**Chunk entries are what remove the amplification.** With admission off, chunk mode at
+64 KiB cut the amplification from about 100 to 14.9, took the fill GETs per op to exactly
+zero (the fill is the demand read), lifted `disk_h` from 0.384 to 0.476, cut the client CPU
+from 1.22 ms to 0.39 ms and raised throughput 16 %, from 8,744 to 10,107. Steady egress
+fell from 2,061 MB/s to 295 MB/s. This is the single change that matters.
+
+**The two together are better than either.** Chunk 64 KiB with admission reached 11,308
+ops/s, `disk_h` 0.510 and 0.32 ms of CPU per op: 29 % more throughput than round 1 at the
+same budget, and a quarter of its CPU. Admission does not reduce the bytes fetched in chunk
+mode, because a refused chunk is still fetched to answer the read that missed. What it
+reduces is the write side: evictions fell 4.5 times, from 37.7x capacity to 8.3x, and the
+fill bytes from 38.7x to 9.3x. Less SSD write churn is why the CPU and the throughput both
+improve while `disk_amp` stays at 15.
+
+**The entry-size sweep favours the smallest chunk measured.** At a 512 MB budget with
+admission on:
+
+| Entry | ops/s | `disk_h` | `disk_amp` | Evicted | Egress | CPU per op |
+|---|--:|--:|--:|--:|--:|--:|
+| 16 KiB | **12,008** | 0.492 | **4.7** | **1.9x cap** | **106 MB/s** | **0.30 ms** |
+| 64 KiB | 11,308 | **0.510** | 15.0 | 8.3x cap | 311 MB/s | 0.32 ms |
+| 256 KiB | 9,760 | 0.485 | 55.5 | 31.6x cap | 1,054 MB/s | 0.41 ms |
+
+Blocks are 4 KiB, so a 16 KiB chunk wastes at most 4 blocks per miss against 16 for 64 KiB
+and 64 for 256 KiB, and the amplification tracks that ratio almost exactly (4.7, 15.0,
+55.5). 16 KiB is the only cell in the campaign that meets the plan's `evicted_bytes <= 2x
+capacity` goal. 64 KiB keeps the best hit rate, because a larger chunk carries more
+neighbouring blocks that a later read wants. The two effects cross somewhere below 64 KiB,
+and 16 KiB wins on every column except `disk_h`.
+
+**The full tier does not regress.** At 2 GB per writer, chunk 64 KiB with admission reached
+48,276 ops/s against round 1's 46,741, with `disk_h` 0.993, zero evictions and 0.12 ms of
+CPU per op. Chunk mode costs nothing when the tier holds the whole dataset. The `open` and
+`pread` per read, which the plan flagged as the risk here, do not show above the noise.
+
+**Workload a stops losing to no tier.** This was the point of the plan. Round 1's 512 MB
+tier ran at 2,469 ops/s against a no-tier control of 2,608, so the tier was a 5 % *loss*.
+Chunk 64 KiB with admission runs at 2,760, a 6 % gain, with the CPU per op back from 4.21 ms
+to the control's 1.18 ms and the egress down from 2,109 MB/s to 98. The workload-a full tier
+is the one place round 2 is behind round 1: 3,479 ops/s against 3,702, with `disk_h` 0.789
+against 0.9966. The cause is structural. A whole-file read, which is how compaction reads
+its inputs, is served locally in chunk mode only when every chunk of the file is present;
+demand reads fetch only the chunks they cover, so many files stay partially resident and
+their compaction reads go to the object store. Round 1 had no such rule, because its entry
+was the whole file.
+
+### Projection: 10,000 ops/s, 50 % reads, RF=3 (USD per month)
+
+Built from `results-disk2-20260828.tsv` with `--tier-variant ch64k-adm`, so the tier
+coefficients come from the three round-2 ratios 0.262, 0.524 and 2.097 and never mix with
+the round-1 file-mode curve. Full table in `results-disk2-20260828-projection.tsv`, plot in
+`results-disk2-20260828.png`.
+
+| Dataset | No tier, 16 GB cache | Round-1 tier | Round-2 tier | Round 2 against no tier |
+|---|--:|--:|--:|--:|
+| 1 GB | 2,997 | 1,822 | 1,830 | -39 % |
+| 10 GB | 2,997 | 1,822 | 1,830 | -39 % |
+| 100 GB | 4,004 | 1,825 | 1,839 | -54 % |
+| 1 TB | 5,230 | 1,938 | 1,936 | -63 % |
+| 10 TB | 5,992 | 6,509 | **5,515** | **-8 %** |
+| 100 TB | 9,007 | 9,698 | **8,359** | **-7 %** |
+
+The plan predicted, before the measurement, that round 2 would make the tier "about neutral
+at 10 TB" and move the break-even from 5.9 TB to about 10 TB. The measurement is better than
+that prediction. The tier is now cheaper than the best no-tier layout at **every** decade
+from 1 GB to 100 TB, so the round-1 break-even at 5.9 TB is gone: there is no data size in
+the modelled range at which the tier stops paying. At 10 TB the tier saves $477 a month
+where round 1 cost an extra $517.
+
+What moved is `disk_h` at the ratios the projection actually uses. A 2 TB tier against
+10 TB of data is a ratio of 0.2, where round 1 measured `disk_h` 0.106 and round 2 measures
+0.29. The tier's own hit rate at a ratio of 0.262 more than doubled, from 0.137 to 0.290,
+and the client CPU per op at the full tier fell, so the tier buys more GETs back per dollar
+of gp3.
+
+The OzoneDB-against-Cassandra crossover is unchanged at 14.7 TB. The tier does not move it,
+because that line is set by the 4 GB-cache OzoneDB layout, which has no tier.
+
+The `ozone_hi_cache` column moves by $1 at 100 GB against the round-1 projection (4,004
+against 4,005). That is a corpus-size effect, not a model change: adding ten cells shifts a
+median that runs over all OzoneDB cells, which `combine_disk_corpus.py` documents. Running
+the same model over the enlarged corpus with `--tier-variant ""` reproduces the committed
+round-1 tier column exactly (1822, 1822, 1825, 1938, 6509, 9698), which is the check that
+the variant filter selects the right rows.
+
+### Caveats
+
+1. **One trial per cell.** Ten cells, one trial each. The round-1 campaign showed cell-to-cell
+   spread of a few percent on workload c, so differences below about 5 % are not resolved.
+   The chunk-against-file differences here are 16 % to 37 % and are safe; the 16 KiB against
+   64 KiB throughput difference is 6 % and is not.
+2. **Uniform keys.** YCSB's default request distribution is uniform, so every SSTable is
+   equally hot and TinyLFU has almost no skew to exploit. Admission still helps, but only by
+   damping churn, never by finding a hot set. A skewed distribution is where frequency
+   admission is designed to win, and the runner still cannot set `requestdistribution`.
+3. **`disk_h` is clamped below the smallest measured ratio.** The projection interpolates
+   `disk_h` over three ratios, 0.262 to 2.097. Below 0.262 it holds the value flat, so the
+   1 GB to 1 TB rows lean on an extrapolation the campaign did not measure.
+4. **Failure counters.** `failed` and `disk_punch_failed` are 0 in all ten cells;
+   `FALLOC_FL_PUNCH_HOLE` works on the nodes' ZFS `/tank`. `disk_fill_failed` is 0 in all
+   eight chunk-mode cells and non-zero only in the two file-mode cells with admission on
+   (2,104 on c, 2,436 on a). Those are not failures. In file mode admission is checked twice,
+   once before the transfer and once at publish, and a refusal at publish makes
+   `publishPartFile` return false, which `fillOne` then counts as a failed fill. The plan
+   accepts the double count of the refusal but also asserts `disk_fill_failed = 0` in every
+   cell; the two statements cannot both hold, and the counter is the one that is wrong.
+   Chunk mode is unaffected, because it refuses inside `reserveChunkLocked` before any byte
+   is written.
+5. **The 2 GB workload-a cell is 6 % behind round 1**, for the structural reason under
+   "Workload a" above. It is below the resolution of a single trial but it has a mechanism,
+   so it is probably real.
+
+### Reproduce
+
+```bash
+# per cell (10 cells, 600 s each, about 2.5 h in total)
+bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim \
+  --lru-cache-bytes 8388608 --disk-cache-bytes 536870912 \
+  --disk-cache-mode chunk --disk-cache-admission frequency \
+  --workloads c --writers-list 1 --trial 1 --duration 600 --run-tag disk2-20260828-long
+
+python3 bench/scripts/extract_cost_coefficients.py \
+    bench/results/local/disk2-20260828-long bench/results/local \
+    --window 60 --tsv bench/results-disk2-20260828.tsv
+
+python3 bench/scripts/plot/combine_disk_corpus.py \
+    --disk2 bench/results-disk2-20260828.tsv /tmp/corpus.tsv
+python3 bench/scripts/plot/plot_cost_model.py /tmp/corpus.tsv bench/scripts/plot/prices.json \
+    --space bench/scripts/plot/space.json --tier-variant ch64k-adm \
+    --out-dir /tmp/plot --table bench/results-disk2-20260828-projection.tsv
+```
+
+### What to do next
+
+1. **A three-ratio campaign at 16 KiB entries.** The single 16 KiB cell wins on throughput,
+   amplification, SSD churn, egress and CPU, and it is the only cell that meets the eviction
+   goal. It is measured at one tier ratio, so no projection can use it yet. Measure it at
+   256 MB, 512 MB and 2 GB and re-run the model with `--tier-variant ch16k-adm`. Try 8 KiB
+   in the same campaign: the amplification tracks entry size over chunk size so closely that
+   the floor has not been found.
+2. **A shared cross-client tier.** Under uniform keys a per-client tier cannot beat
+   `disk_h = capacity / dataset`, and that ceiling, not the transfer waste, is what now
+   limits the 10 TB number. Hash-partitioned peers, or one cache node in front of MinIO, is
+   the only change that lifts it.
+3. **A skewed-key cell.** Frequency admission is built for skew and this campaign gave it
+   none. Needs a runner flag for YCSB's `requestdistribution` first.
+4. **Fix `disk_fill_failed`.** Do not count an admission refusal at publish as a failed fill;
+   count it in `admit_rejected` only, as chunk mode already does.
+5. **Serve a partial whole-file read from the chunks that are present.** This is the whole of
+   the workload-a full-tier regression: fall back to the object store only for the ranges
+   that are absent, instead of for the whole file.
+6. **`SEEK_DATA` recovery and an fd cache**, so a chunk-mode tier survives a restart warm and
+   stops paying an `open` per read.
+
 ## Method notes and caveats
 
 - **Steady-state `h`.** The sampler polls the MinIO request counters every 10 s. `h_steady`

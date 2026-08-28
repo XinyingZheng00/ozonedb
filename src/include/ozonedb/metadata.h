@@ -117,10 +117,11 @@ class Metadata {
   uint64_t disk_cache_fill_queue = 256;
   // Round 2 (bench/PLAN-disk-cache-2.md): "file" keeps whole SSTables, "chunk"
   // keeps disk_cache_entry_bytes pieces of them; "frequency" is TinyLFU
-  // admission, "always" the round-1 evict-to-fit.
-  std::string disk_cache_mode = "file";
+  // admission, "always" the round-1 evict-to-fit. The defaults are the round-2
+  // pair, measured in campaign disk2-20260828 (bench/RESULTS-cost.md).
+  std::string disk_cache_mode = "chunk";
   uint64_t disk_cache_entry_bytes = 65536;
-  std::string disk_cache_admission = "always";
+  std::string disk_cache_admission = "frequency";
   uint64_t disk_cache_admit_window = 0;
 
   // When true, log reads trust the in-memory key index (kept fresh by

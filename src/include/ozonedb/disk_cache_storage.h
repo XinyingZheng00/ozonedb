@@ -88,10 +88,15 @@ class DiskCacheStorage : public Storage {
     size_t chunk_bytes = 64u << 20;  // file mode only: ranged-read size of the fill worker
     bool drop_pages = true;          // POSIX_FADV_DONTNEED after each tier read
     size_t max_queue = 256;          // fill queue bound; the oldest is dropped
-    Admission admission = Admission::kAlways;  // kFrequency: TinyLFU contest for non-free budget
-    uint64_t admit_window = 0;                 // sketch aging window in samples; 0 = 8 x the entries the budget holds
-    Mode mode = Mode::kFile;                   // kChunk: sub-file entries, no fill worker (PLAN-disk-cache-2)
-    size_t entry_bytes = 64u << 10;            // chunk mode: entry size, a power of two >= 4096
+    // Defaults flipped from kAlways/kFile on the evidence of campaign
+    // disk2-20260828 (bench/RESULTS-cost.md, "Disk-cache tier, round 2"): at a
+    // 512 MB budget chunk entries plus admission gave 11,308 ops/s against the
+    // file tier's 8,744 and 0.32 ms of client CPU per op against 1.22 ms, and
+    // the full 2 GB tier did not regress (48,276 against 46,741 ops/s).
+    Admission admission = Admission::kFrequency;  // kAlways: round-1 evict-to-fit
+    uint64_t admit_window = 0;                    // sketch aging window in samples; 0 = 8 x the entries the budget holds
+    Mode mode = Mode::kChunk;                     // kFile: round-1 whole-SSTable entries with a fill worker
+    size_t entry_bytes = 64u << 10;               // chunk mode: entry size, a power of two >= 4096
   };
 
   struct Stats {

@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Superseded in part by `PLAN-disk-cache-2.md` (2026-08-28).** Round 2 built chunk entries and
+TinyLFU admission on top of this tier and measured them in campaign `disk2-20260828`. The
+"below 5.9 TB only" result in this paragraph is round-1 behaviour and no longer describes the
+shipped engine: with `disk_cache_mode = chunk` and `disk_cache_admission = frequency`, which
+are now the defaults, the tier is cheaper than the best no-tier layout at every decade from
+1 GB to 100 TB, and item 2 of "What to do next" below (sub-file entries) is done. Item 1
+(admission control) is done too, but on its own it did not help: it gates whether a transfer
+happens, never how large it is. See "Disk-cache tier, round 2" in `RESULTS-cost.md`.
+
 **Status (2026-08-28):** DONE, built and measured. Engine commits `8ed9b9c1` to
 `dcc9a438` (`DiskCacheStorage`, the `disk_cache_*` config keys, the SSTable-removed
 listener), bench commits `bf09c216` to `a3b17d48` (the SSD provisioning, the runner flags,

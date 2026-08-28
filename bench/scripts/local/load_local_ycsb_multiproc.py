@@ -218,6 +218,12 @@ def cache_warm_label_token(corfu_settings):
 
 
 DEFAULT_DISK_CACHE_DIR = "/tank/cache"
+# The engine defaults, mirrored so the label names what actually ran even when
+# the caller passes no --disk-cache-mode / --disk-cache-admission. Keep these in
+# step with DiskCacheStorage::Options and Metadata (bench/PLAN-disk-cache-2.md,
+# Task 8; flipped on the evidence of campaign disk2-20260828).
+DEFAULT_DISK_CACHE_MODE = "chunk"
+DEFAULT_DISK_CACHE_ADMISSION = "frequency"
 
 
 def size_label_token(n):
@@ -253,19 +259,24 @@ def disk_cache_corfu_settings(corfu_settings, disk_cache_bytes, disk_cache_dir=N
     s["disk_cache_bytes"] = n
     s["disk_cache_dir"] = disk_cache_dir or s.get("disk_cache_dir") or DEFAULT_DISK_CACHE_DIR
     s["disk_cache_drop_pages"] = not keep_pages
-    if mode is not None:
-        if mode not in ("file", "chunk"):
-            raise ValueError("--disk-cache-mode must be file or chunk")
-        s["disk_cache_mode"] = mode
+    if mode is None:
+        mode = s.get("disk_cache_mode") or DEFAULT_DISK_CACHE_MODE
+    if mode not in ("file", "chunk"):
+        raise ValueError("--disk-cache-mode must be file or chunk")
+    # Always written, never left to the engine default: the label token is
+    # derived from these keys, and a run whose label does not name its mode and
+    # its admission policy cannot be told apart from a round-1 run.
+    s["disk_cache_mode"] = mode
+    if admission is None:
+        admission = s.get("disk_cache_admission") or DEFAULT_DISK_CACHE_ADMISSION
+    if admission not in ("always", "frequency"):
+        raise ValueError("--disk-cache-admission must be always or frequency")
+    s["disk_cache_admission"] = admission
     if entry_bytes is not None:
         e = int(entry_bytes)
         if e < 4096 or e & (e - 1):
             raise ValueError("--disk-cache-entry-bytes must be a power of two of at least 4096")
         s["disk_cache_entry_bytes"] = e
-    if admission is not None:
-        if admission not in ("always", "frequency"):
-            raise ValueError("--disk-cache-admission must be always or frequency")
-        s["disk_cache_admission"] = admission
     return s
 
 
