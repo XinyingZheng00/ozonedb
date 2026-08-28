@@ -54,6 +54,15 @@ are dropped. What the larger sizes buy:
   measured on a four-level tree (100 GB spans L1 to L4 with the base config's level
   sizes), which is the shape the projection range has.
 - `L`, `k` and the join cost are checked flat against a tenfold larger dataset.
+- A second request distribution. YCSB's `requestdistribution=zipfian` is a
+  `ScrambledZipfianGenerator`: a zipfian (θ = 0.99) over a fixed 10^10 items
+  (`ScrambledZipfianGenerator.java:33-35`), folded onto the key space by `fnvhash64(item)
+  % itemcount` (line 103). Over 10 M or 100 M keys that is a few hundred very hot keys on
+  a uniform background, which is the measured `h` curve (0.216 at a 0.8 % cache, then
+  about the capacity fraction). Task 7b adds a zipfian over the key space itself
+  (`zipfian_keyspace`, Task 0b) as a second, labelled OzoneDB line. Every cell of the
+  main campaign keeps YCSB's default, because that is what every published YCSB number
+  is.
 
 What the engine changes since `cost-20260827` do to the model, and which coefficient
 each one moves:
@@ -109,6 +118,25 @@ small at any plausible value.
 
 The campaign refutes or confirms the 0.5x row. Nothing in it is tuned to hit it.
 
+The zipfian-over-the-key-space line (Task 7b) is a hand estimate from the model's terms,
+not a model run. With θ = 0.99 the top k keys of N carry `zeta(k) / zeta(N)` of the
+reads, and a hot key costs one 4 KiB block (keys are hashed on insert, so there is no
+block locality). A 16 GB cache holds 4.2 M keys:
+
+| Cache / dataset | Keys held | `h`, YCSB zipfian (measured curve) | `h`, zipfian over the key space |
+|---|--:|--:|--:|
+| 16 GB / 10 TB | 4.2 M of 10^10 | 0.157 | about 0.65 |
+| 4 GB / 10 TB | 1.0 M of 10^10 | 0.07 | about 0.58 |
+| 16 GB / 100 TB | 4.2 M of 10^11 | 0.044 | about 0.58 |
+
+GETs scale with `1 - h`. At 10 TB the GET line falls from about $4,430 to about $1,840,
+so the no-tier 16 GB line (client CPU at 0.5x) goes from $5,712 to about $3,100, under
+the Cassandra EBS layout's $4,742, and the crossover of the 4 GB line moves from 14.7 TB
+to about 2 to 3 TB. Cassandra does not move: its cells are client-bound at 17 % server
+busy. Under a key-space zipfian `h` is not scale-free (`zeta(k) / zeta(N)` rises with N
+at a fixed ratio), so a projection that reads the 100 GB curve is conservative at 10 TB
+by about 0.08 in `h`. The write-up says so.
+
 ## 3. Fixed parameters
 
 Everything in `PLAN-cost.md` "Fixed parameters" holds, with these changes:
@@ -117,6 +145,7 @@ Everything in `PLAN-cost.md` "Fixed parameters" holds, with these changes:
 |---|---|---|
 | Engine | `visibility` + the native merge (Task 0), one commit hash in every result directory | one engine for every OzoneDB cell |
 | Corfu client | `native` (the merged default), label token `-native` | the change under test; two JNI control cells only |
+| Request distribution | YCSB's default (`workloada`, `workloadc`) in every main cell; `workloadaz` / `workloadcz` = the same mixes with `requestdistribution=zipfian_keyspace` in the Task 7b cells | see §1, last bullet; the distribution rides on the workload name, so no runner flag and no label token |
 | Datasets | D10 = 10,000,000 x 1 KB, D100 = 100,000,000 x 1 KB, `--record-cnt` on every load and every cell | see §1 |
 | Server storage | `/dev/sdb` on `amd127` (447 GiB SATA SSD, unused today) as one ext4 mount `/tank/ssd`, holding MinIO, the Corfu log and snapshots, and the Cassandra data | the 100 GB states do not fit the 63 GB root disk (24 GB free); see Task 1 |
 | Client storage | unchanged: `/dev/sdb` is the tier at `/tank/cache` (440 GB), enough for a 52 GB tier per writer | |
@@ -160,6 +189,7 @@ Result tag directories, and which of them feed the model:
 | `$TAG-cass-10g`, `$TAG-cass-100g` | Cassandra quorum and serial at 8 writers, quorum at 2 and 4 (10 GB only) | yes |
 | `$TAG-scale` | OzoneDB workload a at 2 and 4 writers, 10 GB | **no** — `cpu_O` is a median over workload-a cells with no writer filter (`plot_cost_model.py`, `pick`). A 2-writer cell pulls it down |
 | `$TAG-jni` | the JNI control pair, 10 GB | **no** — its label `ozonedb-corfu-lru5g` matches the OzoneDB prefix and enters the same median |
+| `$TAG-10g-zipf`, `$TAG-100g-zipf`, `$TAG-cass-zipf` | the `az` / `cz` cells of Task 7b, both systems | **no** — their own TSV and their own model run (`--h-workload cz --cpu-workload az`); the model keys `h` and `cpu_O` on the workload name, so the two distributions never share a corpus |
 | results root | the load rows (`_rc<N>` samples) | yes, after the root is archived (Task 1) |
 
 How the model combines the two sizes: `h` keeps one point per ratio, and at the three
@@ -228,6 +258,41 @@ Do this on the laptop, in a worktree cut from `visibility`. The user runs the bu
 Exit: the merge commit exists, the dry run prints both flag families, the three label
 checks pass.
 
+### Task 0b. Zipfian over the key space (on the merged tree, no C++)
+
+1. `ycsb/core/src/main/java/site/ycsb/workloads/CoreWorkload.java`, a branch next to
+   the `zipfian` one at line 519:
+   ```java
+   } else if (requestdistrib.compareTo("zipfian_keyspace") == 0) {
+     // A zipfian (theta 0.99) over THIS key space. YCSB's "zipfian" is a
+     // ScrambledZipfianGenerator over 10^10 items folded onto the key space by
+     // fnvhash64, which is close to uniform beyond a few hundred hot keys.
+     keychooser = new ZipfianGenerator(insertstart, insertstart + insertcount + expectednewkeys - 1);
+   ```
+   Mirror the bounds of the `zipfian` branch. The hot values are the low key numbers,
+   and `insertorder=hashed` (the default) hashes the key number into the key string, so
+   the hot records are scattered over every SSTable. `ZipfianGenerator` computes its
+   normalizer with a loop over N at construction: seconds at 100 M, once per process.
+   An unknown distribution name makes `CoreWorkload` throw, so a typo fails loudly.
+2. Two workload files: `ycsb/workloads/workloadaz` and `workloadcz`, copies of
+   `workloada` and `workloadc` with `requestdistribution=zipfian_keyspace` and a comment
+   that says why. `generate_workload.py` names its output after the file, the result
+   files carry `workloadcz`, `RUN_RE` captures `wl = cz`, and nothing else in the chain
+   reads the letter (checked: the wrappers split on spaces, the runner on commas, no
+   validation anywhere).
+3. `plot_cost_model.py`: a `--cpu-workload` option (default: `c` when the read fraction
+   is at least 0.95, else `a`, as today at line 208), so the zipf corpus is read with
+   `--h-workload cz --cpu-workload az`.
+4. A small overlay script, `bench/scripts/plot/overlay_projections.py`: two projection
+   TSVs in, one figure out, the Cassandra lines once, the OzoneDB lines twice (solid for
+   YCSB's zipfian, dashed for the key-space zipfian). About 30 lines of matplotlib.
+5. The functional check needs a loaded dataset, so it is the first cell of Task 5's
+   chain: one `cz` cell at 10 GB, 100 MiB cache, 300 s. Its `[lru_cache]` hit rate must
+   be far above the scrambled cell at the same cache (expect above 0.4 against about
+   0.14), with 0 failed reads. If it is not, stop the chain: the branch did not take.
+
+About 45 min on the laptop. It changes no file that the merge in Task 0 conflicts on.
+
 ### Task 1. Cluster check, server SSD, results root
 
 1. Confirm that no other session drives the cluster: local `pgrep -af
@@ -269,13 +334,13 @@ checks pass.
    |---|--:|--:|--:|
    | Task 2, 10 GB cells | 11 + 11 GB | 1.4 GB (old snapshots) | 24 GB |
    | Task 2, 100 GB load and cells | 107 + 107 GB | 1.4 GB | 216 GB |
-   | Task 2 end, `data` deleted | 107 GB (`data.load` kept) | 0 | 107 GB |
-   | Task 4, 10 GB loads | 107 GB | 13 GB untrimmed log (deleted after `du`), then 12 + 12 GB bucket and snapshot | 132 GB |
-   | Task 7, 100 GB load and cells | 107 GB | 117 + 117 GB bucket and snapshot, log under 1 GB | 341 GB + 24 GB of 10 GB snapshots = 365 GB |
+   | Task 2 end, both 100 GB trees deleted | 11 GB (`data.load-10g`) | 0 | 11 GB |
+   | Task 4, 10 GB load | 11 GB | 12 + 12 GB bucket and snapshot | 35 GB |
+   | Task 7, 100 GB load and cells | 11 GB | 117 + 117 GB bucket and snapshot, log under 1 GB | 234 GB + 24 GB of 10 GB snapshots = 269 GB |
+   | Task 7b, Cassandra `cz` / `az` at 10 GB | 11 + 11 GB | as above | 280 GB |
 
    If the 100 GB bucket comes out above 130 GB (`sO` above 1.3), delete the 10 GB
-   OzoneDB snapshots before the 100 GB load, or delete `data.load` of Cassandra after
-   its cells. The 375 GB on `sda` is the last resort.
+   OzoneDB snapshots before the 100 GB load. The 375 GB on `sda` is the last resort.
 4. Check `/tank/cache` is a mount point on all eight clients (`mountpoint /tank/cache`).
    The runner refuses a tier root that is not one. 440 GB per client covers the 50 GiB
    tier with room.
@@ -311,6 +376,7 @@ done
 
 # 100 GB: load (about 45 min at 40,000 puts/s, plus the save-load copy), then four cells.
 # Read-only cells first, without a restore: they leave the drained load state as it is.
+ssh oliverr3@amd127.utah.cloudlab.us 'cp -a /tank/cassandra/data.load /tank/cassandra/data.load-10g'   # kept for Task 7b
 bash bench/scripts/local/load_multinode_cassandra.sh --writers 8 --record-cnt 100000000
 ssh oliverr3@amd127.utah.cloudlab.us '/tank/cassandra/cassandra_ctl.sh space; du -sk /tank/cassandra/data.load'   # sC: peak, then drained
 for mode in quorum serial; do
@@ -327,7 +393,8 @@ A restore copies 107 GB on one SSD (about 8 min). The order above needs two rest
 (before each workload-a cell) instead of four. `nodetool compact` at 100 GB takes tens of
 minutes and is skipped: `sC` was 1.066 before and after `compact` at both 1 GB and 10 GB,
 and the drained `data.load` after the load is the steady footprint. After the last cell
-delete `/tank/cassandra/data` (keep `data.load`) to free 107 GB.
+delete `/tank/cassandra/data` and `data.load` (214 GB). `data.load-10g` (11 GB) stays
+for the Task 7b cells.
 
 Task 2 needs no new build, so it runs while Task 0 (the merge) is in progress on the
 laptop. It is off the critical path as long as the merge takes longer than it does.
@@ -386,6 +453,9 @@ Exit: `sO` 1.17 within 3 %, `L` at most 250 MiB, `wa` 3.4 within 15 %, `k` 5–7
 
 ```bash
 RC=10000000
+# Task 0b check first: one key-space-zipfian cell; stop the chain if its h is not far above 0.14
+bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes 104857600 \
+  --workloads cz --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 300 --run-tag $TAG-10g-zipf
 # h sweep and the workload-c CPU: 600 s where the cache takes minutes to fill, 300 s where it takes seconds
 for c in 5368709120 671088640; do
   bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes $c \
@@ -415,7 +485,7 @@ bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --corfu-cli
   --workloads a --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-jni
 ```
 
-Twelve cells. Launch the chain detached (`setsid nohup bash chain.sh > chain.log 2>&1 &`)
+Thirteen cells with the Task 0b check. Launch the chain detached (`setsid nohup bash chain.sh > chain.log 2>&1 &`)
 with `set -e`: the harness kills background chains, and a failed cell must not fall
 through to the next one. The 5 GiB cache fills at 20–40 MB/s of misses and slows as it
 fills, so it needs the 600 s. An 80 MiB cache fills in seconds, so 300 s is past the
@@ -522,6 +592,59 @@ Exit:
 - `cpuO` on workload a within 20 % of the 10 GB value.
 - 8/8 writers with `[OVERALL]` in every cell, 0 failed ops, `disk_punch_failed` 0.
 
+### Task 7b. Zipfian over the key space, both sizes, both systems
+
+The same ratios the projection reads, under `workloadcz` / `workloadaz` (Task 0b). At
+10 GB the three twins run inside Task 5's chain, after the sweep. The 100 GB cells run
+after Task 7. The Cassandra cells run last, at 10 GB, from the snapshot Task 2 kept.
+
+```bash
+# 10 GB twins (in the Task 5 chain; the 100 MiB one is the Task 0b check and is already done)
+for c in 83886080 1310720; do
+  bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt 10000000 --lru-cache-bytes $c \
+    --workloads cz --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 300 --run-tag $TAG-10g-zipf
+done
+
+# 100 GB (after Task 7): the h curve, the CPU cell, one tier cell
+RC=100000000
+for c in 838860800 104857600 13107200; do
+  bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes $c \
+    --workloads cz --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 300 --run-tag $TAG-100g-zipf
+done
+bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes 104857600 \
+  --workloads az --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-100g-zipf
+bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes 838860800 \
+  --disk-cache-bytes 26843545600 --workloads cz --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-100g-zipf
+
+# Cassandra, 10 GB, last: Corfu stopped (rule 8), the 10 GB snapshot restored by hand, no restore in the runner
+ssh oliverr3@amd127.utah.cloudlab.us "pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' || true"
+ssh oliverr3@amd127.utah.cloudlab.us '/tank/cassandra/cassandra_ctl.sh stop; rm -rf /tank/cassandra/data; cp -a /tank/cassandra/data.load-10g /tank/cassandra/data'
+bash bench/scripts/local/run_multinode_ycsb_with_cassandra.sh --consistency quorum --record-cnt 10000000 --no-restore \
+  --workloads "cz az" --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 120 --run-tag $TAG-cass-zipf
+ssh oliverr3@amd127.utah.cloudlab.us '/tank/cassandra/cassandra_ctl.sh stop'
+```
+
+Under a key-space zipfian a 100 MiB cache converges in seconds: the hot keys are re-read
+within the first status intervals. 300 s is generous. The tier cell gets 600 s because
+TinyLFU has skew to work with for the first time and its admission decisions take a
+window to settle.
+
+Exit:
+
+- `h_steady`, `cz` at 100 GB: at least 0.55 at 800 MiB, 0.45 at 100 MiB, 0.35 at 12.5 MiB
+  (the estimates are 0.65 / 0.54 / 0.43 for a perfect top-k cache, and an LRU under
+  churn sits below them).
+- `h_steady`, `cz` at 10 GB: **below** the 100 GB twin by 0.03 to 0.10. The sign is the
+  check: `zeta(k) / zeta(N)` falls with N at a fixed k, and the 10 GB cell holds the
+  same k in a tenfold smaller N.
+- `disk_h` at the 25 GiB tier above the YCSB-zipfian cell at the same ratio (0.29 in
+  round 2).
+- `cpuO` on `az` within 20 % of the `a` cell at the same cache: the client does the same
+  work per op, it just misses less.
+- Cassandra `cz` / `az` within 5 % of the `c` / `a` cells at 10 GB: the skew changes
+  nothing on a client-bound server.
+- 8/8 writers with `[OVERALL]`, 0 failed ops.
+
 ### Task 8. Extraction, model, figure, write-up
 
 ```bash
@@ -536,7 +659,20 @@ python3 bench/scripts/extract_cost_coefficients.py bench/results/local/$TAG-scal
 python3 bench/scripts/plot/plot_cost_model.py bench/results-$TAG.tsv bench/scripts/plot/prices.json \
     --space bench/scripts/plot/space.json --tier-variant ch64k-adm \
     --out-dir bench/scripts/plot/out --table bench/results-$TAG-projection.tsv
+# the key-space zipfian: its own corpus, its own run, the same space.json and prices
+python3 bench/scripts/extract_cost_coefficients.py \
+    bench/results/local/$TAG-10g-zipf bench/results/local/$TAG-100g-zipf bench/results/local/$TAG-cass-zipf \
+    bench/results/local --window 60 --tsv bench/results-$TAG-zipf.tsv
+python3 bench/scripts/plot/plot_cost_model.py bench/results-$TAG-zipf.tsv bench/scripts/plot/prices.json \
+    --space bench/scripts/plot/space.json --tier-variant ch64k-adm --h-workload cz --cpu-workload az \
+    --out-dir bench/scripts/plot/out-zipf --table bench/results-$TAG-zipf-projection.tsv
+python3 bench/scripts/plot/overlay_projections.py bench/results-$TAG-projection.tsv \
+    bench/results-$TAG-zipf-projection.tsv --out bench/results-$TAG.png
 ```
+
+The zipf corpus has one tier ratio (0.26), so its tier line is an extrapolation and is
+reported as a number at 10 TB, not drawn. Its Cassandra rows are the 10 GB `cz` / `az`
+cells. The model's Cassandra terms are flat in D, so that is enough.
 
 No `combine_disk_corpus.py`: every coefficient comes from `results-$TAG.tsv`. The model
 must print `measured` for every source line and "4 tier ratios" for `disk_h`. If a
@@ -550,8 +686,9 @@ both systems, 10 GB and 100 GB (`$TAG`)": the coefficient table with 10 GB and 1
 columns and the `cost-20260827` values beside them, the throughput and CPU table for both
 systems at both sizes, the `h` curve with the twin-ratio check, the tier table with the
 new 0.026 point, the JNI control pair, the projection at the decades, the crossover band
-from §2 against the measured one, the caveats (one trial, uniform keys, no full tier at
-100 GB). Update the "Findings" numbers that the campaign changes, in place, with a date.
+from §2 against the measured one, the key-space zipfian line with one paragraph on what
+YCSB's `zipfian` is (§1, last bullet) and why `h` under it is not scale-free, the caveats
+(one trial, no full tier at 100 GB, one tier ratio on the zipf line). Update the "Findings" numbers that the campaign changes, in place, with a date.
 Commit the three TSVs, the projection TSV, the figure, `space.json` and `prices.json`
 (re-read the prices, update `as_of`).
 
@@ -564,14 +701,16 @@ A 600 s cell costs about 14 min with the restart and the restore, a 300 s cell a
 |---|--:|---|---|
 | 1. cluster check, server SSD, archive | | 45 min | yes, first |
 | 0. merge, label checks, push (laptop) | | 2–3 h | yes, in parallel with Task 2 |
+| 0b. `zipfian_keyspace` branch, two workload files, `--cpu-workload`, overlay script (laptop) | | 45 min | yes, after Task 0, still in parallel with Task 2 |
 | 2. Cassandra: 6 cells at 10 GB, 100 GB load, 4 cells (2 restores) | 10 | 35 + 55 + 30 min = 2 h | no: runs during Task 0 |
 | 3. sync, build, tests on a fresh server | | 40 min | yes |
 | 4. one 10 GB load, 16 writers | | 12–18 min | yes |
-| 5. sweep 2 x 600 s + 3 x 300 s, workload a 2, linearizable 2, scaling 2, JNI 1 | 12 | 28 + 27 + 28 + 8 + 8 + 14 = 1 h 55 | yes |
+| 5. Task 0b check 1, sweep 2 x 600 s + 3 x 300 s, workload a 2, linearizable 2, scaling 2, JNI 1, `cz` twins 2 | 15 | 9 + 28 + 27 + 28 + 8 + 8 + 14 + 18 = 2 h 20 | yes |
 | 6. tier at 10 GB, 1 x 300 s + 4 x 600 s | 5 | 65 min | yes |
 | 7. 100 GB load, then 4 RAM cells and 4 tier cells (7 x 600 s + 1 x 300 s) | 8 | 2–3 h + 1 h 50 | yes |
+| 7b. `cz` / `az` at 100 GB (3 x 300 s + 2 x 600 s), Cassandra `cz` / `az` at 10 GB | 7 | 55 + 12 min = 1 h 10 | yes |
 | 8. extraction, model, write-up (tables drafted during the 100 GB load) | | 1 h | yes |
-| **Total** | **35** | **about 12 h from Task 1 to the write-up**, 9.5 h of OzoneDB cluster time | |
+| **Total** | **45** | **about 13.5 h from Task 1 to the write-up**, 11 h of OzoneDB cluster time | |
 
 Against the first version of this plan (14 h on the cluster, then 2.5 h of write-up,
 after a 2–3 h merge: about 19 h in sequence), the schedule above is one long day plus a
@@ -587,9 +726,9 @@ morning. What was cut and why it costs no paper number:
 | JNI control on workload a only | 15 min | the workload-c repeat; the twin-ratio cells at 100 GB are the repeat now |
 | Write-up drafted during the 100 GB load | 1 h 30 of wall clock | nothing |
 
-Two detached chains. Task 2 (Cassandra) starts as soon as Task 1 is done, while the merge
-is in progress. Tasks 4 to 7 follow as one chain of two loads and 25 OzoneDB cells (about
-8 h). The server is idle between them.
+Two detached chains. Task 2 (Cassandra) starts as soon as Task 1 is done, while Tasks 0
+and 0b are in progress. Tasks 4 to 7b follow as one chain of two loads, 33 OzoneDB cells
+and the two Cassandra `cz` / `az` cells (about 9.5 h). The server is idle between them.
 
 ### Optional cuts, not applied
 
@@ -647,6 +786,15 @@ then taught, and what 100 GB adds:
   (Task 1, step 1), kill only pids this job started, keep them in a file.
 - **The trimmer is global writer 0**, the first writer on the first host. The scaling
   cells with `hosts_n 2` keep `amd160` first, so the trimmer does not move.
+- **`zipfian_keyspace` computes its normalizer at process start**: a loop over N with a
+  `pow` per key, seconds at 100 M. The first status lines of an `az` / `cz` cell show
+  0 ops for those seconds. Not a fault.
+- **Under a key-space zipfian `h` is not scale-free.** The 10 GB twin sits below the
+  100 GB cell by design (Task 7b exit). Do not "fix" it, and do not average the two.
+- **The Cassandra `cz` / `az` cells restore by hand** from `data.load-10g` with
+  `--no-restore`, and Corfu must be stopped before them (rule 8). The runner's own
+  restore copies the 100 GB `data.load`, which Task 2 deleted, so the flag is not
+  optional.
 - **Symlinked state directories.** `/tank/minio`, `/mnt/corfu` and `/tank/cassandra` are
   symlinks into `/tank/ssd` after Task 1. `rm -rf /mnt/corfu/run_batch/` in the runner
   follows the link into the directory, which is what is wanted. Never `rm -rf` the link
@@ -673,7 +821,11 @@ then taught, and what 100 GB adds:
 | `L0` under codec NONE (10 GB, untrimmed) | 1.2–1.4 KB per put |
 | `sO` at 100 GB; `wa` at 100 GB | 1.17 within 5 %; reported |
 | Cassandra quorum, workload a, 8 writers, 10 GB; `cpuC`; `sC` at 100 GB | 43,000 ops/s within 5 %; 0.06 ms within 10 %; 1.066 within 3 % |
-| Model sources | every line `measured`, none `ASSUMED` |
+| `h_steady`, `cz`, 100 GB, 800 MiB / 100 MiB / 12.5 MiB | at least 0.55 / 0.45 / 0.35 |
+| `h_steady`, `cz`, 10 GB twins | below the 100 GB values by 0.03 to 0.10 |
+| Cassandra `cz` / `az` at 10 GB | within 5 % of `c` / `a` |
+| Model sources | every line `measured`, none `ASSUMED`, in both runs |
+| Zipf run, 10 TB, no tier, 16 GB cache | at most $3,500 (estimate $3,100); crossover of the 4 GB line reported (estimate 2 to 3 TB) |
 | 10 TB, no tier, 16 GB cache | at most $5,750 (prediction $5,712) |
 | 10 TB, 2 TB tier | at most $4,950 (prediction $4,915); state whether the line is below Cassandra EBS ($4,742) or not, with the one-trial caveat |
 | 100 TB, 2 TB tier | reported against $7,759; the new 0.026 point decides it |
@@ -684,8 +836,11 @@ then taught, and what 100 GB adds:
 - A full tier (ratio above 1) at 100 GB. It needs a 117 GB fill per cell.
 - Trials 2 and 3 of the native phase 5, and the phase 4 restart and `ss -K` tests
   (`PLAN-native-corfu.md`).
-- The 16 KiB tier entries at three ratios, the shared cross-client tier, the skewed-key
-  cell (`RESULTS-cost.md`, "Disk-cache tier, round 2", what to do next).
+- The 16 KiB tier entries at three ratios and the shared cross-client tier
+  (`RESULTS-cost.md`, "Disk-cache tier, round 2", what to do next). The skewed-key
+  cell from that list is Task 7b now.
+- A three-ratio tier sweep under the key-space zipfian. Task 7b has one ratio, so the
+  zipf tier line is a number, not a curve.
 - The real S3 check (`PLAN-cost.md` phase 6).
 - A profile of the native client (phase 0 of `PLAN-native-corfu.md`).
 - A multi-host loader. The 100 GB load runs 8 or 16 processes on one client. Spreading
