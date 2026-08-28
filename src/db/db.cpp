@@ -192,6 +192,24 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   db = new DB(shared_config_path);
   db->active = true;
   db->metadata_log->rollForwardMetadataLog();
+  // Reconcile and start the fill worker BEFORE initSSTMetadata: that call
+  // opens every live SSTable through the LRU cache, and with an empty
+  // tier index every one of those reads would miss and enqueue a fill
+  // (queue depth disk_cache_fill_queue, overflow dropped) instead of
+  // being served from a warm local copy. reconcile() only needs a rolled-
+  // forward view, which rollForwardMetadataLog() above already produced,
+  // so it does not need to wait for the log_handler/lru_cache latest_view
+  // wiring below.
+  if (db->disk_cache != nullptr) {
+    std::shared_ptr<View const> view = db->metadata_log->latestViewSnapshot();
+    size_t const removed = db->disk_cache->reconcile([view](std::string const& name, size_t bytes) {
+      if (!view || view->key_range.find(name) == view->key_range.end()) return false;
+      auto sz = view->file_size.find(name);
+      return sz == view->file_size.end() || sz->second == bytes;
+    });
+    std::cerr << "[disk_cache] reconciled " << db->disk_cache->stats().files << " files, removed " << removed << "\n";
+    db->disk_cache->startFillWorker();
+  }
   db->metadata_log->initSSTMetadata();
   // Seed the log key index from any log files already materialized in
   // the cache by rollforward. Set latest_view on both log_handler and
@@ -204,16 +222,6 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   db->log_handler->setLatestView(view_ptr);
   db->lru_cache->setLatestView(view_ptr);
   db->lru_cache->startWarmWorker();
-  if (db->disk_cache != nullptr) {
-    std::shared_ptr<View const> view = db->latest_view_snapshot;
-    size_t const removed = db->disk_cache->reconcile([view](std::string const& name, size_t bytes) {
-      if (!view || view->key_range.find(name) == view->key_range.end()) return false;
-      auto sz = view->file_size.find(name);
-      return sz == view->file_size.end() || sz->second == bytes;
-    });
-    std::cerr << "[disk_cache] reconciled " << db->disk_cache->stats().files << " files, removed " << removed << "\n";
-    db->disk_cache->startFillWorker();
-  }
   db->log_handler->warmKeyIndex();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl

@@ -589,20 +589,28 @@ TEST(DiskCacheStorageTest, MetadataParsesTheDiskCacheKeys) {
       "\"sstable_dir\": \"" + dir + "sst/\",\n"
       "\"lru_cache_bytes\": 1048576";
   {
+    // Explicit non-default values for every disk-cache key, so this assert
+    // block actually exercises the parse for disk_cache_chunk_bytes and
+    // disk_cache_fill_queue too -- asserting only the 67108864 / 256
+    // defaults would pass whether or not that parsing ever ran.
     Metadata md(write(base +
         ",\n\"disk_cache_dir\": \"/tank/cache/w0\",\n"
         "\"disk_cache_bytes\": \"2147483648\",\n"
-        "\"disk_cache_drop_pages\": \"false\""));
+        "\"disk_cache_drop_pages\": \"false\",\n"
+        "\"disk_cache_chunk_bytes\": \"1048576\",\n"
+        "\"disk_cache_fill_queue\": \"8\""));
     EXPECT_EQ(md.disk_cache_dir, "/tank/cache/w0/");  // slash appended
     EXPECT_EQ(md.disk_cache_bytes, 2147483648ull);
     EXPECT_FALSE(md.disk_cache_drop_pages);
-    EXPECT_EQ(md.disk_cache_chunk_bytes, 67108864ull);
-    EXPECT_EQ(md.disk_cache_fill_queue, 256ull);
+    EXPECT_EQ(md.disk_cache_chunk_bytes, 1048576ull);
+    EXPECT_EQ(md.disk_cache_fill_queue, 8ull);
   }
   {
     Metadata md(write(base));
     EXPECT_TRUE(md.disk_cache_dir.empty());
     EXPECT_TRUE(md.disk_cache_drop_pages);
+    EXPECT_EQ(md.disk_cache_chunk_bytes, 67108864ull);
+    EXPECT_EQ(md.disk_cache_fill_queue, 256ull);
   }
   EXPECT_THROW(Metadata(write(base + ",\n\"disk_cache_dir\": \"/tank/cache/w0\"")),
                std::runtime_error);  // bytes missing
