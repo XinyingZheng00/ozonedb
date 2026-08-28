@@ -142,7 +142,13 @@ S3_BUCKET="$(cfg --get s3.bucket 2>/dev/null || echo "")"
 # load into the same results root, and an untagged name lets the second load
 # overwrite the first load's server sample (extract_cost_coefficients.py SAMPLE_RE).
 SAMPLE_RC="${RECORD_CNT:-$(cd "$OZONEDB_HOME" && python3 bench/scripts/ycsb_config.py --get local.load.record_cnt | tr -d "[] " | cut -d, -f1)}"
-SAMPLE_CELL="ozonedb-corfu_workloadload_w${WRITERS}_rc${SAMPLE_RC}_trial0"
+# The label must match result_label() in load_local_ycsb_multiproc.py for the
+# flags this wrapper forwards, or the extractor pairs the sample with the
+# wrong load rows (the first --cache-warm load overwrote the plain load's
+# sample under the plain name).
+SAMPLE_LABEL="ozonedb-corfu"
+[[ "$CACHE_WARM" -eq 1 ]] && SAMPLE_LABEL="${SAMPLE_LABEL}-warm"
+SAMPLE_CELL="${SAMPLE_LABEL}_workloadload_w${WRITERS}_rc${SAMPLE_RC}_trial0"
 SAMPLE_LOCAL="$OZONEDB_HOME/bench/results/local/_server/$(echo "$CORFU_SSH" | sed 's/^.*@//; s/[^A-Za-z0-9._-]/_/g')"
 sampler_start() {
   scp "${SSH_OPTS[@]}" -q "$SAMPLER_SRC" "$CORFU_SSH:ozonedb_server_sampler.sh" &&
