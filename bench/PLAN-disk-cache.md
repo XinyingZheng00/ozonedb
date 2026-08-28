@@ -7,7 +7,12 @@
 listener), bench commits `bf09c216` to `a3b17d48` (the SSD provisioning, the runner flags,
 the extractor columns), campaign **`disk-20260829`** on 8 clients, 600 s cells, a 1 GB load
 (10 SSTables of about 121 MB per writer's view), rows in `results-disk-20260829.tsv`, write-up
-in the section "Disk-cache tier" of `RESULTS-cost.md`.
+in the section "Disk-cache tier" of `RESULTS-cost.md`. **Task 11's own model text below --
+its Interfaces block and its Step 2 -- was superseded by the review rulings**: the hit rate
+is the composition of the RAM curve with the tier's own `disk_h`, the CPU term is two-state,
+the refill rate is a ratio-aware curve charged per op, and the coefficients come from the
+whole run rather than a last-60 s window. The blocks were rewritten in place to match what
+shipped; the numbers everywhere in this file are the shipped model's.
 
 Headline: a tier at or above the dataset size takes the object store off the read path.
 GETs per op 0.00052 on workload c and 0.0028 on workload a, against 0.760 and 0.658 with
@@ -20,12 +25,16 @@ the tier holds the dataset.
 
 Projection at 10,000 ops/s and 50 % reads, with the tier's own hit rate composed with the
 RAM curve: **a 2 TB tier per client pays only while it holds the dataset.** Below about
-6.3 TB of data it is a large saving (1 TB: $5,230 to $1,934, -63 %; 100 GB: -54 %) and
-above it a small loss (10 TB: $5,992 to $6,417, +7 %; 100 TB: $9,007 to $9,606, +7 %).
+5.9 TB of data it is a large saving (1 TB: $5,230 to $1,938, -63 %; 100 GB: -54 %) and
+above it a small loss (10 TB: $5,992 to $6,509, +9 %; 100 TB: $9,007 to $9,698, +8 %).
 At 10 TB a 2 TB tier covers a fifth of the data, lifting `h` from 0.157 to 0.246 and
-cutting S3 GETs from $4,405 to $4,029, which does not pay for $800 of gp3; the client line
-does not move, because at that ratio the tier is not a full tier. At 10 TB no tier size
-beats no tier at all. The crossover against Cassandra on EBS stays at 14.7 TB.
+cutting S3 GETs from $4,405 to $4,121 -- a net $284, with the $184 the tier spends
+refilling itself already inside that $4,121 -- which does not pay for $800 of gp3; the
+client line does not move, because at that ratio the tier is not a full tier. At 10 TB no
+tier size in the measured ratio range beats no tier at all: the sweep's nominal minimum
+($5,958 at 100 GB per client) sits at a 0.01 ratio, an order of magnitude below the
+smallest measured 0.131, and rides the `disk_h` clamp -- as does everything below about
+185 GB per client. The crossover against Cassandra on EBS stays at 14.7 TB.
 
 **What failed the goal table:** fill GETs per op <= 0.001 in every workload-c cell. Met at
 2 GB (1e-5) and missed at 128, 256 and 512 MB (0.0087, 0.0066, 0.0051). Cause: the tier's
@@ -2376,11 +2385,21 @@ git commit -m "bench: disk-cache campaign disk-20260829 rows"
 - Modify: `bench/RESULTS-cost.md` (new section before "Method notes and caveats"),
   this file's status paragraph, `bench/PLAN-cost.md` status paragraph
 
-**Interfaces:**
-- Produces: `Coefficients.h_disk(ratio)` (log-linear interpolation over the
-  `(disk_ratio, h_total)` points of the workload-c rows with `disk_capacity > 0`),
-  `Coefficients.cpu_O_disk` (client CPU per op of cell 4), `Coefficients.fill_get_per_op`
-  (cell 4, last 60 s), `Model.ozonedb(d_bytes, cache_gb, trimming=True, disk_gb=0)`.
+**Interfaces** (as shipped, after the review rulings -- the original wording of this block
+specified a single measured `h_disk` curve, a constant `cpu_O_disk` and a scalar
+`fill_get_per_op` read off the last 60 s of cell 4, and all three were overturned):
+- `Coefficients.disk_h(ratio)` -- the tier's **own** hit rate, over the reads the RAM cache
+  missed: log-linear interpolation over the `(disk_ratio, disk_h)` points of the
+  workload-`h_workload` rows with `disk_capacity > 0`, `-kp` excluded, one point per ratio
+  (smallest RAM cache wins the tie), clamped at both ends.
+- `Coefficients.h_disk(ratio)` -- the same points' measured `h_total`, kept as an accessor
+  and printed for reference. The model does **not** use it: it composes instead.
+- `Coefficients.cpu_O_disk` -- client CPU per op of the largest-budget cell of the
+  workload the baseline `cpu_O` comes from (`cpu_wl`, `a` at a 50 % read mix), whole run.
+- `Coefficients.fill_get_per_op(ratio)` -- a curve, not a scalar: the same interpolation
+  over the `(disk_ratio, disk_fill_gets_per_op)` points of the `cpu_wl` tier rows, whole
+  run, clamped at both ends.
+- `Model.ozonedb(d_bytes, cache_gb, trimming=True, disk_gb=0)`.
 
 - [ ] **Step 1: Write the failing check**
 
@@ -2412,17 +2431,31 @@ Expected now: `TypeError: unexpected keyword 'disk_gb'`.
 
 - [ ] **Step 2: Implement**
 
-In `Coefficients.__init__`: collect `h_disk_points = sorted((r["disk_ratio"], r["h_total"]) for r in rows if r["workload"] == "c" and r.get("disk_capacity") and not r["label"].endswith("-kp"))`, `cpu_O_disk` and `fill_get_per_op` from the row with the largest `disk_ratio`; `h_disk(ratio)` = the same interpolation as `h()` over those points, clamped at the ends. In `Model.ozonedb`, add `disk_gb=0`:
+In `Coefficients.__init__`: build one point per `disk_ratio` from the tier rows of the
+`h_workload` (`-kp` excluded, the cell with the smallest `cache_capacity` winning a tie, so
+a second trial cannot put two points at one ratio), keeping both `disk_h` (the tier's own
+rate, `disk_h_points`) and `h_total` (as measured, `h_disk_points`); take `cpu_O_disk` from
+the largest-budget cell of `cpu_wl` and build `fill_points` the same way from that
+workload's `disk_fill_gets_per_op`. `disk_h(ratio)` and `fill_get_per_op(ratio)` are the
+same log-linear `_interp` as `h()`, clamped at the ends. In `Model.ozonedb`, add
+`disk_gb=0`:
 
 ```python
+        ratio_disk = disk_gb * GB / d_bytes
+        h_ram = self.c.h(cache_gb * GB / d_bytes)
         if disk_gb > 0:
-            h = self.c.h_disk(disk_gb * GB / d_bytes)
-            cpu = self.c.cpu_O_disk
-            fill = self.R * self.c.fill_get_per_op * self.S
+            # The tier answers what the RAM cache missed, so the two hit rates
+            # compose and the projection is charged for the RAM it buys.
+            h_tier = self.c.disk_h(ratio_disk)
+            h = 1.0 - (1.0 - h_ram) * (1.0 - h_tier)
+            # A partial tier measured MORE client CPU than no tier at all, so
+            # only a tier that holds the dataset may be charged less.
+            cpu = self.c.cpu_O_disk if ratio_disk >= 1.0 else max(self.c.cpu_O, self.c.cpu_O_disk)
+            # Per op, not per read: fill_get_per_op is fill_gets / (reads +
+            # writes + scans) in the extractor.
+            fill = self.ops * self.c.fill_get_per_op(ratio_disk) * self.S
         else:
-            h = self.c.h(cache_gb * GB / d_bytes)
-            cpu = self.c.cpu_O
-            fill = 0.0
+            h_tier, h, cpu, fill = 0.0, h_ram, self.c.cpu_O, 0.0
         gets = (self.R * (1.0 - h) * self.c.g + self.W * self.c.get_per_write) * self.S + fill
         ...
         nc, client_cost = self.clients(cpu, "ozonedb_client")
@@ -2430,7 +2463,14 @@ In `Coefficients.__init__`: collect `h_disk_points = sorted((r["disk_ratio"], r[
         total = log_tier + bulk + req + client_cost + disk_cost
 ```
 
-and return `disk_cost` and `disk_gb` in the dict. `prices.json`: `"disk_gb_per_client": 2000` under `projection`. The figure gains a third OzoneDB line, "16 GB RAM + 2 TB gp3 per client", and the TSV table a `disk_gb` column. Rerun the plotter over both TSVs and check the figure renders.
+and return `disk_cost`, `disk_gb`, `fill_gets`, `h_ram` and `h_tier` in the dict. Note that
+`fill` is added into `gets` before the GET price is applied, so the tier's GET line is
+already net of the refills. `prices.json`: `"disk_gb_per_client": 2000` under `projection`.
+The figure gains a third OzoneDB line, "16 GB RAM + 2 TB gp3 per client", and the TSV table
+the `ozone_disk_cache`, `h_disk_cache`, `disk_h_tier`, `disk_gb`, `ozone_disk_gets_usd`,
+`ozone_disk_clients`, `ozone_disk_clients_usd` and `ozone_disk_gp3_usd` columns. Rerun the
+plotter over the combined corpus (`bench/scripts/plot/combine_disk_corpus.py`) and check
+the figure renders.
 
 - [ ] **Step 3: Write the results section**
 

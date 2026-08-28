@@ -49,14 +49,15 @@ workload a (+42 %), client CPU per op 0.12 ms against 0.42 ms for the no-tier wo
 control and 0.94 against 1.18 ms on workload a, 0 failed reads. The model gains a `disk_gb`
 term fed by those coefficients, composing the tier's own hit rate with the RAM curve:
 at 10,000 ops/s and 50 % reads a 2 TB tier per client pays only while it holds the dataset
--- below about 6.3 TB a large saving (1 TB $5,230 to $1,934, -63 %), above it a small loss
-(10 TB $5,992 to $6,417, 100 TB $9,007 to $9,606, both +7 %, because $800 of gp3 buys back
-only $376 of S3 GETs). The crossover stays at 14.7 TB. Below the dataset size the
-whole-file LRU thrashes (`fills` equals `evictions`, fill GETs per op 0.005 to 0.017
-against a 0.001 target, and the 512 MB workload-a cell is slower than no tier); admission
-control and sub-file entries are the follow-ups, and they are what would make the tier pay
-above 6.3 TB. Task 11 also fixed the extractor's steady window, which ended at the last S3
-counter movement and so reported a full tier's fill burst as its steady state.
+-- below about 5.9 TB a large saving (1 TB $5,230 to $1,938, -63 %), above it a small loss
+(10 TB $5,992 to $6,509 +9 %, 100 TB $9,007 to $9,698 +8 %, because $800 of gp3 buys back
+only $284 of S3 GETs, the tier's own refill traffic already netted off). The crossover
+stays at 14.7 TB. Below the dataset size the whole-file LRU thrashes (`fills` equals
+`evictions`, fill GETs per op 0.005 to 0.017 against a 0.001 target, and the 512 MB
+workload-a cell is slower than no tier); admission control and sub-file entries are the
+follow-ups, and they are what would make the tier pay above 5.9 TB. Task 11 also fixed the
+extractor's steady window, which ended at the last S3 counter movement and so reported a
+full tier's fill burst as its steady state.
 
 ## Goal
 

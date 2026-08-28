@@ -694,7 +694,7 @@ published with them were computed from.
 |---|--:|--:|--:|--:|--:|
 | Cassandra, NVMe / EBS | 1,565 / 2,402 | 1,565 / 2,402 | 12,587 / 4,742 | 122,306 / 45,302 | |
 | OzoneDB, 16 GB RAM per client (`cost-20260829-rr`) | 2,997 | 5,230 | 5,992 | 9,007 | 14.7 TB |
-| **OzoneDB, 16 GB RAM + 2 TB gp3 per client** | **1,821** | **1,934** | **6,417** | **9,606** | **14.7 TB** |
+| **OzoneDB, 16 GB RAM + 2 TB gp3 per client** | **1,822** | **1,938** | **6,509** | **9,698** | **14.7 TB** |
 
 The model gains a `disk_gb` term. The tier answers what the RAM cache missed, so the two
 hit rates compose: `h = 1 - (1 - h(c / D)) * (1 - disk_h(disk_gb / D))`, where `disk_h` is
@@ -705,28 +705,35 @@ baseline `cpu_O` comes from), but only when the tier holds the dataset: below a 
 the baseline is the floor, because every partial tier measured *more* client CPU than no
 tier at all. The refills follow the same rule -- same workload, ratio-aware -- because a
 partial tier evicts what it has just fetched and fetches it again: `fill_get_per_op`
-interpolates (0.524, 0.01747) and (2.097, 0.00022), 79x apart. `clients x disk_gb x gp3`
-is a new cost line. Figure: `results-disk-20260829.png`; every line for 1 GB to 100 TB in
-`results-disk-20260829-projection.tsv`.
+interpolates (0.524, 0.01747) and (2.097, 0.00022), 79x apart, and is charged on the whole
+op rate, not on the reads alone, because that is how the extractor measures it
+(`fill_gets / (reads + writes + scans)`). The refill GETs are added into the GET count
+before it is priced, so the tier's GET line is already net of them.
+`clients x disk_gb x gp3` is a new cost line. Figure: `results-disk-20260829.png`; every
+line for 1 GB to 100 TB in `results-disk-20260829-projection.tsv`.
 
-**A 2 TB tier per client pays only while it holds the dataset.** Below about 6.3 TB of data
-it is a large saving -- 39 % at 1 GB, 54 % at 100 GB, 63 % at 1 TB ($5,230 to $1,934, `h`
-0.256 to 0.984, clients 5 to 4) -- and above it a small loss: at 10 TB $6,417 against
-$5,992 (+7 %) and at 100 TB $9,606 against $9,007 (+7 %). At 10 TB the 2 TB tier covers a
+**A 2 TB tier per client pays only while it holds the dataset.** Below about 5.9 TB of data
+it is a large saving -- 39 % at 1 GB, 54 % at 100 GB, 63 % at 1 TB ($5,230 to $1,938, `h`
+0.256 to 0.984, clients 5 to 4) -- and above it a small loss: at 10 TB $6,509 against
+$5,992 (+9 %) and at 100 TB $9,698 against $9,007 (+8 %). At 10 TB the 2 TB tier covers a
 fifth of the data, so it lifts `h` from 0.157 to 0.246 and cuts S3 GETs from $4,405 to
-$4,029 -- $376 back, of which $92 is spent again on refills -- against $800 of gp3
-(5 clients x 2 TB); the client line does not move, because at that ratio the tier is not a
-full tier. The crossover against Cassandra on EBS stays at 14.7 TB.
+$4,121 -- $284 net, and the $184 the tier spends refilling itself is already inside that
+$4,121 -- against $800 of gp3 (5 clients x 2 TB); the client line does not move, because at
+that ratio the tier is not a full tier. The crossover against Cassandra on EBS stays at
+14.7 TB.
 
-Sweeping the tier size at 10 TB, **no budget beats no tier at all**: the cheapest is a full
-10 TB per client (`h` 0.722, S3 GETs $1,500, clients 4 at $560, but $3,200 of gp3) at
-$6,147 against $5,992, and the smallest budgets sit just above the baseline ($6,026 at
-500 GB). At 100 TB nothing inside the measured ratio range wins either; a full tier there
-is $37,567, and the sweep's nominal minimum of $9,006 at 500 GB per client is a $1 tie with
-the baseline and an artifact of the clamp, which still credits a 0.005 ratio with `disk_h`
-0.0585 where the measured curve says such a tier would thrash. gp3 is $0.08 per GB-month
-against S3 Standard's $0.023, so a tier only pays when its hit rate is high enough to buy
-back more in requests than it costs in bytes -- which, for this whole-file tier under
+Sweeping the tier size at 10 TB, **no budget in the measured ratio range beats no tier at
+all**: the cheapest in-range point is a full 10 TB per client (`h` 0.722, S3 GETs $1,550,
+clients 4 at $560, but $3,200 of gp3) at $6,197 against $5,992, and every partial budget
+from 0.13 to 0.8 of the dataset is dearer still ($6,509 at 2 TB, $6,802 at 8 TB). The
+sweep's nominal minimum is $5,958 at 100 GB per client, a 0.01 ratio -- an order of
+magnitude below the smallest measured 0.131, so it rides the clamp that credits any tier
+with `disk_h` 0.0585 where the measured curve says one that small would thrash. Everything
+below about 185 GB per client at 10 TB, and below about 270 GB at 100 TB, sits in that
+clamp region. At 100 TB the picture is the same one decade over: a full tier is $37,617 and
+the nominal minimum is $8,938 at 100 GB per client, again the clamp. gp3 is $0.08 per
+GB-month against S3 Standard's $0.023, so a tier only pays when its hit rate is high enough
+to buy back more in requests than it costs in bytes -- which, for this whole-file tier under
 uniform keys, means holding the dataset.
 
 ### Caveats
@@ -755,6 +762,41 @@ uniform keys, means holding the dataset.
 8. **The tier is a fixed 2 TB at every dataset size.** `projection.disk_gb_per_client` does
    not scale with D, so the small-D points on that line pay for a tier they cannot fill.
    The tier-size sweep is the honest view of the trade.
+9. **One trial per cell.** Every row of both tables is a single 600 s run; there is no
+   spread. The 3.3x and +42 % throughput results are far outside anything run-to-run
+   variation explains, but the smaller differences (the `-kp` A/B's 8 %, the 512 MB
+   workload-a cell's 5 % deficit against its control) are one sample each.
+
+### Reproduce
+
+From the repo root, with `bench/results/local/disk-20260829-long/` in place:
+
+```bash
+# rows
+python3 bench/scripts/extract_cost_coefficients.py \
+    bench/results/local/disk-20260829-long bench/results/local \
+    --window 60 --tsv bench/results-disk-20260829.tsv
+
+# projection. The plotter takes one TSV, and the coefficients come from four
+# campaigns with different column sets, so the corpus is assembled first:
+#   results-disk-20260829     the tier cells
+#   results-cost-20260829-rr  the no-tier controls
+#   results-cost-20260828-4k  the 4 KiB workload-c cache sweep, i.e. h(c / D)
+#   results-cost-20260827     the cassandra rows
+python3 bench/scripts/plot/combine_disk_corpus.py /tmp/disk-corpus.tsv
+python3 bench/scripts/plot/plot_cost_model.py /tmp/disk-corpus.tsv \
+    bench/scripts/plot/prices.json --space bench/scripts/plot/space.json \
+    --out-dir /tmp/disk-plot --table bench/results-disk-20260829-projection.tsv
+cp /tmp/disk-plot/cost_model.png bench/results-disk-20260829.png
+cp /tmp/disk-plot/cost_model.pdf bench/results-disk-20260829.pdf
+```
+
+The `ozone_hi_cache` column of that projection is the no-tier line, and it matches
+`results-cost-20260829-rr-projection.tsv` to the dollar at every decade -- the tier term
+changes nothing when `disk_gb` is 0. `combine_disk_corpus.py --no-disk` drops the tier rows
+instead, which exercises the model's "no disk-cache rows" fallback (every tier coefficient
+ASSUMED); it is not a second copy of the baseline, because a few medians -- `put_per_write`,
+`k` -- are taken over all OzoneDB cells and so move by about $1 when the tier rows go.
 
 ### What to do next
 
@@ -763,7 +805,7 @@ uniform keys, means holding the dataset.
    which is the whole of result 2.
 2. **Sub-file entries.** Cache block ranges instead of whole SSTables, so a partial budget
    holds the hot part of every file rather than all of a few files. Together with (1) this
-   is the whole question above 6.3 TB, and the reason both sit at the top of this list: a
+   is the whole question above 5.9 TB, and the reason both sit at the top of this list: a
    tier only pays when it holds the working set, and the projection turns on `disk_h` at
    ratios of 0.1 to 0.5, where the whole-file tier measures 0.06 to 0.38 and refills 79x
    more often than a full one.

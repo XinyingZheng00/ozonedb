@@ -256,11 +256,15 @@ by file-level LRU. Config keys (`Metadata`): `disk_cache_dir` (empty = off, and 
 `disk_cache_drop_pages` (default true — `posix_fadvise(DONTNEED)` after a tier read, so the
 measurement is the SSD and not the page cache), `disk_cache_fill_queue` (256). `DB::closeDB` prints
 a `[disk_cache] hits=… misses=… fills=… fill_gets=… evictions=… invalidated=… files=… capacity=…`
-line after `[lru_cache]`. The bench path is `--disk-cache-bytes` / `--disk-cache-dir` /
+line after `[lru_cache]`. An unusable `disk_cache_dir` is fatal, not degraded: the constructor
+throws `std::runtime_error` when the directory cannot be created or fails a write probe, and
+`DB::DB` propagates it. The bench path is `--disk-cache-bytes` / `--disk-cache-dir` /
 `--disk-cache-keep-pages` on `run_multinode_ycsb_with_corfu.sh`, per writer, label token
-`-dc<size>[-kp]` — a flag, never a `ycsb.yaml` edit. Measured in `RESULTS-cost.md`, "Disk-cache
-tier": a tier that holds the dataset removes the object store from the read path; a smaller one
-thrashes, because the unit is a whole SSTable.
+`-dc<size>[-kp]` — a flag, never a `ycsb.yaml` edit. The runner refuses a tier root that is on
+the root filesystem *or* is not itself a mount point (`OZONEDB_DISK_CACHE_ANY_FS=1` overrides),
+because `/tank` is its own filesystem and an unmounted SSD would otherwise land the tier there.
+Measured in `RESULTS-cost.md`, "Disk-cache tier": a tier that holds the dataset removes the
+object store from the read path; a smaller one thrashes, because the unit is a whole SSTable.
 
 ### CorfuDB backend
 
