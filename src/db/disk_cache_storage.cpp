@@ -136,7 +136,10 @@ size_t DiskCacheStorage::size(std::string fileName) {
 
 void DiskCacheStorage::seal(std::string fileName) { backing_->seal(fileName); }
 bool DiskCacheStorage::isSealed(std::string fileName) { return backing_->isSealed(fileName); }
-void DiskCacheStorage::remove(std::string fileName) { backing_->remove(fileName); }
+void DiskCacheStorage::remove(std::string fileName) {
+  backing_->remove(fileName);
+  if (cacheable(fileName)) invalidate(fileName);
+}
 bool DiskCacheStorage::exist(std::string fileName) { return backing_->exist(fileName); }
 void DiskCacheStorage::setRemoteAppendListener(RemoteAppendListener listener) { backing_->setRemoteAppendListener(std::move(listener)); }
 long DiskCacheStorage::lastAppendAddressForThread() const { return backing_->lastAppendAddressForThread(); }

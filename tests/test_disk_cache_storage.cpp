@@ -401,3 +401,67 @@ TEST(DiskCacheStorageTest, StopIsSerialisedAcrossTheJoinAndWaitFillIdleIsNeverSt
   f.tier->waitFillIdle();
   EXPECT_TRUE(f.local(name2));
 }
+
+TEST(DiskCacheStorageTest, BudgetEvictsTheLeastRecentlyReadFile) {
+  TierFixture f(2500);
+  auto put = [&](std::string const& name, size_t n) {
+    std::vector<unsigned char> v(n, 'x');
+    ASSERT_EQ(f.tier->appendNoFlush(name, v.data(), static_cast<int>(n)), Status::kSuccess);
+    ASSERT_EQ(f.tier->flush(name), Status::kSuccess);
+  };
+  std::string const a = "sstable1/" + stamp() + "_a.sst";
+  std::string const b = "sstable1/" + stamp() + "_b.sst";
+  std::string const c = "sstable1/" + stamp() + "_c.sst";
+  put(a, 1000);
+  put(b, 1000);
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(a, data, 0, 10), Status::kSuccess);  // a is now the most recent
+  delete[] data;
+  put(c, 1000);  // 3000 > 2500: evict b, the least recently used
+  EXPECT_TRUE(f.local(a));
+  EXPECT_FALSE(f.local(b));
+  EXPECT_TRUE(f.local(c));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.evictions, 1u);
+  EXPECT_EQ(s.evicted_bytes, 1000u);
+  EXPECT_EQ(s.files, 2u);
+  EXPECT_EQ(s.bytes, 2000u);
+  // b is still on the backing: the tier evicts copies, never objects.
+  EXPECT_TRUE(f.backing->exist(b));
+}
+
+TEST(DiskCacheStorageTest, RemoveDropsTheObjectAndTheCopy) {
+  TierFixture f(1u << 20);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  std::vector<unsigned char> v(100, 'x');
+  ASSERT_EQ(f.tier->appendNoFlush(name, v.data(), 100), Status::kSuccess);
+  ASSERT_EQ(f.tier->flush(name), Status::kSuccess);
+  ASSERT_TRUE(f.local(name));
+  f.tier->remove(name);
+  EXPECT_FALSE(f.local(name));
+  EXPECT_FALSE(f.backing->exist(name));
+  EXPECT_EQ(f.tier->stats().files, 0u);
+  EXPECT_EQ(f.tier->stats().invalidated, 1u);
+}
+
+TEST(DiskCacheStorageTest, InvalidateDropsOnlyTheCopy) {
+  TierFixture f(1u << 20);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  std::vector<unsigned char> v(100, 'x');
+  ASSERT_EQ(f.tier->appendNoFlush(name, v.data(), 100), Status::kSuccess);
+  ASSERT_EQ(f.tier->flush(name), Status::kSuccess);
+  f.tier->invalidate(name);
+  EXPECT_FALSE(f.local(name));
+  EXPECT_TRUE(f.backing->exist(name));
+  EXPECT_EQ(f.tier->stats().invalidated, 1u);
+  f.tier->invalidate(name);  // absent: a no-op
+  EXPECT_EQ(f.tier->stats().invalidated, 1u);
+  // A part in progress is discarded too.
+  std::string const other = "sstable1/" + stamp() + "_part.sst";
+  ASSERT_EQ(f.tier->appendNoFlush(other, v.data(), 100), Status::kSuccess);
+  ASSERT_TRUE(f.part(other));
+  f.tier->invalidate(other);
+  EXPECT_FALSE(f.part(other));
+  ASSERT_EQ(f.tier->flush(other), Status::kSuccess);  // the backing still flushes
+  EXPECT_FALSE(f.local(other));                        // but nothing is published
+}
