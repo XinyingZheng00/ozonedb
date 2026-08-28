@@ -118,3 +118,96 @@ TEST(DiskCacheStorageTest, ZeroCapacityCachesNothing) {
   EXPECT_EQ(f.tier->stats().passthrough, 1u);
   EXPECT_EQ(f.tier->stats().misses, 0u);
 }
+
+TEST(DiskCacheStorageTest, WriteThroughPublishesOnFlushAndServesReads) {
+  TierFixture f(1u << 20);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  std::vector<unsigned char> a(3000, 'a'), b(2000, 'b');
+  ASSERT_EQ(f.tier->appendNoFlush(name, a.data(), 3000), Status::kSuccess);
+  ASSERT_EQ(f.tier->appendNoFlush(name, b.data(), 2000), Status::kSuccess);
+  EXPECT_TRUE(f.part(name));
+  EXPECT_FALSE(f.local(name));
+  ASSERT_EQ(f.tier->flush(name), Status::kSuccess);
+  EXPECT_TRUE(f.local(name));
+  EXPECT_FALSE(f.part(name));
+  EXPECT_EQ(std::filesystem::file_size(f.tier_dir + name), 5000u);
+
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(name, data, 2990, 20), Status::kSuccess);
+  EXPECT_EQ(0, memcmp(data, "aaaaaaaaaabbbbbbbbbb", 20));
+  delete[] data;
+  EXPECT_EQ(f.backing->ranged_reads, 0);
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.hits, 1u);
+  EXPECT_EQ(s.hit_bytes, 20u);
+  EXPECT_EQ(s.misses, 0u);
+  EXPECT_EQ(s.writethrough_files, 1u);
+  EXPECT_EQ(s.files, 1u);
+  EXPECT_EQ(s.bytes, 5000u);
+
+  // size() answers locally for a complete copy.
+  int const sizes_before = f.backing->sizes;
+  EXPECT_EQ(f.tier->size(name), 5000u);
+  EXPECT_EQ(f.backing->sizes, sizes_before);
+}
+
+TEST(DiskCacheStorageTest, MissIsServedFromTheBackingAndCounted) {
+  TierFixture f(1u << 20);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 10000);
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(name, data, 4096, 4096), Status::kSuccess);
+  EXPECT_EQ(0, memcmp(data, bytes.data() + 4096, 4096));
+  delete[] data;
+  EXPECT_EQ(f.backing->ranged_reads, 1);
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.misses, 1u);
+  EXPECT_EQ(s.miss_bytes, 4096u);
+  EXPECT_EQ(s.hits, 0u);
+  // A read of an absent file fails and is not a local hit.
+  // FileStorage::read returns kNotFound (not kFailure) for a genuinely
+  // missing file (src/db/storage.cpp); the tier forwards it unchanged.
+  EXPECT_EQ(f.tier->read("sstable1/absent.sst", data, 0, 10), Status::kNotFound);
+}
+
+TEST(DiskCacheStorageTest, ShortLocalCopyIsDroppedAndTheBackingServes) {
+  TierFixture f(1u << 20);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  std::vector<unsigned char> a(3000, 'a');
+  ASSERT_EQ(f.tier->appendNoFlush(name, a.data(), 3000), Status::kSuccess);
+  ASSERT_EQ(f.tier->flush(name), Status::kSuccess);
+  std::filesystem::resize_file(f.tier_dir + name, 100);  // corrupt the copy
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(name, data, 2000, 500), Status::kSuccess);
+  EXPECT_EQ(data[0], 'a');
+  delete[] data;
+  EXPECT_FALSE(f.local(name));
+  EXPECT_EQ(f.tier->stats().files, 0u);
+  EXPECT_EQ(f.tier->stats().invalidated, 1u);
+}
+
+TEST(DiskCacheStorageTest, FailedFlushDiscardsThePart) {
+  // The backing rejects the flush: the tier must not publish the part.
+  class RejectingStorage : public CountingStorage {
+   public:
+    explicit RejectingStorage(std::string const& path) : CountingStorage(path) {}
+    Status flush(std::string const&) override { return Status::kFailure; }
+  };
+  std::string const s = stamp();
+  std::string const backing_dir = kRoot + "backing_" + s + "/";
+  std::string const tier_dir = kRoot + "tier_" + s + "/";
+  std::filesystem::create_directories(backing_dir + "sstable1");
+  DiskCacheStorage::Options o;
+  o.dir = tier_dir;
+  o.capacity_bytes = 1u << 20;
+  DiskCacheStorage tier(std::make_unique<RejectingStorage>(backing_dir), o);
+  std::string const name = "sstable1/x.sst";
+  std::vector<unsigned char> a(10, 'a');
+  ASSERT_EQ(tier.appendNoFlush(name, a.data(), 10), Status::kSuccess);
+  EXPECT_EQ(tier.flush(name), Status::kFailure);
+  EXPECT_FALSE(std::filesystem::exists(tier_dir + name));
+  EXPECT_FALSE(std::filesystem::exists(tier_dir + name + ".part"));
+  EXPECT_EQ(tier.stats().files, 0u);
+  std::filesystem::remove_all(backing_dir);
+  std::filesystem::remove_all(tier_dir);
+}
