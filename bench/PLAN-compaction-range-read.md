@@ -1,6 +1,18 @@
 # Plan: compaction reads SSTable inputs as ranges, not one GET per block (branch `worktree-plan-cost`)
 
-**Status (2026-08-27):** planned, not started. Follow-up to `PLAN-cost.md` and the section
+**Status (2026-08-28):** DONE. P0 in `2dc2ed24` (chunked `Table::getAll` with `Status`,
+`compaction_read_bytes`, compaction skips a removed input and abandons the task on an
+unreadable one, three new `SSTableTest` cases) plus `2380ddf0` (`FileStorage` ranged read
+reported a short read as success; found by the truncated-file test). P1 to P4 ran as campaign
+`cost-20260829-rr` on the cluster (amd127 + 8 clients): `get_per_write` 0.205 to **0.00015**
+(100 GETs for 1M puts), load 9,634 puts/s, client CPU per put 0.83 ms, server CPU per put
+0.30 ms, 600 s workload-a cells 8/8 writers with throughput unchanged within 2 % and
+GETs per op down 0.12, workload-c control identical to the 4 KiB cell, projection $5,992
+at 10 TB, crossover 14.7 TB. Write-up: section "Compaction range reads" of
+`RESULTS-cost.md`; rows `results-cost-20260829-rr.tsv`. One deviation from the plan below:
+an input that still exists but cannot be read abandons the task (inputs kept) instead of
+being skipped, because a skipped input would be deleted after the COMPACT. The optional
+`read_meta=false` open was not needed (100 requests in total). Follow-up to `PLAN-cost.md` and the section
 "Re-run with 4 KiB blocks" of `RESULTS-cost.md`. This plan covers the SSTable tier
 (`sstable_storage`, S3/MinIO). Range reads on the Corfu log tier are a different plan
 (`PLAN-range-read.md`, untracked, kept by the user) and are out of scope here.

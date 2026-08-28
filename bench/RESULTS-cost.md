@@ -39,7 +39,8 @@ Artifacts, all under `bench/`:
    ranges instead of blocks.
 3. **OzoneDB clients need 35x the CPU per operation of Cassandra clients.** Workload a:
    2.16 ms per op (median, 8 writers, survivor writers of the crash below) against
-   0.061 ms; 1.37 ms on the 4 KiB build with the crash fix (600 s, 8/8 writers). Every OzoneDB process tails the
+   0.061 ms; 1.37 ms on the 4 KiB build with the crash fix (600 s, 8/8 writers), 1.16 ms
+   with compaction range reads (`2dc2ed24`, 600 s cells only). Every OzoneDB process tails the
    whole shared log and runs compaction, so the per-op client CPU grows with the
    aggregate write rate: 0.85 ms at 2 writers, 1.09 ms at 4, 1.58 ms at 8. At 10,000 ops/s
    that is 8 `m6i.xlarge` clients ($1,120) against one `c6i.large` ($62).
@@ -329,13 +330,119 @@ a compile-time constant; a config key for it would let both sizes run from one b
    blocks from memory, as SlateDB does with `blocks_to_fetch: 256` on its compaction
    iterator. Compaction already holds the full table in memory, so the buffer adds no new
    peak. Expected: GETs per put near zero, load puts/s back to the 64 KiB rate, projection
-   $5,993 at 10 TB, crossover 14.7 TB. The change is not yet made.
+   $5,993 at 10 TB, crossover 14.7 TB. **Done and measured** (`2dc2ed24`, section
+   "Compaction range reads"): 0.00015 GETs per put, 9,634 puts/s, $5,992 at 10 TB.
 3. **`h` still tracks the capacity fraction.** With 4 KiB blocks the model reaches 0.157
    at a 16 GB cache on 10 TB. Cache bytes (a local-disk tier) and key-range read affinity
    remain the levers at scale; the block size alone does not reach `h >= 0.99`.
 4. **Runner exit codes hide native crashes.** A JVM abort leaves `rc=0` at every layer.
    The extractor must count writers with an `[OVERALL]` block per cell and flag cells
    with fewer than the configured number (not yet done).
+
+## Compaction range reads (campaign `cost-20260829-rr`, engine commits `2dc2ed24` + `2380ddf0`)
+
+The change planned in `PLAN-compaction-range-read.md`: `Table::getAll`, which compaction
+uses to read an SSTable input, now reads the data section in block-aligned ranged reads of
+at most `compaction_read_bytes` (default 64 MiB, one read per input) and slices the blocks
+in memory, instead of one `storage->read` per 4 KiB block. It also validates the index and
+returns `Status`; compaction skips an input that a peer removed and abandons the task when
+an input that still exists cannot be read. The point-read path is unchanged. Same cluster
+and settings as the 4 KiB re-run: 4 KiB blocks, trimming on, a fresh 1 GB load, then 600 s
+cells with 8 writers at 512 MB and 8 MB (workload a) and one 600 s workload-c control at
+512 MB. All cells `rc=0`, 8/8 writers finished, 0 crashes. Rows in
+`results-cost-20260829-rr.tsv`; the projection in `results-cost-20260829-rr-projection.tsv`
+takes `h` from the 4 KiB sweep (the read path did not change; the control cell checks it).
+
+### Load and compaction
+
+| | 64 KiB | 4 KiB | 4 KiB + range reads |
+|---|--:|--:|--:|
+| Load, 8 writers, 1M x 1 KB | 9,417 puts/s | 8,054 puts/s | **9,634 puts/s** |
+| S3 GETs during the load | 15,003 | 204,858 | **100** |
+| GETs per put (`get_per_write`) | 0.015 | 0.205 | **0.00015** |
+| Bytes read back from MinIO | 988 MB | 998 MB | 1,000 MB |
+| PUTs per put | 4.7e-5 | 4.4e-5 | 4.7e-5 |
+| Client CPU per put | 0.86 ms | 0.91 ms | **0.83 ms** |
+| Server CPU per put (MinIO + Corfu) | 0.32 ms | 0.56 ms | **0.30 ms** |
+| Server busy fraction | 8.3 % | 15.7 % | 8.5 % |
+| SSTables after the load (bucket) | 203 + 942 MiB | 204 + 953 MiB | 206 + 955 MiB |
+| Trimmed log, checkpoints, objects | 187 MiB, 4, 22 | 188 MiB, 4, 20 | 154 MiB, 4, 23 |
+
+Compaction still reads the bucket about once (1.0 GB out of MinIO), in 100 requests
+instead of 204,858: about 6 per input file (`size`, footer, index, meta-index, two filter
+blocks, one data read). The load rate, the client CPU and the server CPU are back at or
+below the 64 KiB values. The 4 KiB penalty was the request count, not the bytes.
+
+### Workload a, 600 s, 8 writers: 4 KiB with the crash fix against 4 KiB + range reads
+
+| Cell | ops/s | GETs per op, last 60 s | GETs per miss | Client CPU per op | Server CPU per op | NOT_FOUND reads |
+|---|--:|--:|--:|--:|--:|--:|
+| 512 MB | 2,708 / **2,674** | 0.654 / **0.532** | 1.14 / **0.99** | 1.17 / **1.14 ms** | 1.26 / **1.16 ms** | 1 / 7 |
+| 8 MB | 2,566 / **2,608** | 0.787 / **0.674** | 1.12 / **0.99** | 1.21 / **1.18 ms** | 1.37 / **1.28 ms** | 6 / 5 |
+
+Each cell issues 117k to 133k fewer GETs (about 800k puts x 0.205, minus the compactions
+that fall outside the run). GETs per miss is back to 0.99: the extra 0.14 per miss in the
+4 KiB cells was compaction. Throughput is unchanged within 2 %, and the client CPU per op
+that the projection uses is 1.16 ms (median of the two cells; 1.19 ms in the two 4 KiB
+600 s cells, 1.37 ms when the 120 s warm-up cells are included). No compaction skipped an
+input or abandoned a task in any cell (20 compactions per cell, `inputs_skipped=0`).
+
+### Workload c control, 600 s, 512 MB
+
+The read path did not change, and the control says so: 4 KiB against 4 KiB + range reads
+at 512 MB, 600 s, 8 writers: 14,350 against 14,331 ops/s, `h` (last 60 s) 0.675 against
+0.679, 0.322 against 0.319 GETs per op, 0.993 GETs per miss both, client CPU per read
+0.247 against 0.245 ms, server CPU per read 0.423 against 0.425 ms, 0 failed operations
+both. The projection therefore takes the `h` curve from the 4 KiB sweep, with this cell
+as its 52 % point.
+
+### Reads under a write-heavy mix miss the block cache
+
+With compaction GETs gone, the remaining 0.53 GETs per op at 512 MB (52 % cache ratio) are
+read misses: 1.06 per read, where workload c at the same cache gets 0.32. The block-cache
+counters agree: `h` = 0.179 under workload a against 0.650 under workload c at 512 MB, and
+0.010 against 0.231 at 8 MB. The cost model takes `h` from the workload-c sweep, so it
+understates the GET line of a 50 % write mix at high cache ratios; at the projection's
+0.16 % ratio (16 GB on 10 TB) both `h` values are small and the gap is at most 17 % of the
+GET line. Two mechanisms fit the numbers and are not yet separated: the LRU also holds
+parsed log records, and every process indexes every writer's puts (about 1.3 MB/s, 780 MB
+per 600 s cell, more than the 512 MB cache), which evicts blocks; and peer compactions
+replace files whose blocks are cached (a writer publishes its own outputs write-through,
+the other seven see cold files). A split LRU (blocks against log tail) is the measurement
+that separates them.
+
+### Projection: 10,000 ops/s, 50 % reads, RF=3 (USD per month)
+
+| | 1 GB | 1 TB | 10 TB | Crossover vs Cassandra on EBS |
+|---|--:|--:|--:|--:|
+| Cassandra, NVMe / EBS | 1,565 / 2,402 | 1,565 / 2,402 | 12,587 / 4,742 | |
+| OzoneDB 64 KiB (`cost-20260827`) | 3,693 | 6,247 | 7,053 | 17.8 TB |
+| OzoneDB 4 KiB, compaction GETs as measured (0.205 per put) | 4,092 | 6,308 | 7,070 | 17.8 TB |
+| OzoneDB 4 KiB, compaction range reads, predicted (0 per put) | 3,014 | 5,231 | 5,993 | 14.7 TB |
+| **OzoneDB 4 KiB + range reads, measured (0.00015 per put)** | **2,997** | **5,230** | **5,992** | **14.7 TB** |
+
+The measured line lands on the predicted one to the dollar. At 10 TB with a 16 GB cache:
+`h` 0.157; S3 GETs $4,405 (from $5,482 with compaction GETs as measured, $5,045 at
+64 KiB), of which compaction is now about $1 (from $1,078); clients 5 ($700, from 8 and
+$1,120 at 64 KiB); log tier $614, storage $270, PUTs $4. Against the 64 KiB engine of
+`cost-20260827` the two changes together save $1,061 per month at 10 TB (15 %) and move
+the crossover from 17.8 TB to 14.7 TB. Figure: `results-cost-20260829-rr.png`.
+
+### Conclusions
+
+1. **The 4 KiB block curve is now realised.** Compaction GETs per put fell 1,375x (0.205
+   to 0.00015), the load rate, client CPU and server CPU are back at the 64 KiB values, and
+   the read-side gain of 4 KiB blocks (`h` 1.05x to 19x) is no longer cancelled. The 10 TB
+   projection is $5,992 per month, crossover 14.7 TB.
+2. **Request count, not bytes, was the penalty.** MinIO served the same 1.0 GB to
+   compaction either way; 204,858 requests cost 0.25 ms of server CPU per put and 0.08 ms
+   of client CPU per put more than 100 requests.
+3. **`FileStorage` reported short reads as success.** `FileStorage::read(name, buf, offset,
+   length)` tested the stream pointer, not the stream. Fixed in `2380ddf0`; found by the
+   new truncated-file test. The S3 backend was not affected.
+4. **Under a write-heavy mix the block cache is nearly cold.** `h` 0.18 against 0.65 at a
+   52 % cache ratio. The projection's `h` comes from the read-only sweep; a split LRU is
+   the next measurement, and the next lever after cache bytes.
 
 ## Method notes and caveats
 

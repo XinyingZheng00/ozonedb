@@ -17,7 +17,13 @@ to 0.675 / 0.341 / 0.215 / 0.141 / 0.032 at the five cache ratios (1.05x to 19x)
 throughput +18 to 36 %, client CPU per read -25 %; but compaction GETs per put rose from
 0.015 to 0.205 because `Table::getAll` reads one block per GET. The projection is
 unchanged at 10 TB ($7,070) until compaction reads ranges ($5,993, crossover 14.7 TB).
-That engine change is the next step, planned in `PLAN-compaction-range-read.md`. The re-run also found that every workload-a cell
+That engine change is done (`PLAN-compaction-range-read.md`, commits `2dc2ed24` and
+`2380ddf0`, campaign `cost-20260829-rr`, section "Compaction range reads" of
+`RESULTS-cost.md`): compaction GETs per put 0.205 to 0.00015, the load back at 9,634 puts/s
+with client and server CPU at the 64 KiB values, workload-a and workload-c cells unchanged
+within 2 %, projection $5,992 at 10 TB, crossover 14.7 TB. The same cells show `h` 0.18
+under workload a against 0.65 under workload c at a 52 % cache ratio (the LRU also holds
+the log tail; a split LRU is the next measurement). The re-run also found that every workload-a cell
 of `cost-20260827` had lost 1 to 4 of 8 writers to a native crash (`readDataBlocks` on a
 file removed under the reader; runner still `rc=0`); fixed in `96b9265d`, the 600 s
 workload-a cells now finish 8/8. The 64 KiB workload-a sums are survivor sums.
