@@ -26,7 +26,15 @@ under workload a against 0.65 under workload c at a 52 % cache ratio: the LRU bu
 blocks only, compaction outputs are cold in every process but their builder, and deleted
 SSTables' blocks are never dropped; next: per-level miss counters, drop blocks on SSTable
 REMOVE, warm outputs in the peers with one range read each, planned in
-`PLAN-compaction-cache.md`. The re-run also found that every workload-a cell
+`PLAN-compaction-cache.md`. **That change is done (2026-08-28**, commits `9ddaf573` to
+`f987cd54`, campaigns `cost-20260828-cache` and `-cache2`, section "Compaction-aware block
+cache" of `RESULTS-cost.md`): the drop alone changes nothing; warming the L1 outputs takes
+the L1 hit rate from 0.22 to 0.89 and `h` from 0.18 to 0.35 (GETs per op -20 %), L2
+outputs too (level 2, 50 % budget) `h` 0.40 and GETs per op -27 %, throughput +7 %, at
+about 1,100 extra requests per cell and +0.5 GB RSS. L2 stays cold because every L1-to-L2
+compaction rewrites the L2 files an L1 file overlaps, which under hashed keys is most of
+the level; a key-range-selective warm is the next lever. The projection does not change
+(its `h` is the read-only sweep). The warm is off by default. The re-run also found that every workload-a cell
 of `cost-20260827` had lost 1 to 4 of 8 writers to a native crash (`readDataBlocks` on a
 file removed under the reader; runner still `rc=0`); fixed in `96b9265d`, the 600 s
 workload-a cells now finish 8/8. The 64 KiB workload-a sums are survivor sums.

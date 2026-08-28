@@ -460,6 +460,110 @@ the crossover from 17.8 TB to 14.7 TB. Figure: `results-cost-20260829-rr.png`.
    compaction output in the peers with one range read per output (the read path that
    compaction now uses); count misses per level to size the effect first.
 
+## Compaction-aware block cache (campaigns `cost-20260828-cache` and `-cache2`, engine commits `9ddaf573` to `f987cd54`)
+
+The change planned in `PLAN-compaction-cache.md`, in three parts. C: block-cache hits and
+misses per SSTable level, dead blocks (files no longer in the View), warm counters, printed
+as a second `[lru_cache] levels …` line at DB close. A: when a COMPACT is applied to a
+process's view, the inputs' cached blocks leave the byte budget and their `Table*` is
+retired (queued under `view_mutex`, drained after it). B: one worker thread per process
+reads each accepted output in ranged chunks (`Table::warm`, one GET per 64 MiB) and
+publishes its blocks the way the builder's write-through does. B is off by default
+(`cache_warm_enabled`); the policy has a level rule (`cache_warm_max_level`, default 1), a
+budget rule (`cache_warm_max_fraction` of the cache, default 0.25) and an affinity rule
+(`cache_warm_min_input_blocks`, default 1). Same cluster and settings as the range-read
+campaign: 4 KiB blocks, trimming on, a fresh 1 GB load, 600 s cells with 8 writers. Rows in
+`results-cost-20260828-cache.tsv` (`-cache-long` = the first build, `-cache2-long` = the
+build with the affinity fix `4facdec7`).
+
+### Load
+
+The load with the warm on: 9,380 puts/s (range reads: 9,634), 99 GETs for 1M puts
+(`get_per_write` 0.00015, unchanged), client CPU 0.83 ms per put (0.83), server CPU 0.32 ms
+(0.30), 8/8 writers, no file warmed. The affinity rule refused every output, as planned for
+a pure load. The load rows print non-zero `dead_bytes`; that was a scan against the
+open-time View (the raw pointer is refreshed only by `DB::get`), fixed in `74099ed4` to use a
+fresh snapshot. Run cells refresh it per get and were not affected.
+
+### Workload a, 600 s, 8 writers, 512 MB (52 % cache ratio)
+
+| Cell | ops/s | `h` | L1 hits / misses | L2 hits / misses | GETs per op (run / last 60 s) | Warmed files / blocks / read fraction | Client CPU per op | Server CPU per op | RSS peak |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| Range reads (`cost-20260829-rr`) | 2,674 | 0.179 | | | 0.532 / | | 1.14 ms | 1.16 ms | |
+| A + C, warm off | 2,724 | 0.183 | 64,574 / 226,140 | 135,248 / 666,435 | 0.543 / 0.518 | 0 | 1.18 ms | 1.14 ms | 3.68 GB |
+| Warm on, first build (defaults) | 2,706 | 0.183 | 64,347 / 225,803 | 135,781 / 665,837 | 0.543 / 0.521 | 0 | 1.17 ms | 1.16 ms | 3.77 GB |
+| Warm on, first build, level 2, 50 % | 2,783 | 0.269 | 66,352 / 231,842 | 233,404 / 583,473 | 0.486 / 0.465 | 42 / 880k / 0.14 | 1.18 ms | 1.10 ms | 3.77 GB |
+| Warm on, affinity fix (defaults) | 2,857 | 0.348 | 273,200 / 33,701 | 126,561 / 715,517 | 0.434 / 0.409 | 105 / 1.01M / 0.20 | 1.13 ms | 1.03 ms | 4.00 GB |
+| **Warm on, affinity fix, level 2, 50 %** | **2,912** | **0.403** | 275,436 / 37,386 | 194,835 / 660,020 | **0.397 / 0.373** | 154 / 2.02M / 0.15 | 1.14 ms | 1.01 ms | 4.18 GB |
+
+Every cell finished 8/8 with 0 to 7 NOT_FOUND reads (the documented transient miss), GETs
+per miss 0.99, `dead_blocks` 0 to 2 (a reader that published a block of a file removed
+under it) and every retired `Table*` freed. `h` here is per block lookup; a workload-a read
+probes about 1.3 levels, so the extractor's `h_steady` (one lookup per read) understates it
+and is not quoted.
+
+Three results, in the order they were found.
+
+1. **The drop alone (A + C) changes nothing measurable**: 2,724 against 2,674 ops/s, `h`
+   0.183 against 0.179. Dead blocks were a hygiene problem, not a hit-rate problem.
+2. **The first warm-on build warmed nothing.** Its counters said why: `skipped_affinity`
+   248 and `skipped_level` 104 (minus 23 per process for the load's COMPACT records
+   replayed at open). Every L1 output comes from a log-to-L1 compaction, whose inputs are
+   log files and never had an SSTable block cached, so the affinity rule refused all of
+   them; the level rule refused the L2 outputs. The fix (`4facdec7`): for a compaction with
+   log inputs the affinity signal is the number of lookups on the destination level since
+   the previous such event (0 in a load, hundreds per second under workload a).
+3. **Warming the L1 outputs lifts the L1 hit rate from 0.22 to 0.89** (misses 226k to
+   34k), `h` from 0.18 to 0.35, GETs per op from 0.54 to 0.43 (-20 %), throughput +5 %,
+   client CPU per op -4 %, server CPU per op -10 %. Adding the L2 outputs (level rule 2,
+   budget rule 50 %) takes `h` to 0.40 and GETs per op to 0.40 (-27 %), throughput +7 %.
+   The cost: 154 files read once (about 1,100 extra requests, 9 GB more read from MinIO
+   over 600 s, free in-region on S3), RSS +0.5 GB (the 64 MiB chunk plus the parsed blocks
+   in flight), and only 15 to 20 % of the warmed blocks are read before they are evicted
+   or dropped again.
+
+### Why L2 stays cold
+
+Three quarters of the misses are on L2 in every cell. Under hashed keys one L1 file spans
+the whole key space, so every L1-to-L2 compaction rewrites the L2 files it overlaps: 13
+such compactions per process per 600 s, 48 L2 outputs of about 100 MB, about 4.8 GB of L2
+rewritten per 600 s against a level that holds 1 GB. Part A drops the cached half of L2
+at each rewrite, and part B can only put it back by reading the whole output into a cache
+that holds half of the level: 85 % of what it publishes is never read. A warm that
+publishes only the blocks whose key range overlaps the dropped inputs' cached blocks
+("restore what the LRU had") would keep the read to one GET and cut the published bytes;
+that is the next step in `PLAN-compaction-cache.md`. The structural cause, L1 files that
+overlap all of L2, is the compaction shape, not the cache.
+
+### Workload a at 8 MB and the workload-c control
+
+At 8 MB (0.8 % ratio) the budget rule refused every L1 output (`skipped_budget` 240,
+`skipped_level` 104): 2,591 ops/s, `h` 0.010, 0.657 GETs per op, 0 failed, `dead_blocks`
+0, against the range-read cell's 2,608 / 0.010 / 0.674. The control (workload c, 512 MB,
+warm on): 14,011 ops/s, `h` 0.649, 0.347 GETs per op, 0 failed, no file warmed (no
+compaction), against the range-read control's 14,331 / 0.679 / 0.319. The read path did
+not change; the 2 % throughput gap is inside the run-to-run spread of the three controls
+(14,350 / 14,331 / 14,011).
+
+### Two bugs found on the way
+
+The bucket restore between cells (`mc mirror --overwrite --remove`) kept a cell's
+`checkpoint/LATEST` (same 8 bytes, newer mtime) while removing the checkpoint it named,
+so every writer of the next cell died at open ("a LATEST that cannot be read"); three
+cells were lost before the restore force-copied every `LATEST` (`1127b7cc`). The loader
+wrapper named its server sample after the plain label, so the `--cache-warm` load
+overwrote the range-read load's sample (`41fd65a0`; the sample files were renamed by hand).
+
+### Projection
+
+Unchanged. The model's `h` comes from the workload-c sweep, and at the projection's 0.16 %
+ratio (16 GB on 10 TB) both `h` values are small. What changed is the write-heavy `h` at
+52 %: 0.40 with the warm on against 0.65 read-only, so the model overstates the GET line of
+a 50 % write mix at high cache ratios by less than before (0.18 against 0.65 in the
+range-read campaign). The engine default keeps the warm off; `cache_warm_enabled=true`
+with `cache_warm_max_level=2` and `cache_warm_max_fraction=0.5` is the measured setting
+for a write mix at a large cache ratio.
+
 ## Method notes and caveats
 
 - **Steady-state `h`.** The sampler polls the MinIO request counters every 10 s. `h_steady`

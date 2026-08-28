@@ -1,9 +1,29 @@
 # Plan: a compaction-aware block cache (branch `worktree-plan-cost`)
 
-**Status (2026-08-28):** planned, not started. Follow-up to `PLAN-compaction-range-read.md`
-and the section "Compaction range reads" of `RESULTS-cost.md` (finding 4: `h` 0.18 under
-workload a against 0.65 under workload c at a 52 % cache ratio). Depends on the chunked
-reader of `2dc2ed24`.
+**Status (2026-08-28):** DONE and measured. Commits `9ddaf573` (C, counters), `d2c61f43`
+(A, drop on REMOVE), `5760dff1` (B, warm worker), `5867a321`, `74099ed4` (dead-block scan
+on a fresh View snapshot), `5c98526e` (runner pass-through `--cache-warm-max-level` /
+`--cache-warm-max-fraction`), `1127b7cc` (bucket restore force-copies `LATEST`),
+`41fd65a0` (loader sample name), `4facdec7` (affinity for log-input compactions),
+`f987cd54` (counters before start count as disabled). Campaigns `cost-20260828-cache` and
+`-cache2`, write-up in the section "Compaction-aware block cache" of `RESULTS-cost.md`,
+rows in `results-cost-20260828-cache.tsv`. Results against the goal at 512 MB, workload a,
+600 s: `h` 0.18 to 0.40 (goal 0.5), GETs per op 0.54 to 0.40 (goal 0.25), throughput +7 %
+(goal within 2 %), about 1,100 extra requests (goal under 2,000), RSS 4.2 GB (goal 3.9).
+Deviations from the plan below: `invalidateSSTable` returns the block count instead of an
+out parameter; the affinity signal for a log-to-L1 compaction is the number of
+destination-level lookups since the previous such event, because log inputs never have a
+cached SSTable block (the first warm-on cell warmed nothing for that reason); `Table::warm`
+scans a private copy of the index block so it is safe on a shared `Table`; the worker
+checks liveness through a fresh View snapshot from `MetadataLogHandler`, not the cache's
+raw `latest_view` pointer; `TableBuilder::finish` marks its file complete so the builder
+never reads its own output back. Three quarters of the misses are on L2 (every L1-to-L2
+compaction rewrites the L2 files an L1 file overlaps), and whole-file warming of L2
+outputs is 85 % waste. **Next:** a key-range-selective warm (publish only the blocks whose
+key range overlaps the dropped inputs' cached blocks), then the compaction shape. Follow-up
+to `PLAN-compaction-range-read.md` and the section "Compaction range reads" of
+`RESULTS-cost.md` (finding 4: `h` 0.18 under workload a against 0.65 under workload c at a
+52 % cache ratio). Depends on the chunked reader of `2dc2ed24`.
 
 ## Goal
 
