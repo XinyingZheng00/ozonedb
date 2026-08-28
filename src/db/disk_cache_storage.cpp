@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -284,13 +285,106 @@ void DiskCacheStorage::invalidate(std::string const& name) {
   eraseLocked(name, /*count_as_invalidated=*/true);
 }
 
-void DiskCacheStorage::enqueueFill(std::string const&) {}
+void DiskCacheStorage::enqueueFill(std::string const& name) {
+  std::lock_guard<std::mutex> lk(fill_mtx_);
+  if (queued_.count(name)) return;
+  while (fill_queue_.size() >= options_.max_queue && !fill_queue_.empty()) {
+    queued_.erase(fill_queue_.front());
+    fill_queue_.pop_front();
+    fill_dropped_.fetch_add(1);
+  }
+  fill_queue_.push_back(name);
+  queued_.insert(name);
+  fill_cv_.notify_all();
+}
 
-// --- tier API stubs completed in Tasks 3-5 ---
+void DiskCacheStorage::startFillWorker() {
+  std::lock_guard<std::mutex> lk(fill_mtx_);
+  if (fill_started_) return;
+  fill_started_ = true;
+  fill_stop_ = false;
+  fill_thread_ = std::thread([this] { fillLoop(); });
+}
+
+void DiskCacheStorage::stopFillWorker() {
+  {
+    std::lock_guard<std::mutex> lk(fill_mtx_);
+    if (!fill_started_) return;
+    fill_stop_ = true;
+    fill_cv_.notify_all();
+  }
+  fill_thread_.join();
+  std::lock_guard<std::mutex> lk(fill_mtx_);
+  fill_started_ = false;
+}
+
+void DiskCacheStorage::waitFillIdle() {
+  std::unique_lock<std::mutex> lk(fill_mtx_);
+  fill_cv_.wait(lk, [this] { return !fill_started_ || (fill_queue_.empty() && !fill_busy_); });
+}
+
+void DiskCacheStorage::fillLoop() {
+  for (;;) {
+    std::string name;
+    {
+      std::unique_lock<std::mutex> lk(fill_mtx_);
+      fill_cv_.wait(lk, [this] { return fill_stop_ || !fill_queue_.empty(); });
+      if (fill_stop_) return;
+      name = fill_queue_.front();
+      fill_queue_.pop_front();
+      queued_.erase(name);
+      fill_busy_ = true;
+    }
+    fillOne(name);
+    {
+      std::lock_guard<std::mutex> lk(fill_mtx_);
+      fill_busy_ = false;
+    }
+    fill_cv_.notify_all();
+  }
+}
+
+void DiskCacheStorage::fillOne(std::string const& name) {
+  if (present(name)) {
+    fill_skipped_present_.fetch_add(1);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(parts_mtx_);
+    if (parts_.count(name)) return;  // the builder is writing it through right now
+  }
+  size_t const total = backing_->size(name);
+  if (total == 0) {
+    fill_gone_.fetch_add(1);
+    return;
+  }
+  if (total > options_.capacity_bytes) {
+    fill_skipped_budget_.fetch_add(1);
+    return;
+  }
+  for (size_t off = 0; off < total; off += options_.chunk_bytes) {
+    size_t const len = std::min(options_.chunk_bytes, total - off);
+    unsigned char* buf = nullptr;
+    Status s = backing_->read(name, buf, off, len);
+    fill_gets_.fetch_add(1);
+    if (s != Status::kSuccess || buf == nullptr) {
+      discardPart(name);
+      fill_failed_.fetch_add(1);
+      return;
+    }
+    writePart(name, buf, len);
+    delete[] buf;
+  }
+  if (publishPart(name)) {
+    fills_.fetch_add(1);
+    fill_bytes_.fetch_add(total);
+  } else {
+    fill_failed_.fetch_add(1);
+  }
+}
+
+// --- tier API stubs completed in Tasks 4-5 ---
 size_t DiskCacheStorage::reconcile(std::function<bool(std::string const&, size_t)> const&) { return 0; }
-void DiskCacheStorage::startFillWorker() {}
-void DiskCacheStorage::stopFillWorker() {}
-void DiskCacheStorage::waitFillIdle() {}
 
 DiskCacheStorage::Stats DiskCacheStorage::stats() {
   Stats s;

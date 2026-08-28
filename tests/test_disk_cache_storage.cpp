@@ -211,3 +211,89 @@ TEST(DiskCacheStorageTest, FailedFlushDiscardsThePart) {
   std::filesystem::remove_all(backing_dir);
   std::filesystem::remove_all(tier_dir);
 }
+
+TEST(DiskCacheStorageTest, MissQueuesAChunkedFillAndTheNextReadHits) {
+  TierFixture f(1u << 20, /*chunk=*/1024);
+  f.tier->startFillWorker();
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 3 * 1024 + 1);
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(name, data, 5, 10), Status::kSuccess);
+  delete[] data;
+  f.tier->waitFillIdle();
+  EXPECT_TRUE(f.local(name));
+  EXPECT_FALSE(f.part(name));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.fills, 1u);
+  EXPECT_EQ(s.fill_bytes, 3u * 1024 + 1);
+  EXPECT_EQ(s.fill_gets, 4u);  // 3 full chunks + 1 byte
+  EXPECT_EQ(s.files, 1u);
+  std::ifstream in(f.tier_dir + name, std::ios::binary);
+  std::vector<unsigned char> copy((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  EXPECT_EQ(copy, bytes);
+
+  int const before = f.backing->ranged_reads;
+  ASSERT_EQ(f.tier->read(name, data, 2048, 100), Status::kSuccess);
+  EXPECT_EQ(0, memcmp(data, bytes.data() + 2048, 100));
+  delete[] data;
+  EXPECT_EQ(f.backing->ranged_reads, before);
+  EXPECT_EQ(f.tier->stats().hits, 1u);
+}
+
+TEST(DiskCacheStorageTest, FillSkipsFilesLargerThanTheCapacityAndFilesThatAreGone) {
+  TierFixture f(2000, /*chunk=*/1024);
+  f.tier->startFillWorker();
+  std::string const big = "sstable1/" + stamp() + "_big.sst";
+  f.seed(big, 5000);
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(big, data, 0, 10), Status::kSuccess);
+  delete[] data;
+  f.tier->waitFillIdle();
+  EXPECT_FALSE(f.local(big));
+  EXPECT_EQ(f.tier->stats().fill_skipped_budget, 1u);
+
+  // Queue a name, then delete it from the backing before the worker runs.
+  f.tier->stopFillWorker();
+  std::string const gone = "sstable1/" + stamp() + "_gone.sst";
+  f.seed(gone, 100);
+  ASSERT_EQ(f.tier->read(gone, data, 0, 10), Status::kSuccess);
+  delete[] data;
+  std::filesystem::remove(f.backing_dir + gone);
+  f.tier->startFillWorker();
+  f.tier->waitFillIdle();
+  EXPECT_FALSE(f.local(gone));
+  EXPECT_EQ(f.tier->stats().fill_gone, 1u);
+  EXPECT_EQ(f.tier->stats().fills, 0u);
+}
+
+TEST(DiskCacheStorageTest, FillQueueIsBoundedAndDeduplicated) {
+  TierFixture f(1u << 20);
+  DiskCacheStorage::Options o = f.tier->options();
+  // Rebuild with a queue of 2 (Options are read at construction).
+  f.tier.reset();
+  auto owned = std::make_unique<CountingStorage>(f.backing_dir);
+  f.backing = owned.get();
+  o.max_queue = 2;
+  f.tier = std::make_unique<DiskCacheStorage>(std::move(owned), o);
+  // The worker is not started, so the queue only grows.
+  std::vector<std::string> names;
+  for (int i = 0; i < 4; ++i) {
+    names.push_back("sstable1/" + stamp() + "_" + std::to_string(i) + ".sst");
+    f.seed(names.back(), 100);
+  }
+  unsigned char* data = nullptr;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_EQ(f.tier->read(names[i], data, 0, 10), Status::kSuccess);
+    delete[] data;
+    ASSERT_EQ(f.tier->read(names[i], data, 0, 10), Status::kSuccess);  // duplicate
+    delete[] data;
+  }
+  EXPECT_EQ(f.tier->stats().fill_dropped, 2u);  // 4 distinct names, bound 2
+  f.tier->startFillWorker();
+  f.tier->waitFillIdle();
+  EXPECT_EQ(f.tier->stats().fills, 2u);
+  EXPECT_FALSE(f.local(names[0]));
+  EXPECT_FALSE(f.local(names[1]));
+  EXPECT_TRUE(f.local(names[2]));
+  EXPECT_TRUE(f.local(names[3]));
+}
