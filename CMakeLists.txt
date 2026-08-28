@@ -109,6 +109,7 @@ set(OZONEDB_SOURCES
     src/db/task_log_handler.cpp
     src/db/checkpoint.cpp
     src/db/storage.cpp
+    src/db/disk_cache_storage.cpp
     src/db/azure_blob_storage.cpp
     src/db/sstable/block_handler.cpp
     src/db/sstable/table_builder.cpp
@@ -223,6 +224,7 @@ set(OZONEDB_TEST_SOURCES
     tests/test_filter_block.cpp
     tests/test_checkpoint.cpp
     tests/test_cache.cpp
+    tests/test_disk_cache_storage.cpp
 )
 if (OZONEDB_ENABLE_CORFU)
     list(APPEND OZONEDB_TEST_SOURCES tests/test_corfu_storage.cpp)
