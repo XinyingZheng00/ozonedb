@@ -20,13 +20,12 @@ the tier holds the dataset.
 
 Projection at 10,000 ops/s and 50 % reads, with the tier's own hit rate composed with the
 RAM curve: **a 2 TB tier per client pays only while it holds the dataset.** Below about
-6.7 TB of data it is a large saving (1 TB: $5,230 to $1,930, -63 %; 100 GB: -54 %) and
-above it a small loss (10 TB: $5,992 to $6,325, +6 %; 100 TB: $9,007 to $9,515, +6 %).
+6.3 TB of data it is a large saving (1 TB: $5,230 to $1,934, -63 %; 100 GB: -54 %) and
+above it a small loss (10 TB: $5,992 to $6,417, +7 %; 100 TB: $9,007 to $9,606, +7 %).
 At 10 TB a 2 TB tier covers a fifth of the data, lifting `h` from 0.157 to 0.246 and
-cutting S3 GETs from $4,405 to $3,937, which does not pay for $800 of gp3; the client line
-does not move, because at that ratio the tier is not a full tier. No budget inside the
-measured ratio range beats no tier at 10 TB or 100 TB. The crossover against Cassandra on
-EBS stays at 14.7 TB.
+cutting S3 GETs from $4,405 to $4,029, which does not pay for $800 of gp3; the client line
+does not move, because at that ratio the tier is not a full tier. At 10 TB no tier size
+beats no tier at all. The crossover against Cassandra on EBS stays at 14.7 TB.
 
 **What failed the goal table:** fill GETs per op <= 0.001 in every workload-c cell. Met at
 2 GB (1e-5) and missed at 128, 256 and 512 MB (0.0087, 0.0066, 0.0051). Cause: the tier's
@@ -46,7 +45,8 @@ the 100 TB point is an extrapolation. Its CPU per op is a two-state approximatio
 full tier's 0.938 ms/op at a ratio of 1 or more, the no-tier baseline below it -- while the
 measurement in between is worse than the baseline (1.22 to 1.64 ms/op on workload c at
 ratios 0.131 to 0.524, 4.21 ms/op on workload a at 0.524), so the partial-tier line is
-optimistic there too. Task 11 also fixed `steady_rates` in the extractor, which the full
+optimistic there too. The refill rate is interpolated over only two workload-a ratios
+(0.524 and 2.097) and clamped below 0.524, where the campaign has no workload-a point. Task 11 also fixed `steady_rates` in the extractor, which the full
 tier exposed: the window ended at the last S3 counter movement, which with a full tier is
 the end of the fill burst.
 
@@ -2397,8 +2397,14 @@ assert len(coef.h_disk_points) == 4, coef.h_disk_points  # cells 1-4; the -kp ro
 m = pcm.Model(coef, prices)
 base = m.ozonedb(10_000 * pcm.GB, 16)
 disk = m.ozonedb(10_000 * pcm.GB, 16, disk_gb=2000)
-assert disk["h"] > base["h"] and disk["disk_cost"] > 0 and disk["total"] < base["total"], (base, disk)
-print(round(base["total"]), round(disk["total"]))
+assert disk["h"] > base["h"] and disk["disk_cost"] > 0, (base, disk)
+# A 2 TB tier per client pays only while it holds the dataset: cheaper than no
+# tier at 1 TB, dearer at 10 TB. This is the measurement, not the plan's
+# expectation, which was that the tier wins at every size.
+small, small_disk = m.ozonedb(1_000 * pcm.GB, 16), m.ozonedb(1_000 * pcm.GB, 16, disk_gb=2000)
+assert small_disk["total"] < small["total"], (small, small_disk)
+assert disk["total"] > base["total"], (base, disk)
+print(round(small["total"]), round(small_disk["total"]), round(base["total"]), round(disk["total"]))
 PY
 ```
 

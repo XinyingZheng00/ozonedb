@@ -33,8 +33,9 @@ tier answers what the RAM cache missed, so the two hit rates compose:
 disk_h is the tier's own measured hit rate. The client CPU per op is the full
 tier's, but only when the tier holds the dataset: a partial tier measured more
 CPU than no tier at all, so below a ratio of 1 the baseline is the floor. An
-extra fill_get_per_op GETs per read pay for the misses the tier fills, and the
-tier's gp3 volumes are the last term.
+extra fill_get_per_op(disk_gb / D) GETs per read pay for the misses the tier
+fills -- also ratio-aware, because a partial tier refills far more often than a
+full one -- and the tier's gp3 volumes are the last term.
 
 S is seconds per month; R and W are reads/s and writes/s of the offered
 load; h is interpolated in log(c/D) between the measured cache-sweep points
@@ -236,25 +237,39 @@ class Coefficients:
             return min((r for r in cands if fnum(r["disk_ratio"]) == best),
                        key=lambda r: fnum(r.get("cache_capacity")) or 0.0)
 
-        # The fill rate is a property of the read-only sweep that gives the h
-        # curve; the CPU per op must come from the same workload as the
-        # baseline cpu_O, or the tier line would compare two workloads.
-        full = full_tier(h_workload)
+        # The CPU per op and the fill rate must both come from the same workload
+        # as the baseline cpu_O, or the tier line would compare two workloads.
+        # Both are ratio-dependent: a partial tier costs more CPU than no tier
+        # and refills about 80x as often as a full one, because it evicts what
+        # it has just fetched.
         full_cpu = full_tier(cpu_wl)
-        if self.disk_h_points and full is not None and full_cpu is not None:
+        fpts = {}
+        for r in tier:
+            if r["workload"] != cpu_wl or r["label"].endswith("-kp"):
+                continue
+            ratio, f = fnum(r.get("disk_ratio")), fnum(r.get("disk_fill_gets_per_op"))
+            if not ratio or ratio <= 0 or f is None:
+                continue
+            # One point per ratio: the cell with the smallest RAM cache, so the
+            # tier is what was varied. Same rule as full_tier().
+            cap = fnum(r.get("cache_capacity")) or 0.0
+            if ratio not in fpts or cap < fpts[ratio][0]:
+                fpts[ratio] = (cap, f)
+        self.fill_points = sorted((ratio, f) for ratio, (_, f) in fpts.items())
+        if self.disk_h_points and full_cpu is not None and self.fill_points:
             self.src["h_disk"] = (f"measured, workload {h_workload}, "
                                   f"{len(self.disk_h_points)} tier ratios")
             self.cpu_O_disk = fnum(full_cpu.get("client_cpu_s_per_op")) or self.cpu_O
             self.src["cpu_s_per_op_O_disk"] = f"measured ({full_cpu['label']}, workload {cpu_wl})"
-            self.fill_get_per_op = fnum(full.get("disk_fill_gets_per_op")) or 0.0
-            self.src["fill_get_per_op"] = f"measured ({full['label']}, workload {h_workload})"
+            self.src["fill_get_per_op"] = (f"measured, workload {cpu_wl}, "
+                                           f"{len(self.fill_points)} tier ratios")
         else:
-            # No tier cells: the tier hits nothing and costs the baseline CPU,
-            # so the disk_gb line is priced but changes nothing else.
+            # No tier cells: the tier hits nothing, fills nothing and costs the
+            # baseline CPU, so the disk_gb line is priced but changes nothing else.
             self.h_disk_points = list(self.h_points)
             self.disk_h_points = [(1.0, 0.0)]
+            self.fill_points = [(1.0, 0.0)]
             self.cpu_O_disk = self.cpu_O
-            self.fill_get_per_op = 0.0
             for name in ("h_disk", "cpu_s_per_op_O_disk", "fill_get_per_op"):
                 self.src[name] = "ASSUMED (no disk-cache rows)"
 
@@ -298,14 +313,20 @@ class Coefficients:
         measured ratio: a tier bigger than the dataset is a full tier."""
         return self._interp(self.disk_h_points, ratio)
 
+    def fill_get_per_op(self, ratio):
+        """S3 GETs per read spent refilling the tier, at a tier budget of
+        `ratio` times the dataset. A partial tier evicts what it has just
+        fetched and fetches it again: 0.0175 GETs per op at a 0.52 ratio
+        against 0.00022 at a full tier, so this cannot be a constant."""
+        return self._interp(self.fill_points, ratio)
+
     def report(self):
         print("coefficients:")
         for name, val in (("g", self.g), ("get_per_write", self.get_per_write),
                           ("put_per_write", self.put_per_write), ("k", self.k),
                           ("cpu_s_per_op_O", self.cpu_O), ("cpu_s_per_op_C", self.cpu_C),
                           ("ops_node_C", self.ops_node_C),
-                          ("cpu_s_per_op_O_disk", self.cpu_O_disk),
-                          ("fill_get_per_op", self.fill_get_per_op)):
+                          ("cpu_s_per_op_O_disk", self.cpu_O_disk)):
             print(f"  {name:19} {val:<14.6g} {self.src[name]}")
         for key in DEFAULT_SPACE:
             print(f"  {key:19} {self.space[key]:<14.6g} {self.src[key]}")
@@ -315,6 +336,9 @@ class Coefficients:
         print(f"  {'disk_h':19} {self.src['h_disk']}")
         for (ratio, dh), (_, ht) in zip(self.disk_h_points, self.h_disk_points):
             print(f"      disk/D={ratio:<7.3g} disk_h={dh:.4f}  (h_total as measured {ht:.4f})")
+        print(f"  {'fill_get_per_op':19} {self.src['fill_get_per_op']}")
+        for ratio, f in self.fill_points:
+            print(f"      disk/D={ratio:<7.3g} fill_gets_per_op={f:.5f}")
 
 
 class Model:
@@ -384,7 +408,7 @@ class Model:
             # it pays for the fills it keeps evicting -- so only a tier that
             # holds the dataset may be charged less than the baseline.
             cpu = self.c.cpu_O_disk if ratio_disk >= 1.0 else max(self.c.cpu_O, self.c.cpu_O_disk)
-            fill = self.R * self.c.fill_get_per_op * self.S
+            fill = self.R * self.c.fill_get_per_op(ratio_disk) * self.S
         else:
             h_tier = 0.0
             h = h_ram

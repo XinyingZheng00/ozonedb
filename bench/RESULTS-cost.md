@@ -694,7 +694,7 @@ published with them were computed from.
 |---|--:|--:|--:|--:|--:|
 | Cassandra, NVMe / EBS | 1,565 / 2,402 | 1,565 / 2,402 | 12,587 / 4,742 | 122,306 / 45,302 | |
 | OzoneDB, 16 GB RAM per client (`cost-20260829-rr`) | 2,997 | 5,230 | 5,992 | 9,007 | 14.7 TB |
-| **OzoneDB, 16 GB RAM + 2 TB gp3 per client** | **1,820** | **1,930** | **6,325** | **9,515** | **14.7 TB** |
+| **OzoneDB, 16 GB RAM + 2 TB gp3 per client** | **1,821** | **1,934** | **6,417** | **9,606** | **14.7 TB** |
 
 The model gains a `disk_gb` term. The tier answers what the RAM cache missed, so the two
 hit rates compose: `h = 1 - (1 - h(c / D)) * (1 - disk_h(disk_gb / D))`, where `disk_h` is
@@ -703,28 +703,31 @@ the tier's own measured hit rate ((0.131, 0.059), (0.262, 0.137), (0.524, 0.384)
 is the full tier's 0.938 ms (the workload-a `lru8m-dc2g` cell, the same workload the
 baseline `cpu_O` comes from), but only when the tier holds the dataset: below a ratio of 1
 the baseline is the floor, because every partial tier measured *more* client CPU than no
-tier at all. The fills add 1e-5 GETs per read, and `clients x disk_gb x gp3` is a new cost
-line. Figure: `results-disk-20260829.png`; every line for 1 GB to 100 TB in
+tier at all. The refills follow the same rule -- same workload, ratio-aware -- because a
+partial tier evicts what it has just fetched and fetches it again: `fill_get_per_op`
+interpolates (0.524, 0.01747) and (2.097, 0.00022), 79x apart. `clients x disk_gb x gp3`
+is a new cost line. Figure: `results-disk-20260829.png`; every line for 1 GB to 100 TB in
 `results-disk-20260829-projection.tsv`.
 
-**A 2 TB tier per client pays only while it holds the dataset.** Below about 6.7 TB of data
-it is a large saving -- 39 % at 1 GB, 54 % at 100 GB, 63 % at 1 TB ($5,230 to $1,930, `h`
-0.256 to 0.984, clients 5 to 4) -- and above it a small loss: at 10 TB $6,325 against
-$5,992 (+6 %) and at 100 TB $9,515 against $9,007 (+6 %). At 10 TB the 2 TB tier covers a
+**A 2 TB tier per client pays only while it holds the dataset.** Below about 6.3 TB of data
+it is a large saving -- 39 % at 1 GB, 54 % at 100 GB, 63 % at 1 TB ($5,230 to $1,934, `h`
+0.256 to 0.984, clients 5 to 4) -- and above it a small loss: at 10 TB $6,417 against
+$5,992 (+7 %) and at 100 TB $9,606 against $9,007 (+7 %). At 10 TB the 2 TB tier covers a
 fifth of the data, so it lifts `h` from 0.157 to 0.246 and cuts S3 GETs from $4,405 to
-$3,937, which does not pay for $800 of gp3 (5 clients x 2 TB); the client line does not
-move, because at that ratio the tier is not a full tier. The crossover against Cassandra on
-EBS stays at 14.7 TB.
+$4,029 -- $376 back, of which $92 is spent again on refills -- against $800 of gp3
+(5 clients x 2 TB); the client line does not move, because at that ratio the tier is not a
+full tier. The crossover against Cassandra on EBS stays at 14.7 TB.
 
-Sweeping the tier size, no budget inside the measured ratio range beats no tier at either
-size. At 10 TB the cheapest measured-range point is a full 10 TB per client: `h` 0.722, S3
-GETs $1,450, clients 4 ($560), but $3,200 of gp3, for $6,098 against $5,992. At 100 TB a
-full tier is $37,518. The sweep's apparent minima below the measured range (500 GB per
-client, $5,934 at 10 TB and $8,915 at 100 TB) are an artifact of the clamp: below a 0.131
-ratio the model still credits the tier with `disk_h` 0.0585, and the measured curve says a
-tier that small would thrash instead. gp3 is $0.08 per GB-month against S3 Standard's
-$0.023, so a tier only pays when its hit rate is high enough to buy back more in requests
-than it costs in bytes -- which, for this whole-file tier, means holding the dataset.
+Sweeping the tier size at 10 TB, **no budget beats no tier at all**: the cheapest is a full
+10 TB per client (`h` 0.722, S3 GETs $1,500, clients 4 at $560, but $3,200 of gp3) at
+$6,147 against $5,992, and the smallest budgets sit just above the baseline ($6,026 at
+500 GB). At 100 TB nothing inside the measured ratio range wins either; a full tier there
+is $37,567, and the sweep's nominal minimum of $9,006 at 500 GB per client is a $1 tie with
+the baseline and an artifact of the clamp, which still credits a 0.005 ratio with `disk_h`
+0.0585 where the measured curve says such a tier would thrash. gp3 is $0.08 per GB-month
+against S3 Standard's $0.023, so a tier only pays when its hit rate is high enough to buy
+back more in requests than it costs in bytes -- which, for this whole-file tier under
+uniform keys, means holding the dataset.
 
 ### Caveats
 
@@ -760,8 +763,10 @@ than it costs in bytes -- which, for this whole-file tier, means holding the dat
    which is the whole of result 2.
 2. **Sub-file entries.** Cache block ranges instead of whole SSTables, so a partial budget
    holds the hot part of every file rather than all of a few files. Together with (1) this
-   is what decides whether the tier is worth anything above 6.7 TB: the projection turns on
-   `disk_h` at ratios of 0.1 to 0.5, where the whole-file tier measures 0.06 to 0.38.
+   is the whole question above 6.3 TB, and the reason both sit at the top of this list: a
+   tier only pays when it holds the working set, and the projection turns on `disk_h` at
+   ratios of 0.1 to 0.5, where the whole-file tier measures 0.06 to 0.38 and refills 79x
+   more often than a full one.
 3. **Re-measure with a skewed key distribution** and with a dataset large enough to give a
    level hundreds of files, which is what caveats 2 and 3 predict will change.
 4. **The compaction-aware warm on top of the tier.** The workload-a cells here ran with the
