@@ -59,12 +59,34 @@ if findmnt -n "$MOUNT" >/dev/null 2>&1; then
   die "$MOUNT is mounted from $src, which does not carry the label $LABEL"
 fi
 
-# 2. Pick the device.
-root_disk=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)")
+# 2. Determine the root disk(s), robustly. `/` is usually mounted from a
+# partition, so PKNAME gives the parent disk. If `/` is mounted directly
+# from a whole disk (no partition table), PKNAME prints an empty line and
+# the disk is its own root -- fall back to the source's own basename. If
+# `/` is mounted from device-mapper/LVM, PKNAME can print one line per
+# underlying physical volume; treat every one of them as a root disk so
+# none of them can be auto-picked or accepted as an explicit --device.
+root_src=$(findmnt -n -o SOURCE /)
+mapfile -t root_disks < <(lsblk -no PKNAME "$root_src" | sed '/^$/d')
+if [[ ${#root_disks[@]} -eq 0 ]]; then
+  root_disks=("$(basename "$root_src")")
+fi
+[[ ${#root_disks[@]} -gt 0 && -n "${root_disks[0]}" ]] || die "cannot determine the root disk, refusing to continue"
+
+is_root_disk() {
+  local name="$1" d
+  for d in "${root_disks[@]}"; do
+    [[ "$name" == "$d" ]] && return 0
+  done
+  return 1
+}
+
+# 3. Pick the device.
 if [[ -z "$DEVICE" ]]; then
   candidates=()
   while read -r name type rota; do
-    [[ "$type" == "disk" && "$rota" == "0" && "$name" != "$root_disk" ]] || continue
+    [[ "$type" == "disk" && "$rota" == "0" ]] || continue
+    is_root_disk "$name" && continue
     [[ "$(lsblk -n "/dev/$name" | wc -l)" -eq 1 ]] || continue
     [[ -z "$(sudo blkid -o value -s TYPE "/dev/$name" 2>/dev/null || true)" ]] || continue
     candidates+=("/dev/$name")
@@ -76,13 +98,13 @@ if [[ -z "$DEVICE" ]]; then
   DEVICE="${candidates[0]}"
 fi
 [[ -b "$DEVICE" ]] || die "$DEVICE is not a block device"
-[[ "$(basename "$DEVICE")" != "$root_disk" ]] || die "$DEVICE holds the root filesystem"
+is_root_disk "$(basename "$DEVICE")" && die "$DEVICE holds the root filesystem"
 if lsblk -no MOUNTPOINT "$DEVICE" 2>/dev/null | grep -q .; then
   die "$DEVICE (or a child) is mounted. Unmount it first."
 fi
 [[ "$(lsblk -n "$DEVICE" | wc -l)" -eq 1 ]] || die "$DEVICE has partitions; this script formats whole disks only"
 
-# 3. Format unless our label is already there.
+# 4. Format unless our label is already there.
 existing_label=$(sudo blkid -s LABEL -o value "$DEVICE" 2>/dev/null || true)
 existing_type=$(sudo blkid -s TYPE -o value "$DEVICE" 2>/dev/null || true)
 if [[ "$existing_label" == "$LABEL" && "$existing_type" == "$FSTYPE" ]]; then
@@ -95,12 +117,17 @@ else
   sudo mkfs.ext4 -q -F -L "$LABEL" -m 0 -E lazy_itable_init=0,lazy_journal_init=0 "$DEVICE"
 fi
 
-# 4. fstab by label, mount, permissions.
+# 5. fstab by label, mount, permissions. Reaching here means $MOUNT was not
+# already mounted (step 1 would have exited), so the mount below is always
+# a real state transition -- log it (and a new fstab entry) under a distinct
+# tag so ansible's changed_when can see it even on a run that formats
+# nothing, e.g. a labeled device whose mount was lost by a reboot.
 sudo mkdir -p "$MOUNT"
 if ! grep -qE "^LABEL=${LABEL}[[:space:]]" /etc/fstab; then
   echo "LABEL=$LABEL $MOUNT $FSTYPE defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
-  log "fstab entry added"
+  log "fstab: added LABEL=$LABEL $MOUNT $FSTYPE"
 fi
+log "mounting $DEVICE at $MOUNT"
 sudo mount "$MOUNT"
 sudo chmod 777 "$MOUNT"
 log "mounted $DEVICE at $MOUNT"

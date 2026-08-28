@@ -23,7 +23,7 @@
         {{ ("--device " ~ device) if device else "" }}
         --mount {{ mount | quote }} {{ extra_args }}'
       register: disk_cache
-      changed_when: "'formatting' in disk_cache.stdout"
+      changed_when: "'formatting' in disk_cache.stdout or 'mounting' in disk_cache.stdout or 'fstab: added' in disk_cache.stdout"
 
     - name: Report
       ansible.builtin.debug:
