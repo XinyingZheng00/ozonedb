@@ -88,6 +88,10 @@ DB::DB(std::string const& shared_config_path) {
     o.chunk_bytes = static_cast<size_t>(this->metadata->disk_cache_chunk_bytes);
     o.drop_pages = this->metadata->disk_cache_drop_pages;
     o.max_queue = static_cast<size_t>(this->metadata->disk_cache_fill_queue);
+    o.mode = this->metadata->disk_cache_mode == "chunk" ? DiskCacheStorage::Mode::kChunk : DiskCacheStorage::Mode::kFile;
+    o.entry_bytes = static_cast<size_t>(this->metadata->disk_cache_entry_bytes);
+    o.admission = this->metadata->disk_cache_admission == "frequency" ? DiskCacheStorage::Admission::kFrequency : DiskCacheStorage::Admission::kAlways;
+    o.admit_window = this->metadata->disk_cache_admit_window;
     auto* tier = new DiskCacheStorage(std::unique_ptr<Storage>(this->sstable_storage), o);
     this->sstable_storage = tier;
     this->disk_cache = tier;

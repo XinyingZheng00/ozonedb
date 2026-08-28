@@ -115,6 +115,13 @@ class Metadata {
   uint64_t disk_cache_chunk_bytes = 67108864;
   bool disk_cache_drop_pages = true;
   uint64_t disk_cache_fill_queue = 256;
+  // Round 2 (bench/PLAN-disk-cache-2.md): "file" keeps whole SSTables, "chunk"
+  // keeps disk_cache_entry_bytes pieces of them; "frequency" is TinyLFU
+  // admission, "always" the round-1 evict-to-fit.
+  std::string disk_cache_mode = "file";
+  uint64_t disk_cache_entry_bytes = 65536;
+  std::string disk_cache_admission = "always";
+  uint64_t disk_cache_admit_window = 0;
 
   // When true, log reads trust the in-memory key index (kept fresh by
   // local addRecord and, on Corfu, the tailer's remote-append listener)
@@ -293,6 +300,27 @@ class Metadata {
     }
     if (auto it = result.find("disk_cache_fill_queue"); it != result.end()) {
       disk_cache_fill_queue = std::stoull(it->second);
+    }
+    if (auto it = result.find("disk_cache_mode"); it != result.end()) {
+      disk_cache_mode = it->second;
+    }
+    if (auto it = result.find("disk_cache_entry_bytes"); it != result.end()) {
+      disk_cache_entry_bytes = std::stoull(it->second);
+    }
+    if (auto it = result.find("disk_cache_admission"); it != result.end()) {
+      disk_cache_admission = it->second;
+    }
+    if (auto it = result.find("disk_cache_admit_window"); it != result.end()) {
+      disk_cache_admit_window = std::stoull(it->second);
+    }
+    if (disk_cache_mode != "file" && disk_cache_mode != "chunk") {
+      throw std::runtime_error("disk_cache_mode must be \"file\" or \"chunk\", got \"" + disk_cache_mode + "\"");
+    }
+    if (disk_cache_admission != "always" && disk_cache_admission != "frequency") {
+      throw std::runtime_error("disk_cache_admission must be \"always\" or \"frequency\", got \"" + disk_cache_admission + "\"");
+    }
+    if (disk_cache_entry_bytes < 4096 || (disk_cache_entry_bytes & (disk_cache_entry_bytes - 1)) != 0) {
+      throw std::runtime_error("disk_cache_entry_bytes must be a power of two of at least 4096");
     }
     if (!disk_cache_dir.empty() && !sstable_backend_set) {
       throw std::runtime_error("disk_cache_dir requires sstable_backend: the tier fronts the object store that holds the SSTables");

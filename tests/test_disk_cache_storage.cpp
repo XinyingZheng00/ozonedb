@@ -688,12 +688,20 @@ TEST(DiskCacheStorageTest, MetadataParsesTheDiskCacheKeys) {
         "\"disk_cache_bytes\": \"2147483648\",\n"
         "\"disk_cache_drop_pages\": \"false\",\n"
         "\"disk_cache_chunk_bytes\": \"1048576\",\n"
-        "\"disk_cache_fill_queue\": \"8\""));
+        "\"disk_cache_fill_queue\": \"8\",\n"
+        "\"disk_cache_mode\": \"chunk\",\n"
+        "\"disk_cache_entry_bytes\": \"16384\",\n"
+        "\"disk_cache_admission\": \"frequency\",\n"
+        "\"disk_cache_admit_window\": \"4096\""));
     EXPECT_EQ(md.disk_cache_dir, "/tank/cache/w0/");  // slash appended
     EXPECT_EQ(md.disk_cache_bytes, 2147483648ull);
     EXPECT_FALSE(md.disk_cache_drop_pages);
     EXPECT_EQ(md.disk_cache_chunk_bytes, 1048576ull);
     EXPECT_EQ(md.disk_cache_fill_queue, 8ull);
+    EXPECT_EQ(md.disk_cache_mode, "chunk");
+    EXPECT_EQ(md.disk_cache_entry_bytes, 16384ull);
+    EXPECT_EQ(md.disk_cache_admission, "frequency");
+    EXPECT_EQ(md.disk_cache_admit_window, 4096ull);
   }
   {
     Metadata md(write(base));
@@ -701,9 +709,18 @@ TEST(DiskCacheStorageTest, MetadataParsesTheDiskCacheKeys) {
     EXPECT_TRUE(md.disk_cache_drop_pages);
     EXPECT_EQ(md.disk_cache_chunk_bytes, 67108864ull);
     EXPECT_EQ(md.disk_cache_fill_queue, 256ull);
+    EXPECT_EQ(md.disk_cache_mode, "file");
+    EXPECT_EQ(md.disk_cache_entry_bytes, 65536ull);
+    EXPECT_EQ(md.disk_cache_admission, "always");
+    EXPECT_EQ(md.disk_cache_admit_window, 0ull);
   }
   EXPECT_THROW(Metadata(write(base + ",\n\"disk_cache_dir\": \"/tank/cache/w0\"")),
                std::runtime_error);  // bytes missing
+  std::string const tier_on = base + ",\n\"disk_cache_dir\": \"/tank/cache/w0\",\n\"disk_cache_bytes\": \"1\"";
+  EXPECT_THROW(Metadata(write(tier_on + ",\n\"disk_cache_mode\": \"block\"")), std::runtime_error);
+  EXPECT_THROW(Metadata(write(tier_on + ",\n\"disk_cache_admission\": \"lru\"")), std::runtime_error);
+  EXPECT_THROW(Metadata(write(tier_on + ",\n\"disk_cache_entry_bytes\": \"3000\"")), std::runtime_error);  // not a power of two
+  EXPECT_THROW(Metadata(write(tier_on + ",\n\"disk_cache_entry_bytes\": \"2048\"")), std::runtime_error);  // below 4096
   std::string const no_backend =
       "\"backend\": \"local\",\n"
       "\"db_path\": \"" + dir + "db/\",\n"
