@@ -25,11 +25,16 @@ The model (bench/PLAN-cost.md, "The model"), per month:
                + clients_O * disk_gb * p_disk
     clients_X  = max(min_clients, ceil(ops * cpu_s_per_op_X / (vcpu * util)))
 
-With a disk-cache tier of `disk_gb` per client (bench/PLAN-disk-cache.md), h is
-h_disk(disk_gb / D) -- the measured combined hit rate of the RAM block cache and
-the tier -- the client CPU per op is the tier's, an extra fill_get_per_op GETs
-per read pay for the misses the tier fills, and the tier's gp3 volumes are the
-last term.
+With a disk-cache tier of `disk_gb` per client (bench/PLAN-disk-cache.md), the
+tier answers what the RAM cache missed, so the two hit rates compose:
+
+  h = 1 - (1 - h(c / D)) * (1 - disk_h(disk_gb / D))
+
+disk_h is the tier's own measured hit rate. The client CPU per op is the full
+tier's, but only when the tier holds the dataset: a partial tier measured more
+CPU than no tier at all, so below a ratio of 1 the baseline is the floor. An
+extra fill_get_per_op GETs per read pay for the misses the tier fills, and the
+tier's gp3 volumes are the last term.
 
 S is seconds per month; R and W are reads/s and writes/s of the offered
 load; h is interpolated in log(c/D) between the measured cache-sweep points
@@ -199,35 +204,55 @@ class Coefficients:
         self.ops_node_C = pick("ops_node_C", [max(caps)] if caps else [], DEFAULT_COEF["ops_node_C"])
 
         # Disk-cache tier (bench/PLAN-disk-cache.md, campaign disk-20260829).
-        # h_disk(ratio) is the combined hit rate h_total of the RAM cache and
-        # the tier against the tier budget over the dataset, from the same
-        # workload as h. The -kp cell is the page-cache A/B of the largest
-        # budget, not another ratio, so it is excluded.
-        dpts = []
+        # disk_h(ratio) is the *tier's own* hit rate against the tier budget
+        # over the dataset, so the model can compose it with whatever RAM
+        # cache the projection buys; h_disk(ratio) is the combined h_total of
+        # the cells as measured, kept for callers that want the raw curve. Both
+        # come from the same workload as h. The -kp cell is the page-cache A/B
+        # of the largest budget, not another ratio, so it is excluded.
+        dpts, rpts = [], []
         for r in tier:
             if r["workload"] != h_workload or r["label"].endswith("-kp"):
                 continue
-            ratio, h = fnum(r.get("disk_ratio")), fnum(r.get("h_total"))
-            if ratio and ratio > 0 and h is not None:
-                dpts.append((ratio, h))
+            ratio = fnum(r.get("disk_ratio"))
+            if not ratio or ratio <= 0:
+                continue
+            ht, dh = fnum(r.get("h_total")), fnum(r.get("disk_h"))
+            if ht is not None:
+                dpts.append((ratio, ht))
+            if dh is not None:
+                rpts.append((ratio, dh))
         self.h_disk_points = sorted(dpts)
-        # The full tier: the largest budget measured. Its client CPU per op is
-        # what an op costs when the object store is off the read path, and its
-        # fill GETs per op are what the tier still pays to stay full.
-        full = max(((fnum(r.get("disk_ratio")), r) for r in tier
-                    if r["workload"] == h_workload and not r["label"].endswith("-kp")
-                    and fnum(r.get("disk_ratio"))), default=(None, None), key=lambda p: p[0])[1]
-        if self.h_disk_points and full is not None:
+        self.disk_h_points = sorted(rpts)
+
+        def full_tier(workload):
+            """The largest tier budget measured on `workload`. On a tie, the
+            cell with the smallest RAM cache, so the tier is what was varied."""
+            cands = [r for r in tier if r["workload"] == workload
+                     and not r["label"].endswith("-kp") and fnum(r.get("disk_ratio"))]
+            if not cands:
+                return None
+            best = max(fnum(r["disk_ratio"]) for r in cands)
+            return min((r for r in cands if fnum(r["disk_ratio"]) == best),
+                       key=lambda r: fnum(r.get("cache_capacity")) or 0.0)
+
+        # The fill rate is a property of the read-only sweep that gives the h
+        # curve; the CPU per op must come from the same workload as the
+        # baseline cpu_O, or the tier line would compare two workloads.
+        full = full_tier(h_workload)
+        full_cpu = full_tier(cpu_wl)
+        if self.disk_h_points and full is not None and full_cpu is not None:
             self.src["h_disk"] = (f"measured, workload {h_workload}, "
-                                  f"{len(self.h_disk_points)} tier ratios")
-            self.cpu_O_disk = fnum(full.get("client_cpu_s_per_op")) or self.cpu_O
-            self.src["cpu_s_per_op_O_disk"] = f"measured ({full['label']})"
+                                  f"{len(self.disk_h_points)} tier ratios")
+            self.cpu_O_disk = fnum(full_cpu.get("client_cpu_s_per_op")) or self.cpu_O
+            self.src["cpu_s_per_op_O_disk"] = f"measured ({full_cpu['label']}, workload {cpu_wl})"
             self.fill_get_per_op = fnum(full.get("disk_fill_gets_per_op")) or 0.0
-            self.src["fill_get_per_op"] = f"measured ({full['label']})"
+            self.src["fill_get_per_op"] = f"measured ({full['label']}, workload {h_workload})"
         else:
-            # No tier cells: the tier behaves like the RAM cache and costs the
-            # same CPU, so the disk_gb line is priced but changes nothing else.
+            # No tier cells: the tier hits nothing and costs the baseline CPU,
+            # so the disk_gb line is priced but changes nothing else.
             self.h_disk_points = list(self.h_points)
+            self.disk_h_points = [(1.0, 0.0)]
             self.cpu_O_disk = self.cpu_O
             self.fill_get_per_op = 0.0
             for name in ("h_disk", "cpu_s_per_op_O_disk", "fill_get_per_op"):
@@ -261,10 +286,17 @@ class Coefficients:
         return self._interp(self.h_points, ratio)
 
     def h_disk(self, ratio):
-        """Combined hit rate of the RAM cache and the disk-cache tier at a tier
-        budget of `ratio` times the dataset. Clamped at the largest measured
-        ratio: a tier bigger than the dataset is a full tier."""
+        """Combined hit rate of the RAM cache and the disk-cache tier exactly as
+        the cells measured it (an 8 MB RAM cache behind the tier). The model
+        composes h() with disk_h() instead, so that the RAM cache the projection
+        buys is the one it is charged for."""
         return self._interp(self.h_disk_points, ratio)
+
+    def disk_h(self, ratio):
+        """The tier's own hit rate, over the reads the RAM cache missed, at a
+        tier budget of `ratio` times the dataset. Clamped at the largest
+        measured ratio: a tier bigger than the dataset is a full tier."""
+        return self._interp(self.disk_h_points, ratio)
 
     def report(self):
         print("coefficients:")
@@ -280,9 +312,9 @@ class Coefficients:
         print(f"  {'h':19} {self.src['h']}")
         for ratio, h in self.h_points:
             print(f"      c/D={ratio:<10.3g} h={h:.4f}")
-        print(f"  {'h_disk':19} {self.src['h_disk']}")
-        for ratio, h in self.h_disk_points:
-            print(f"      disk/D={ratio:<7.3g} h_total={h:.4f}")
+        print(f"  {'disk_h':19} {self.src['h_disk']}")
+        for (ratio, dh), (_, ht) in zip(self.disk_h_points, self.h_disk_points):
+            print(f"      disk/D={ratio:<7.3g} disk_h={dh:.4f}  (h_total as measured {ht:.4f})")
 
 
 class Model:
@@ -340,15 +372,22 @@ class Model:
             log_gb = max(sp["L_gb"], d_bytes / 1024.0 * sp["L0_kb_per_put"] * 1024.0 / GB)
         log_tier = seq + pr["log_units"] * (logunit + log_gb * st["gp3_usd_gb_month"])
         bulk = sp["sO"] * d_gb * st["s3_standard_usd_gb_month"]
+        ratio_disk = disk_gb * GB / d_bytes
+        h_ram = self.c.h(cache_gb * GB / d_bytes)
         if disk_gb > 0:
-            # The tier answers the RAM cache's misses; h is the combined hit
-            # rate, the client CPU per op is the tier's, and the fills that
-            # keep it full are the only extra GETs.
-            h = self.c.h_disk(disk_gb * GB / d_bytes)
-            cpu = self.c.cpu_O_disk
+            # The tier answers what the RAM cache missed, so the two hit rates
+            # compose: the projection is charged for the RAM cache it buys, not
+            # for the 8 MB the tier cells ran behind.
+            h_tier = self.c.disk_h(ratio_disk)
+            h = 1.0 - (1.0 - h_ram) * (1.0 - h_tier)
+            # A partial tier measured *more* client CPU than no tier at all --
+            # it pays for the fills it keeps evicting -- so only a tier that
+            # holds the dataset may be charged less than the baseline.
+            cpu = self.c.cpu_O_disk if ratio_disk >= 1.0 else max(self.c.cpu_O, self.c.cpu_O_disk)
             fill = self.R * self.c.fill_get_per_op * self.S
         else:
-            h = self.c.h(cache_gb * GB / d_bytes)
+            h_tier = 0.0
+            h = h_ram
             cpu = self.c.cpu_O
             fill = 0.0
         gets = (self.R * (1.0 - h) * self.c.g + self.W * self.c.get_per_write) * self.S + fill
@@ -364,7 +403,7 @@ class Model:
                 "put_cost": puts * st["s3_put_usd_per_million"] / 1e6,
                 "ckpt_cost": ckpt * st["s3_put_usd_per_million"] / 1e6,
                 "client_cost": client_cost, "disk_cost": disk_cost, "disk_gb": disk_gb,
-                "fill_gets": fill}
+                "fill_gets": fill, "h_ram": h_ram, "h_tier": h_tier}
 
 
 def grid(d_min_gb, d_max_gb, per_decade=12):
@@ -470,8 +509,8 @@ def main():
                       r1(oz["log_tier"]), r1(oz["bulk"]), r1(oz["get_cost"]), round(ozl["h"], 4), r1(ozl["get_cost"]),
                       r1(oz["put_cost"]), r1(oz["ckpt_cost"]), oz["clients"], r1(oz["client_cost"]),
                       r1(ozt["log_tier"]), round(ozt["log_gb"], 1),
-                      r1(od), round(ozd["h"], 4), round(disk_gb), r1(ozd["get_cost"]),
-                      ozd["clients"], r1(ozd["client_cost"]), r1(ozd["disk_cost"])))
+                      r1(od), round(ozd["h"], 4), round(ozd["h_tier"], 4), round(disk_gb),
+                      r1(ozd["get_cost"]), ozd["clients"], r1(ozd["client_cost"]), r1(ozd["disk_cost"])))
     print(crossover_note)
     print(disk_note)
     if args.table:
@@ -481,7 +520,7 @@ def main():
                 "ozone_log_tier_usd", "ozone_s3_storage_usd", "ozone_gets_hi_usd", "h_lo_cache", "ozone_gets_lo_usd",
                 "ozone_puts_compaction_usd", "ozone_puts_checkpoint_usd", "ozone_clients", "ozone_clients_usd",
                 "ozone_today_log_tier_usd", "ozone_today_log_gb",
-                "ozone_disk_cache", "h_disk_cache", "disk_gb", "ozone_disk_gets_usd",
+                "ozone_disk_cache", "h_disk_cache", "disk_h_tier", "disk_gb", "ozone_disk_gets_usd",
                 "ozone_disk_clients", "ozone_disk_clients_usd", "ozone_disk_gp3_usd"]
         with open(args.table, "w") as f:
             f.write("\t".join(cols) + "\n")

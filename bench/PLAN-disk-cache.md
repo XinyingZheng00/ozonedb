@@ -12,13 +12,21 @@ in the section "Disk-cache tier" of `RESULTS-cost.md`.
 Headline: a tier at or above the dataset size takes the object store off the read path.
 GETs per op 0.00052 on workload c and 0.0028 on workload a, against 0.760 and 0.658 with
 the same 8 MB RAM cache and no tier; 46,741 ops/s on workload c (3.3x the best RAM-cache
-cell) and 3,702 on workload a (+42 %); client CPU per op 0.12 ms against 1.14 to 1.64 ms;
-0 failed reads and 0 failed fills in every cell. Keeping the page cache is worth +8 %
-throughput and -4 % CPU, so the `DONTNEED` default measures the SSD honestly. A RAM block
-cache adds nothing once the tier holds the dataset. Projection at 10,000 ops/s and 50 %
-reads: 10 TB $5,992 to $4,777 with 2 TB of gp3 per client (-20 %), 100 TB $9,007 to $7,393
-(-18 %), crossover against Cassandra on EBS 14.7 TB to 12.1 TB. Both savings come mostly
-from the client line, not the GET line.
+cell) and 3,702 on workload a (+42 %); client CPU per op 0.12 ms against 0.42 ms for the
+no-tier workload-c control, and 0.94 ms against 1.18 ms on workload a; 0 failed reads and
+0 failed fills in every cell. Keeping the page cache is worth +8 % throughput and -4 % CPU,
+so the `DONTNEED` default measures the SSD honestly. A RAM block cache adds nothing once
+the tier holds the dataset.
+
+Projection at 10,000 ops/s and 50 % reads, with the tier's own hit rate composed with the
+RAM curve: **a 2 TB tier per client pays only while it holds the dataset.** Below about
+6.7 TB of data it is a large saving (1 TB: $5,230 to $1,930, -63 %; 100 GB: -54 %) and
+above it a small loss (10 TB: $5,992 to $6,325, +6 %; 100 TB: $9,007 to $9,515, +6 %).
+At 10 TB a 2 TB tier covers a fifth of the data, lifting `h` from 0.157 to 0.246 and
+cutting S3 GETs from $4,405 to $3,937, which does not pay for $800 of gp3; the client line
+does not move, because at that ratio the tier is not a full tier. No budget inside the
+measured ratio range beats no tier at 10 TB or 100 TB. The crossover against Cassandra on
+EBS stays at 14.7 TB.
 
 **What failed the goal table:** fill GETs per op <= 0.001 in every workload-c cell. Met at
 2 GB (1e-5) and missed at 128, 256 and 512 MB (0.0087, 0.0066, 0.0051). Cause: the tier's
@@ -32,11 +40,15 @@ recently hit file, or fill after N misses) and sub-file entries. Also open: the 
 measured under YCSB's uniform hashed keys, which is the worst case for a file-granular
 cache, and with only 10 files per writer.
 
-**Deviations from the plan:** the model's `disk_gb` term clamps `h_disk` below the smallest
-measured ratio (0.131) and charges the full tier's CPU per op at any budget, so the small-tier
-end of the projection is optimistic and the 100 TB point is an extrapolation. Task 11 also
-fixed `steady_rates` in the extractor, which the full tier exposed: the window ended at the
-last S3 counter movement, which with a full tier is the end of the fill burst.
+**Deviations from the plan:** the model's `disk_gb` term clamps `disk_h` below the smallest
+measured ratio (0.131) at 0.0585, so the small-tier end of the projection is optimistic and
+the 100 TB point is an extrapolation. Its CPU per op is a two-state approximation -- the
+full tier's 0.938 ms/op at a ratio of 1 or more, the no-tier baseline below it -- while the
+measurement in between is worse than the baseline (1.22 to 1.64 ms/op on workload c at
+ratios 0.131 to 0.524, 4.21 ms/op on workload a at 0.524), so the partial-tier line is
+optimistic there too. Task 11 also fixed `steady_rates` in the extractor, which the full
+tier exposed: the window ended at the last S3 counter movement, which with a full tier is
+the end of the fill burst.
 
 Every CloudLab node has two Micron `MTFDDAK480TDN` 447 GiB SATA SSDs: `sda` holds the OS
 (64 GB root, 8 GB swap, 375 GB unpartitioned) and `sdb` is the tier, formatted by

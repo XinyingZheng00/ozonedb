@@ -45,15 +45,18 @@ workload-a cells now finish 8/8. The 64 KiB workload-a sums are survivor sums.
 file-level LRU. A tier at or above the dataset size takes the object store off the read
 path -- GETs per op 0.00052 on workload c and 0.0028 on workload a against 0.760 and 0.658
 with no tier, 46,741 ops/s on workload c (3.3x the best RAM-cache cell) and 3,702 on
-workload a (+42 %), client CPU per op 0.12 ms against 1.14 to 1.64 ms, 0 failed reads. The
-model gains a `disk_gb` term fed by those coefficients: at 10,000 ops/s and 50 % reads,
-10 TB $5,992 to $4,777 with 2 TB of gp3 per client (-20 %) and 100 TB $9,007 to $7,393
-(-18 %), crossover 14.7 TB to 12.1 TB, mostly from the client line. Below the dataset size
-the whole-file LRU thrashes (`fills` equals `evictions`, fill GETs per op 0.005 to 0.017
+workload a (+42 %), client CPU per op 0.12 ms against 0.42 ms for the no-tier workload-c
+control and 0.94 against 1.18 ms on workload a, 0 failed reads. The model gains a `disk_gb`
+term fed by those coefficients, composing the tier's own hit rate with the RAM curve:
+at 10,000 ops/s and 50 % reads a 2 TB tier per client pays only while it holds the dataset
+-- below about 6.7 TB a large saving (1 TB $5,230 to $1,930, -63 %), above it a small loss
+(10 TB $5,992 to $6,325, 100 TB $9,007 to $9,515, both +6 %, because $800 of gp3 buys back
+only $468 of S3 GETs). The crossover stays at 14.7 TB. Below the dataset size the
+whole-file LRU thrashes (`fills` equals `evictions`, fill GETs per op 0.005 to 0.017
 against a 0.001 target, and the 512 MB workload-a cell is slower than no tier); admission
-control and sub-file entries are the follow-ups. Task 11 also fixed the extractor's steady
-window, which ended at the last S3 counter movement and so reported a full tier's fill
-burst as its steady state.
+control and sub-file entries are the follow-ups, and they are what would make the tier pay
+above 6.7 TB. Task 11 also fixed the extractor's steady window, which ended at the last S3
+counter movement and so reported a full tier's fill burst as its steady state.
 
 ## Goal
 
