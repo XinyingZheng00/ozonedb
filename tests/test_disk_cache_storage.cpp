@@ -64,36 +64,49 @@ class PartVanishingStorage : public CountingStorage {
   int calls_ = 0;
 };
 
-// A CountingStorage whose ranged read signals a latch on entry -- so a test
-// can deterministically know the worker has begun the call instead of
+// A CountingStorage whose ranged read counts its own calls -- so a test can
+// deterministically know the worker has begun a *specific* call instead of
 // guessing from a fixed delay -- and then sleeps before delegating, so the
 // test can reliably land on "the worker is mid-fill" (review finding,
-// PLAN-disk-cache T3 fix 2; the latch is PLAN-disk-cache T4's fix for the
+// PLAN-disk-cache T3 fix 2; the counter is PLAN-disk-cache T4's fix for the
 // carried-over review item: a bare sleep before start is not synchronization
-// and can race the worker's first dequeue).
+// and can race the worker's first dequeue). A one-shot "entered" bool is not
+// enough here: in the test below, the setup misses call this same read()
+// directly on the main thread, before the worker thread exists, so a
+// one-shot latch would already be tripped by the time the worker starts and
+// would provide no synchronisation at all (PLAN-disk-cache T4 review round
+// 1). Counting lets the test snapshot the count immediately before starting
+// the worker and then wait for the worker's own call to advance it.
 class SlowStorage : public CountingStorage {
  public:
   SlowStorage(std::string const& path, std::chrono::milliseconds delay) : CountingStorage(path), delay_(delay) {}
   Status read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) override {
     {
-      std::lock_guard<std::mutex> lk(entered_mtx_);
-      entered_ = true;
+      std::lock_guard<std::mutex> lk(reads_mtx_);
+      ++reads_;
     }
-    entered_cv_.notify_all();
+    reads_cv_.notify_all();
     std::this_thread::sleep_for(delay_);
     return CountingStorage::read(fileName, data, a, length);
   }
-  // Blocks until the first call to read() above has begun.
-  void waitEntered() {
-    std::unique_lock<std::mutex> lk(entered_mtx_);
-    entered_cv_.wait(lk, [this] { return entered_; });
+  int reads() {
+    std::lock_guard<std::mutex> lk(reads_mtx_);
+    return reads_;
+  }
+  // Blocks, bounded by `timeout`, until at least `n` calls to read() above
+  // have begun; false on timeout instead of hanging forever (e.g. if the
+  // worker skips the read entirely via fillOne's present/gone/budget
+  // early-outs -- PLAN-disk-cache T4 review round 1, finding 2).
+  bool waitForReadsAtLeast(int n, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(reads_mtx_);
+    return reads_cv_.wait_for(lk, timeout, [this, n] { return reads_ >= n; });
   }
   std::chrono::milliseconds delay_;
 
  private:
-  std::mutex entered_mtx_;
-  std::condition_variable entered_cv_;
-  bool entered_ = false;
+  std::mutex reads_mtx_;
+  std::condition_variable reads_cv_;
+  int reads_ = 0;
 };
 
 struct TierFixture {
@@ -404,15 +417,24 @@ TEST(DiskCacheStorageTest, StopIsSerialisedAcrossTheJoinAndWaitFillIdleIsNeverSt
   ASSERT_EQ(f.tier->read(name2, data, 0, 10), Status::kSuccess);
   delete[] data;
 
+  // Snapshot the read count *before* starting the worker: the two misses
+  // above already called SlowStorage::read() once each, directly on the main
+  // thread, so the count is nonzero here. Only the worker thread can advance
+  // it from this point on, which is what makes "wait for it to advance by 1"
+  // below a wait on the worker's own dequeue-and-read of name1, not on
+  // something that already happened.
+  int const reads_before = slow->reads();
   f.tier->startFillWorker();
-  // Wait for the worker to actually dequeue name1 and enter its (slow)
-  // chunk read before requesting a stop. Nothing else orders the worker's
-  // fill_queue_.pop_front() ahead of stopFillWorker() setting fill_stop_; a
-  // bare sleep before start races that dequeue and can leave name1 unfilled.
-  // The latch makes the ordering exact, and the ~150ms delay then just holds
-  // the worker inside the read long enough for the stop and the waiter
-  // thread below to land before that read returns.
-  slow->waitEntered();
+  // Wait, bounded, for the worker to actually dequeue name1 and enter its
+  // (slow) chunk read before requesting a stop. Nothing else orders the
+  // worker's fill_queue_.pop_front() ahead of stopFillWorker() setting
+  // fill_stop_; a bare sleep before start races that dequeue and can leave
+  // name1 unfilled. The bound turns a skipped fill (which would otherwise
+  // hang this wait forever) into a clear assertion failure instead. Once the
+  // wait is satisfied, the ~150ms delay inside that read holds the worker
+  // there long enough for the stop and the waiter thread below to land
+  // before the read returns.
+  ASSERT_TRUE(slow->waitForReadsAtLeast(reads_before + 1, std::chrono::seconds(5)));
   std::thread waiter([&f] { f.tier->waitFillIdle(); });
   f.tier->stopFillWorker();
   waiter.join();  // must return promptly: this is the regression under test
