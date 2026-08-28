@@ -354,9 +354,11 @@ TEST(LRUCacheTest, WarmWorkerQueueAndSkips) {
   fx.cache.setLiveFileCheck([&live](std::string const& name) { return live.count(name) > 0; });
 
   auto sz = [&](std::string const& name) { return fx.storage.size(name); };
-  // Offered before the worker exists: disabled.
-  fx.cache.onCompactionApplied({f_live}, {sz(f_live)}, 1, 5);
-  EXPECT_EQ(fx.cache.stats().warm_skipped_disabled, 1u);
+  // Offered before the worker exists: disabled, whatever the policy says
+  // (a level-2 output too, which the level rule would otherwise count).
+  fx.cache.onCompactionApplied({f_live, f_l2}, {sz(f_live), sz(f_l2)}, 1, 5);
+  EXPECT_EQ(fx.cache.stats().warm_skipped_disabled, 2u);
+  EXPECT_EQ(fx.cache.stats().warm_skipped_level, 0u);
 
   fx.cache.startWarmWorker();
   fx.cache.onCompactionApplied({f_live, f_gone}, {sz(f_live), sz(f_gone)}, 1, 5);
@@ -391,7 +393,7 @@ TEST(LRUCacheTest, WarmWorkerQueueAndSkips) {
 
   fx.cache.stopWarmWorker();
   fx.cache.onCompactionApplied({f_live}, {sz(f_live)}, 1, 5);
-  EXPECT_EQ(fx.cache.stats().warm_skipped_disabled, 2u);
+  EXPECT_EQ(fx.cache.stats().warm_skipped_disabled, 3u);
   fx.cache.stopWarmWorker();  // idempotent
 }
 

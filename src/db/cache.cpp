@@ -597,6 +597,16 @@ void LRUCache::setLiveFileCheck(std::function<bool(std::string const&)> check) {
 }
 
 void LRUCache::onCompactionApplied(std::vector<std::string> const& outputs, std::vector<size_t> const& output_bytes, int dest_level, size_t cached_input_blocks, bool log_inputs) {
+  {
+    // Before startWarmWorker (openDB's replay of the metadata log offers
+    // every historical COMPACT) or after stop: count as disabled, not as
+    // a policy skip, so the per-rule counters describe the run only.
+    std::lock_guard<std::mutex> lk(warm_mtx_);
+    if (!warm_started_ || warm_stop_) {
+      warm_skipped_disabled_.fetch_add(outputs.size(), std::memory_order_relaxed);
+      return;
+    }
+  }
   size_t affinity = cached_input_blocks;
   if (log_inputs) {
     int const slot = (dest_level > 0 && dest_level < kLevelSlots) ? dest_level : 0;
