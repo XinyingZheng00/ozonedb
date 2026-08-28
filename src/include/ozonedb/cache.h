@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 namespace ozonedb {
 
@@ -85,6 +86,13 @@ class LRUCache {
     std::unordered_map<std::string, std::unordered_map<std::string, std::shared_ptr<Record>>*> block_records;  // index_value_for_block -> records
     std::unordered_map<std::string, size_t> block_size;                                       // index_value_for_block -> tail
     std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> lru_itr;
+    // Blocks published by the warm worker (part B of
+    // bench/PLAN-compaction-cache.md) that no reader has touched yet. A
+    // get() on a marked block counts one warm hit and clears the mark, so
+    // warm_hits_ / warm_blocks_ is the fraction of warmed blocks that
+    // were worth the read. Evict and invalidate drop the mark with the
+    // block.
+    std::unordered_set<std::string> warmed_blocks;
 
     Table* table = nullptr;
     size_t offset = 0;    // Offset indicating the cached records until this offset
@@ -159,6 +167,31 @@ class LRUCache {
   // hits >> misses once the hot set fits in `capacity`.
   std::atomic<uint64_t> sstable_cache_hits_{0};
   std::atomic<uint64_t> sstable_cache_misses_{0};
+  // The same hits and misses split by SSTable level (slot = the level
+  // parsed from "sstable<L>/<name>", slot 0 = any other name). Which
+  // level misses is what tells a write-heavy cell apart from a
+  // read-only one (bench/PLAN-compaction-cache.md, part C).
+  static constexpr int kLevelSlots = 16;
+  std::atomic<uint64_t> level_hits_[kLevelSlots] = {};
+  std::atomic<uint64_t> level_misses_[kLevelSlots] = {};
+  // Warm-worker counters (part B). All zero until the worker exists.
+  std::atomic<uint64_t> warm_files_{0};
+  std::atomic<uint64_t> warm_blocks_{0};
+  std::atomic<uint64_t> warm_bytes_{0};
+  std::atomic<uint64_t> warm_hits_{0};
+  std::atomic<uint64_t> warm_skipped_disabled_{0};
+  std::atomic<uint64_t> warm_skipped_level_{0};
+  std::atomic<uint64_t> warm_skipped_budget_{0};
+  std::atomic<uint64_t> warm_skipped_affinity_{0};
+  std::atomic<uint64_t> warm_skipped_gone_{0};
+  std::atomic<uint64_t> warm_skipped_built_{0};
+  std::atomic<uint64_t> warm_dropped_{0};
+
+  // Level of an SSTable name "sstable<L>/<name>", 0 for any other name
+  // or a level outside [1, kLevelSlots). A plain scan, not std::regex:
+  // needReadBlock runs on every read and getSSTLayerNumber builds a
+  // regex per call.
+  static int levelSlot(std::string const& file_name);
 
   // Function to move a key to the front of the LRU list
   void updateLRU(std::string const& file_name, std::string const& index_value);
@@ -167,6 +200,37 @@ class LRUCache {
   void evict();
 
  public:
+  // One consistent reading of every counter, taken under the cache
+  // mutex. dead_* cover blocks whose file is not in latest_view (a
+  // compacted-away SSTable that nobody dropped); after part A they must
+  // be 0. printCacheStats formats exactly this.
+  struct Stats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t level_hits[kLevelSlots] = {};
+    uint64_t level_misses[kLevelSlots] = {};
+    size_t capacity = 0;
+    size_t current_size = 0;
+    size_t files = 0;
+    size_t sstable_files = 0;  // entries that hold a Table* or blocks
+    size_t dead_bytes = 0;
+    size_t dead_blocks = 0;
+    size_t dead_files = 0;
+    size_t retired_tables = 0;
+    uint64_t warm_files = 0;
+    uint64_t warm_blocks = 0;
+    uint64_t warm_bytes = 0;
+    uint64_t warm_hits = 0;
+    uint64_t warm_skipped_disabled = 0;
+    uint64_t warm_skipped_level = 0;
+    uint64_t warm_skipped_budget = 0;
+    uint64_t warm_skipped_affinity = 0;
+    uint64_t warm_skipped_gone = 0;
+    uint64_t warm_skipped_built = 0;
+    uint64_t warm_dropped = 0;
+  };
+  Stats stats();
+
   // Legacy single-storage constructor — both log and sstable reads go
   // through the same backend. Kept for backward-compat with tests and
   // configs that don't split storage.
@@ -251,8 +315,12 @@ class LRUCache {
     latest_view = view;
   }
 
-  // Dump steady-state cache counters to stderr. Safe to call at shutdown.
-  void printCacheStats() const;
+  // Dump the counters to stderr at DB close. Two lines: the original
+  // `[lru_cache] sstable hits=…` line, unchanged because the extractor
+  // (bench/scripts/extract_cost_coefficients.py) parses it, and a
+  // `[lru_cache] levels …` line with the per-level, dead-block and warm
+  // counters.
+  void printCacheStats();
 };
 }  // namespace ozonedb
 #endif

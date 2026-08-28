@@ -64,6 +64,45 @@ YCSB_RE = re.compile(r"^\[([A-Z\-]+)\],\s*([^,]+?),\s*(.+?)\s*$")
 CACHE_RE = re.compile(
     r"\[lru_cache\] sstable hits=(\d+) misses=(\d+) hit_rate=([\d.]+)% capacity=(\d+)"
 )
+# Second stats line (bench/PLAN-compaction-cache.md part C): hits and misses
+# per SSTable level as "<level>:<count>" pairs, blocks of files no longer in
+# the View, retired Table objects, and the warm-worker counters.
+LEVELS_RE = re.compile(
+    r"\[lru_cache\] levels hits=(?P<hits>[\d:,]+) misses=(?P<misses>[\d:,]+)"
+    r" sstable_files=(?P<sstable_files>\d+) dead_files=(?P<dead_files>\d+)"
+    r" dead_blocks=(?P<dead_blocks>\d+) dead_bytes=(?P<dead_bytes>\d+)"
+    r" retired=(?P<retired>\d+) warm files=(?P<warm_files>\d+) blocks=(?P<warm_blocks>\d+)"
+    r" bytes=(?P<warm_bytes>\d+) skipped_disabled=(?P<skipped_disabled>\d+)"
+    r" skipped_level=(?P<skipped_level>\d+) skipped_budget=(?P<skipped_budget>\d+)"
+    r" skipped_affinity=(?P<skipped_affinity>\d+) skipped_gone=(?P<skipped_gone>\d+)"
+    r" skipped_built=(?P<skipped_built>\d+) dropped=(?P<dropped>\d+) warm_hits=(?P<warm_hits>\d+)"
+)
+LEVEL_COLUMNS = ("l1", "l2", "l3", "l4plus")
+
+
+def level_pairs(s):
+    """'0:5,1:194,2:12' -> {0: 5, 1: 194, 2: 12}."""
+    out = {}
+    for pair in s.split(","):
+        if ":" in pair:
+            lvl, n = pair.split(":", 1)
+            out[int(lvl)] = int(n)
+    return out
+
+
+def level_buckets(counts):
+    """{level: n} -> {l1, l2, l3, l4plus}; slot 0 (non-SSTable names) is dropped."""
+    b = {c: 0 for c in LEVEL_COLUMNS}
+    for lvl, n in counts.items():
+        if lvl == 1:
+            b["l1"] += n
+        elif lvl == 2:
+            b["l2"] += n
+        elif lvl == 3:
+            b["l3"] += n
+        elif lvl >= 4:
+            b["l4plus"] += n
+    return b
 REPLAY_RE = re.compile(
     r"\[corfu\] initial replay drained (\d+) entries in (\d+) batches, (\d+) ms.*?"
     r"stream_MB=(\d+) live_files=(\d+) live_MB=(\d+)"
@@ -108,6 +147,7 @@ def parse_writer(path, window):
     w = {
         "ops": {}, "failed": 0, "runtime_ms": None,
         "cache_hits": None, "cache_misses": None, "cache_capacity": None,
+        "levels": None,
         "replay": None, "restore": None, "ckpts": [], "ack_fast": None, "ack_slow": None,
         "user_s": None, "sys_s": None, "rss_kb": None,
     }
@@ -131,6 +171,13 @@ def parse_writer(path, window):
                 w["cache_hits"] = int(m.group(1))
                 w["cache_misses"] = int(m.group(2))
                 w["cache_capacity"] = int(m.group(4))
+                continue
+            m = LEVELS_RE.search(line)
+            if m:
+                d = {k: int(v) for k, v in m.groupdict().items() if k not in ("hits", "misses")}
+                d["hits"] = level_buckets(level_pairs(m.group("hits")))
+                d["misses"] = level_buckets(level_pairs(m.group("misses")))
+                w["levels"] = d
                 continue
             m = REPLAY_RE.search(line)
             if m:
@@ -427,6 +474,27 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
         "cache_capacity": caps[0] if caps else "",
         "cache_ratio": round(caps[0] / (rc * record_bytes), 7) if caps and rc else "",
     }
+    # Second cache line: sums over the writers that printed it. Absent on
+    # result files from builds before part C, so every column stays "".
+    levels = [w["levels"] for w in ws if w["levels"]]
+    if levels:
+        for c in LEVEL_COLUMNS:
+            row[f"hits_{c}"] = sum(lv["hits"][c] for lv in levels)
+            row[f"misses_{c}"] = sum(lv["misses"][c] for lv in levels)
+        for src, dst in (("dead_files", "cache_dead_files"), ("dead_blocks", "cache_dead_blocks"),
+                         ("dead_bytes", "cache_dead_bytes"), ("retired", "cache_retired_tables"),
+                         ("warm_files", "warm_files"), ("warm_blocks", "warm_blocks"),
+                         ("warm_bytes", "warm_bytes"), ("warm_hits", "warm_hits"),
+                         ("skipped_disabled", "warm_skipped_disabled"),
+                         ("skipped_level", "warm_skipped_level"),
+                         ("skipped_budget", "warm_skipped_budget"),
+                         ("skipped_affinity", "warm_skipped_affinity"),
+                         ("skipped_gone", "warm_skipped_gone"),
+                         ("skipped_built", "warm_skipped_built"),
+                         ("dropped", "warm_dropped")):
+            row[dst] = sum(lv[src] for lv in levels)
+        wb = row["warm_blocks"]
+        row["warm_hit_frac"] = round(row["warm_hits"] / wb, 4) if wb else ""
     # Server samples: request deltas, bytes, du, bucket, CPU.
     agg = {"get": 0.0, "head": 0.0, "put": 0.0, "list": 0.0, "delete": 0.0, "other": 0.0,
            "bytes_in": 0.0, "bytes_out": 0.0}
@@ -555,6 +623,12 @@ COLUMNS = [
     "tag", "label", "workload", "writers", "have", "trial", "record_cnt", "dataset_bytes",
     "ops", "reads", "writes", "failed", "run_s", "steady_ops_s",
     "cache_hits", "cache_misses", "h", "cache_capacity", "cache_ratio",
+    "hits_l1", "hits_l2", "hits_l3", "hits_l4plus",
+    "misses_l1", "misses_l2", "misses_l3", "misses_l4plus",
+    "cache_dead_files", "cache_dead_blocks", "cache_dead_bytes", "cache_retired_tables",
+    "warm_files", "warm_blocks", "warm_bytes", "warm_hits", "warm_hit_frac",
+    "warm_skipped_disabled", "warm_skipped_level", "warm_skipped_budget",
+    "warm_skipped_affinity", "warm_skipped_gone", "warm_skipped_built", "warm_dropped",
     "s3_get", "s3_head", "s3_put", "s3_list", "s3_delete", "s3_other",
     "s3_bytes_in", "s3_bytes_out", "get_per_op", "get_per_miss", "put_per_op", "put_per_write",
     "s3_get_rate_steady", "s3_put_rate_steady", "s3_bytes_out_rate_steady", "steady_window_s",

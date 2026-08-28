@@ -8,6 +8,22 @@
 #include <stdexcept>
 
 namespace ozonedb {
+int LRUCache::levelSlot(std::string const& file_name) {
+  static constexpr char kPrefix[] = "sstable";
+  static constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
+  if (file_name.compare(0, kPrefixLen, kPrefix) != 0) return 0;
+  size_t i = kPrefixLen;
+  int level = 0;
+  bool digits = false;
+  for (; i < file_name.size() && file_name[i] >= '0' && file_name[i] <= '9'; ++i) {
+    level = level * 10 + (file_name[i] - '0');
+    digits = true;
+    if (level >= kLevelSlots) return 0;
+  }
+  if (!digits || i >= file_name.size() || file_name[i] != '/') return 0;
+  return level;
+}
+
 // Function to move a key to the front of the LRU list
 void LRUCache::updateLRU(std::string const& file_name, std::string const& index_value) {
   lru_list.erase(file_to_entry_map[file_name].lru_itr[index_value]);
@@ -32,6 +48,7 @@ void LRUCache::evict() {
     }
     entry.block_size.erase(it->second);
     entry.lru_itr.erase(it->second);
+    entry.warmed_blocks.erase(it->second);
     lru_list.pop_back();
   }
 }
@@ -226,6 +243,7 @@ void LRUCache::needReadBlock(std::string const& file_name, bool& read_more, std:
       it->second.block_records.find(index_value) != it->second.block_records.end()) {
     read_more = false;
     sstable_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    level_hits_[levelSlot(file_name)].fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -252,6 +270,7 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
     if (it != file_to_entry_map.end() &&
         it->second.block_records.find(index_value) != it->second.block_records.end()) {
       sstable_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      level_hits_[levelSlot(file_name)].fetch_add(1, std::memory_order_relaxed);
       return;
     }
     auto in_it = block_inflight_.find(inflight_key);
@@ -262,6 +281,7 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
       block_inflight_[inflight_key] = my_promise->get_future().share();
       table = (it != file_to_entry_map.end()) ? it->second.table : nullptr;
       sstable_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+      level_misses_[levelSlot(file_name)].fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -372,6 +392,11 @@ void LRUCache::get(std::string const& file_name, std::string const& key, std::sh
   auto block_it = file_it->second.block_records.find(index_value);
   if (block_it == file_it->second.block_records.end() || block_it->second == nullptr) return;
   updateLRU(file_name, index_value);
+  // First read of a block the warm worker published: one warm hit, and
+  // the mark goes so the block counts once.
+  if (!file_it->second.warmed_blocks.empty() && file_it->second.warmed_blocks.erase(index_value) != 0) {
+    warm_hits_.fetch_add(1, std::memory_order_relaxed);
+  }
   auto record_it = block_it->second->find(key);
   if (record_it != block_it->second->end()) record = record_it->second;
 }
@@ -514,17 +539,82 @@ void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std:
   }
 }
 
-void LRUCache::printCacheStats() const {
-  auto hits = sstable_cache_hits_.load(std::memory_order_relaxed);
-  auto misses = sstable_cache_misses_.load(std::memory_order_relaxed);
-  auto total = hits + misses;
-  double hit_rate = total ? (100.0 * hits / static_cast<double>(total)) : 0.0;
-  std::cerr << "[lru_cache] sstable hits=" << hits
-            << " misses=" << misses
+LRUCache::Stats LRUCache::stats() {
+  Stats s;
+  s.hits = sstable_cache_hits_.load(std::memory_order_relaxed);
+  s.misses = sstable_cache_misses_.load(std::memory_order_relaxed);
+  for (int i = 0; i < kLevelSlots; ++i) {
+    s.level_hits[i] = level_hits_[i].load(std::memory_order_relaxed);
+    s.level_misses[i] = level_misses_[i].load(std::memory_order_relaxed);
+  }
+  s.warm_files = warm_files_.load(std::memory_order_relaxed);
+  s.warm_blocks = warm_blocks_.load(std::memory_order_relaxed);
+  s.warm_bytes = warm_bytes_.load(std::memory_order_relaxed);
+  s.warm_hits = warm_hits_.load(std::memory_order_relaxed);
+  s.warm_skipped_disabled = warm_skipped_disabled_.load(std::memory_order_relaxed);
+  s.warm_skipped_level = warm_skipped_level_.load(std::memory_order_relaxed);
+  s.warm_skipped_budget = warm_skipped_budget_.load(std::memory_order_relaxed);
+  s.warm_skipped_affinity = warm_skipped_affinity_.load(std::memory_order_relaxed);
+  s.warm_skipped_gone = warm_skipped_gone_.load(std::memory_order_relaxed);
+  s.warm_skipped_built = warm_skipped_built_.load(std::memory_order_relaxed);
+  s.warm_dropped = warm_dropped_.load(std::memory_order_relaxed);
+
+  std::shared_lock<std::shared_mutex> lock(mutex);
+  s.capacity = capacity;
+  s.current_size = current_size;
+  s.files = file_to_entry_map.size();
+  s.retired_tables = retired_tables_.size();
+  for (auto const& [name, entry] : file_to_entry_map) {
+    if (entry.table == nullptr && entry.block_records.empty()) continue;  // a log file
+    ++s.sstable_files;
+    if (latest_view == nullptr || entry.block_records.empty()) continue;
+    if (latest_view->key_range.find(name) != latest_view->key_range.end()) continue;
+    ++s.dead_files;
+    for (auto const& [index_value, size] : entry.block_size) {
+      s.dead_bytes += size;
+      ++s.dead_blocks;
+    }
+  }
+  return s;
+}
+
+void LRUCache::printCacheStats() {
+  Stats s = stats();
+  auto total = s.hits + s.misses;
+  double hit_rate = total ? (100.0 * s.hits / static_cast<double>(total)) : 0.0;
+  std::cerr << "[lru_cache] sstable hits=" << s.hits
+            << " misses=" << s.misses
             << " hit_rate=" << hit_rate << "%"
-            << " capacity=" << capacity
-            << " current_size=" << current_size
-            << " files=" << file_to_entry_map.size()
+            << " capacity=" << s.capacity
+            << " current_size=" << s.current_size
+            << " files=" << s.files
+            << std::endl;
+  // Levels print as "<level>:<count>" pairs up to the highest level that
+  // saw a hit or a miss (slot 0 = names that are not "sstable<L>/…").
+  int top = 0;
+  for (int i = 0; i < kLevelSlots; ++i) {
+    if (s.level_hits[i] != 0 || s.level_misses[i] != 0) top = i;
+  }
+  std::cerr << "[lru_cache] levels hits=";
+  for (int i = 0; i <= top; ++i) std::cerr << (i ? "," : "") << i << ":" << s.level_hits[i];
+  std::cerr << " misses=";
+  for (int i = 0; i <= top; ++i) std::cerr << (i ? "," : "") << i << ":" << s.level_misses[i];
+  std::cerr << " sstable_files=" << s.sstable_files
+            << " dead_files=" << s.dead_files
+            << " dead_blocks=" << s.dead_blocks
+            << " dead_bytes=" << s.dead_bytes
+            << " retired=" << s.retired_tables
+            << " warm files=" << s.warm_files
+            << " blocks=" << s.warm_blocks
+            << " bytes=" << s.warm_bytes
+            << " skipped_disabled=" << s.warm_skipped_disabled
+            << " skipped_level=" << s.warm_skipped_level
+            << " skipped_budget=" << s.warm_skipped_budget
+            << " skipped_affinity=" << s.warm_skipped_affinity
+            << " skipped_gone=" << s.warm_skipped_gone
+            << " skipped_built=" << s.warm_skipped_built
+            << " dropped=" << s.warm_dropped
+            << " warm_hits=" << s.warm_hits
             << std::endl;
 }
 

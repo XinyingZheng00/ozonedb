@@ -222,6 +222,7 @@ set(OZONEDB_TEST_SOURCES
     tests/test_sstable.cpp
     tests/test_filter_block.cpp
     tests/test_checkpoint.cpp
+    tests/test_cache.cpp
 )
 if (OZONEDB_ENABLE_CORFU)
     list(APPEND OZONEDB_TEST_SOURCES tests/test_corfu_storage.cpp)
