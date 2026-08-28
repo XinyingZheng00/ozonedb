@@ -46,9 +46,9 @@ DiskCacheStorage::DiskCacheStorage(std::unique_ptr<Storage> backing, Options opt
   }
   fs::remove(probe, ec);
   if (options_.admission == Admission::kFrequency) {
-    // Sized from the entries the budget holds: a file-mode entry is about one
-    // SSTable, taken as 64 MiB here (Task 4 uses entry_bytes in chunk mode).
-    uint64_t const unit = 64u << 20;
+    // Sized from the entries the budget holds: one chunk in chunk mode, and
+    // in file mode about one SSTable, taken as 64 MiB.
+    uint64_t const unit = options_.mode == Mode::kChunk ? options_.entry_bytes : (64u << 20);
     uint64_t const expected = std::max<uint64_t>(16, options_.capacity_bytes / unit);
     uint64_t const window = options_.admit_window ? options_.admit_window : 8 * expected;
     sketch_ = std::make_unique<FrequencySketch>(static_cast<size_t>(std::min<uint64_t>(4 * expected, 1u << 22)), window);
@@ -113,6 +113,33 @@ Status DiskCacheStorage::read(std::string const& fileName, unsigned char*& data,
   if (!cacheable(fileName)) {
     passthrough_.fetch_add(1);
     return backing_->read(fileName, data, size);
+  }
+  if (options_.mode == Mode::kChunk) {
+    size_t total = 0;
+    bool complete = false;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      auto it = chunks_.find(fileName);
+      if (it != chunks_.end() && it->second.present == it->second.state.size()) {
+        complete = true;
+        total = it->second.size;
+        for (uint8_t& st : it->second.state) st |= kReferenced;
+      }
+    }
+    if (complete && readLocal(fileName, data, 0, total)) {
+      size = total;
+      hits_.fetch_add(1);
+      hit_bytes_.fetch_add(total);
+      return Status::kSuccess;
+    }
+    // A whole-file read is a compaction input on its way out: never admitted.
+    Status s = backing_->read(fileName, data, size);
+    misses_.fetch_add(1);
+    if (s == Status::kSuccess) {
+      miss_bytes_.fetch_add(size);
+      fetch_bytes_.fetch_add(size);
+    }
+    return s;
   }
   recordAccess(fileName);
   if (touch(fileName)) {
@@ -286,7 +313,14 @@ bool DiskCacheStorage::publishPartFile(std::string const& name, std::string cons
     fs::remove(part_path, ec);
     return false;
   }
-  if (!admit(name, static_cast<size_t>(bytes), how)) {
+  bool admitted;
+  if (options_.mode == Mode::kChunk) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    admitted = admitWholeFileLocked(name, static_cast<size_t>(bytes), how);
+  } else {
+    admitted = admit(name, static_cast<size_t>(bytes), how);
+  }
+  if (!admitted) {
     fs::remove(localPath(name), ec);  // refused: nothing indexes the copy, so it must not stay
     return false;
   }
@@ -851,6 +885,36 @@ void DiskCacheStorage::dropChunkFileLocked(std::string const& name, bool unlink,
     fs::remove(localPath(name), ec);
   }
   if (count_as_invalidated) invalidated_.fetch_add(1);
+}
+
+bool DiskCacheStorage::admitWholeFileLocked(std::string const& name, size_t bytes, AdmitMode how) {
+  if (bytes > options_.capacity_bytes) return false;
+  dropChunkFileLocked(name, /*unlink=*/false, false);  // a re-created name: the new bytes are already in place
+  if (current_bytes_ + bytes > options_.capacity_bytes) {
+    if (how != AdmitMode::kForce) {  // a write-through never contests: no history
+      admit_rejected_.fetch_add(1);
+      return false;
+    }
+    while (current_bytes_ + bytes > options_.capacity_bytes) {
+      std::string vname;
+      size_t vchunk = 0;
+      if (!clockVictimLocked(vname, vchunk)) {
+        admit_rejected_.fetch_add(1);
+        return false;
+      }
+      evictChunkLocked(vname, vchunk);
+    }
+  }
+  ChunkFile& cf = chunks_[name];
+  cf.size = bytes;
+  cf.state.assign(chunkCount(bytes), static_cast<uint8_t>(kPresent | kReferenced));
+  cf.present = cf.state.size();
+  cf.pending = 0;
+  cf.ring = ring_.size();
+  ring_.push_back(name);
+  present_chunks_ += cf.present;
+  current_bytes_ += bytes;
+  return true;
 }
 
 bool DiskCacheStorage::pwriteLocal(std::string const& name, size_t off, unsigned char const* buf, size_t len) {

@@ -971,3 +971,83 @@ TEST(DiskCacheStorageTest, ChunkTwoConcurrentMissesFetchTwiceAndWriteOnce) {
   std::filesystem::remove_all(backing_dir);
   std::filesystem::remove_all(tier_dir);
 }
+
+TEST(DiskCacheStorageTest, ChunkWriteThroughPublishesEveryChunk) {
+  TierFixture f(1u << 20, 64u << 20, true, Adm::kAlways, Mode::kChunk, /*entry=*/1024);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  std::vector<unsigned char> v(2500);
+  for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<unsigned char>(i % 251);
+  ASSERT_EQ(f.tier->appendNoFlush(name, v.data(), 2500), Status::kSuccess);
+  ASSERT_EQ(f.tier->flush(name), Status::kSuccess);
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.writethrough_files, 1u);
+  EXPECT_EQ(s.entries, 3u);
+  EXPECT_EQ(s.bytes, 2500u);
+  EXPECT_FALSE(f.part(name));
+  f.readAt(name, v, 2040, 20);  // straddles chunks 1 and 2: a hit
+  EXPECT_EQ(f.backing->ranged_reads, 0);
+  EXPECT_EQ(f.tier->stats().hits, 1u);
+}
+
+TEST(DiskCacheStorageTest, ChunkWholeFileReadIsServedOnlyWhenComplete) {
+  TierFixture f(1u << 20, 64u << 20, true, Adm::kAlways, Mode::kChunk, /*entry=*/1024);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 2048);
+  unsigned char* d = nullptr;
+  size_t n = 0;
+  ASSERT_EQ(f.tier->read(name, d, n), Status::kSuccess);  // incomplete: the backing, never admitted
+  EXPECT_EQ(n, 2048u);
+  EXPECT_EQ(0, memcmp(d, bytes.data(), 2048));
+  delete[] d;
+  EXPECT_EQ(f.backing->full_reads, 1);
+  EXPECT_EQ(f.tier->stats().entries, 0u);
+  f.readAt(name, bytes, 0, 8);
+  f.readAt(name, bytes, 1024, 8);  // both chunks present now
+  ASSERT_EQ(f.tier->read(name, d, n), Status::kSuccess);  // complete: local
+  EXPECT_EQ(0, memcmp(d, bytes.data(), 2048));
+  delete[] d;
+  EXPECT_EQ(f.backing->full_reads, 1);
+  EXPECT_EQ(f.tier->stats().hits, 1u);
+}
+
+TEST(DiskCacheStorageTest, ChunkFrequencyAdmissionKeepsTheHotterChunk) {
+  TierFixture f(2048, 64u << 20, true, Adm::kFrequency, Mode::kChunk, /*entry=*/1024);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 4096);
+  auto chunk = [&](size_t c) { f.readAt(name, bytes, c * 1024 + 1, 8); };
+  chunk(0);  // free budget
+  chunk(1);  // free budget
+  chunk(2);  // 2 (one access) is not above the victim (one access): refused, still fetched
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.entries, 2u);
+  EXPECT_EQ(s.admit_rejected, 1u);
+  EXPECT_EQ(s.evictions, 0u);
+  EXPECT_EQ(s.fetch_bytes, 3 * 1024u);
+  chunk(2);  // 2 accesses > 1: admitted, one victim evicted
+  s = f.tier->stats();
+  EXPECT_EQ(s.entries, 2u);
+  EXPECT_EQ(s.evictions, 1u);
+  EXPECT_EQ(s.admit_rejected, 1u);
+  int const before = f.backing->ranged_reads;
+  chunk(2);  // a hit now
+  EXPECT_EQ(f.backing->ranged_reads, before);
+}
+
+TEST(DiskCacheStorageTest, ChunkWriteThroughUnderFrequencyAdmissionTakesOnlyFreeBudget) {
+  TierFixture f(2048, 64u << 20, true, Adm::kFrequency, Mode::kChunk, /*entry=*/1024);
+  std::string const x = "sstable1/" + stamp() + "_x.sst";
+  std::string const y = "sstable1/" + stamp() + "_y.sst";
+  auto bx = f.seed(x, 2048);
+  f.readAt(x, bx, 0, 8);
+  f.readAt(x, bx, 1024, 8);  // the budget is full
+  std::vector<unsigned char> v(1000, 'y');
+  ASSERT_EQ(f.tier->appendNoFlush(y, v.data(), 1000), Status::kSuccess);
+  ASSERT_EQ(f.tier->flush(y), Status::kSuccess);
+  EXPECT_FALSE(f.local(y));
+  EXPECT_FALSE(f.part(y));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.admit_rejected, 1u);
+  EXPECT_EQ(s.evictions, 0u);
+  EXPECT_EQ(s.entries, 2u);
+  EXPECT_TRUE(f.backing->exist(y));
+}

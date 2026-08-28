@@ -204,6 +204,10 @@ class DiskCacheStorage : public Storage {
   // Under mtx_. Forgets the file's accounting and its ring slot. `unlink`
   // also removes the local file.
   void dropChunkFileLocked(std::string const& name, bool unlink, bool count_as_invalidated);
+  // Under mtx_, chunk mode. Indexes localPath(name) as a complete file of
+  // `bytes` (every chunk kPresent | kReferenced), taking budget under `how`
+  // chunk by chunk through the CLOCK hand. False (nothing indexed) when refused.
+  bool admitWholeFileLocked(std::string const& name, size_t bytes, AdmitMode how);
   bool pwriteLocal(std::string const& name, size_t off, unsigned char const* buf, size_t len);
   bool punchHole(std::string const& name, size_t off, size_t len);
 
