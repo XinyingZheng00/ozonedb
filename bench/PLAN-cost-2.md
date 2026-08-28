@@ -305,9 +305,14 @@ About 45 min on the laptop. It changes no file that the merge in Task 0 conflict
    filesystem. Use `sdb` whole. Do not partition `sda`: `setup_disk_cache.sh` refuses the
    root disk for a reason, and the unallocated part of `sda` is the fallback only if
    `sdb` turns out to be too small (see the space table below).
+   The server's `~/ozonedb` is an old tree without `setup_disk_cache.sh`: copy the script
+   first (`scp bench/scripts/setup_disk_cache.sh amd127:~/`). The whole step is one
+   detached script, `~/relayout.sh` on `amd127`, which the laptop cannot launch from a
+   background job (the permission classifier blocks a remote format + `rm -rf`). Run it
+   by hand: `bash ~/relayout.sh 2>&1 | tee ~/relayout.log`. It ends with `RELAYOUT-DONE`.
    ```bash
    # on amd127; the script formats, labels and writes the fstab entry (idempotent)
-   bash ~/ozonedb/bench/scripts/setup_disk_cache.sh --device /dev/sdb --mount /tank/ssd --label ozssd
+   bash ~/setup_disk_cache.sh --device /dev/sdb --mount /tank/ssd --label ozssd
    sudo systemctl stop minio
    pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' || true
    /tank/cassandra/cassandra_ctl.sh stop
@@ -326,7 +331,9 @@ About 45 min on the laptop. It changes no file that the merge in Task 0 conflict
    ```
    Every consumer reaches the state through the old paths: the MinIO unit, the runner's
    `/mnt/corfu/{load,run_batch,load-bucket}`, `cassandra.install_dir`, and the sampler's
-   `du` on `/tank/minio` and `/tank/cassandra/data` (an intermediate symlink is followed).
+   `du` on `/tank/minio` and `/tank/cassandra/data`. `du` follows an intermediate symlink
+   but not one given on the command line, so `server_sampler.sh` now runs `du -skD`
+   (the `/tank/minio` entry of `DU_CLASSES` is a top-level link after the move).
 
    Peak space on `/tank/ssd` (440 GB usable), in the order the tasks run:
 
@@ -350,7 +357,7 @@ About 45 min on the laptop. It changes no file that the merge in Task 0 conflict
    mv bench/results/local/*insert* bench/results/local/*_rc[0-9]* bench/results/local/archive-pre-cost2/ 2>/dev/null
    ```
    Do the same on every client's `bench/results/local` (the orchestrator pulls the load
-   files from there).
+   files from there). Done 2026-08-28 17:55: 54 files on `amd160`, none elsewhere.
 
 ### Task 2. Cassandra cells, both sizes (before any build)
 
