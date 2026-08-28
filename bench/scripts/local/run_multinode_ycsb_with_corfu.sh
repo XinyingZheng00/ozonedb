@@ -283,7 +283,14 @@ MC_ALIAS="${MC_ALIAS:-ozonedb-local}"
 
 start_corfu() {
   echo "[corfu] starting on $CORFU_TARGET ($CORFU_BIND_HOST:$CORFU_PORT)"
-  corfu_sh "if [ -d /mnt/corfu/load-bucket ]; then mc mirror --overwrite --remove --quiet /mnt/corfu/load-bucket $MC_ALIAS/$S3_BUCKET >/dev/null && echo '[corfu] bucket restored from /mnt/corfu/load-bucket'; else echo '[corfu] WARNING: no /mnt/corfu/load-bucket snapshot; bucket left as is'; fi"
+  # `mc mirror --overwrite` copies an object only when the source is newer
+  # or the size differs. A cell's trimmer rewrites checkpoint/LATEST with a
+  # newer mtime and the same 8 bytes, so the mirror kept the cell's LATEST
+  # while --remove deleted the checkpoint it names, and every writer of the
+  # next cell died at open ("a LATEST that cannot be read"). Copy every
+  # LATEST of the snapshot unconditionally after the mirror (mc cp always
+  # overwrites); the manifests and SSTables have unique names.
+  corfu_sh "if [ -d /mnt/corfu/load-bucket ]; then mc mirror --overwrite --remove --quiet /mnt/corfu/load-bucket $MC_ALIAS/$S3_BUCKET >/dev/null && cd /mnt/corfu/load-bucket && find . -type f -name LATEST | while read -r f; do mc cp --quiet \"\$f\" \"$MC_ALIAS/$S3_BUCKET/\${f#./}\" >/dev/null || exit 1; done && echo '[corfu] bucket restored from /mnt/corfu/load-bucket (LATEST forced)'; else echo '[corfu] WARNING: no /mnt/corfu/load-bucket snapshot; bucket left as is'; fi"
   # Trailing & must apply only to nohup, not to the whole chain — otherwise
   # ssh holds stdout open on a foregrounded subshell and hangs.
   corfu_sh "cd $CORFU_DIR && rm -rf /mnt/corfu/run_batch/ && cp -r /mnt/corfu/load/ /mnt/corfu/run_batch/ && ( setsid nohup env CORFUDB_HEAP=122880 ./bin/corfu_server -l /mnt/corfu/run_batch -s -a $CORFU_BIND_HOST $CORFU_PORT </dev/null >$CORFU_LOG 2>&1 & )"
