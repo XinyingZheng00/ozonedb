@@ -736,6 +736,16 @@ LRUCache::Stats LRUCache::stats() {
   s.warm_skipped_built = warm_skipped_built_.load(std::memory_order_relaxed);
   s.warm_dropped = warm_dropped_.load(std::memory_order_relaxed);
 
+  // Liveness comes from a fresh View snapshot when DB gave us the check
+  // (setLiveFileCheck): the raw latest_view pointer is refreshed only by
+  // DB::get, so at the end of a pure load it is the open-time View and
+  // every file built since would count as dead. Tests without a DB set
+  // latest_view directly.
+  std::function<bool(std::string const&)> live;
+  {
+    std::lock_guard<std::mutex> lk(warm_mtx_);
+    live = live_file_check_;
+  }
   std::shared_lock<std::shared_mutex> lock(mutex);
   s.capacity = capacity;
   s.current_size = current_size;
@@ -744,8 +754,13 @@ LRUCache::Stats LRUCache::stats() {
   for (auto const& [name, entry] : file_to_entry_map) {
     if (entry.table == nullptr && entry.block_records.empty()) continue;  // a log file
     ++s.sstable_files;
-    if (latest_view == nullptr || entry.block_records.empty()) continue;
-    if (latest_view->key_range.find(name) != latest_view->key_range.end()) continue;
+    if (entry.block_records.empty()) continue;
+    if (live) {
+      if (live(name)) continue;
+    } else {
+      if (latest_view == nullptr) continue;
+      if (latest_view->key_range.find(name) != latest_view->key_range.end()) continue;
+    }
     ++s.dead_files;
     for (auto const& [index_value, size] : entry.block_size) {
       s.dead_bytes += size;
