@@ -2,16 +2,45 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status (2026-08-28):** planned, not started. Follow-up to `PLAN-compaction-cache.md`
-(the RAM block cache is compaction-aware, `h` 0.40 under workload a at a 52 % ratio) and to
-the section "Compaction-aware block cache" of `RESULTS-cost.md`. The cost model says a
-local disk tier is the largest remaining lever: at 10 TB, 2 TB of gp3 per client or an
-`i4i.4xlarge` cuts the bill by about $1,100 per month (19 %), at 100 TB by about $600.
-Those numbers assume a disk hit costs nothing and extrapolate the read-only `h` curve.
-This plan builds the tier, measures it on the cluster, and feeds the model with measured
-coefficients. Every CloudLab node has two Micron `MTFDDAK480TDN` 447 GiB SATA SSDs:
-`sda` holds the OS (64 GB root, 8 GB swap, 375 GB unpartitioned) and `sdb` is unused.
-`/tank` sits on the 63 GB root filesystem today.
+**Status (2026-08-28):** DONE, built and measured. Engine commits `8ed9b9c1` to
+`dcc9a438` (`DiskCacheStorage`, the `disk_cache_*` config keys, the SSTable-removed
+listener), bench commits `bf09c216` to `a3b17d48` (the SSD provisioning, the runner flags,
+the extractor columns), campaign **`disk-20260829`** on 8 clients, 600 s cells, a 1 GB load
+(10 SSTables of about 121 MB per writer's view), rows in `results-disk-20260829.tsv`, write-up
+in the section "Disk-cache tier" of `RESULTS-cost.md`.
+
+Headline: a tier at or above the dataset size takes the object store off the read path.
+GETs per op 0.00052 on workload c and 0.0028 on workload a, against 0.760 and 0.658 with
+the same 8 MB RAM cache and no tier; 46,741 ops/s on workload c (3.3x the best RAM-cache
+cell) and 3,702 on workload a (+42 %); client CPU per op 0.12 ms against 1.14 to 1.64 ms;
+0 failed reads and 0 failed fills in every cell. Keeping the page cache is worth +8 %
+throughput and -4 % CPU, so the `DONTNEED` default measures the SSD honestly. A RAM block
+cache adds nothing once the tier holds the dataset. Projection at 10,000 ops/s and 50 %
+reads: 10 TB $5,992 to $4,777 with 2 TB of gp3 per client (-20 %), 100 TB $9,007 to $7,393
+(-18 %), crossover against Cassandra on EBS 14.7 TB to 12.1 TB. Both savings come mostly
+from the client line, not the GET line.
+
+**What failed the goal table:** fill GETs per op <= 0.001 in every workload-c cell. Met at
+2 GB (1e-5) and missed at 128, 256 and 512 MB (0.0087, 0.0066, 0.0051). Cause: the tier's
+unit is a whole SSTable, so a budget below the dataset holds 1, 2 or 4 of the 10 files a
+writer reads, and every miss on an absent file fills a whole file and evicts another --
+`fills` equals `evictions` to within 0.3 % in all three cells. Under a write mix the
+512 MB cell is slower than no tier at all (2,469 against 2,608 ops/s, 4.21 ms of client CPU
+per op). The measured curve is `h_total` about equal to the ratio up to 1, then saturation.
+The two follow-ups are admission control (do not fill a file whose fill would evict a
+recently hit file, or fill after N misses) and sub-file entries. Also open: the tier was
+measured under YCSB's uniform hashed keys, which is the worst case for a file-granular
+cache, and with only 10 files per writer.
+
+**Deviations from the plan:** the model's `disk_gb` term clamps `h_disk` below the smallest
+measured ratio (0.131) and charges the full tier's CPU per op at any budget, so the small-tier
+end of the projection is optimistic and the 100 TB point is an extrapolation. Task 11 also
+fixed `steady_rates` in the extractor, which the full tier exposed: the window ended at the
+last S3 counter movement, which with a full tier is the end of the fill burst.
+
+Every CloudLab node has two Micron `MTFDDAK480TDN` 447 GiB SATA SSDs: `sda` holds the OS
+(64 GB root, 8 GB swap, 375 GB unpartitioned) and `sdb` is the tier, formatted by
+`bench/scripts/setup_disk_cache.sh` and mounted at `/tank/cache`.
 
 **Goal:** serve SSTable block reads from a local SSD copy of the SSTable when the RAM
 block cache misses, so the object store sees one GET per SSTable fill instead of one GET

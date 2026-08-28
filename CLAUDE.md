@@ -244,6 +244,24 @@ the guard alive while dereferencing.
 concurrent reader; cold block and table loads are single-flighted. `TailCache` is legacy — its write
 side is commented out in `db.cpp`, so lookups always miss.
 
+`DiskCacheStorage` (`src/db/disk_cache_storage.cpp`, `PLAN-disk-cache.md`) is a second tier
+*below* the LRU: a `Storage` decorator that `DB::DB` wraps around `sstable_storage`, keeping whole
+SSTables as local files under `disk_cache_dir` (a client's own SSD, `/tank/cache` on the bench
+nodes). Only names with the `sstable` prefix are cacheable; everything else passes through. A hit
+is a `pread` on the local copy, a miss goes to the object store and queues one fill, which copies
+the file in `disk_cache_chunk_bytes` ranged reads; compaction outputs are written through after the
+backing PUT, `remove`/`invalidate` drop the local copy, and the budget `disk_cache_bytes` is held
+by file-level LRU. Config keys (`Metadata`): `disk_cache_dir` (empty = off, and it throws without
+`sstable_backend`), `disk_cache_bytes` (required with the dir), `disk_cache_chunk_bytes` (64 MiB),
+`disk_cache_drop_pages` (default true — `posix_fadvise(DONTNEED)` after a tier read, so the
+measurement is the SSD and not the page cache), `disk_cache_fill_queue` (256). `DB::closeDB` prints
+a `[disk_cache] hits=… misses=… fills=… fill_gets=… evictions=… invalidated=… files=… capacity=…`
+line after `[lru_cache]`. The bench path is `--disk-cache-bytes` / `--disk-cache-dir` /
+`--disk-cache-keep-pages` on `run_multinode_ycsb_with_corfu.sh`, per writer, label token
+`-dc<size>[-kp]` — a flag, never a `ycsb.yaml` edit. Measured in `RESULTS-cost.md`, "Disk-cache
+tier": a tier that holds the dataset removes the object store from the read path; a smaller one
+thrashes, because the unit is a whole SSTable.
+
 ### CorfuDB backend
 
 All files are packed into one Corfu stream; each entry is a `CorfuEntry` protobuf

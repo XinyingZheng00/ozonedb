@@ -580,6 +580,168 @@ range-read campaign). The engine default keeps the warm off; `cache_warm_enabled
 with `cache_warm_max_level=2` and `cache_warm_max_fraction=0.5` is the measured setting
 for a write mix at a large cache ratio.
 
+## Disk-cache tier (campaign `disk-20260829`, engine commits `8ed9b9c1` to `dcc9a438`)
+
+The change planned in `PLAN-disk-cache.md`. `DiskCacheStorage` is a `Storage` decorator
+around `sstable_storage`: it keeps whole SSTables as local files on each client's SATA SSD
+at `/tank/cache`, under a byte budget with file-level LRU eviction. A read of a cached file
+is a `pread` on the local copy; a read of an absent file goes to the object store and
+queues one fill, which copies the file in 64 MiB ranged reads. Compaction outputs are
+written through after the backing PUT, a file removed by any process is dropped from the
+tier, and a tier read ends with `posix_fadvise(DONTNEED)` unless the page cache is kept.
+
+Load and layout as in the two campaigns above: 4 KiB blocks, compaction range reads,
+trimming on, a fresh 1 GB load (1 M records), 600 s cells, 8 writers on 8 clients, MinIO on
+the log node. Each writer has its own tier, so the ratio in the tables is one writer's
+budget over the 1 GB dataset. Each writer's view holds 10 SSTables of about 121 MB. The RAM
+block cache is 8 MB unless stated, so the tier is the measured quantity. Rows in
+`results-disk-20260829.tsv`; every cell finished 8/8 with 0 failed reads and 0 failed fills.
+
+### Workload c, 600 s, 8 writers
+
+| Cell | Tier per writer | Ratio | ops/s | `h` (RAM) | `disk_h` | `h_total` | GETs per op (run / last 60 s) | Fill GETs per op | Fills / evictions | Client CPU per op | Server CPU per op | RSS peak |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| RAM 8 MB, no tier (`cost-20260828-4k`) | — | — | 7,057 | 0.231 | — | 0.231 | 0.760 / 0.779 | — | — | 0.42 ms | 0.87 ms | 1.18 GB |
+| RAM 512 MB, no tier (`cost-20260829-rr`) | — | — | 14,331 | 0.649 | — | 0.649 | 0.348 / 0.319 | — | — | 0.25 ms | 0.42 ms | 1.88 GB |
+| `lru8m-dc128m` | 128 MB | 0.131 | 6,374 | 0.231 | 0.059 | 0.276 | 0.738 / 0.756 | 0.0087 | 16,719 / 16,711 | 1.64 ms | 1.15 ms | 0.63 GB |
+| `lru8m-dc256m` | 256 MB | 0.262 | 6,646 | 0.231 | 0.137 | 0.336 | 0.666 / 0.684 | 0.0066 | 9,885 / 9,874 | 1.56 ms | 1.07 ms | 0.64 GB |
+| `lru8m-dc512m` | 512 MB | 0.524 | 8,744 | 0.232 | 0.384 | 0.527 | 0.475 / 0.485 | 0.0051 | 10,036 / 10,007 | 1.22 ms | 0.79 ms | 0.65 GB |
+| **`lru8m-dc2g`** | **2 GB** | **2.097** | **46,741** | 0.231 | **0.9994** | **0.9995** | **0.00052 / 0.000** | **0.00001** | 80 / 0 | **0.12 ms** | 0.05 ms | 1.22 GB |
+| `lru8m-dc2g-kp` (page cache kept) | 2 GB | 2.097 | 50,665 | 0.231 | 0.9994 | 0.9995 | 0.00049 / 0.000 | 0.00001 | 80 / 0 | 0.12 ms | 0.05 ms | 1.21 GB |
+
+The fill GETs per op column is over the whole run; the extractor has no last-window column
+for it. `h_total` = 1 - (1 - `h`)(1 - `disk_h`).
+
+### Workload a, 600 s, 8 writers
+
+| Cell | ops/s | `h` (RAM) | `disk_h` | `h_total` | GETs per op (run / last 60 s) | Fill GETs per op | Fills / evictions / invalidated | Client CPU per op | Server CPU per op | RSS peak |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| RAM 8 MB, no tier (`cost-20260829-rr`) | 2,608 | 0.010 | — | — | 0.658 / 0.673 | — | — | 1.18 ms | 1.28 ms | 2.99 GB |
+| RAM 512 MB, no tier (`cost-20260829-rr`) | 2,674 | 0.179 | — | — | 0.545 / 0.532 | — | — | 1.14 ms | 1.16 ms | 3.80 GB |
+| RAM 512 MB + warm (`cost-20260828-cache3`) | 2,894 | 0.404 | — | — | 0.397 / 0.374 | — | — | 1.14 ms | 1.01 ms | 4.12 GB |
+| `lru8m-dc512m` | 2,469 | 0.010 | 0.321 | 0.328 | 0.471 / 0.515 | 0.0175 | 11,267 / 11,235 / 13 | 4.21 ms | 1.82 ms | 2.99 GB |
+| **`lru8m-dc2g`** | **3,702** | 0.010 | **0.9966** | **0.9966** | **0.0028 / 0.0013** | 0.00022 | 277 / 1 / 144 | **0.94 ms** | 0.52 ms | 3.43 GB |
+| `lru512m-dc2g` | 3,604 | 0.201 | 0.9958 | 0.9966 | 0.0029 / 0.0004 | 0.00022 | 281 / 2 / 144 | 0.94 ms | 0.53 ms | 4.13 GB |
+
+Five results.
+
+1. **A full tier takes the object store off the read path.** With a budget at or above the
+   dataset, GETs per op are 0.0005 on workload c and 0.0028 on workload a, against 0.760
+   and 0.658 with the same 8 MB RAM cache and no tier. Throughput is 46,741 ops/s on
+   workload c, 3.3x the best RAM-cache cell (14,331 at 512 MB), and 3,702 on workload a,
+   +42 % over the 2,608 control and +28 % over the compaction-aware warm at 512 MB. The
+   reason is the cost of a RAM miss: a local `pread` instead of an S3 round trip. Client
+   CPU per op is 0.12 ms with the full tier against 0.42 ms for the no-tier workload-c
+   control, and 0.94 ms against 1.18 ms on workload a. Divided by the GETs those controls
+   issue, an S3 block GET costs the client about 0.4 ms of CPU (0.39 on c, 0.36 on a) and
+   a tier hit costs almost none.
+2. **Below the dataset size, whole-file LRU thrashes.** A 128, 256 or 512 MB budget holds
+   1, 2 or 4 of the 10 files a writer reads. Every miss on an absent file fills the whole
+   file (two 64 MiB GETs) and evicts another, so `fills` equals `evictions` to within 0.3 %
+   in all three cells, and fill GETs per op stay at 0.005 to 0.017 against the plan's
+   target of 0.001. Under a write mix the 512 MB cell is *slower* than no tier at all:
+   2,469 ops/s against 2,608, at 4.21 ms of client CPU per op against 1.18. The measured
+   curve is therefore `h_total` about equal to the ratio up to 1, then saturation --
+   (0.131, 0.276), (0.262, 0.336), (0.524, 0.527), (2.097, 0.9995) -- not the RAM cache's
+   log-linear shape.
+3. **Keeping the page cache is worth 8 %.** The `-kp` cell (no `posix_fadvise(DONTNEED)`
+   after a tier read) runs 50,665 ops/s at 0.118 ms of client CPU per op, against 46,741
+   and 0.123 ms with the default. The SSD path is close to a page-cache hit, so the default
+   measures the SSD honestly and is kept.
+4. **A RAM block cache adds nothing once the tier holds the dataset.** Workload a with
+   512 MB of RAM on top of the 2 GB tier runs 3,604 ops/s against 3,702 with 8 MB. `h` rises
+   from 0.010 to 0.201 and `h_total` does not move (0.9966 either way).
+5. **Invalidation works under compaction.** The two 2 GB workload-a cells dropped 144 files
+   each on a peer's COMPACT (`invalidated`), evicted 1 or 2 on the budget, failed 0 fills
+   and served 0 failed reads. The 512 MB cell invalidated only 13: the rest had already
+   been evicted when their COMPACT arrived, and `invalidate` is a no-op on an absent name.
+
+### Against the plan's goal table
+
+| Goal | Result |
+|---|---|
+| Workload c, 8 MB + 2 GB: `h_total` >= 0.95 | 0.9995. Met. |
+| Workload c, 8 MB + 2 GB: GETs per op <= 0.05 | 0.00052 over the run, 0.0 in the last 60 s. Met. |
+| Workload c, 8 MB + 2 GB: throughput within 10 % of the 512 MB RAM cell | 46,741 against 14,331, 3.3x. Met. |
+| Four-point `h_total`(disk ratio) curve | Measured, above. Met. |
+| Workload a, 8 MB + 2 GB: GETs per op <= 0.05, throughput >= 2,600 | 0.0028, 3,702 ops/s. Met. |
+| Workload a, 512 MB + 2 GB: GETs per op <= 0.05 | 0.0029. Met. |
+| Client CPU per op with a disk hit <= 1.3 ms | 0.12 ms (workload c), 0.94 ms (workload a). Met. |
+| NOT_FOUND reads 0 | 0 failed in every cell. Met. |
+| Fill GETs per op <= 0.001 in every workload-c cell | 0.00001 at 2 GB; **0.0087 / 0.0066 / 0.0051 at 128 / 256 / 512 MB. Failed**, for the reason in result 2. |
+
+### An extractor bug the full tier exposed
+
+`steady_rates` ended its window at the last sampler sample whose S3 GET or PUT counter
+moved. With a full tier the counters stop after the fill burst, so the "steady" window of
+the 2 GB workload-c cell was the first 21 s of the run: 688 GET/s, the fill itself, and a
+`get_per_op_steady` of 0.0147 against a whole-run 0.00052. The window now ends at the
+writers' last status line, converted to the sampler's clock through the `before` snapshot,
+with the counter rule kept as the fallback. Non-tier cells move by 0.1 % or less on the GET
+columns, except where the old window straddled the writers' exit; the committed TSVs of the
+earlier campaigns were not rewritten.
+
+### Projection: 10,000 ops/s, 50 % reads, RF=3 (USD per month)
+
+| | 1 GB | 1 TB | 10 TB | 100 TB | Crossover vs Cassandra on EBS |
+|---|--:|--:|--:|--:|--:|
+| Cassandra, NVMe / EBS | 1,565 / 2,402 | 1,565 / 2,402 | 12,587 / 4,742 | 122,306 / 45,302 | |
+| OzoneDB, 16 GB RAM per client (`cost-20260829-rr`) | 2,997 | 5,230 | 5,992 | 9,007 | 14.7 TB |
+| **OzoneDB, 16 GB RAM + 2 TB gp3 per client** | **921** | **1,033** | **4,777** | **7,393** | **12.1 TB** |
+
+The model gains a `disk_gb` term: `h` becomes `h_disk(disk_gb / D)` interpolated over the
+four workload-c points above, the client CPU per op becomes the full tier's 0.123 ms, the
+fills add 1e-5 GETs per read, and `clients x disk_gb x gp3` is a new cost line. At 10 TB the
+tier saves $1,215 per month (20 %): S3 GETs $4,405 to $3,590 (`h` 0.157 to `h_total` 0.313)
+and clients $700 (5 boxes) to $140 (1 box), against $160 of gp3. At 100 TB it saves $1,614
+(18 %): GETs $4,993 to $3,780 and the same client line. Two lines in similar proportion,
+then -- the GET line because the tier answers half the RAM cache's misses, the client line
+because it cuts the client CPU per op by 9x. Figure: `results-disk-20260829.png`; every
+line for 1 GB to 100 TB in `results-disk-20260829-projection.tsv`.
+
+Sweeping the tier size at 10 TB, inside the measured ratio range (1.3 TB to 21 TB per
+client), the bill falls all the way to a full tier: 20 TB per client costs $2,715 per month,
+55 % below the no-tier line, of which $1,600 is gp3 and $88 is S3 GETs. That needs two gp3
+volumes per client (the 16,384 GB volume cap). Below 1.3 TB per client the sweep is not
+measured: the model clamps `h_disk` at the smallest measured ratio and charges the full
+tier's CPU per op at any budget, so its apparent minimum of 100 GB per client is an
+artifact, and the measured curve says a tier that small would thrash.
+
+### Caveats
+
+1. **Whole-file entries.** The tier's unit is an SSTable. Below the dataset size the LRU
+   thrashes, which is result 2 and the reason the fill-traffic goal failed.
+2. **Uniform keys.** YCSB's hashed key distribution is the worst case for a file-granular
+   cache: every read is equally likely to land in any file, so a partial tier has no
+   working set to hold. A skewed distribution would lift the sub-dataset points.
+3. **Ten files per writer.** A 1 GB dataset gives each writer 10 SSTables of about 121 MB.
+   At 10 TB a level holds thousands of files, so one eviction costs a smaller share of the
+   budget and the partial-tier curve should be less sharp than the one measured here.
+4. **SATA, not NVMe.** The clients' `sdb` is a Micron `MTFDDAK480TDN` SATA SSD. An instance
+   store on NVMe would be faster and would have no gp3 line at all; the model prices gp3.
+5. **The tier is cold at cell start.** The fills are inside the run figures. At 1 GB the
+   full tier fills in about 20 s of a 600 s cell; a 10 TB tier would take far longer, and
+   the projection charges only the steady-state fill rate.
+6. **The 100 TB point is an extrapolation.** 2 TB per client is a 0.02 ratio there, below
+   the smallest measured 0.131, so it rides the model's clamp.
+7. **One client at 10,000 ops/s.** The projection's client count comes from 0.123 ms per
+   op, measured at 5,842 ops/s per client. It has not been measured at 10,000 ops/s on one
+   box.
+
+### What to do next
+
+1. **Admission control.** Do not fill a file whose fill would evict a file hit recently, or
+   fill only after N misses on the same file. Both attack `fills` equal to `evictions`,
+   which is the whole of result 2.
+2. **Sub-file entries.** Cache block ranges instead of whole SSTables, so a partial budget
+   holds the hot part of every file rather than all of a few files.
+3. **Re-measure with a skewed key distribution** and with a dataset large enough to give a
+   level hundreds of files, which is what caveats 2 and 3 predict will change.
+4. **The compaction-aware warm on top of the tier.** The workload-a cells here ran with the
+   warm off; `h` 0.40 from the warm and `disk_h` 0.997 from the tier are independent levers.
+5. **Price the instance-store variant.** An `i4i.4xlarge` client carries 3.75 TB of NVMe
+   with no separate volume line; the model has only the gp3 form today.
+
 ## Method notes and caveats
 
 - **Steady-state `h`.** The sampler polls the MinIO request counters every 10 s. `h_steady`

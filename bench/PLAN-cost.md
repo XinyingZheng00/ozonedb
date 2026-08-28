@@ -39,6 +39,21 @@ the level; a key-range-selective warm is the next lever. The projection does not
 of `cost-20260827` had lost 1 to 4 of 8 writers to a native crash (`readDataBlocks` on a
 file removed under the reader; runner still `rc=0`); fixed in `96b9265d`, the 600 s
 workload-a cells now finish 8/8. The 64 KiB workload-a sums are survivor sums.
+**Disk-cache tier done (2026-08-28**, `PLAN-disk-cache.md`, engine commits `8ed9b9c1` to
+`dcc9a438`, campaign `disk-20260829`, section "Disk-cache tier" of `RESULTS-cost.md`):
+`DiskCacheStorage` keeps whole SSTables on each client's SATA SSD under a byte budget with
+file-level LRU. A tier at or above the dataset size takes the object store off the read
+path -- GETs per op 0.00052 on workload c and 0.0028 on workload a against 0.760 and 0.658
+with no tier, 46,741 ops/s on workload c (3.3x the best RAM-cache cell) and 3,702 on
+workload a (+42 %), client CPU per op 0.12 ms against 1.14 to 1.64 ms, 0 failed reads. The
+model gains a `disk_gb` term fed by those coefficients: at 10,000 ops/s and 50 % reads,
+10 TB $5,992 to $4,777 with 2 TB of gp3 per client (-20 %) and 100 TB $9,007 to $7,393
+(-18 %), crossover 14.7 TB to 12.1 TB, mostly from the client line. Below the dataset size
+the whole-file LRU thrashes (`fills` equals `evictions`, fill GETs per op 0.005 to 0.017
+against a 0.001 target, and the 512 MB workload-a cell is slower than no tier); admission
+control and sub-file entries are the follow-ups. Task 11 also fixed the extractor's steady
+window, which ended at the last S3 counter movement and so reported a full tier's fill
+burst as its steady state.
 
 ## Goal
 
