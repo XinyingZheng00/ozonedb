@@ -141,14 +141,20 @@ Status FileStorage::read(std::string const& fileName, unsigned char*& data, size
   // Read the specified number of bytes
   data = new unsigned char[length];
   input_file->read(reinterpret_cast<char*>(data), length);
-  if (!input_file) {
+  // `input_file` is a pointer: `!input_file` tested it for null and never
+  // the stream, so a short read (file truncated or removed under the
+  // reader) returned kSuccess with an uninitialised tail. Test the stream
+  // and the byte count, and hand back no buffer on failure.
+  if (!*input_file || static_cast<size_t>(input_file->gcount()) != length) {
     if (input_file->eof()) {
       std::cerr << "End of file reached prematurely while reading from: " << fileName << std::endl;
-    } else if (input_file->fail()) {
-      std::cerr << "Failed to read data correctly from: " << fileName << std::endl;
     } else if (input_file->bad()) {
       std::cerr << "Critical I/O error occurred while reading from: " << fileName << std::endl;
+    } else {
+      std::cerr << "Failed to read data correctly from: " << fileName << std::endl;
     }
+    delete[] data;
+    data = nullptr;
     return Status::kFailure;
   }
   return Status::kSuccess;
