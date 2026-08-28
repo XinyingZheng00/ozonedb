@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package org.corfudb.runtime;
+option java_package = "org.corfudb.runtime.proto";
+
+/**
+ * LogData and related Protobuf definitions.
+ * Used by the LogUnit RPCs and ValueAdoptedErrorMsg.
+ */
+
+message LogDataMsg {
+  bytes entry = 1;
+}
+
+message ReadResponseMsg {
+  int64 address = 1;
+  LogDataMsg log_data = 2;
+}

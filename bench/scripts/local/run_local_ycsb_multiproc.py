@@ -21,6 +21,8 @@ from load_local_ycsb_multiproc import (
     cassandra_ycsb_props,
     disk_cache_corfu_settings,
     disk_cache_label_token,
+    CORFU_CLIENTS,
+    corfu_client_corfu_settings,
     linearizable_corfu_settings,
     log_trim_corfu_settings,
     lru_cache_corfu_settings,
@@ -437,6 +439,15 @@ if __name__ == "__main__":
     parser.add_argument("--disk-cache-admission", choices=("always", "frequency"), default=None,
                         help="always: evict to fit (default); frequency: TinyLFU contest for non-free budget; label -adm")
     parser.add_argument(
+        "--corfu-client",
+        choices=CORFU_CLIENTS,
+        default=None,
+        help="ozonedb-corfu only: which Corfu client every writer runs, written as "
+             "corfu_client into each generated shared_config. native = the C++ client "
+             "(PLAN-native-corfu.md, default), jni = the embedded JVM + CorfuBridge; "
+             "native result files get a -native token. Prefer this over a ycsb.yaml edit.",
+    )
+    parser.add_argument(
         "--db_name",
         type=str,
         default=None,
@@ -513,6 +524,8 @@ if __name__ == "__main__":
         corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages,
                                                    mode=args.disk_cache_mode, entry_bytes=args.disk_cache_entry_bytes,
                                                    admission=args.disk_cache_admission)
+    if args.corfu_client:
+        corfu_settings = corfu_client_corfu_settings(corfu_settings, args.corfu_client)
     s3_settings = config.get("s3")
     max_exec_time = (
         args.max_exec_time
@@ -531,6 +544,7 @@ if __name__ == "__main__":
         f"read_mode={'linearizable' if args.linearizable else 'default'}, "
         f"log_trim={'on' if args.log_trim else 'yaml'}, "
         f"cache_warm={'on' if args.cache_warm else 'yaml'}, "
+        f"corfu_client={args.corfu_client or 'yaml'}, "
         f"cassandra_consistency={args.cassandra_consistency or 'yaml'}, "
         f"record_cnt={record_cnts}, "
         f"lru_cache_bytes={args.lru_cache_bytes or 'base config'}, "

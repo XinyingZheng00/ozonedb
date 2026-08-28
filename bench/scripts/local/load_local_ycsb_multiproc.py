@@ -165,6 +165,36 @@ def log_trim_corfu_settings(corfu_settings):
     return s
 
 
+# The two Corfu clients of CorfuDBStorage (src/include/ozonedb/corfu_client.h).
+CORFU_CLIENTS = ("jni", "native")
+# What Metadata and the base config select when neither --corfu-client nor
+# corfu.client says otherwise. Must match src/config/corfu/shared_config_base.json.
+DEFAULT_CORFU_CLIENT = "native"
+# Suffix appended to the result-file engine token on the native client.
+NATIVE_LABEL_SUFFIX = "-native"
+
+
+def effective_corfu_client(corfu_settings):
+    """The client a run actually uses: corfu.client, else the default."""
+    return (corfu_settings or {}).get("client") or DEFAULT_CORFU_CLIENT
+
+
+def corfu_client_corfu_settings(corfu_settings, client):
+    """Copy of `corfu_settings` with the Corfu client pinned.
+
+    `jni` is the embedded JVM + CorfuBridge.java, `native` the C++ client
+    (PLAN-native-corfu.md). Written as corfu_client into every generated
+    shared_config; result files get a -native token so the two clients'
+    cells never overwrite each other. The ONE place the --corfu-client
+    override lives, shared by the loader, the runner and the orchestrator.
+    """
+    if client not in CORFU_CLIENTS:
+        raise ValueError(f"corfu client must be one of {CORFU_CLIENTS} (got {client!r})")
+    s = dict(corfu_settings or {})
+    s["client"] = client
+    return s
+
+
 def lru_cache_corfu_settings(corfu_settings, lru_cache_bytes):
     """Copy of `corfu_settings` with the per-process block cache pinned.
 
@@ -420,6 +450,12 @@ def result_label(db_name, corfu_settings, cassandra_settings=None, lru_cache_byt
         (corfu_settings or {}).get("linearizable_reads")
     ):
         label += LINEARIZABLE_LABEL_SUFFIX
+    # The Corfu client (--corfu-client, corfu.client, else the default):
+    # `native` gets a token, `jni` keeps the name every result file had
+    # before the native client existed. Derived from the EFFECTIVE client,
+    # so a run that takes the default is labelled ozonedb-corfu-native too.
+    if db_name == "ozonedb-corfu" and effective_corfu_client(corfu_settings) == "native":
+        label += NATIVE_LABEL_SUFFIX
     if db_name == "cassandra":
         return db_name + "-" + cassandra_mode(cassandra_settings)
     if db_name in ("ozonedb", "ozonedb-corfu"):
@@ -460,6 +496,10 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
             data["corfu_stream_name"] = corfu_settings["stream_name"]
         if "jvm_opts" in corfu_settings:
             data["corfu_jvm_opts"] = corfu_settings["jvm_opts"]
+        # The Corfu client (--corfu-client): jni or native. Metadata
+        # rejects anything else. Absent => the base config's value (native).
+        if corfu_settings.get("client"):
+            data["corfu_client"] = str(corfu_settings["client"])
         # Compaction-tuning passthrough — used by the compaction-contention
         # experiment script to override shared_config_base.json's defaults.
         # Names match shared_config_base.json keys 1:1.
@@ -1023,6 +1063,15 @@ if __name__ == "__main__":
     parser.add_argument("--disk-cache-admission", choices=("always", "frequency"), default=None,
                         help="always: evict to fit (default); frequency: TinyLFU contest for non-free budget; label -adm")
     parser.add_argument(
+        "--corfu-client",
+        choices=CORFU_CLIENTS,
+        default=None,
+        help="ozonedb-corfu only: which Corfu client every writer runs, written as "
+             "corfu_client into each generated shared_config. native = the C++ client "
+             "(PLAN-native-corfu.md, default), jni = the embedded JVM + CorfuBridge; "
+             "native result files get a -native token. Prefer this over a ycsb.yaml edit.",
+    )
+    parser.add_argument(
         "--db_name",
         type=str,
         default=None,
@@ -1094,6 +1143,8 @@ if __name__ == "__main__":
         corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages,
                                                    mode=args.disk_cache_mode, entry_bytes=args.disk_cache_entry_bytes,
                                                    admission=args.disk_cache_admission)
+    if args.corfu_client:
+        corfu_settings = corfu_client_corfu_settings(corfu_settings, args.corfu_client)
     s3_settings = config.get("s3")
     os.makedirs(ycsb_data_path, exist_ok=True)
 
@@ -1101,6 +1152,7 @@ if __name__ == "__main__":
           f" (db={db_names}, record_cnt={record_cnts}, "
           f"log_trim={'on' if args.log_trim else 'yaml'}, "
           f"cache_warm={'on' if args.cache_warm else 'yaml'}, "
+          f"corfu_client={args.corfu_client or 'yaml'}, "
           f"lru_cache_bytes={args.lru_cache_bytes or 'base config'}, "
           f"disk_cache={disk_cache_label_token(corfu_settings) or 'off'})")
     load_ycsb(

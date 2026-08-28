@@ -25,8 +25,34 @@ class CorfuStorageEnv {
     char const* j = std::getenv("CORFU_BRIDGE_JAR");
     return j ? std::string(j) : std::string();
   }
+  // CORFU_TEST_CLIENT selects the CorfuClient the suite runs on: "native"
+  // (default) or "jni". The whole suite runs once per value
+  // (PLAN-native-corfu.md phase 3). The jar is needed for jni only.
+  static std::string client() {
+    char const* c = std::getenv("CORFU_TEST_CLIENT");
+    return c && *c ? std::string(c) : std::string("native");
+  }
   static bool available() {
+    if (endpoint().empty()) return false;
+    return client() == "native" || !jarPath().empty();
+  }
+  // The cross-client test needs both clients: the jar for jni, and a
+  // build with the native client.
+  static bool bothAvailable() {
+#ifdef OZONEDB_CORFU_NATIVE
     return !endpoint().empty() && !jarPath().empty();
+#else
+    return false;
+#endif
+  }
+  static CorfuClientOptions options(std::string const& stream, std::string const& which) {
+    CorfuClientOptions o;
+    o.endpoint = endpoint();
+    o.stream_name = stream;
+    o.client = which;
+    o.jar_path = jarPath();
+    o.jvm_opts = "-Xmx512m";
+    return o;
   }
   static std::string uniqueStream(std::string const& prefix) {
     return prefix + "_" + std::to_string(time(nullptr));
@@ -40,13 +66,19 @@ class CorfuStorageEnv {
     }                                                                                       \
   } while (0)
 
+#define SKIP_IF_NOT_BOTH_CLIENTS()                                                               \
+  do {                                                                                           \
+    if (!CorfuStorageEnv::bothAvailable()) {                                                     \
+      GTEST_SKIP() << "needs CORFU_TEST_ENDPOINT, CORFU_BRIDGE_JAR and OZONEDB_CORFU_NATIVE=ON"; \
+    }                                                                                            \
+  } while (0)
+
+CorfuDBStorage* makeStorageWith(std::string const& stream, std::string const& client) {
+  return new CorfuDBStorage(CorfuStorageEnv::options(stream, client), /*db_path=*/"test/");
+}
+
 CorfuDBStorage* makeStorage(std::string const& stream) {
-  return new CorfuDBStorage(
-      CorfuStorageEnv::endpoint(),
-      CorfuStorageEnv::jarPath(),
-      /*jvm_opts=*/"-Xmx512m",
-      stream,
-      /*db_path=*/"test/");
+  return makeStorageWith(stream, CorfuStorageEnv::client());
 }
 
 }  // namespace
@@ -231,6 +263,61 @@ std::vector<unsigned char> readAllFenced(CorfuDBStorage* s, std::string const& f
 }
 }  // namespace
 
+// Cross-client (PLAN-native-corfu.md phase 3): one JNI and one native
+// storage on one stream, in both directions. Each side appends, seals and
+// removes; the other side must read exactly the acked bytes, and a seal
+// from either client must refuse the other's appends. This is what keeps
+// a mixed cell -- and the differential tools -- honest: both clients
+// write codec-NONE entries with the stream in the backpointer map and raw
+// file-name conflict keys.
+TEST(CorfuStorageTest, cross_client_jni_and_native_share_a_stream) {
+  SKIP_IF_NOT_BOTH_CLIENTS();
+  std::string stream = CorfuStorageEnv::uniqueStream("corfu_cross_client");
+  CorfuDBStorage* j = makeStorageWith(stream, "jni");
+  CorfuDBStorage* n = makeStorageWith(stream, "native");
+  struct Side {
+    CorfuDBStorage* writer;
+    CorfuDBStorage* reader;
+    char const* name;
+  };
+  Side sides[2] = {{j, n, "jni->native"}, {n, j, "native->jni"}};
+  for (Side const& s : sides) {
+    std::string file = std::string("f_") + (s.writer == j ? "j" : "n");
+    std::vector<unsigned char> acked;
+    for (int i = 0; i < 64; ++i) {
+      std::vector<unsigned char> p(32, static_cast<unsigned char>(i));
+      ASSERT_EQ(Status::kSuccess, s.writer->appendInBatch(file, p.data(), static_cast<int>(p.size())))
+          << s.name << " append #" << i;
+      acked.insert(acked.end(), p.begin(), p.end());
+    }
+    EXPECT_EQ(acked, readAllFenced(s.reader, file)) << s.name;
+    EXPECT_EQ(acked, readAllFenced(s.writer, file)) << s.name << " (own copy)";
+
+    // The reader seals; the writer's next append must be refused with
+    // nothing landing.
+    s.reader->seal(file);
+    std::vector<unsigned char> late(32, 0xEE);
+    Status late_status = s.writer->appendInBatch(file, late.data(), static_cast<int>(late.size()));
+    EXPECT_EQ(Status::kSealed, late_status) << s.name;
+    EXPECT_EQ(acked, readAllFenced(s.reader, file)) << s.name << " after seal";
+    EXPECT_EQ(acked, readAllFenced(s.writer, file)) << s.name << " after seal (own copy)";
+    s.writer->sync();
+    EXPECT_TRUE(s.writer->isSealed(file)) << s.name;
+    s.writer->clearSync();
+
+    // The writer removes; the reader must see the file gone.
+    s.writer->remove(file);
+    s.reader->sync();
+    EXPECT_FALSE(s.reader->exist(file)) << s.name << " after remove";
+    s.reader->clearSync();
+  }
+  EXPECT_EQ(0u, j->droppedAboveSeal());
+  EXPECT_EQ(0u, n->droppedAboveSeal());
+  EXPECT_EQ(0u, n->spuriousConflicts());
+  delete n;
+  delete j;
+}
+
 // The fast path (PLAN-trimming.md §0): a data append is acked on the
 // sequencer's answer, not after the tailer applied it, because its token
 // request carries the file's conflict key. Checks that the fast path is
@@ -295,10 +382,7 @@ std::string checkpointRoot(std::string const& tag) {
 
 CorfuDBStorage* makeStorageWithStore(std::string const& stream, Storage* store) {
   return new CorfuDBStorage(
-      CorfuStorageEnv::endpoint(),
-      CorfuStorageEnv::jarPath(),
-      /*jvm_opts=*/"-Xmx512m",
-      stream,
+      CorfuStorageEnv::options(stream, CorfuStorageEnv::client()),
       /*db_path=*/"test/",
       store,
       "checkpoint");

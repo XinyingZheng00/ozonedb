@@ -4,12 +4,92 @@ Replace the embedded JVM and `CorfuBridge.java` with a C++ Corfu client that spe
 Corfu protobuf protocol over TCP. The put path then crosses one JNI boundary (YCSB to
 OzoneDB) instead of three, and the tailer applies peer entries with no Java code.
 
-## 0. Status — plan only (2026-08-27)
+## 0. Status — phases 0–4 validated on the cluster (2026-08-27)
 
-Written after the cost campaign `cost-20260827` (`bench/RESULTS-cost.md`). Nothing is
-implemented. Base the work on `visibility` at `35f5cb90` or later, in a new worktree
-`worktree-native-corfu`. The plan does not depend on `worktree-plan-cost`, but phase 5
-reuses its extractor and its result tables.
+Written after the cost campaign `cost-20260827` (`bench/RESULTS-cost.md`). Branch
+`worktree-native-corfu` (worktree `.claude/worktrees/native-corfu`), cut from
+`worktree-plan-cost` at `79cbc054` so that phase 5 has the cost extractor and the result
+tables.
+
+| Phase | Item | State |
+|---|---|---|
+| 0 | `CorfuClient` seam, `JniCorfuClient`, `applyEntry(addr, data, len)`, `corfu_client` + four tuning keys in `Metadata`, `codecType(NONE)` in `CorfuBridge`, `pollNext` dropped | done |
+| 0 | codec NONE reload of the 1 GB dataset | done (`/mnt/corfu/load`, 1.3 GB on disk versus 188 MB with ZSTD; the old snapshot is kept as `/mnt/corfu/load-zstd-20260827` + `load-bucket-zstd-20260827`) |
+| 0 | profile (perf + async-profiler) | **not done** |
+| 1 | transport, layout, codec, `corfu_native_probe`, 11 unit tests in `tests/test_corfu_codec.cpp` | done, 11/11 on the node |
+| 1 | proto diff against commit `8f144d4` | done: eight files byte-identical, `corfu_message.proto` differs only by the intended trim |
+| 1 | golden frames from `tcpdump` | **not done** (the probe against the real server covers the same ground) |
+| 1 | gate: probe reports 0 foreign entries | **PASS** on the reloaded dataset: 1,003,397 addresses, `foreign=0 corfu_payload=0 decode_errors=0`, all codec NONE, scan 17.7 s |
+| 2 | sequential reader with the hole policy, `kTrimmed`, `seek`; `corfu_stream_stats --client` | done |
+| 2 | differential, 1 GB dataset | **PASS**: both clients print `fnv1a=2372b7cdd13d8a26`, the same View and the same 90 records; native replay 2.2 s user + 1.5 s sys, 164 MB RSS (3.6 µs/entry); JNI 19.6 s + 3.8 s, 2.4 GB RSS |
+| 2 | differential on the 10 GB and the trimmed datasets | **not done** |
+| 3 | writer (`TK_MULTI_STREAM`, `TK_TX`, overwrite retry, abort mapping, wake channel), `CORFU_TEST_CLIENT`, `cross_client_jni_and_native_share_a_stream` | done: `CorfuStorageTest` 13/13 with `CORFU_TEST_CLIENT=native` and 13/13 with `jni` (fresh server), `corfu_smoke` 2000/2000 and `corfu_multiwriter_smoke` 4000/4000 on native |
+| 3 | 8-writer load on native | done: 1,070–1,178 puts/s per writer, `fast=125k slow=0 spurious=0`, 20–32 conflicts (peer seals), same as the JNI load |
+| 4 | `prefixTrim` (sequencer, log unit, compact, trim mark), reconnect + re-handshake + layout refresh on a dead socket, `wrong_epoch` refresh | done for the trim path (`join_from_checkpoint`, `trimmed_stream_without_checkpoint_refuses_to_open`, `snapshot_under_concurrent_writes_is_a_prefix`, `trimmer_two_cycles` pass on native); the restart and `ss -K` tests are **not written** |
+| 5 | `--corfu-client jni|native` on the loader, the runner, the orchestrator and both shell wrappers; label `ozonedb-corfu-native` | done |
+| 5 | cells (a and c at 2, 4, 8 writers, both clients, c `--linearizable` at 8), one trial | done, table below; trials 2 and 3 and the `RESULTS-cost.md` update are **not done** |
+| 5 | default flip to `native` | done 2026-08-27 (item 5 of phase 5) |
+
+The vcpkg build (`bench/scripts/build.sh` plus the test targets) passed on the first try
+on all eight clients: `protobuf_generate_cpp(... IMPORT_DIRS ...)` works on vcpkg protobuf
+4.25.1. Load-phase client CPU per writer (YCSB JVM included, 8 writers on one node,
+~117 s): JNI 100–129 CPU-seconds and 2.7–3.5 GB RSS; native 57–90 CPU-seconds and 1.2–2.3
+GB RSS. `DB::openDB` on an empty stream takes 6.0 s (native) and 6.6 s (JNI), so the 6 s
+is outside the Corfu client (a follow-up: the join criterion is 3 s).
+
+Phase 5 campaign, one trial per cell, tag `native-p5-20260827`
+(`bench/results/local/native-p5-20260827`, laptop only, plus the earlier 8-writer pair
+under `native-20260827`): 120 s, one writer per host (2 = amd160+amd126, 4 = +amd138
++amd135, 8 = all), 512 MB cache, trimming off, the same codec-NONE dataset for both
+clients. Client CPU and RSS include the YCSB JVM. `h` (block cache hit rate), GETs per op
+and the server's busy fraction were the same on both clients in every cell (within 0.5
+points), so the server side is unchanged by the client.
+
+| Workload | Writers | Reads | ops/s jni → native | Client CPU per op jni → native | RSS per writer jni → native | Replay jni → native |
+|---|--:|---|--:|--:|--:|--:|
+| a | 2 | default | 1,179 → 1,228 (1.04×) | 1.32 → 0.65 ms (0.49×) | 3.71 → 1.02 GB | 27.1 → 21.7 s |
+| a | 4 | default | 1,756 → 1,876 (1.07×) | 1.71 → 0.78 ms (0.45×) | 3.39 → 0.93 GB | 27.4 → 22.1 s |
+| a | 8 | default | 2,476 → 3,029 (1.22×) | 2.33 → 0.97 ms (0.42×) | 3.97 → 1.44 GB | 26.7 → 22.4 s |
+| c | 2 | default | 2,644 → 2,627 (0.99×) | 0.59 → 0.35 ms (0.59×) | 3.36 → 0.85 GB | 27.0 → 22.8 s |
+| c | 4 | default | 4,988 → 5,136 (1.03×) | 0.61 → 0.35 ms (0.57×) | 3.31 → 0.85 GB | 27.6 → 22.1 s |
+| c | 8 | default | 9,597 → 9,493 (0.99×) | 0.64 → 0.36 ms (0.57×) | 3.31 → 0.80 GB | 27.4 → 23.9 s |
+| c | 8 | linearizable | 9,600 → 9,414 (0.98×) | 0.63 → 0.36 ms (0.56×) | 3.38 → 0.81 GB | 27.1 → 22.6 s |
+
+Every cell had 0 failed ops. Both linearizable cells returned OK on every READ
+(816,800 reads native, 795,000 jni). The 8-writer pair of `native-20260827` repeats
+within 2 %: a 2,486 → 3,091 at 2.37 → 0.95 ms, c 9,343 → 9,456 at 0.65 → 0.36 ms.
+
+Against the phase 5 exit criteria (one trial, so provisional):
+
+| Check | Result |
+|---|---|
+| Workload a, 8 writers, client CPU per op ≤ 1.0 ms and ≤ 50 % of JNI | **pass**: 0.97 ms, 42 % of the same-dataset JNI cell (61 % of the ZSTD-era JNI cell in `RESULTS-cost.md`, 1.58 ms) |
+| Workload c, 8 writers, 0 misses, default and linearizable | **pass** |
+| Workload a, 8 writers, throughput ≥ JNI | **pass**: 3,029 against 2,476 |
+| Join, first op ≤ 3 s | **fail** for both clients without a checkpoint: the whole 1.1 GB log is replayed, 22–27 s, and the time does not depend on the number of concurrent readers (a lone reader on a warm server took 10.6 s) |
+| RSS per writer ≤ 1.0 GB | **pass** on workload c (0.80–0.85 GB) and on workload a at 2 and 4 writers; **fail** at 8 writers on workload a (1.44 GB) |
+| `LogTrimmer`, 4 cycles | **not run** |
+
+The native client removes 0.4–0.5 ms of client CPU per op on workload a and 0.25 ms on
+workload c, and 2.4–2.9 GB of RSS per writer. Throughput is unchanged on the read-only
+workload (the S3 GET path dominates) and up to 22 % higher on workload a at 8 writers.
+The JNI baseline itself moved with the codec NONE reload: 2,476 ops/s and 2.33 ms per op
+on workload a at 8 writers, against 2,960 and 1.58 ms on the ZSTD dataset — the tailer
+now moves seven times the bytes through the JNI boundary, so the ZSTD-era numbers in
+`RESULTS-cost.md` are the fairer JNI baseline for the cost model, and the native figures
+above are directly comparable to them only on throughput.
+
+Deviations from the design below: `CheckedAppend` keeps the three-field
+`{addr, abort, offending}` shape of the old code instead of `{addr, offending}`;
+`Poll` has a fourth value `kError`; the writer lives in `native_corfu_client.cpp` and the
+typed RPC layer with the retry policy is `corfu_rpc.{h,cpp}` (no `corfu_writer` file);
+headers are under `src/include/ozonedb/corfu/`; the CMake option is `OZONEDB_CORFU_NATIVE`
+(default ON) rather than `OZONEDB_CORFU_JNI`; the writer emits `PAYLOAD_CODEC = 0`, as the
+Java runtime does with codec NONE.
+
+Next: the phase 5 campaign (3 trials, 120 s, workloads a and c at 2, 4 and 8 writers,
+both clients, then workload c `--linearizable`), the phase 4 restart and `ss -K` tests,
+the 10 GB and trimmed differentials, and the profile.
 
 ## 1. Purpose
 
@@ -142,8 +222,8 @@ Two implementations:
 `CorfuEntry` protobuf envelope stays in this plan (see §9 for the follow-up).
 
 The config key `corfu_client` selects the implementation (`jni` or `native`). The default
-is `jni` until phase 5 flips it. The key is the A/B switch for every measurement and the
-differential tests.
+was `jni` until the phase 5 campaign; it is `native` since 2026-08-27. The key is the A/B
+switch for every measurement and the differential tests.
 
 ### 4.2 Transport (`corfu_transport.{h,cpp}`)
 
@@ -323,7 +403,7 @@ All parsed in the `Metadata` constructor, all strings:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `corfu_client` | `jni` (phase 5: `native`) | `jni` or `native` |
+| `corfu_client` | `native` (was `jni` until phase 5) | `jni` or `native` |
 | `corfu_read_batch` | `1000` | addresses per `ReadLogRequest` (Java `bulkReadSize` in the bridge is 1000) |
 | `corfu_idle_poll_ms` | `5` | idle wait between stream-tail queries |
 | `corfu_hole_fill_timeout_ms` | `10000` | wait before a HOLE write |
@@ -437,7 +517,11 @@ Exit: every `CorfuStorageTest` passes on both clients, the two failure tests pas
    latency, fast-ack share, first-op time at join.
 4. Update `bench/RESULTS-cost.md`: a new `cpu_O`, the projection table, and the crossover.
    Note that `client_rss_max_kb` still includes the YCSB JVM.
-5. Flip the `corfu_client` default to `native`. Keep `jni` selectable.
+5. Flip the `corfu_client` default to `native`. Keep `jni` selectable. Done 2026-08-27:
+   `CorfuClientOptions::client`, `Metadata::corfu_client`, `shared_config_base.json`,
+   `CORFU_TEST_CLIENT`, `corfu_stream_stats --client` and the bench label logic
+   (`effective_corfu_client`: a run that takes the default is labelled
+   `ozonedb-corfu-native`, plain `ozonedb-corfu` stays jni).
 
 Exit criteria:
 
@@ -526,12 +610,12 @@ Exit criteria:
 |---|---|
 | `src/include/ozonedb/corfu_client.h` (new) | the interface (§4.1) |
 | `src/db/corfu_client_jni.cpp` (new) | the JVM code moved out of `corfu_storage.cpp` |
-| `src/db/corfu/corfu_transport.{h,cpp}` (new) | frames, handshake, keepalive, reconnect |
-| `src/db/corfu/corfu_layout.{h,cpp}` (new) | layout fetch and validation |
-| `src/db/corfu/corfu_codec.{h,cpp}` (new) | `LogData`, UUIDs, stream id |
-| `src/db/corfu/corfu_writer.{h,cpp}` (new) | tokens, writes, trim |
-| `src/db/corfu/corfu_reader.{h,cpp}` (new) | sequential tailer, holes, seek |
-| `src/db/corfu/native_corfu_client.{h,cpp}` (new) | `CorfuClient` over the four above |
+| `src/include/ozonedb/corfu/corfu_transport.h`, `src/db/corfu/corfu_transport.cpp` (new) | frames, handshake, keepalive, reconnect |
+| `src/include/ozonedb/corfu/corfu_layout.h`, `src/db/corfu/corfu_layout.cpp` (new) | layout fetch and validation |
+| `src/include/ozonedb/corfu/corfu_codec.h`, `src/db/corfu/corfu_codec.cpp` (new) | `LogData`, UUIDs, stream id |
+| `src/include/ozonedb/corfu/corfu_rpc.h`, `src/db/corfu/corfu_rpc.cpp` (new) | typed RPCs (token, write, read, trim) with the retry policy of §4.2 |
+| `src/include/ozonedb/corfu/corfu_reader.h`, `src/db/corfu/corfu_reader.cpp` (new) | sequential tailer, holes, seek |
+| `src/db/corfu/native_corfu_client.cpp` (new) | `CorfuClient` over the four above, plus the writer (§4.4) |
 | `src/corfu_proto/**` (new) | vendored protos with the commit hash |
 | `src/db/corfu_storage.{cpp,h}` | use `CorfuClient`, `applyEntry(addr, data, len)` |
 | `src/include/ozonedb/metadata.h` | five keys (§4.7) |

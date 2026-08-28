@@ -328,6 +328,22 @@ listener synchronously** — a dedicated dispatch thread does, because the liste
 `LRUCache` mutex that a foreground thread may hold while fencing on the tailer. Preserve that
 separation when touching `corfu_storage.cpp`.
 
+**Two Corfu clients** (`PLAN-native-corfu.md`). `CorfuDBStorage` drives the stream through
+the `CorfuClient` seam (`src/include/ozonedb/corfu_client.h`): `corfu_client = native` (the
+default, in `Metadata` and in `shared_config_base.json`) is the C++ client in `src/db/corfu/`
+that speaks the Corfu protobuf protocol over TCP (protos vendored under `src/corfu_proto/`,
+CMake option `OZONEDB_CORFU_NATIVE`, default ON); `corfu_client = jni` is the embedded JVM +
+`CorfuBridge.java` (`src/db/corfu_client_jni.cpp`), kept for A/B runs.
+Everything below the seam — locks, batches, the ack rule, the tailer — is shared. Both
+clients write codec-NONE entries with the stream in `BACKPOINTER_MAP` and raw file-name
+conflict keys, so one cell can mix them; a dataset written before the bridge set
+`codecType(NONE)` holds ZSTD entries that the native reader refuses. The native reader scans
+the **global** address space in order and assumes every entry belongs to the one OzoneDB
+stream (`corfu_native_probe` checks that). Select the client with `--corfu-client` on the
+bench scripts (the label carries `-native` whenever the effective client is native, so a
+run that takes the default is `ozonedb-corfu-native`; plain `ozonedb-corfu` is jni),
+`CORFU_TEST_CLIENT=jni` for `CorfuStorageTest`, and `--client jni` on `corfu_stream_stats`.
+
 **Checkpoints and trimming** (`PLAN-trimming.md`). A process with `log_trim_enabled = true`
 runs a `LogTrimmer` (`src/db/log_trimmer.cpp`): every `log_trim_interval_ms` it takes an
 exact snapshot of the live log state at one address `C` (`CorfuDBStorage::takeSnapshot`, which

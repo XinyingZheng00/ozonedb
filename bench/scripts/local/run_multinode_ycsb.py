@@ -13,6 +13,8 @@ import yaml
 
 from load_local_ycsb_multiproc import (
     cassandra_mode_settings,
+    CORFU_CLIENTS,
+    corfu_client_corfu_settings,
     linearizable_corfu_settings,
     lru_cache_corfu_settings,
     cache_warm_corfu_settings,
@@ -219,7 +221,8 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          cache_warm_max_level=None, cache_warm_max_fraction=None,
                          disk_cache_bytes=None, disk_cache_dir=None,
                          disk_cache_keep_pages=False, disk_cache_mode=None,
-                         disk_cache_entry_bytes=None, disk_cache_admission=None):
+                         disk_cache_entry_bytes=None, disk_cache_admission=None,
+                         corfu_client=None):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -255,6 +258,7 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--disk-cache-mode", disk_cache_mode] if disk_cache_mode else [])
             + (["--disk-cache-entry-bytes", str(int(disk_cache_entry_bytes))] if disk_cache_entry_bytes is not None else [])
             + (["--disk-cache-admission", disk_cache_admission] if disk_cache_admission else [])
+            + (["--corfu-client", corfu_client] if corfu_client else [])
         ),
     ]
     return " && ".join(parts)
@@ -290,6 +294,8 @@ def cell_label(config, args):
         corfu = disk_cache_corfu_settings(corfu, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages,
                                           mode=args.disk_cache_mode, entry_bytes=args.disk_cache_entry_bytes,
                                           admission=args.disk_cache_admission)
+    if args.corfu_client:
+        corfu = corfu_client_corfu_settings(corfu, args.corfu_client)
     cass = config.get("cassandra")
     if args.cassandra_consistency:
         cass = cassandra_mode_settings(cass, args.cassandra_consistency)
@@ -603,6 +609,14 @@ def main():
              "local.run.record_cnt on every client); must match the load.",
     )
     parser.add_argument(
+        "--corfu-client",
+        choices=CORFU_CLIENTS,
+        default=None,
+        help="Pass-through to per-host runner (ozonedb-corfu only): native (the C++ "
+             "client, default) or jni (embedded JVM + CorfuBridge); native result files "
+             "are labelled ozonedb-corfu-native.",
+    )
+    parser.add_argument(
         "--no_server_sample",
         action="store_true",
         help="Do not run bench/scripts/server_sampler.sh on the server node(s) "
@@ -704,6 +718,7 @@ def main():
         f"cache_warm={'on' if args.cache_warm else 'yaml'} "
         f"disk_cache_bytes={args.disk_cache_bytes or 'off'} "
         f"record_cnt={args.record_cnt or 'yaml'} "
+        f"corfu_client={args.corfu_client or 'yaml'} "
         f"label={label} server_sample={sample_hosts or 'off'}"
     )
     for p in plan:
@@ -727,6 +742,7 @@ def main():
             disk_cache_mode=args.disk_cache_mode,
             disk_cache_entry_bytes=args.disk_cache_entry_bytes,
             disk_cache_admission=args.disk_cache_admission,
+            corfu_client=args.corfu_client,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         if sample_hosts:
@@ -761,6 +777,7 @@ def main():
             disk_cache_mode=args.disk_cache_mode,
             disk_cache_entry_bytes=args.disk_cache_entry_bytes,
             disk_cache_admission=args.disk_cache_admission,
+            corfu_client=args.corfu_client,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:
