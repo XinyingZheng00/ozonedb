@@ -76,6 +76,7 @@ DURATION=""       # --duration S: forwarded to every client as --max_exec_time
 LINEARIZABLE=0    # --linearizable: strict reads, label ozonedb-corfu-linearizable
 LOG_TRIM=0        # --log-trim: writer 0 checkpoints + trims the Corfu stream
 LRU_CACHE_BYTES=""  # --lru-cache-bytes N: per-process block cache, label -lru64m
+CACHE_WARM=0      # --cache-warm: warm compaction outputs into the block cache, label -warm
 RECORD_CNT=""     # --record-cnt N: dataset size, forwarded as --record_cnt
 RUN_TAG=""        # --run-tag: bench/results/local/<tag> on every host and here
 DRY_RUN=0
@@ -130,6 +131,12 @@ Usage: $(basename "$0") [options]
                             into every writer's generated shared_config and
                             appended to the result label (-lru64m). The
                             cache sweep of bench/PLAN-cost.md phase 2.
+  --cache-warm              compaction-aware block cache: every writer warms
+                            the outputs of an applied COMPACT into its cache
+                            (cache_warm_enabled=true in each generated
+                            shared_config; bench/PLAN-compaction-cache.md).
+                            Result label gets -warm. Forwarded to each
+                            client as --cache-warm.
   --record-cnt N            dataset size in records, forwarded to every
                             client as --record_cnt (must match the load).
   --run-tag TAG             results dir bench/results/local/TAG on every host
@@ -165,6 +172,7 @@ while [[ $# -gt 0 ]]; do
   --linearizable)   LINEARIZABLE=1; shift ;;
   --log-trim)       LOG_TRIM=1; shift ;;
   --lru-cache-bytes) LRU_CACHE_BYTES="$2"; shift 2 ;;
+  --cache-warm)     CACHE_WARM=1; shift ;;
   --record-cnt)     RECORD_CNT="$2"; shift 2 ;;
   --run-tag)        RUN_TAG="$2"; shift 2 ;;
   --dry-run)        DRY_RUN=1; shift ;;
@@ -340,9 +348,10 @@ COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG")
 [[ "$LINEARIZABLE" -eq 1 ]] && COMMON_ARGS+=(--linearizable)
 [[ "$LOG_TRIM" -eq 1 ]] && COMMON_ARGS+=(--log-trim)
 [[ -n "$LRU_CACHE_BYTES" ]] && COMMON_ARGS+=(--lru-cache-bytes "$LRU_CACHE_BYTES")
+[[ "$CACHE_WARM" -eq 1 ]] && COMMON_ARGS+=(--cache-warm)
 [[ -n "$RECORD_CNT"      ]] && COMMON_ARGS+=(--record_cnt "$RECORD_CNT")
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} cache_warm=$CACHE_WARM record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
 echo "=== corfu server: $CORFU_TARGET:$CORFU_PORT ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="

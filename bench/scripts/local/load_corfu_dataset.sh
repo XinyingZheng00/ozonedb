@@ -35,6 +35,7 @@ CORFU_HEAP="${CORFU_HEAP:-122880}"
 WRITERS=8
 LOAD_HOST=""
 LOG_TRIM=0      # --log-trim: writer 0 checkpoints + trims during the load
+CACHE_WARM=0    # --cache-warm: forward --cache-warm to the loader (label -warm)
 RECORD_CNT=""   # --record-cnt N: dataset size (default: local.load.record_cnt)
 DRY_RUN=0
 
@@ -50,6 +51,9 @@ Usage: $(basename "$0") [options]
                     snapshot holds one trim interval, not the whole load
                     (bench/PLAN-cost.md phase 1). The checkpoint lives in the
                     bucket: snapshot the bucket together with /mnt/corfu/load.
+  --cache-warm      forward --cache-warm to the loader: every writer warms
+                    the outputs of an applied COMPACT into its block cache
+                    (bench/PLAN-compaction-cache.md). Result label gets -warm.
   --record-cnt N    dataset size in records, forwarded as --record_cnt
   --corfu-dir PATH  corfu repo on the log node (default: $CORFU_DIR)
   --dry-run         print the plan; no ssh
@@ -63,6 +67,7 @@ while [[ $# -gt 0 ]]; do
   --writers) WRITERS="$2"; shift 2 ;;
   --load-host) LOAD_HOST="$2"; shift 2 ;;
   --log-trim) LOG_TRIM=1; shift ;;
+  --cache-warm) CACHE_WARM=1; shift ;;
   --record-cnt) RECORD_CNT="$2"; shift 2 ;;
   --corfu-dir) CORFU_DIR="$2"; shift 2 ;;
   --dry-run) DRY_RUN=1; shift ;;
@@ -154,9 +159,10 @@ sampler_stop() {
 
 LOAD_CMD="cd \$OZONEDB_HOME && python3 bench/scripts/local/load_local_ycsb_multiproc.py --db_name ozonedb-corfu --num_writers $WRITERS"
 [[ "$LOG_TRIM" -eq 1 ]] && LOAD_CMD="$LOAD_CMD --log-trim"
+[[ "$CACHE_WARM" -eq 1 ]] && LOAD_CMD="$LOAD_CMD --cache-warm"
 [[ -n "$RECORD_CNT" ]] && LOAD_CMD="$LOAD_CMD --record_cnt $RECORD_CNT"
 
-echo "=== corfu load: server=$CORFU_SSH ($CORFU_BIND:$CORFU_PORT) load_host=$LOAD_HOST writers=$WRITERS log_trim=$LOG_TRIM record_cnt=${RECORD_CNT:-yaml} ==="
+echo "=== corfu load: server=$CORFU_SSH ($CORFU_BIND:$CORFU_PORT) load_host=$LOAD_HOST writers=$WRITERS log_trim=$LOG_TRIM cache_warm=$CACHE_WARM record_cnt=${RECORD_CNT:-yaml} ==="
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "[dry-run] stop corfu; wipe run_batch; empty bucket $MC_ALIAS/$S3_BUCKET; start corfu -l $CORFU_DATA/run_batch"
   echo "[dry-run] server sample start: cell=$SAMPLE_CELL on $CORFU_SSH -> $SAMPLE_LOCAL"

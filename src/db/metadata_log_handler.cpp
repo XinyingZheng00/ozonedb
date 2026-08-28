@@ -357,7 +357,9 @@ void MetadataLogHandler::drainCacheEvents() {
     for (auto const& input : ev.inputs) {
       cached_input_blocks += this->lru_cache->invalidateSSTable(input);
     }
-    (void)cached_input_blocks;
+    // Part B: the outputs go to the warm worker, which applies the
+    // policy (enabled, level, budget, affinity = the blocks just dropped).
+    this->lru_cache->onCompactionApplied(ev.outputs, ev.output_bytes, ev.dest_level, cached_input_blocks);
   }
 }
 

@@ -15,6 +15,7 @@ from load_local_ycsb_multiproc import (
     cassandra_mode_settings,
     linearizable_corfu_settings,
     lru_cache_corfu_settings,
+    cache_warm_corfu_settings,
     result_label,
     write_aggregate,
 )
@@ -213,7 +214,7 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          total_writers, workloads, trial, max_exec_time=None,
                          linearizable=False, log_trim=False, db_name=None,
                          cassandra_consistency=None, lru_cache_bytes=None,
-                         record_cnt=None):
+                         record_cnt=None, cache_warm=False):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -234,6 +235,7 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--max_exec_time", str(int(max_exec_time))] if max_exec_time else [])
             + (["--linearizable"] if linearizable else [])
             + (["--log-trim"] if log_trim else [])
+            + (["--cache-warm"] if cache_warm else [])
             + (["--db_name", shlex.quote(db_name)] if db_name else [])
             + (["--cassandra_consistency", cassandra_consistency] if cassandra_consistency else [])
             + (["--lru-cache-bytes", str(int(lru_cache_bytes))] if lru_cache_bytes is not None else [])
@@ -265,6 +267,8 @@ def cell_label(config, args):
         corfu = linearizable_corfu_settings(corfu)
     if args.lru_cache_bytes is not None:
         corfu = lru_cache_corfu_settings(corfu, args.lru_cache_bytes)
+    if args.cache_warm:
+        corfu = cache_warm_corfu_settings(corfu)
     cass = config.get("cassandra")
     if args.cassandra_consistency:
         cass = cassandra_mode_settings(cass, args.cassandra_consistency)
@@ -518,6 +522,12 @@ def main():
              "global writer 0 (first writer on the first host) runs the trimmer.",
     )
     parser.add_argument(
+        "--cache-warm",
+        action="store_true",
+        help="Pass-through to per-host runner (ozonedb-corfu): warm compaction "
+             "outputs into every writer's block cache; result files get a -warm token.",
+    )
+    parser.add_argument(
         "--db_name",
         help="Pass-through to per-host runner: comma-separated backends "
              "(overrides local.run.db_name on every client), e.g. cassandra.",
@@ -642,6 +652,7 @@ def main():
         f"db_name={args.db_name or 'yaml'} "
         f"cassandra_consistency={args.cassandra_consistency or 'yaml'} "
         f"lru_cache_bytes={args.lru_cache_bytes or 'base'} "
+        f"cache_warm={'on' if args.cache_warm else 'yaml'} "
         f"record_cnt={args.record_cnt or 'yaml'} "
         f"label={label} server_sample={sample_hosts or 'off'}"
     )
@@ -659,6 +670,7 @@ def main():
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
+            cache_warm=args.cache_warm,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         if sample_hosts:
@@ -686,6 +698,7 @@ def main():
             log_trim=args.log_trim,
             db_name=args.db_name, cassandra_consistency=args.cassandra_consistency,
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
+            cache_warm=args.cache_warm,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

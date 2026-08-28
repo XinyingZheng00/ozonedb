@@ -182,6 +182,20 @@ def lru_cache_corfu_settings(corfu_settings, lru_cache_bytes):
     return s
 
 
+def cache_warm_corfu_settings(corfu_settings):
+    """Copy of `corfu_settings` with the compaction-aware block cache on.
+
+    bench/PLAN-compaction-cache.md part B: every generated shared_config
+    gets cache_warm_enabled=true (the other cache_warm_* keys keep the
+    engine defaults) and result files get a `-warm` token, so the A/B
+    cells of one tag never overwrite each other. One override, one place,
+    the way --log-trim and --lru-cache-bytes work.
+    """
+    s = dict(corfu_settings or {})
+    s["cache_warm"] = True
+    return s
+
+
 def lru_label_token(lru_cache_bytes):
     """`lru512m`, `lru64m`, `lru128k`, `lru1000b`: the cache size as a
     filename token. Exact powers of 1024 stay short; anything else is bytes,
@@ -295,6 +309,9 @@ def result_label(db_name, corfu_settings, cassandra_settings=None, lru_cache_byt
             lru_cache_bytes = (corfu_settings or {}).get("lru_cache_bytes")
         if lru_cache_bytes is not None:
             label += "-" + lru_label_token(lru_cache_bytes)
+        # Warm outputs on (--cache-warm, or corfu.cache_warm): `-warm`.
+        if _truthy((corfu_settings or {}).get("cache_warm")):
+            label += "-warm"
     return label
 
 
@@ -344,6 +361,12 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         # with std::stoull, so an integer literal is what it expects.
         if corfu_settings.get("lru_cache_bytes") is not None:
             data["lru_cache_bytes"] = int(corfu_settings["lru_cache_bytes"])
+        # Compaction-aware block cache (--cache-warm). The engine default
+        # is off; the flag turns it on in every writer.
+        if "cache_warm" in corfu_settings:
+            data["cache_warm_enabled"] = (
+                "true" if _truthy(corfu_settings["cache_warm"]) else "false"
+            )
         # Log trimming (PLAN-trimming.md): exactly one trimmer per cluster,
         # global writer 0. writer_idx is global (offset + local index), so
         # on a multi-host run only the first host's first writer trims.
@@ -825,6 +848,14 @@ if __name__ == "__main__":
              "Prefer this over toggling corfu.log_trim.enabled in ycsb.yaml.",
     )
     parser.add_argument(
+        "--cache-warm",
+        action="store_true",
+        help="ozonedb-corfu only: warm compaction outputs into every writer's block "
+             "cache when a COMPACT is applied (cache_warm_enabled=true in each "
+             "generated shared_config; bench/PLAN-compaction-cache.md). Result "
+             "files get a -warm token.",
+    )
+    parser.add_argument(
         "--db_name",
         type=str,
         default=None,
@@ -888,12 +919,15 @@ if __name__ == "__main__":
     corfu_settings = config.get("corfu")
     if args.log_trim:
         corfu_settings = log_trim_corfu_settings(corfu_settings)
+    if args.cache_warm:
+        corfu_settings = cache_warm_corfu_settings(corfu_settings)
     s3_settings = config.get("s3")
     os.makedirs(ycsb_data_path, exist_ok=True)
 
     print(f"Launching {num_writers} parallel writer processes"
           f" (db={db_names}, record_cnt={record_cnts}, "
           f"log_trim={'on' if args.log_trim else 'yaml'}, "
+          f"cache_warm={'on' if args.cache_warm else 'yaml'}, "
           f"lru_cache_bytes={args.lru_cache_bytes or 'base config'})")
     load_ycsb(
         record_cnts,

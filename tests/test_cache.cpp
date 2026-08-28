@@ -10,9 +10,12 @@
 #include "storage.h"
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -247,4 +250,198 @@ TEST(LRUCacheTest, CompactApplyDropsInputBlocks) {
   mlh.rollForwardMetadataLog();
   EXPECT_EQ(cache.stats().retired_tables, 1u);
   cache.setLatestView(nullptr);
+}
+
+// The warm policy as a pure function: one case per rule, and the rule
+// order (enabled, level, budget, affinity).
+TEST(LRUCacheTest, WarmDecisionRules) {
+  using Skip = LRUCache::WarmSkip;
+  LRUCache::WarmPolicy p;
+  p.enabled = true;
+  p.max_level = 1;
+  p.max_fraction = 0.25;
+  p.min_input_blocks = 1;
+  size_t const cap = 1000;
+  EXPECT_EQ(LRUCache::warmDecision(p, 1, 250, cap, 1), Skip::kNone);
+  EXPECT_EQ(LRUCache::warmDecision(p, 0, 0, cap, 1), Skip::kNone);
+  LRUCache::WarmPolicy off = p;
+  off.enabled = false;
+  EXPECT_EQ(LRUCache::warmDecision(off, 1, 250, cap, 1), Skip::kDisabled);
+  EXPECT_EQ(LRUCache::warmDecision(p, 2, 250, cap, 1), Skip::kLevel);
+  EXPECT_EQ(LRUCache::warmDecision(p, 1, 251, cap, 1), Skip::kBudget);
+  EXPECT_EQ(LRUCache::warmDecision(p, 1, 250, cap, 0), Skip::kAffinity);
+  // Rule order.
+  EXPECT_EQ(LRUCache::warmDecision(off, 2, 999, cap, 0), Skip::kDisabled);
+  EXPECT_EQ(LRUCache::warmDecision(p, 2, 999, cap, 0), Skip::kLevel);
+  EXPECT_EQ(LRUCache::warmDecision(p, 1, 999, cap, 0), Skip::kBudget);
+  p.min_input_blocks = 0;
+  EXPECT_EQ(LRUCache::warmDecision(p, 1, 250, cap, 0), Skip::kNone);
+  // The engine defaults are the plan's: off, L1, a quarter, one block.
+  LRUCache::WarmPolicy d;
+  EXPECT_FALSE(d.enabled);
+  EXPECT_EQ(d.max_level, 1);
+  EXPECT_DOUBLE_EQ(d.max_fraction, 0.25);
+  EXPECT_EQ(d.min_input_blocks, 1u);
+}
+
+// Table::warm publishes every data block: current_size equals the bytes
+// it reports, every later get is a hit, and each warmed block counts one
+// warm hit on its first get. A second warm changes nothing.
+TEST(LRUCacheTest, WarmPublishesEveryBlock) {
+  CacheFixture fx;
+  std::string const f = "sstable1/" + stamp() + ".sst";
+  auto expected = buildTable(&fx.storage, f, 800, 600);
+  Table* t = nullptr;
+  fx.cache.getSSTable(f, t);
+  ASSERT_NE(t, nullptr);
+
+  size_t blocks = 0;
+  size_t bytes = 0;
+  ASSERT_EQ(t->warm(&fx.cache, 10240, blocks, bytes), Status::kSuccess);  // 2.5 blocks per read
+  EXPECT_GT(blocks, 100u);
+  EXPECT_GT(bytes, 800u * 600u);
+  LRUCache::Stats s = fx.cache.stats();
+  EXPECT_EQ(s.current_size, bytes);
+  EXPECT_EQ(s.misses, 0u);
+  EXPECT_EQ(s.hits, 0u);
+
+  std::shared_ptr<Record> rec;
+  for (auto const& [key, value] : expected) {
+    ASSERT_EQ(t->get(key, rec), Status::kSuccess) << key;
+    ASSERT_EQ(rec->value(), value);
+  }
+  s = fx.cache.stats();
+  EXPECT_EQ(s.misses, 0u);
+  EXPECT_EQ(s.hits, expected.size());
+  EXPECT_EQ(s.level_hits[1], expected.size());
+  EXPECT_EQ(s.warm_hits, blocks);
+
+  size_t blocks2 = 0;
+  size_t bytes2 = 0;
+  ASSERT_EQ(t->warm(&fx.cache, Table::kDefaultScanReadBytes, blocks2, bytes2), Status::kSuccess);
+  EXPECT_EQ(blocks2, blocks);
+  EXPECT_EQ(fx.cache.stats().current_size, bytes);
+  // Duplicates were dropped, so no block is marked again.
+  ASSERT_EQ(t->get("key0", rec), Status::kSuccess);
+  EXPECT_EQ(fx.cache.stats().warm_hits, blocks);
+}
+
+// The worker: a live file is warmed, a file no longer in the View is
+// skipped, a file the local builder wrote through is skipped, a level-2
+// output is refused by the policy, and an offer before start (or after
+// stop) counts as disabled.
+TEST(LRUCacheTest, WarmWorkerQueueAndSkips) {
+  CacheFixture fx;
+  std::string const f_live = "sstable1/live_" + stamp() + ".sst";
+  std::string const f_gone = "sstable1/gone_" + stamp() + ".sst";
+  std::string const f_built = "sstable1/built_" + stamp() + ".sst";
+  std::string const f_l2 = "sstable2/l2_" + stamp() + ".sst";
+  auto expected = buildTable(&fx.storage, f_live, 300, 600);
+  buildTable(&fx.storage, f_gone, 100, 600);
+  buildTable(&fx.storage, f_built, 100, 600, &fx.cache);  // write-through + complete
+  buildTable(&fx.storage, f_l2, 100, 600);
+  size_t const built_bytes = fx.cache.stats().current_size;
+  ASSERT_GT(built_bytes, 0u);
+
+  LRUCache::WarmPolicy p;
+  p.enabled = true;
+  p.max_level = 1;
+  p.max_fraction = 1.0;
+  p.min_input_blocks = 1;
+  p.read_bytes = 1u << 20;
+  fx.cache.setWarmPolicy(p);
+  std::set<std::string> const live = {f_live, f_built, f_l2};
+  fx.cache.setLiveFileCheck([&live](std::string const& name) { return live.count(name) > 0; });
+
+  auto sz = [&](std::string const& name) { return fx.storage.size(name); };
+  // Offered before the worker exists: disabled.
+  fx.cache.onCompactionApplied({f_live}, {sz(f_live)}, 1, 5);
+  EXPECT_EQ(fx.cache.stats().warm_skipped_disabled, 1u);
+
+  fx.cache.startWarmWorker();
+  fx.cache.onCompactionApplied({f_live, f_gone}, {sz(f_live), sz(f_gone)}, 1, 5);
+  fx.cache.onCompactionApplied({f_built}, {sz(f_built)}, 1, 5);
+  fx.cache.onCompactionApplied({f_l2}, {sz(f_l2)}, 2, 5);
+  fx.cache.onCompactionApplied({f_live}, {sz(f_live)}, 1, 0);  // affinity
+  fx.cache.waitWarmIdle();
+
+  LRUCache::Stats s = fx.cache.stats();
+  EXPECT_EQ(s.warm_files, 1u);
+  EXPECT_GT(s.warm_blocks, 0u);
+  EXPECT_EQ(s.warm_skipped_gone, 1u);
+  EXPECT_EQ(s.warm_skipped_built, 1u);
+  EXPECT_EQ(s.warm_skipped_level, 1u);
+  EXPECT_EQ(s.warm_skipped_affinity, 1u);
+  EXPECT_EQ(s.warm_dropped, 0u);
+  EXPECT_EQ(s.current_size, built_bytes + s.warm_bytes);
+  EXPECT_EQ(s.misses, 0u);
+
+  // Every key of the warmed file is a hit now.
+  Table* t = nullptr;
+  fx.cache.getSSTable(f_live, t);
+  ASSERT_NE(t, nullptr);
+  std::shared_ptr<Record> rec;
+  for (auto const& [key, value] : expected) {
+    ASSERT_EQ(t->get(key, rec), Status::kSuccess) << key;
+  }
+  s = fx.cache.stats();
+  EXPECT_EQ(s.misses, 0u);
+  EXPECT_EQ(s.hits, expected.size());
+  EXPECT_EQ(s.warm_hits, s.warm_blocks);
+
+  fx.cache.stopWarmWorker();
+  fx.cache.onCompactionApplied({f_live}, {sz(f_live)}, 1, 5);
+  EXPECT_EQ(fx.cache.stats().warm_skipped_disabled, 2u);
+  fx.cache.stopWarmWorker();  // idempotent
+}
+
+// The queue is bounded: with max_queue 2, offering 5 files drops the 3
+// oldest. Checked with the worker stopped so nothing is consumed
+// (the entries are dropped by stop; only the counter matters here).
+TEST(LRUCacheTest, WarmQueueIsBounded) {
+  CacheFixture fx;
+  LRUCache::WarmPolicy p;
+  p.enabled = true;
+  p.max_fraction = 1.0;
+  p.min_input_blocks = 0;
+  p.max_queue = 2;
+  fx.cache.setWarmPolicy(p);
+  // A live check that parks the worker on a flag keeps the queue full
+  // while the test offers more files than the bound.
+  std::mutex m;
+  std::condition_variable cv;
+  bool entered = false;
+  bool release = false;
+  fx.cache.setLiveFileCheck([&](std::string const&) {
+    std::unique_lock<std::mutex> lk(m);
+    entered = true;
+    cv.notify_all();
+    cv.wait(lk, [&] { return release; });
+    return false;
+  });
+  fx.cache.startWarmWorker();
+  fx.cache.onCompactionApplied({"sstable1/q0.sst"}, {1}, 1, 0);
+  {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&] { return entered; });  // q0 is in flight, queue empty
+  }
+  std::vector<std::string> names;
+  std::vector<size_t> sizes;
+  for (int i = 1; i <= 5; ++i) {
+    names.push_back("sstable1/q" + std::to_string(i) + ".sst");
+    sizes.push_back(1);
+  }
+  fx.cache.onCompactionApplied(names, sizes, 1, 0);
+  // The queue kept 2 of the 5 (q4, q5); q1..q3 were dropped.
+  {
+    std::lock_guard<std::mutex> lk(m);
+    release = true;
+  }
+  cv.notify_all();
+  fx.cache.waitWarmIdle();
+  LRUCache::Stats s = fx.cache.stats();
+  EXPECT_EQ(s.warm_dropped, 3u);
+  EXPECT_EQ(s.warm_skipped_gone, 3u);  // q0, q4, q5: the check says not live
+  EXPECT_EQ(s.warm_files, 0u);
+  fx.cache.stopWarmWorker();
 }

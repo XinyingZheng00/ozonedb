@@ -19,6 +19,11 @@ struct Table::Rep {
   Comparator* comparator = nullptr;
   std::string fileName;
   uint64_t file_size = 0;  // as reported by storage->size() at open; bounds getAll's reads
+  // The index block. index_iter owns it (BlockIter deletes its
+  // BlockData); this alias lets scanBlocks copy it into a private
+  // iterator, because index_iter is shared with every reader of the
+  // Table and a seek from one thread would corrupt a scan on another.
+  BlockData* index_block = nullptr;
   Iterator* index_iter = nullptr;
   FilterPolicy const* filter_policy = nullptr;
   filterBlockReader* filter_block_reader = nullptr;
@@ -63,6 +68,7 @@ Status Table::open(Storage* storage,
     rep->fileName = fileName;
     rep->file_size = size;
     rep->comparator = newBytewiseComparator();  // set to default for now
+    rep->index_block = index_block;
     rep->index_iter = newIterator(index_block, rep->comparator);
     rep->filter_policy = newBloomFilterPolicy(10);
     table = new Table(rep);
@@ -213,10 +219,9 @@ void Table::setFileSizeForTesting(uint64_t size) {
   rep_->file_size = size;
 }
 
-Status Table::getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& out,
-                     size_t max_read_bytes) {
-  out.clear();
-  if (rep_ == nullptr || rep_->index_iter == nullptr || rep_->storage == nullptr) {
+Status Table::scanBlocks(size_t max_read_bytes,
+                         std::function<Status(std::string const&, Iterator*)> const& visit) {
+  if (rep_ == nullptr || rep_->index_block == nullptr || rep_->storage == nullptr) {
     return Status::kFailure;
   }
 
@@ -224,17 +229,27 @@ Status Table::getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& o
   //    before touching storage: ascending, non-overlapping, inside the
   //    file. TableBuilder::writeBlock lays data blocks out contiguously,
   //    so a violation means a corrupt or foreign index, not a layout we
-  //    should try to serve.
+  //    should try to serve. The index entry's raw value is kept as well:
+  //    it is the cache key Table::get and TableBuilder::flush use.
+  //    A private iterator over a copy of the index block, because
+  //    rep_->index_iter is shared with concurrent Table::get callers.
   std::vector<BlockIdentifier> blocks;
-  uint64_t prev_end = 0;
-  for (rep_->index_iter->seekToFirst(); rep_->index_iter->valid(); rep_->index_iter->next()) {
-    BlockIdentifier id;
-    if (!id.ParseFromString(rep_->index_iter->value())) return Status::kFailure;
-    if (id.length() == 0 || id.offset() < prev_end || id.offset() + id.length() > rep_->file_size) {
-      return Status::kFailure;
+  std::vector<std::string> index_values;
+  {
+    Iterator* index = newIterator(new BlockData(*rep_->index_block), rep_->comparator);
+    uint64_t prev_end = 0;
+    for (index->seekToFirst(); index->valid(); index->next()) {
+      BlockIdentifier id;
+      if (!id.ParseFromString(index->value()) || id.length() == 0 || id.offset() < prev_end ||
+          id.offset() + id.length() > rep_->file_size) {
+        delete index;
+        return Status::kFailure;
+      }
+      prev_end = id.offset() + id.length();
+      blocks.push_back(id);
+      index_values.push_back(index->value());
     }
-    prev_end = id.offset() + id.length();
-    blocks.push_back(id);
+    delete index;
   }
 
   // 2. Read block-aligned chunks of at most max_read_bytes and slice the
@@ -252,7 +267,6 @@ Status Table::getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& o
     Status s = rep_->storage->read(rep_->fileName, buf, static_cast<size_t>(base), len);
     if (s != Status::kSuccess || buf == nullptr) {
       delete[] buf;
-      out.clear();
       return s == Status::kSuccess ? Status::kFailure : s;
     }
     for (size_t k = i; k < j; ++k) {
@@ -265,27 +279,62 @@ Status Table::getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& o
       if (s != Status::kSuccess || parsed.empty() || parsed[0] == nullptr) {
         if (!parsed.empty()) delete parsed[0];
         delete[] buf;
-        out.clear();
         return Status::kFailure;
       }
       // The iterator owns the BlockData (BlockIter::~BlockIter deletes it).
       Iterator* block_iter = newIterator(static_cast<BlockData*>(parsed[0]), rep_->comparator);
-      for (block_iter->seekToFirst(); block_iter->valid(); block_iter->next()) {
-        auto record = std::make_shared<Record>();
-        if (!record->ParseFromString(block_iter->value())) {
-          delete block_iter;
-          delete[] buf;
-          out.clear();
-          return Status::kFailure;
-        }
-        out[block_iter->key()] = std::move(record);
-      }
+      Status v = visit(index_values[k], block_iter);
       delete block_iter;
+      if (v != Status::kSuccess) {
+        delete[] buf;
+        return v;
+      }
     }
     delete[] buf;
     i = j;
   }
   return Status::kSuccess;
+}
+
+Status Table::getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& out,
+                     size_t max_read_bytes) {
+  out.clear();
+  Status s = scanBlocks(max_read_bytes, [&out](std::string const&, Iterator* block_iter) {
+    for (block_iter->seekToFirst(); block_iter->valid(); block_iter->next()) {
+      auto record = std::make_shared<Record>();
+      if (!record->ParseFromString(block_iter->value())) return Status::kFailure;
+      out[block_iter->key()] = std::move(record);
+    }
+    return Status::kSuccess;
+  });
+  if (s != Status::kSuccess) out.clear();
+  return s;
+}
+
+Status Table::warm(LRUCache* cache, size_t max_read_bytes, size_t& blocks, size_t& bytes) {
+  blocks = 0;
+  bytes = 0;
+  if (cache == nullptr || rep_ == nullptr) return Status::kFailure;
+  std::string const& file_name = rep_->fileName;
+  return scanBlocks(max_read_bytes, [&](std::string const& index_value, Iterator* block_iter) {
+    // Same shape as TableBuilder::flush: a heap map the cache owns, sized
+    // by Record::ByteSizeLong, keyed by the index entry's bytes.
+    auto* records = new std::unordered_map<std::string, std::shared_ptr<Record>>();
+    size_t size = 0;
+    for (block_iter->seekToFirst(); block_iter->valid(); block_iter->next()) {
+      auto record = std::make_shared<Record>();
+      if (!record->ParseFromString(block_iter->value())) {
+        delete records;
+        return Status::kFailure;
+      }
+      size += record->ByteSizeLong();
+      (*records)[block_iter->key()] = std::move(record);
+    }
+    cache->putSSTableRecords(file_name, records, index_value, size, /*warmed=*/true);
+    ++blocks;
+    bytes += size;
+    return Status::kSuccess;
+  });
 }
 
 }  // namespace ozonedb

@@ -16,6 +16,7 @@ from load_local_ycsb_multiproc import (
     CASSANDRA_MODES,
     SERVER_BACKENDS,
     YCSB_DB_CLASSNAMES,
+    cache_warm_corfu_settings,
     cassandra_mode_settings,
     cassandra_ycsb_props,
     linearizable_corfu_settings,
@@ -404,6 +405,14 @@ if __name__ == "__main__":
              "Prefer this over toggling corfu.log_trim.enabled in ycsb.yaml.",
     )
     parser.add_argument(
+        "--cache-warm",
+        action="store_true",
+        help="ozonedb-corfu only: warm compaction outputs into every writer's block "
+             "cache when a COMPACT is applied (cache_warm_enabled=true in each "
+             "generated shared_config; bench/PLAN-compaction-cache.md). Result "
+             "files get a -warm token.",
+    )
+    parser.add_argument(
         "--db_name",
         type=str,
         default=None,
@@ -472,6 +481,8 @@ if __name__ == "__main__":
     corfu_settings = config.get("corfu")
     if args.log_trim:
         corfu_settings = log_trim_corfu_settings(corfu_settings)
+    if args.cache_warm:
+        corfu_settings = cache_warm_corfu_settings(corfu_settings)
     s3_settings = config.get("s3")
     max_exec_time = (
         args.max_exec_time
@@ -489,6 +500,7 @@ if __name__ == "__main__":
         f"(db={db_names}, offset={offset}, total_writers={total_writers}, trial={trial}, "
         f"read_mode={'linearizable' if args.linearizable else 'default'}, "
         f"log_trim={'on' if args.log_trim else 'yaml'}, "
+        f"cache_warm={'on' if args.cache_warm else 'yaml'}, "
         f"cassandra_consistency={args.cassandra_consistency or 'yaml'}, "
         f"record_cnt={record_cnts}, "
         f"lru_cache_bytes={args.lru_cache_bytes or 'base config'})"

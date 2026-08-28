@@ -90,6 +90,24 @@ class Metadata {
   // input is one read; lower it to bound memory per in-flight compaction.
   uint64_t compaction_read_bytes = 67108864;
 
+  // Compaction-aware block cache (bench/PLAN-compaction-cache.md, part B).
+  // When a COMPACT is applied to this process's view, the outputs are
+  // read once (compaction_read_bytes per ranged read) and published into
+  // the block cache, so the peers of the compactor do not fetch them one
+  // block per GET. Off by default; each rule below skips an output and
+  // counts the skip in the `[lru_cache] levels` line.
+  bool cache_warm_enabled = false;
+  // Warm outputs whose level is at most this (L1 holds the newest
+  // versions of the hot keys; the last level is the cold bulk).
+  int cache_warm_max_level = 1;
+  // Warm an output only if its size is at most this fraction of
+  // lru_cache_bytes, so one file cannot flush the cache.
+  double cache_warm_max_fraction = 0.25;
+  // Warm only if this process held at least this many cached blocks of
+  // the compaction's inputs: a process that never read the region does
+  // not warm it, and a pure load warms nothing.
+  uint64_t cache_warm_min_input_blocks = 1;
+
   // When true, log reads trust the in-memory key index (kept fresh by
   // local addRecord and, on Corfu, the tailer's remote-append listener)
   // and skip the synchronous log-file scan entirely. Removes the
@@ -238,6 +256,18 @@ class Metadata {
 
     if (auto it = result.find("compaction_read_bytes"); it != result.end()) {
       compaction_read_bytes = std::stoull(it->second);
+    }
+    if (auto it = result.find("cache_warm_enabled"); it != result.end()) {
+      cache_warm_enabled = (it->second == "true" || it->second == "1");
+    }
+    if (auto it = result.find("cache_warm_max_level"); it != result.end()) {
+      cache_warm_max_level = std::stoi(it->second);
+    }
+    if (auto it = result.find("cache_warm_max_fraction"); it != result.end()) {
+      cache_warm_max_fraction = std::stod(it->second);
+    }
+    if (auto it = result.find("cache_warm_min_input_blocks"); it != result.end()) {
+      cache_warm_min_input_blocks = std::stoull(it->second);
     }
 
     auto tbt_it = result.find("trust_background_tail");

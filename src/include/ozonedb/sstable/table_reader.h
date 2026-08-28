@@ -9,6 +9,7 @@
 #include "protobuf/sstable.pb.h"
 #include "sstable/iterator.h"
 #include "storage.h"
+#include <functional>
 #include <memory>
 #include <stdint.h>
 #include <unordered_map>
@@ -56,6 +57,19 @@ class Table {
   Status getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& out,
                 size_t max_read_bytes = kDefaultScanReadBytes);
 
+  // Publish every data block into `cache` the way the compaction's
+  // output builder does (TableBuilder::flush): same putSSTableRecords
+  // call, same key bytes (the index entry's value), same size (the sum
+  // of Record::ByteSizeLong). Reads the file in the same ranged chunks
+  // as getAll, so a 64 MiB output is one GET. Blocks already in the
+  // cache are left as they are. Returns the number of blocks and the
+  // bytes it published; a failed read returns the storage status with
+  // whatever was published so far still in the cache (each block is
+  // complete or absent). Safe on a Table that readers share: the scan
+  // iterates a private copy of the index block, never rep_->index_iter.
+  // Part B of bench/PLAN-compaction-cache.md.
+  Status warm(LRUCache* cache, size_t max_read_bytes, size_t& blocks, size_t& bytes);
+
   ~Table();
 
   void setCache(LRUCache* cache);
@@ -72,6 +86,14 @@ class Table {
   Rep* rep_ = nullptr;
 
   explicit Table(Rep* rep) : rep_(rep) {}
+  // The chunked scan shared by getAll and warm. Validates the index,
+  // reads block-aligned chunks of at most max_read_bytes, and calls
+  // `visit(index_value, block_iter)` once per data block in file order
+  // with an iterator positioned before the first entry. The iterator is
+  // owned by the scan. A visit that returns anything but kSuccess stops
+  // the scan with that status.
+  Status scanBlocks(size_t max_read_bytes,
+                    std::function<Status(std::string const&, Iterator*)> const& visit);
   void readMeta(FooterBlock const& footer);
   void readFilter(std::string const& filter_handle_value);
   void readFileFilter(std::string const& filter_handle_value);

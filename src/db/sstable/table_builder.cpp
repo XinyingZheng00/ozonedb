@@ -191,6 +191,12 @@ Status TableBuilder::finish() {
   flush();
   assert(!r->closed);
   r->closed = true;
+  // Every data block went through the write-through in flush(): tell the
+  // cache, so its warm worker does not read this file back into the
+  // process that built it (bench/PLAN-compaction-cache.md, part B).
+  if (r->lru_cache != nullptr && ok()) {
+    r->lru_cache->markSSTableComplete(r->fileName);
+  }
 
   BlockIdentifier* filter_block_identifier = nullptr;
   BlockIdentifier* filter_block_for_file_identifier = nullptr;

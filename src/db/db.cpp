@@ -94,6 +94,26 @@ DB::DB(std::string const& shared_config_path) {
   this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log, this->log_storage, this->tail_cache);
   this->metadata_log->setLRUCache(this->lru_cache);
   this->metadata_log->setMetadata(this->metadata);
+  {
+    // Compaction-aware block cache (bench/PLAN-compaction-cache.md, part
+    // B). Policy and the liveness check are set before any thread runs;
+    // the worker itself starts in openDB once a view exists and stops in
+    // closeDB before the counters print.
+    LRUCache::WarmPolicy policy;
+    policy.enabled = this->metadata->cache_warm_enabled;
+    policy.max_level = this->metadata->cache_warm_max_level;
+    policy.max_fraction = this->metadata->cache_warm_max_fraction;
+    policy.min_input_blocks = static_cast<size_t>(this->metadata->cache_warm_min_input_blocks);
+    policy.read_bytes = static_cast<size_t>(this->metadata->compaction_read_bytes);
+    this->lru_cache->setWarmPolicy(policy);
+    MetadataLogHandler* mlh = this->metadata_log;
+    this->lru_cache->setLiveFileCheck([mlh](std::string const& file_name) {
+      // The snapshot is a shared_ptr, so the View stays alive for the
+      // check; the cache's raw latest_view pointer is not used here.
+      auto view = mlh->latestViewSnapshot();
+      return view != nullptr && view->key_range.find(file_name) != view->key_range.end();
+    });
+  }
   // Enable the in-memory key index on all backends. On Corfu, the
   // storage layer's remote-append listener (see CorfuDBStorage and
   // LogHandler::onRemoteAppend) keeps the index in sync with peer
@@ -162,6 +182,7 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   View const* view_ptr = db->latest_view_snapshot.get();
   db->log_handler->setLatestView(view_ptr);
   db->lru_cache->setLatestView(view_ptr);
+  db->lru_cache->startWarmWorker();
   db->log_handler->warmKeyIndex();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl
@@ -199,6 +220,9 @@ Status DB::closeDB(DB*& db) {
   // keeps the bench's log snapshot small).
   if (db->trimmer != nullptr) db->trimmer->stop();
 #endif
+  // Join the warm worker before the counters print, so a warm in flight
+  // is counted and no thread touches the stores after this point.
+  db->lru_cache->stopWarmWorker();
   db->lru_cache->printCacheStats();
   delete db;
   return Status::kSuccess;

@@ -546,7 +546,7 @@ void LRUCache::putSSTableMeta(std::string const& key, Table* table) {
   file_to_entry_map[key] = entry;
 }
 
-void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std::string, std::shared_ptr<Record>>* records, std::string const& index_value, size_t size) {
+void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std::string, std::shared_ptr<Record>>* records, std::string const& index_value, size_t size, bool warmed) {
   // Defensive: the singleflight path in readDataBlocks now handles
   // publishing. If this is still called directly by older callers and
   // races publish the same block twice, drop the duplicate instead of
@@ -564,9 +564,156 @@ void LRUCache::putSSTableRecords(std::string const& key, std::unordered_map<std:
   current_size += size;
   lru_list.push_front({key, index_value});
   entry.lru_itr[index_value] = lru_list.begin();
+  if (warmed) entry.warmed_blocks.insert(index_value);
   if (current_size > capacity) {
     evict();
   }
+}
+
+void LRUCache::markSSTableComplete(std::string const& file_name) {
+  std::unique_lock<std::shared_mutex> lock(mutex);
+  auto it = file_to_entry_map.find(file_name);
+  if (it != file_to_entry_map.end()) it->second.complete = true;
+}
+
+// ---- Warm worker ----
+
+LRUCache::WarmSkip LRUCache::warmDecision(WarmPolicy const& policy, int level, size_t bytes, size_t capacity, size_t input_blocks) {
+  if (!policy.enabled) return WarmSkip::kDisabled;
+  if (level > policy.max_level) return WarmSkip::kLevel;
+  if (static_cast<double>(bytes) > policy.max_fraction * static_cast<double>(capacity)) return WarmSkip::kBudget;
+  if (input_blocks < policy.min_input_blocks) return WarmSkip::kAffinity;
+  return WarmSkip::kNone;
+}
+
+void LRUCache::setWarmPolicy(WarmPolicy const& policy) {
+  std::lock_guard<std::mutex> lk(warm_mtx_);
+  warm_policy_ = policy;
+}
+
+void LRUCache::setLiveFileCheck(std::function<bool(std::string const&)> check) {
+  std::lock_guard<std::mutex> lk(warm_mtx_);
+  live_file_check_ = std::move(check);
+}
+
+void LRUCache::onCompactionApplied(std::vector<std::string> const& outputs, std::vector<size_t> const& output_bytes, int dest_level, size_t cached_input_blocks) {
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    size_t const bytes = i < output_bytes.size() ? output_bytes[i] : 0;
+    switch (warmDecision(warm_policy_, dest_level, bytes, capacity, cached_input_blocks)) {
+      case WarmSkip::kDisabled: warm_skipped_disabled_.fetch_add(1, std::memory_order_relaxed); continue;
+      case WarmSkip::kLevel: warm_skipped_level_.fetch_add(1, std::memory_order_relaxed); continue;
+      case WarmSkip::kBudget: warm_skipped_budget_.fetch_add(1, std::memory_order_relaxed); continue;
+      case WarmSkip::kAffinity: warm_skipped_affinity_.fetch_add(1, std::memory_order_relaxed); continue;
+      case WarmSkip::kNone: break;
+    }
+    {
+      std::lock_guard<std::mutex> lk(warm_mtx_);
+      if (!warm_started_ || warm_stop_) {
+        warm_skipped_disabled_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      while (warm_queue_.size() >= warm_policy_.max_queue) {
+        warm_queue_.pop_front();
+        warm_dropped_.fetch_add(1, std::memory_order_relaxed);
+      }
+      warm_queue_.push_back(outputs[i]);
+    }
+    warm_cv_.notify_all();
+  }
+}
+
+void LRUCache::startWarmWorker() {
+  std::lock_guard<std::mutex> lk(warm_mtx_);
+  if (warm_started_) return;
+  warm_stop_ = false;
+  warm_busy_ = false;
+  warm_started_ = true;
+  warm_thread_ = std::thread(&LRUCache::warmLoop, this);
+}
+
+void LRUCache::stopWarmWorker() {
+  {
+    std::lock_guard<std::mutex> lk(warm_mtx_);
+    if (!warm_started_) return;
+    warm_stop_ = true;
+  }
+  warm_cv_.notify_all();
+  if (warm_thread_.joinable()) warm_thread_.join();
+  std::lock_guard<std::mutex> lk(warm_mtx_);
+  warm_started_ = false;
+  warm_queue_.clear();
+}
+
+void LRUCache::waitWarmIdle() {
+  std::unique_lock<std::mutex> lk(warm_mtx_);
+  warm_cv_.wait(lk, [this] { return !warm_started_ || warm_stop_ || (warm_queue_.empty() && !warm_busy_); });
+}
+
+void LRUCache::warmLoop() {
+  for (;;) {
+    std::string file_name;
+    {
+      std::unique_lock<std::mutex> lk(warm_mtx_);
+      warm_cv_.wait(lk, [this] { return warm_stop_ || !warm_queue_.empty(); });
+      if (warm_stop_) return;
+      file_name = std::move(warm_queue_.front());
+      warm_queue_.pop_front();
+      warm_busy_ = true;
+    }
+    try {
+      warmOne(file_name);
+    } catch (...) {
+      std::cerr << "[lru_cache] warm threw for " << file_name << "\n";
+      warm_skipped_gone_.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard<std::mutex> lk(warm_mtx_);
+      warm_busy_ = false;
+    }
+    warm_cv_.notify_all();
+  }
+}
+
+void LRUCache::warmOne(std::string const& file_name) {
+  std::function<bool(std::string const&)> live;
+  size_t read_bytes = 0;
+  {
+    std::lock_guard<std::mutex> lk(warm_mtx_);
+    live = live_file_check_;
+    read_bytes = warm_policy_.read_bytes;
+  }
+  // Replaced by a later compaction while it waited in the queue.
+  if (live && !live(file_name)) {
+    warm_skipped_gone_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex);
+    auto it = file_to_entry_map.find(file_name);
+    if (it != file_to_entry_map.end() && it->second.complete) {
+      warm_skipped_built_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+  // The open every peer pays on its first read of the file anyway
+  // (singleflight with those readers).
+  Table* table = nullptr;
+  getSSTable(file_name, table);
+  if (table == nullptr) {
+    warm_skipped_gone_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  size_t blocks = 0;
+  size_t bytes = 0;
+  Status s = table->warm(this, read_bytes, blocks, bytes);
+  warm_blocks_.fetch_add(blocks, std::memory_order_relaxed);
+  warm_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  if (s != Status::kSuccess) {
+    // A removed object mid-read: what was published stays valid.
+    warm_skipped_gone_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  warm_files_.fetch_add(1, std::memory_order_relaxed);
 }
 
 LRUCache::Stats LRUCache::stats() {

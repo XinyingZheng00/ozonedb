@@ -5,8 +5,10 @@
 #include "storage.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <future>
 #include <list>
 #include <memory>
@@ -15,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <mutex>
 namespace ozonedb {
 
@@ -93,6 +96,10 @@ class LRUCache {
     // were worth the read. Evict and invalidate drop the mark with the
     // block.
     std::unordered_set<std::string> warmed_blocks;
+    // Set by TableBuilder::finish through markSSTableComplete: every
+    // block of this file went through the write-through, so the warm
+    // worker has nothing to add.
+    bool complete = false;
 
     Table* table = nullptr;
     size_t offset = 0;    // Offset indicating the cached records until this offset
@@ -203,6 +210,53 @@ class LRUCache {
   void evict();
 
  public:
+  // ---- Warm worker (bench/PLAN-compaction-cache.md, part B) ----
+  //
+  // When a COMPACT is applied to this process's view, the outputs are
+  // offered to one worker thread that reads each accepted file in
+  // ranged chunks (Table::warm) and publishes its blocks, so the peers
+  // of the compactor stop paying one GET per block for the newest
+  // versions of the hot keys. The policy is evaluated at enqueue time
+  // and every rule has a counter, so a cell's `[lru_cache] levels` line
+  // says which rule to change.
+  //
+  // Lock order: the worker takes `mutex` (getSSTable, putSSTableRecords)
+  // and warm_mtx_ separately, never nested, and onCompactionApplied is
+  // called with no cache lock held (MetadataLogHandler::drainCacheEvents,
+  // outside view_mutex).
+  struct WarmPolicy {
+    bool enabled = false;
+    int max_level = 1;               // warm outputs of level <= this
+    double max_fraction = 0.25;      // output bytes <= max_fraction * capacity
+    size_t min_input_blocks = 1;     // cached input blocks needed (affinity)
+    size_t read_bytes = 64u << 20;   // ranged-read chunk (compaction_read_bytes)
+    size_t max_queue = 64;           // oldest entries beyond this are dropped
+  };
+  enum class WarmSkip { kNone, kDisabled, kLevel, kBudget, kAffinity };
+  // The policy as a pure function, rule order: enabled, level, budget,
+  // affinity.
+  static WarmSkip warmDecision(WarmPolicy const& policy, int level, size_t bytes, size_t capacity, size_t input_blocks);
+  // Set before startWarmWorker; not re-read under a lock afterwards.
+  void setWarmPolicy(WarmPolicy const& policy);
+  WarmPolicy const& warmPolicy() const { return warm_policy_; }
+  // Tells the worker whether a queued file is still in the View when
+  // it reaches the front (a later compaction may have replaced it).
+  // Unset means every file is live.
+  void setLiveFileCheck(std::function<bool(std::string const&)> check);
+  // COMPACT outputs, with the sizes the record carries and the number
+  // of the inputs' blocks that were cached here (invalidateSSTable's
+  // return values, summed). Applies the policy and queues the accepted
+  // outputs. Before startWarmWorker every output counts as disabled.
+  void onCompactionApplied(std::vector<std::string> const& outputs, std::vector<size_t> const& output_bytes, int dest_level, size_t cached_input_blocks);
+  void startWarmWorker();
+  // Joins the worker; queued files are dropped. Idempotent; the
+  // destructor calls it.
+  void stopWarmWorker();
+  // Testing: block until the queue is empty and no file is in flight.
+  void waitWarmIdle();
+  // TableBuilder::finish: every block of the file is already published.
+  void markSSTableComplete(std::string const& file_name);
+
   // One consistent reading of every counter, taken under the cache
   // mutex. dead_* cover blocks whose file is not in latest_view (a
   // compacted-away SSTable that nobody dropped); after part A they must
@@ -249,6 +303,7 @@ class LRUCache {
         capacity(capacity) {}
 
   ~LRUCache() {
+    stopWarmWorker();
     for (auto& entry : file_to_entry_map) {
       // Log + block records are shared_ptr — destructors handle them.
       // Each block_records entry is a heap-allocated map we still own.
@@ -321,7 +376,10 @@ class LRUCache {
   void snapshotLogFileRecords(std::string const& file_name,
                               std::unordered_map<std::string, std::shared_ptr<Record>>& out);
   void putSSTableMeta(std::string const& key, Table* table);
-  void putSSTableRecords(std::string const& key, std::unordered_map<std::string, std::shared_ptr<Record>>* records, std::string const& index_value, size_t size);
+  // Publish one block (the cache takes ownership of `records`; a
+  // duplicate is dropped). `warmed` marks the block for the warm-hit
+  // counter; TableBuilder::flush and readDataBlocks leave it false.
+  void putSSTableRecords(std::string const& key, std::unordered_map<std::string, std::shared_ptr<Record>>* records, std::string const& index_value, size_t size, bool warmed = false);
 
   // set latest view
   void setLatestView(View const* view) {
@@ -334,6 +392,21 @@ class LRUCache {
   // `[lru_cache] levels …` line with the per-level, dead-block and warm
   // counters.
   void printCacheStats();
+
+ private:
+  // Warm worker state (see the public block above; declared after it
+  // because WarmPolicy is a nested type).
+  WarmPolicy warm_policy_;
+  std::function<bool(std::string const&)> live_file_check_;
+  std::mutex warm_mtx_;
+  std::condition_variable warm_cv_;
+  std::deque<std::string> warm_queue_;
+  bool warm_started_ = false;
+  bool warm_stop_ = false;
+  bool warm_busy_ = false;
+  std::thread warm_thread_;
+  void warmLoop();
+  void warmOne(std::string const& file_name);
 };
 }  // namespace ozonedb
 #endif
