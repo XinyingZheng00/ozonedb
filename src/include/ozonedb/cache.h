@@ -197,12 +197,6 @@ class LRUCache {
   std::atomic<uint64_t> warm_skipped_built_{0};
   std::atomic<uint64_t> warm_dropped_{0};
 
-  // Level of an SSTable name "sstable<L>/<name>", 0 for any other name
-  // or a level outside [1, kLevelSlots). A plain scan, not std::regex:
-  // needReadBlock runs on every read and getSSTLayerNumber builds a
-  // regex per call.
-  static int levelSlot(std::string const& file_name);
-
   // Function to move a key to the front of the LRU list
   void updateLRU(std::string const& file_name, std::string const& index_value);
 
@@ -210,6 +204,12 @@ class LRUCache {
   void evict();
 
  public:
+  // Level of an SSTable name "sstable<L>/<name>", 0 for any other name
+  // or a level outside [1, kLevelSlots). A plain scan, not std::regex:
+  // needReadBlock runs on every read and getSSTLayerNumber builds a
+  // regex per call.
+  static int levelSlot(std::string const& file_name);
+
   // ---- Warm worker (bench/PLAN-compaction-cache.md, part B) ----
   //
   // When a COMPACT is applied to this process's view, the outputs are
