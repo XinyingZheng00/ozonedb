@@ -249,7 +249,7 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--lru-cache-bytes", str(int(lru_cache_bytes))] if lru_cache_bytes is not None else [])
             + (["--record_cnt", str(int(record_cnt))] if record_cnt is not None else [])
             + (["--disk-cache-bytes", str(int(disk_cache_bytes))] if disk_cache_bytes is not None else [])
-            + (["--disk-cache-dir", disk_cache_dir] if disk_cache_dir else [])
+            + (["--disk-cache-dir", shlex.quote(disk_cache_dir)] if disk_cache_dir else [])
             + (["--disk-cache-keep-pages"] if disk_cache_keep_pages else [])
         ),
     ]

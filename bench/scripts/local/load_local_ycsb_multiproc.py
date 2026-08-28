@@ -267,12 +267,22 @@ def disk_cache_label_token(corfu_settings):
 def require_disk_cache_mount(path):
     """Refuses a disk-cache dir that lives on the root filesystem: the
     experiment measures the SSD, not the OS disk. OZONEDB_DISK_CACHE_ANY_FS=1
-    overrides (single-node tests)."""
-    if os.environ.get("OZONEDB_DISK_CACHE_ANY_FS") == "1":
-        return
+    overrides (single-node tests).
+
+    Checks the nearest existing ancestor's filesystem BEFORE creating
+    anything -- a root-fs path must be refused without leaving a directory
+    tree behind."""
+    if os.environ.get("OZONEDB_DISK_CACHE_ANY_FS") != "1":
+        probe = os.path.normpath(path)
+        while not os.path.exists(probe):
+            parent = os.path.dirname(probe)
+            if not parent or parent == probe:
+                probe = "/"
+                break
+            probe = parent
+        if os.stat(probe).st_dev == os.stat("/").st_dev:
+            sys.exit(f"disk cache dir {path} is on the root filesystem; run bench/scripts/setup_disk_cache.sh (or set OZONEDB_DISK_CACHE_ANY_FS=1)")
     os.makedirs(path, exist_ok=True)
-    if os.stat(path).st_dev == os.stat("/").st_dev:
-        sys.exit(f"disk cache dir {path} is on the root filesystem; run bench/scripts/setup_disk_cache.sh (or set OZONEDB_DISK_CACHE_ANY_FS=1)")
 
 
 def parse_lru_label_token(token):
