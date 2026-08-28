@@ -125,7 +125,7 @@ Everything in `PLAN-cost.md` "Fixed parameters" holds, with these changes:
 | Warm | off (default) | +7 % throughput, L2 stays cold; it is not part of the paper's line |
 | Disk tier | off in the no-tier cells; `--disk-cache-bytes` at the sizes in the ratio table, chunk + frequency defaults (label `-dc<size>-ch64k-adm`) | the round-2 ratios plus 0.026, so `--tier-variant ch64k-adm` applies |
 | Trimming | `--log-trim` in every OzoneDB cell and in every trimmed load | one checkpoint every 30 s |
-| Duration | 600 s at 10 GB for the sweep, workload a, the JNI control and the tier; 900 s for every 100 GB OzoneDB cell; 120 s for linearizable, scaling and Cassandra cells | a 100 GB cell must win the model's per-ratio tie-break (longest cell), and a 52 GB tier fills in about 3 min at 300 MB/s |
+| Duration | 300 s for a cell whose cache or tier fills in under 30 s at the miss rate (RAM caches up to 800 MiB, 2.5 GiB tiers); 600 s for every other cell and for every workload-a cell (compactions must happen inside the cell); 120 s for linearizable, scaling and Cassandra cells | the last-60 s window must sit after the fill; a 100 GB RAM cell at 600 s beats its 300 s twin at 10 GB in the model's per-ratio tie-break (longest cell) |
 | Window | last 60 s of activity (`--window 60`) | as in every campaign since the 4 KiB re-run |
 | Trial | 1 | coefficients are ratios; the JNI control pair is the repeatability check |
 | Tag | `TAG=cost2-$(date +%Y%m%d)`, one date for both systems, sub-tags per table below | |
@@ -163,10 +163,12 @@ Result tag directories, and which of them feed the model:
 | results root | the load rows (`_rc<N>` samples) | yes, after the root is archived (Task 1) |
 
 How the model combines the two sizes: `h` keeps one point per ratio, and at the three
-twin ratios the 900 s cell at 100 GB wins over the 600 s cell at 10 GB. `cpu_O` is the
+twin ratios the 600 s cell at 100 GB wins over the 300 s cell at 10 GB. `cpu_O` is the
 median of the three workload-a no-tier cells (5 GiB and 80 MiB at 10 GB, 100 MiB at
 100 GB). `get_per_write` is the median over both trimmed loads. `disk_h` interpolates over
-the five tier ratios 0.026 to 2.1. `space.json` takes `sO`, `wa` and `L` from the 100 GB
+four tier ratios: 0.026 (100 GB), 0.26 and 0.52 (the 10 GB cells, which the model picks
+because they run behind the smaller RAM cache) and 2.1 (10 GB). The 100 GB cells at 0.26
+and 0.52 are the scale check, not model inputs. `space.json` takes `sO`, `wa` and `L` from the 100 GB
 load, `L0` from the untrimmed 10 GB load and `sC` from the 100 GB Cassandra `space` after
 `compact`.
 
@@ -307,21 +309,28 @@ for n in 2 4; do
     --workloads a --writers-list 1 --client-hosts "$(hosts_n $n)" --trial 1 --duration 120 --run-tag $TAG-cass-10g
 done
 
-# 100 GB: load (about 45 min at 40,000 puts/s, plus the save-load copy), then four cells
+# 100 GB: load (about 45 min at 40,000 puts/s, plus the save-load copy), then four cells.
+# Read-only cells first, without a restore: they leave the drained load state as it is.
 bash bench/scripts/local/load_multinode_cassandra.sh --writers 8 --record-cnt 100000000
+ssh oliverr3@amd127.utah.cloudlab.us '/tank/cassandra/cassandra_ctl.sh space; du -sk /tank/cassandra/data.load'   # sC: peak, then drained
+for mode in quorum serial; do
+  bash bench/scripts/local/run_multinode_ycsb_with_cassandra.sh --consistency $mode --record-cnt 100000000 --no-restore \
+    --workloads c --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 120 --run-tag $TAG-cass-100g
+done
 for mode in quorum serial; do
   bash bench/scripts/local/run_multinode_ycsb_with_cassandra.sh --consistency $mode --record-cnt 100000000 \
-    --workloads "a c" --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 120 --run-tag $TAG-cass-100g
+    --workloads a --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 120 --run-tag $TAG-cass-100g
 done
-ssh oliverr3@amd127.utah.cloudlab.us '/tank/cassandra/cassandra_ctl.sh start; /tank/cassandra/cassandra_ctl.sh wait; /tank/cassandra/cassandra_ctl.sh space; /tank/cassandra/cassandra_ctl.sh compact; /tank/cassandra/cassandra_ctl.sh space; /tank/cassandra/cassandra_ctl.sh stop'
 ```
 
-The 100 GB restore copies 107 GB on one SSD before every cell (about 8 min each). Four
-cells is 32 min of copying. Accept it: the alternative, `--no-restore` on the workload-c
-cells, leaves the compaction state of the previous workload-a cell in place.
-`nodetool compact` on 100 GB takes tens of minutes. Wait for it before the second
-`space`: that pair is `sC` (peak, then steady). After the last cell delete
-`/tank/cassandra/data` (keep `data.load`) to free 107 GB.
+A restore copies 107 GB on one SSD (about 8 min). The order above needs two restores
+(before each workload-a cell) instead of four. `nodetool compact` at 100 GB takes tens of
+minutes and is skipped: `sC` was 1.066 before and after `compact` at both 1 GB and 10 GB,
+and the drained `data.load` after the load is the steady footprint. After the last cell
+delete `/tank/cassandra/data` (keep `data.load`) to free 107 GB.
+
+Task 2 needs no new build, so it runs while Task 0 (the merge) is in progress on the
+laptop. It is off the critical path as long as the merge takes longer than it does.
 
 Exit: 10 cells, `rc=0`, 0 failed ops, `cpuC` 0.06 ms per op within 10 % of
 `cost-20260827`, quorum workload a at 8 writers 43,000 ops/s within 5 % at 10 GB, `sC`
@@ -347,26 +356,23 @@ Exit: 10 cells, `rc=0`, 0 failed ops, `cpuC` 0.06 ms per op within 10 % of
 
 Exit: eight clients at one hash, tests green on native, `corfu_native_probe` present.
 
-### Task 4. Phase 1 at 10 GB: two loads
+### Task 4. Phase 1 at 10 GB: one load
 
-1. Untrimmed load, for `L0` under codec NONE. About 18 min at 9,600 puts/s.
+1. There is no untrimmed load. `L0` under codec NONE is already measured on this cluster:
+   the native reload of 2026-08-27 (`PLAN-native-corfu.md` §0, trimming off) left 1.3 GB
+   on disk for 1 M puts, so `L0_kb_per_put` = 1.3 goes into `space.json` with that
+   source. It only draws the dashed "no trimming" line.
+2. Trimmed load with **16** loader processes on the load host. The put path is bound per
+   writer by the sequencer (about 1,100 puts/s each), not by the host's 32 cores, so 16
+   processes are the cheap way to find out whether the 100 GB load can run in 2 h
+   instead of 3 h. About 12 min if it scales, 18 min if it does not.
    ```bash
-   bash bench/scripts/local/load_corfu_dataset.sh --writers 8 --record-cnt 10000000      # no --log-trim
-   ssh oliverr3@amd127.utah.cloudlab.us 'du -sb /mnt/corfu/load'                         # L0 = bytes / 10,000,000 puts
+   bash bench/scripts/local/load_corfu_dataset.sh --writers 16 --record-cnt 10000000 --log-trim
    ```
-   Expect about 1.3 KB per put (13 GB). Write it into `space.json` as `L0_kb_per_put`.
-   Move the load's result files and `_rc10000000` sample to
-   `bench/results/local/$TAG-loads-notrim/`, so the trimmed load below is the only
-   10 GB `load` row in the root. Delete the untrimmed snapshot (`/mnt/corfu/load`) after
-   the `du`.
-2. Trimmed load, the dataset every 10 GB OzoneDB cell restores. Run it once with
-   `--writers 8` and, if time allows, note the puts/s: Task 7 needs to know whether
-   `--writers 16` on the load host beats it, and the 10 GB load is the cheap place to
-   find out (run the 16-writer variant first, then the 8-writer one that the cells use,
-   so that the snapshot on disk is the standard one).
-   ```bash
-   bash bench/scripts/local/load_corfu_dataset.sh --writers 8 --record-cnt 10000000 --log-trim
-   ```
+   Read the aggregate puts/s from the loader log. **If it is at least 13,000, Task 7
+   loads with 16 writers. If it is below, Task 7 loads with 8.** The snapshot on disk is
+   the dataset either way: the key partition covers the same 10 M keys, and the load
+   row's coefficients are ratios.
    From its extractor row take `bucket_bytes`, `checkpoint_bytes`, `du_corfu_kb` (`L`),
    `s3_bytes_in` / dataset bytes (`wa`), `get_per_write`, `ckpt_objects / ckpt_count`
    (`k`). These are the 10 GB column of the coefficient table. `space.json` takes the
@@ -374,16 +380,21 @@ Exit: eight clients at one hash, tests green on native, `corfu_native_probe` pre
 3. Remove the two `-zstd-20260827` snapshots now.
 
 Exit: `sO` 1.17 within 3 %, `L` at most 250 MiB, `wa` 3.4 within 15 %, `k` 5–7,
-`get_per_write` at most 0.001, load rate at least 9,000 puts/s, `slow=0 spurious=0`.
+`get_per_write` at most 0.001, `slow=0 spurious=0`, and the 16-writer puts/s recorded.
 
 ### Task 5. Phase 2 at 10 GB: `h`, `cpuO`, linearizable, scaling, JNI control
 
 ```bash
 RC=10000000
-# h sweep and the workload-c CPU, 600 s
-for c in 5368709120 671088640 83886080 10485760 1310720; do
+# h sweep and the workload-c CPU: 600 s where the cache takes minutes to fill, 300 s where it takes seconds
+for c in 5368709120 671088640; do
   bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes $c \
     --workloads c --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-10g \
+    || { echo "FAILED at lru=$c"; break; }
+done
+for c in 83886080 10485760 1310720; do
+  bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes $c \
+    --workloads c --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 300 --run-tag $TAG-10g \
     || { echo "FAILED at lru=$c"; break; }
 done
 # workload a at the two ratios the projection reads, 600 s
@@ -399,15 +410,16 @@ for n in 2 4; do
   bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes 5368709120 \
     --workloads a --writers-list 1 --client-hosts "$(hosts_n $n)" --trial 1 --duration 120 --run-tag $TAG-scale
 done
-# JNI control on the same engine and dataset, 600 s, own tag
+# JNI control on the same engine and dataset, workload a only (the CPU claim), 600 s, own tag
 bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --corfu-client jni --record-cnt $RC --lru-cache-bytes 5368709120 \
-  --workloads "a c" --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-jni
+  --workloads a --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-jni
 ```
 
-Thirteen cells. Launch the chain detached (`setsid nohup bash chain.sh > chain.log 2>&1 &`)
+Twelve cells. Launch the chain detached (`setsid nohup bash chain.sh > chain.log 2>&1 &`)
 with `set -e`: the harness kills background chains, and a failed cell must not fall
-through to the next one. The 5 GiB cache fills at 20–40 MB/s of misses, so it converges
-in about 3 min. The last-60 s window of a 600 s cell is past that.
+through to the next one. The 5 GiB cache fills at 20–40 MB/s of misses and slows as it
+fills, so it needs the 600 s. An 80 MiB cache fills in seconds, so 300 s is past the
+fill by a wide margin, and the 100 GB twin at 600 s wins the model's tie-break.
 
 Exit:
 
@@ -428,9 +440,9 @@ run_tier() { # $1 record count, $2 tier bytes, $3 workloads, $4 tag, $5 seconds
     --disk-cache-bytes $2 --workloads "$3" --writers-list 1 --client-hosts "$HOSTS" \
     --trial 1 --duration $5 --run-tag $4
 }
-run_tier 10000000 2684354560  c     $TAG-10g-tier 600
+run_tier 10000000 2684354560  c     $TAG-10g-tier 300   # fills in about 10 s
 run_tier 10000000 5368709120  "a c" $TAG-10g-tier 600
-run_tier 10000000 21474836480 "a c" $TAG-10g-tier 600
+run_tier 10000000 21474836480 "a c" $TAG-10g-tier 600   # the full tier converges as it fills, 3 to 5 min
 ```
 
 The RAM cache behind the tier is 80 MiB, the 0.82 % ratio, so the tier is what is
@@ -457,29 +469,37 @@ Exit:
    From its extractor row fill `space.json`: `sO` (`bucket_bytes` minus
    `checkpoint_bytes`, over 1.024e11), `wa`, `L_gb` (`du_corfu_kb`), `k`. `L0` stays the
    Task 4 value. Keep the previous `space.json` as `space-disk2.json`.
-2. RAM cells, 900 s, no tier:
+2. While the load runs (2 to 3 h, the server is busy, the laptop is not): extract the
+   10 GB tags, run the model on them alone, and draft the write-up's tables from that
+   preliminary projection. The 100 GB rows then only replace numbers.
+3. RAM cells, 600 s, no tier. The largest cache here (800 MiB) fills in under a minute.
+   The 600 s is for the tie-break against the 300 s twins at 10 GB:
    ```bash
    RC=100000000
    for c in 838860800 104857600 13107200; do
      bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes $c \
-       --workloads c --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 900 --run-tag $TAG-100g
+       --workloads c --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-100g
    done
    bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt $RC --lru-cache-bytes 104857600 \
-     --workloads a --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 900 --run-tag $TAG-100g
+     --workloads a --writers-list 1 --client-hosts "$HOSTS" --trial 1 --duration 600 --run-tag $TAG-100g
    ```
-3. Tier cells, 900 s, behind an 800 MiB RAM cache (the 0.82 % ratio again):
+4. Tier cells behind an 800 MiB RAM cache (the 0.82 % ratio again). 300 s for the
+   2.5 GiB tier, 600 s for the rest:
    ```bash
    run_tier100() { bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --log-trim --record-cnt 100000000 \
        --lru-cache-bytes 838860800 --disk-cache-bytes $1 --workloads "$2" --writers-list 1 --client-hosts "$HOSTS" \
-       --trial 1 --duration 900 --run-tag $TAG-100g-tier; }
-   run_tier100 2684354560  c
-   run_tier100 26843545600 c
-   run_tier100 53687091200 "a c"
+       --trial 1 --duration $3 --run-tag $TAG-100g-tier; }
+   run_tier100 2684354560  c     300
+   run_tier100 26843545600 c     600
+   run_tier100 53687091200 "a c" 600
    ```
    A 50 GiB tier fills at the miss rate times 64 KiB, about 300 MB/s on a SATA SSD, so it
-   holds its budget after about 3 min. No full tier at 100 GB: the ratio-2.1 point comes
-   from the 20 GiB cell at 10 GB, and a 117 GB fill does not converge in one cell.
-4. The join numbers (`j`, `b_j`, replay time, time to first op) come from the replay line
+   holds its budget after about 3 min, and the last-60 s window of a 600 s cell is past
+   that. If the cumulative `h` and `h_steady` of a tier cell differ by more than 0.1,
+   the cell was still warming: rerun it at 1200 s. No full tier at 100 GB: the ratio-2.1
+   point comes from the 20 GiB cell at 10 GB, and a 117 GB fill does not converge in one
+   cell.
+5. The join numbers (`j`, `b_j`, replay time, time to first op) come from the replay line
    of every writer at every cell start. No extra cell is needed. Report the 100 GB
    values next to the 10 GB ones: both restore live log files, not SSTables, so both must
    be tens of MB and under 5 s.
@@ -519,9 +539,11 @@ python3 bench/scripts/plot/plot_cost_model.py bench/results-$TAG.tsv bench/scrip
 ```
 
 No `combine_disk_corpus.py`: every coefficient comes from `results-$TAG.tsv`. The model
-must print `measured` for every source line and "5 tier ratios" for `disk_h`. If a
+must print `measured` for every source line and "4 tier ratios" for `disk_h`. If a
 source prints `ASSUMED`, a cell is missing. Rerun it before writing anything. The
-"measured cells" dots on the figure land at 10 GB and 100 GB.
+"measured cells" dots on the figure land at 10 GB and 100 GB. The tables were drafted
+during the 100 GB load (Task 7, step 2), so this task is about one hour after the last
+cell.
 
 Write-up, as a new top section of `bench/RESULTS-cost.md` named "Campaign 2: one engine,
 both systems, 10 GB and 100 GB (`$TAG`)": the coefficient table with 10 GB and 100 GB
@@ -535,22 +557,52 @@ Commit the three TSVs, the projection TSV, the figure, `space.json` and `prices.
 
 ## 6. Cell count and time budget
 
-| Task | Cells | Time |
-|---|--:|---|
-| 0. merge, label checks, push | | 2–3 h on the laptop |
-| 1. cluster check, server SSD, archive | | 45 min |
-| 2. Cassandra: 6 cells at 10 GB, 100 GB load, 4 cells, compact | 10 | 35 min + 55 min + 45 min + 30 min = 2 h 45 |
-| 3. sync, build, tests on a fresh server | | 40 min |
-| 4. two 10 GB loads (+ the 16-writer trial) | | 55 min |
-| 5. sweep 5, workload a 2, linearizable 2, scaling 2, JNI 2 | 13 | 9 x 14 min + 4 x 4 min = 2 h 25 |
-| 6. tier at 10 GB | 5 | 70 min |
-| 7. 100 GB load, 4 RAM cells, 4 tier cells | 8 | 3 h + 8 x 19 min = 5 h 30 |
-| 8. extraction, model, write-up | | 2 h 30 |
-| **Total** | **36** | about 14 h on the cluster, two cluster days plus the merge |
+A 600 s cell costs about 14 min with the restart and the restore, a 300 s cell about
+9 min, a 120 s cell about 4 min.
 
-Two detached chains: Task 2 (Cassandra, day 1 morning, before the build), then Tasks 4
-to 7 as one chain of two loads and 26 OzoneDB cells (about 10 h, day 1 afternoon into
-day 2). Day 2 ends with the extraction. The server is idle between chains.
+| Task | Cells | Time | On the critical path? |
+|---|--:|---|---|
+| 1. cluster check, server SSD, archive | | 45 min | yes, first |
+| 0. merge, label checks, push (laptop) | | 2–3 h | yes, in parallel with Task 2 |
+| 2. Cassandra: 6 cells at 10 GB, 100 GB load, 4 cells (2 restores) | 10 | 35 + 55 + 30 min = 2 h | no: runs during Task 0 |
+| 3. sync, build, tests on a fresh server | | 40 min | yes |
+| 4. one 10 GB load, 16 writers | | 12–18 min | yes |
+| 5. sweep 2 x 600 s + 3 x 300 s, workload a 2, linearizable 2, scaling 2, JNI 1 | 12 | 28 + 27 + 28 + 8 + 8 + 14 = 1 h 55 | yes |
+| 6. tier at 10 GB, 1 x 300 s + 4 x 600 s | 5 | 65 min | yes |
+| 7. 100 GB load, then 4 RAM cells and 4 tier cells (7 x 600 s + 1 x 300 s) | 8 | 2–3 h + 1 h 50 | yes |
+| 8. extraction, model, write-up (tables drafted during the 100 GB load) | | 1 h | yes |
+| **Total** | **35** | **about 12 h from Task 1 to the write-up**, 9.5 h of OzoneDB cluster time | |
+
+Against the first version of this plan (14 h on the cluster, then 2.5 h of write-up,
+after a 2–3 h merge: about 19 h in sequence), the schedule above is one long day plus a
+morning. What was cut and why it costs no paper number:
+
+| Cut | Saved | What it costs |
+|---|--:|---|
+| Cassandra runs during the merge, not after it | 2 h of wall clock | nothing: Task 2 needs no new build |
+| Read-only Cassandra cells first, `--no-restore`, no `nodetool compact` at 100 GB | 45 min | `sC` from the drained snapshot; it was 1.066 before and after `compact` at 1 GB and 10 GB |
+| No untrimmed 10 GB load | 20 min | `L0` from the 2026-08-27 native reload (1.3 GB per 1 M puts), same engine, same codec |
+| One 10 GB load at 16 writers instead of an 8-writer load plus a 16-writer trial | 20 min, and up to 1 h on the 100 GB load | none if 16 writers scale; the 8-writer fallback is the old plan |
+| 300 s for cells whose cache fills in seconds; 600 s instead of 900 s at 100 GB | 1 h 10 | none: every window sits well after the fill, and the warming check in §7 catches the exception |
+| JNI control on workload a only | 15 min | the workload-c repeat; the twin-ratio cells at 100 GB are the repeat now |
+| Write-up drafted during the 100 GB load | 1 h 30 of wall clock | nothing |
+
+Two detached chains. Task 2 (Cassandra) starts as soon as Task 1 is done, while the merge
+is in progress. Tasks 4 to 7 follow as one chain of two loads and 25 OzoneDB cells (about
+8 h). The server is idle between them.
+
+### Optional cuts, not applied
+
+Each of these is a paper number lost. Take them only if the schedule above still does not
+fit.
+
+| Cut | Saves | What the paper loses |
+|---|--:|---|
+| Drop the 100 GB Cassandra load and cells | 1 h 25, but only off the critical path if the merge takes under 2 h | the measured Cassandra dot at 100 GB on the figure; every Cassandra coefficient is flat in D and the 10 GB cells give them |
+| Drop the 5 GiB and 640 MiB cells at 10 GB (workload c twice, workload a once) | 45 min | `h` at 52 % and 6.6 %, which the projection uses only below 30 GB; the "hot set fits" throughput row; `cpu_O` becomes the median of the two low-ratio workload-a cells, which is the more conservative value for the TB range |
+| Drop the scaling cells, both systems | 16 min | the server-scaling table (OzoneDB sublinear in writers, Cassandra linear) |
+| Drop the linearizable pair | 8 min | the "strict reads cost nothing on OzoneDB" row at 10 GB |
+| A multi-host loader (`--writer_offset` / `--writers_total` in `load_local_ycsb_multiproc.py`, fan-out in `load_corfu_dataset.sh`) | up to 2 h on the 100 GB load, if 16 writers on one host do not scale | 1–2 h of tooling before Task 4; the loader partitions keys over its local `--num_writers` only today (`load_local_ycsb_multiproc.py:593`) |
 
 ## 7. What to watch
 
@@ -573,10 +625,10 @@ then taught, and what 100 GB adds:
 - **Space on `/tank/ssd`.** `df -h /tank/ssd` before every load. The peak is 365 GB
   (Task 1 table). A full disk under MinIO fails PUTs mid-cell and looks like a compaction
   bug.
-- **Cold-start windows at 100 GB.** The last-60 s window is what is reported. An 800 MiB
-  cache fills in under a minute, a 50 GiB tier in about 3 min. Check the `h_steady`
-  against the cumulative `h`: a cell whose two values differ by more than 0.1 is still
-  warming, and its window must be extended (`--duration 1800`), not accepted.
+- **Cold-start windows.** The last-60 s window is what is reported. A cache up to
+  800 MiB fills in under a minute, a 5 GiB cache in minutes, a 50 GiB tier in about
+  3 min. Check `h_steady` against the cumulative `h`: a cell whose two values differ by
+  more than 0.1 is still warming. Rerun it at twice the duration, do not accept it.
 - **The h sweep's `h_steady` assumes one lookup per read.** Workload a does about 1.3.
   Quote the counter `h` for workload a, `h_steady` for workload c.
 - **A whole-file read is served from the tier only when every chunk is present.** That is
@@ -599,9 +651,9 @@ then taught, and what 100 GB adds:
   symlinks into `/tank/ssd` after Task 1. `rm -rf /mnt/corfu/run_batch/` in the runner
   follows the link into the directory, which is what is wanted. Never `rm -rf` the link
   itself with a trailing slash omitted.
-- **One trial.** Differences under 5 % are not resolved. The JNI control pair is the only
-  repeat: its workload-c throughput must agree with the native cell within 3 % (phase 5
-  measured 0.99x), which is the noise floor for the write-up.
+- **One trial.** Differences under 5 % are not resolved. The three twin-ratio cells at
+  100 GB are the only repeat of a measurement: their `h_steady` must agree with the 10 GB
+  cells within 0.06, which is the noise floor the write-up quotes.
 
 ## 8. Exit criteria for the campaign
 
@@ -615,7 +667,7 @@ then taught, and what 100 GB adds:
 | `h_steady`, workload c, 100 GB, three twin ratios | within 0.06 of the 10 GB values |
 | `disk_h` at 0.26 / 0.52 / 2.1 (10 GB) | within 0.05 of 0.29 / 0.51 / 0.99 |
 | `disk_h` at 0.26 / 0.52 (100 GB) | within 0.05 of the 10 GB points |
-| `disk_h` at 0.026 (100 GB) | reported; the model prints "5 tier ratios" |
+| `disk_h` at 0.026 (100 GB) | reported; the model prints "4 tier ratios" |
 | `get_per_write` (both trimmed loads) | at most 0.001 |
 | `L` (10 GB and 100 GB) | at most 250 MiB, and the two within 20 % |
 | `L0` under codec NONE (10 GB, untrimmed) | 1.2–1.4 KB per put |
@@ -636,9 +688,9 @@ then taught, and what 100 GB adds:
   cell (`RESULTS-cost.md`, "Disk-cache tier, round 2", what to do next).
 - The real S3 check (`PLAN-cost.md` phase 6).
 - A profile of the native client (phase 0 of `PLAN-native-corfu.md`).
-- A multi-host loader. The 100 GB load runs 8 (or 16) processes on one client. Spreading
-  it over the eight hosts cuts the 3 h to under 1 h. That is the first tooling change
-  to make if this campaign is repeated.
+- A multi-host loader. The 100 GB load runs 8 or 16 processes on one client. Spreading
+  it over the eight hosts cuts the 3 h to about 1 h. See the optional cuts in §6: the
+  loader needs a global writer offset first.
 - An extractor check that counts writers with an `[OVERALL]` block per cell and flags a
   short cell. This is still by hand (§7, first bullet). It is a two-hour change and the
   first thing to add if Task 5 has to be re-run.
