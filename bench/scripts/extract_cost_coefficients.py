@@ -370,16 +370,30 @@ def parse_series(path):
     return sorted(by_t.items())
 
 
-def steady_rates(series, window):
-    """Request rates over the last `window` seconds of activity: the window
-    ends at the last sample whose counters moved, so the idle tail between
-    the writers' exit and the sampler's stop is not averaged in."""
+def steady_rates(series, window, end_at=None):
+    """Request rates over the last `window` seconds of the run.
+
+    `end_at` is the writers' last activity in sampler epoch seconds; the
+    window ends at the last sample at or before it, so the idle tail between
+    the writers' exit and the sampler's stop is not averaged in. Without it
+    the window ends at the last sample whose counters moved, which is only
+    the same thing while the object store is busy for as long as the writers
+    are: with a disk-cache tier that holds the dataset the counters stop at
+    the end of the fill burst, and that fallback would report the fill as
+    the steady state."""
     if len(series) < 2:
         return None
     end = None
-    for (t0, a), (t1, b) in zip(series, series[1:]):
-        if b["get"] > a["get"] or b["put"] > a["put"]:
-            end = (t1, b)
+    if end_at is not None:
+        for t, s in series:
+            if t <= end_at:
+                end = (t, s)
+        if end is not None and end[0] <= series[0][0]:
+            end = None  # no window left; fall back to the counters
+    if end is None:
+        for (t0, a), (t1, b) in zip(series, series[1:]):
+            if b["get"] > a["get"] or b["put"] > a["put"]:
+                end = (t1, b)
     if end is None:
         return None
     t_end, s_end = end
@@ -474,6 +488,7 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
     replays = [w["replay"] for w in ws if w["replay"]]
     restores = [w["restore"] for w in ws if w["restore"]]
     ckpts = [c for w in ws for c in w["ckpts"]]
+    writer_last_t = max((w["last_t"] for w in ws if w["last_t"]), default=None)
     notes = []
     if have != total:
         notes.append(f"missing_writers={total - have}")
@@ -551,7 +566,13 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
     for e in samples:
         b, a = e["before"], e["after"]
         if e["series"] and rates is None:
-            rates = steady_rates(e["series"], window)
+            # The writers report elapsed seconds; the sampler reports epoch
+            # seconds and its `before` snapshot is taken at cell start, so
+            # start + the longest writer's last status line is the end of
+            # the run on the sampler's clock.
+            start_t = (e["before"] or {}).get("time") or e["series"][0][0]
+            end_at = start_t + writer_last_t if writer_last_t else None
+            rates = steady_rates(e["series"], window, end_at)
         if b and a and not (b["errors"] and a["errors"]):
             have_counters = True
             for cls, apis in (("get", GET_APIS), ("head", HEAD_APIS), ("put", PUT_APIS),
