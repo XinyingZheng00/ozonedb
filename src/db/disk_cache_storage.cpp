@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <system_error>
 #include <vector>
 
@@ -19,9 +20,29 @@ DiskCacheStorage::DiskCacheStorage(std::unique_ptr<Storage> backing, Options opt
     : Storage(options.dir), backing_(std::move(backing)), options_(std::move(options)) {
   if (!options_.dir.empty() && options_.dir.back() != '/') options_.dir += '/';
   storage_path = options_.dir;
+  options_.max_queue = std::max<size_t>(1, options_.max_queue);
+  // An unusable tier directory is a configuration error, not something to
+  // limp on: the tier would silently become a pure pass-through while the
+  // run still claims to measure an SSD. Fail the open instead, the way
+  // Metadata fails an inconsistent config.
   std::error_code ec;
   fs::create_directories(options_.dir, ec);
-  if (ec) std::cerr << "[disk_cache] cannot create " << options_.dir << ": " << ec.message() << "\n";
+  if (ec && !fs::is_directory(options_.dir)) {
+    throw std::runtime_error("[disk_cache] cannot create " + options_.dir + ": " + ec.message());
+  }
+  if (!fs::is_directory(options_.dir)) {
+    throw std::runtime_error("[disk_cache] not a directory: " + options_.dir);
+  }
+  // create_directories succeeds on a read-only parent that already holds the
+  // directory, so probe the write we actually need.
+  std::string const probe = options_.dir + ".ozonedb_disk_cache_probe";
+  {
+    std::ofstream out(probe, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      throw std::runtime_error("[disk_cache] not writable: " + options_.dir);
+    }
+  }
+  fs::remove(probe, ec);
 }
 
 DiskCacheStorage::~DiskCacheStorage() {
@@ -248,10 +269,20 @@ bool DiskCacheStorage::publishPartFile(std::string const& name, std::string cons
 
 void DiskCacheStorage::discardPart(std::string const& name) {
   std::lock_guard<std::mutex> lk(parts_mtx_);
-  parts_.erase(name);
-  poisoned_parts_.erase(name);
   std::error_code ec;
-  fs::remove(partPath(name), ec);
+  // Poison rather than forget, whenever a write-through was actually in
+  // flight. The builder may still be appending: without the poison the next
+  // writePart would reopen the .part with `trunc` and the following flush
+  // would publish the tail of the file as a complete copy (final review of
+  // PLAN-disk-cache, finding 7). publishPart clears the poison and publishes
+  // nothing, so the set only ever holds the write-throughs that were
+  // interrupted and is emptied by their own flush. Discarding a name with no
+  // part in flight -- which is what invalidate() does on every peer COMPACT
+  // input -- leaves nothing behind: a write-through that starts after this
+  // point writes the whole file from byte 0 and is safe to publish.
+  bool const had_stream = parts_.erase(name) != 0;
+  bool const had_file = fs::remove(partPath(name), ec);  // true only if it was there
+  if (had_stream || had_file) poisoned_parts_.insert(name);
 }
 
 bool DiskCacheStorage::admit(std::string const& name, size_t bytes) {
@@ -291,6 +322,11 @@ void DiskCacheStorage::eraseLocked(std::string const& name, bool count_as_invali
 }
 
 void DiskCacheStorage::invalidate(std::string const& name) {
+  // The peer path (a COMPACT apply) hands us every input of the compaction,
+  // which includes datalog* names the tier never cached. Poisoning one of
+  // those would be harmless but pointless bookkeeping that never gets
+  // cleared, since publishPart only runs for cacheable names.
+  if (!cacheable(name)) return;
   discardPart(name);
   std::lock_guard<std::mutex> lk(mtx_);
   eraseLocked(name, /*count_as_invalidated=*/true);

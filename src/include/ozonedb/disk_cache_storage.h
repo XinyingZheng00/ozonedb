@@ -37,10 +37,36 @@ namespace ozonedb {
 // Invalidation: remove() (this process compacted) and invalidate() (a peer
 // compacted; wired to the COMPACT apply in MetadataLogHandler).
 //
-// Lock order: mtx_ (index, LRU, budget) and fill_mtx_ (queue, worker) are
-// never held across a backing-store call or file I/O other than unlink.
+// A fill that is already in flight may publish a file a peer's COMPACT has
+// just removed from the view. That is deliberate and harmless: SSTable
+// content is immutable and a name is never reused, so the copy is either
+// correct or dead, and a dead one is dropped by the LRU or by the next
+// reconcile() at open. Nothing reads a file the view no longer names.
+//
+// Lock order and what each mutex covers:
+//   * mtx_        - index_, lru_, current_bytes_ (the budget). Held across an
+//                   unlink in eviction/erase, never across a backing-store
+//                   call or any other file I/O.
+//   * parts_mtx_  - parts_ (the write-through streams) and poisoned_parts_.
+//                   Deliberately held across the part's create_directories,
+//                   ofstream open, write, flush and remove, because those are
+//                   what serialise two threads on one .part; never held across
+//                   a backing-store call, and never while mtx_ is held (the
+//                   publish path drops it before calling publishPartFile).
+//   * fill_mtx_   - fill_queue_, queued_, the fill_* flags and fill_cv_. Never
+//                   held across the fill's I/O: fillOne() runs unlocked.
+//   * fill_lifecycle_mtx_ - serialises startFillWorker/stopFillWorker; held
+//                   across fill_thread_.join(), which is why it is the
+//                   outermost of the four.
+// Order: fill_lifecycle_mtx_ -> fill_mtx_ (start/stop take both, in that
+// order). parts_mtx_ and mtx_ are never nested, in either direction, and
+// neither is ever taken under fill_mtx_.
 // Nothing here takes a cache or view mutex; the DB calls the tier only
 // outside view_mutex.
+//
+// The constructor throws std::runtime_error when `dir` cannot be created or
+// is not writable: a tier configured onto an unusable path would otherwise
+// degrade into a pure pass-through that still charges the SSD's cost.
 class DiskCacheStorage : public Storage {
  public:
   struct Options {
@@ -60,6 +86,8 @@ class DiskCacheStorage : public Storage {
     uint64_t files = 0, bytes = 0, capacity = 0;
   };
 
+  // Throws std::runtime_error when options.dir cannot be created or is not
+  // writable (probed with a create + unlink).
   DiskCacheStorage(std::unique_ptr<Storage> backing, Options options);
   ~DiskCacheStorage() override;
 
@@ -116,10 +144,17 @@ class DiskCacheStorage : public Storage {
   bool present(std::string const& name);
   // pread of [a, a+length) from the local copy into a new buffer; false on any short read.
   bool readLocal(std::string const& name, unsigned char*& data, size_t a, size_t length);
-  // Appends to the .part stream (opened on first use). Failures poison the part.
+  // Appends to the .part stream (opened on first use). A write failure poisons
+  // the name; a poisoned name is skipped, because reopening with trunc would
+  // leave the tail of the file looking like a whole one.
   void writePart(std::string const& name, unsigned char const* data, size_t length);
-  // Closes the .part, renames it into place and admits it; discards it on any failure.
+  // Closes the .part, renames it into place and admits it; discards it on any
+  // failure. On a poisoned name it removes the part, clears the poison and
+  // returns false: nothing is published for that name, and the tier is free to
+  // fill the file from the backing later.
   bool publishPart(std::string const& name);
+  // Drops a write-through in progress and poisons the name, so the appends
+  // that follow this discard cannot be published as a complete copy.
   void discardPart(std::string const& name);
   // Shared publish tail for a finished file at `part_path`: verifies its size
   // (against `expected_size` when nonzero), checks the budget, renames into

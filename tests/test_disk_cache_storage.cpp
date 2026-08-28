@@ -517,6 +517,68 @@ TEST(DiskCacheStorageTest, InvalidateDropsOnlyTheCopy) {
   EXPECT_FALSE(f.local(other));                        // but nothing is published
 }
 
+TEST(DiskCacheStorageTest, InvalidateMidWriteThroughPoisonsThePart) {
+  // A peer's COMPACT drops the file while the builder is still appending it.
+  // discardPart poisons the name, so the appends that follow cannot be
+  // reopened with `trunc` and published as a complete copy of the tail
+  // (final review of PLAN-disk-cache, finding 7).
+  TierFixture f(1u << 20);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  std::vector<unsigned char> head(3000, 'a'), tail(2000, 'b');
+  ASSERT_EQ(f.tier->appendNoFlush(name, head.data(), 3000), Status::kSuccess);
+  ASSERT_TRUE(f.part(name));
+  f.tier->invalidate(name);
+  EXPECT_FALSE(f.part(name));
+  ASSERT_EQ(f.tier->appendNoFlush(name, tail.data(), 2000), Status::kSuccess);
+  EXPECT_FALSE(f.part(name));  // the poisoned name is not reopened
+  EXPECT_EQ(f.tier->flush(name), Status::kSuccess);  // the status is the backing's
+  EXPECT_FALSE(f.local(name));                       // and nothing was published
+  EXPECT_FALSE(f.part(name));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.writethrough_files, 0u);
+  EXPECT_EQ(s.files, 0u);
+  EXPECT_EQ(f.backing->size(name), 5000u);  // the object itself is whole
+  // The poison is cleared by that flush, so the tier is free to cache the
+  // file again -- a read of it misses and is served by the backing.
+  unsigned char* data = nullptr;
+  size_t size = 0;
+  ASSERT_EQ(f.tier->read(name, data, size), Status::kSuccess);
+  EXPECT_EQ(size, 5000u);
+  delete[] data;
+  EXPECT_EQ(f.tier->stats().misses, 1u);
+}
+
+TEST(DiskCacheStorageTest, UnwritableDirThrows) {
+  // A tier configured onto a path it cannot use must fail the open, not
+  // degrade into a silent pass-through (final review of PLAN-disk-cache,
+  // finding 4b). Both cases run as an ordinary user.
+  std::string const base = kRoot + "unusable_" + stamp() + "/";
+  std::filesystem::create_directories(base + "backing/sstable1");
+  auto make = [&](std::string const& dir) {
+    DiskCacheStorage::Options o;
+    o.dir = dir;
+    o.capacity_bytes = 1u << 20;
+    return std::make_unique<DiskCacheStorage>(std::make_unique<FileStorage>(base + "backing/"), o);
+  };
+  // (a) The parent is a regular file, so create_directories cannot make it.
+  { std::ofstream(base + "regular") << "x"; }
+  EXPECT_THROW(make(base + "regular/tier"), std::runtime_error);
+  // (b) The directory is there but has no write permission, so only the
+  //     probe catches it: create_directories succeeds on an existing dir.
+  std::string const ro = base + "ro/";
+  std::filesystem::create_directories(ro);
+  std::filesystem::permissions(ro, std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
+                               std::filesystem::perm_options::replace);
+  EXPECT_THROW(make(ro), std::runtime_error);
+  std::filesystem::permissions(ro, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+  // A usable directory still constructs, and the probe leaves nothing behind.
+  std::string const ok = base + "ok/";
+  EXPECT_NO_THROW(make(ok));
+  EXPECT_TRUE(std::filesystem::is_directory(ok));
+  EXPECT_TRUE(std::filesystem::is_empty(ok));
+  std::filesystem::remove_all(base);
+}
+
 TEST(DiskCacheStorageTest, ReconcileDropsPartsDeadFilesAndForeignNames) {
   TierFixture f(1u << 20);
   auto write = [&](std::string const& rel, size_t n) {
