@@ -132,6 +132,43 @@ TEST(LRUCacheTest, PerLevelCountersAndDeadBytes) {
   fx.cache.setLatestView(nullptr);
 }
 
+// A read of a file the View lists that fails at the storage layer moves
+// readFailures(): a block read on a removed file, an open of a missing
+// file, a log read of a missing file. A miss on a readable file does not.
+TEST(LRUCacheTest, ReadFailuresCountRemovedFiles) {
+  CacheFixture fx;
+  std::string const f = "sstable1/" + stamp() + ".sst";
+  buildTable(&fx.storage, f, 200, 600);
+  Table* t = nullptr;
+  fx.cache.getSSTable(f, t);
+  ASSERT_NE(t, nullptr);
+  std::shared_ptr<Record> rec;
+  ASSERT_EQ(t->get("key0", rec), Status::kSuccess);
+  ASSERT_EQ(t->get("nokey", rec), Status::kNotFound);  // a plain miss
+  EXPECT_EQ(fx.cache.readFailures(), 0u);
+
+  // The file goes away under the open Table (a peer's REMOVE): a block
+  // not yet cached cannot be read. Truncated rather than unlinked,
+  // because FileStorage keeps an open stream per file and an unlinked
+  // file still reads through it.
+  std::filesystem::resize_file(kDir + f, 0);
+  ASSERT_EQ(t->get("key150", rec), Status::kNotFound);
+  EXPECT_EQ(fx.cache.readFailures(), 1u);
+  // The cached block still answers, and does not count.
+  ASSERT_EQ(t->get("key0", rec), Status::kSuccess);
+  EXPECT_EQ(fx.cache.readFailures(), 1u);
+
+  // An open of a file that is not there.
+  Table* missing = nullptr;
+  fx.cache.getSSTable("sstable1/missing_" + stamp() + ".sst", missing);
+  EXPECT_EQ(missing, nullptr);
+  EXPECT_EQ(fx.cache.readFailures(), 2u);
+
+  // A log read of a file that is not there.
+  fx.cache.readDataLog("datalog/404", 0, 100);
+  EXPECT_EQ(fx.cache.readFailures(), 3u);
+}
+
 // invalidateSSTable: the blocks leave the budget, the Table* is retired
 // (not freed: a reader may hold it), the entry is gone, and the return
 // value is the number of blocks that were cached.

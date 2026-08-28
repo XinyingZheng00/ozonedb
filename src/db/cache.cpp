@@ -129,6 +129,7 @@ void LRUCache::readDataLog(std::string const& file_name, size_t cached_offset, s
   // metadata-log rollforward will eventually drop this file from view.
   if (read_status != Status::kSuccess || buffer == nullptr) {
     delete[] buffer;
+    read_failures_.fetch_add(1, std::memory_order_release);
     return;
   }
   std::vector<google::protobuf::Message*> messages;
@@ -225,6 +226,7 @@ void LRUCache::getSSTable(std::string const& file_name, Table*& table) {
   } catch (...) {
     opened = nullptr;
   }
+  if (opened == nullptr) read_failures_.fetch_add(1, std::memory_order_release);
   if (opened != nullptr) {
     try {
       opened->setCache(this);
@@ -373,6 +375,7 @@ void LRUCache::readDataBlocks(std::string const& file_name, std::string const& i
   } catch (...) {
     std::cerr << "[lru_cache] readDataBlocks threw for " << file_name << "\n";
     fetch_ok = false;
+    read_failures_.fetch_add(1, std::memory_order_release);
   }
   if (iter) delete iter;
   // cleanup() publishes + erases + signals the promise; Guard

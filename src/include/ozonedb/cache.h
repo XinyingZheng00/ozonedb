@@ -177,6 +177,15 @@ class LRUCache {
   // hits >> misses once the hot set fits in `capacity`.
   std::atomic<uint64_t> sstable_cache_hits_{0};
   std::atomic<uint64_t> sstable_cache_misses_{0};
+  // Reads of a file the View listed that failed at the storage layer: a
+  // log read (readDataLog), a table open (getSSTable) or a block read
+  // (readDataBlocks). The one cause in normal operation is a peer's
+  // compaction that removed the file after the reader took its View
+  // snapshot; DB::get samples this counter around its scan and retries
+  // against a fresh view when it moved (see db.cpp). A per-call flag
+  // would not do: a single-flight follower never sees the leader's
+  // failure.
+  std::atomic<uint64_t> read_failures_{0};
   // The same hits and misses split by SSTable level (slot = the level
   // parsed from "sstable<L>/<name>", slot 0 = any other name). Which
   // level misses is what tells a write-heavy cell apart from a
@@ -209,6 +218,9 @@ class LRUCache {
   // needReadBlock runs on every read and getSSTLayerNumber builds a
   // regex per call.
   static int levelSlot(std::string const& file_name);
+
+  // Number of failed file reads so far (see read_failures_).
+  uint64_t readFailures() const { return read_failures_.load(std::memory_order_acquire); }
 
   // ---- Warm worker (bench/PLAN-compaction-cache.md, part B) ----
   //

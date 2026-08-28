@@ -345,12 +345,25 @@ Status DB::get(std::string const& key, std::string const*& value,
   if (strict && !log_storage->hasSyncToken()) {
     fence.emplace(*log_storage);
   }
+  // Default mode has the same compaction window and closes it the
+  // cheap way. The snapshot below is the periodic thread's (up to
+  // ~100 ms old). If a peer's compaction removes a listed file after
+  // the snapshot, the scan's read of that file fails at the storage
+  // layer and the key's new home (the output) is not in the snapshot:
+  // NOT_FOUND for a key that exists (1 to 7 per 0.8 M reads in the
+  // 600 s workload-a cells before this). The cache counts failed file
+  // reads; when the scan found nothing and that counter moved during
+  // the scan, the view is rolled forward (one fence, only on this
+  // path) and the scan runs again. A hit, or a miss with every listed
+  // file readable, costs nothing extra. The cap bounds a broken store.
   constexpr int kStrictMaxAttempts = 5;
+  constexpr int kDefaultMaxAttempts = 5;
   for (int attempt = 0;; ++attempt) {
     size_t view_offset = 0;
     if (strict) {
       view_offset = metadata_log->syncView();
     }
+    uint64_t const read_failures_before = lru_cache->readFailures();
 
     // Atomic snapshot of the metadata-log view — no deep copy, no lock.
     // Held locally so children's raw latest_view pointers stay valid
@@ -390,6 +403,11 @@ Status DB::get(std::string const& key, std::string const*& value,
 
     if (strict && attempt + 1 < kStrictMaxAttempts &&
         log_storage->size(this->metadata->metadata_log) != view_offset) {
+      continue;
+    }
+    if (!strict && !latest_record && attempt + 1 < kDefaultMaxAttempts &&
+        lru_cache->readFailures() != read_failures_before) {
+      metadata_log->syncView();
       continue;
     }
 
