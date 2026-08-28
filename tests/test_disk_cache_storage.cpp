@@ -2,9 +2,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -62,17 +64,36 @@ class PartVanishingStorage : public CountingStorage {
   int calls_ = 0;
 };
 
-// A CountingStorage whose ranged read sleeps before delegating, so a test
-// can reliably land on "the worker is mid-fill" (review finding,
-// PLAN-disk-cache T3 fix 2).
+// A CountingStorage whose ranged read signals a latch on entry -- so a test
+// can deterministically know the worker has begun the call instead of
+// guessing from a fixed delay -- and then sleeps before delegating, so the
+// test can reliably land on "the worker is mid-fill" (review finding,
+// PLAN-disk-cache T3 fix 2; the latch is PLAN-disk-cache T4's fix for the
+// carried-over review item: a bare sleep before start is not synchronization
+// and can race the worker's first dequeue).
 class SlowStorage : public CountingStorage {
  public:
   SlowStorage(std::string const& path, std::chrono::milliseconds delay) : CountingStorage(path), delay_(delay) {}
   Status read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) override {
+    {
+      std::lock_guard<std::mutex> lk(entered_mtx_);
+      entered_ = true;
+    }
+    entered_cv_.notify_all();
     std::this_thread::sleep_for(delay_);
     return CountingStorage::read(fileName, data, a, length);
   }
+  // Blocks until the first call to read() above has begun.
+  void waitEntered() {
+    std::unique_lock<std::mutex> lk(entered_mtx_);
+    entered_cv_.wait(lk, [this] { return entered_; });
+  }
   std::chrono::milliseconds delay_;
+
+ private:
+  std::mutex entered_mtx_;
+  std::condition_variable entered_cv_;
+  bool entered_ = false;
 };
 
 struct TierFixture {
@@ -366,6 +387,7 @@ TEST(DiskCacheStorageTest, StopIsSerialisedAcrossTheJoinAndWaitFillIdleIsNeverSt
   DiskCacheStorage::Options o = f.tier->options();
   f.tier.reset();
   auto owned = std::make_unique<SlowStorage>(f.backing_dir, std::chrono::milliseconds(150));
+  SlowStorage* slow = owned.get();
   f.backing = owned.get();
   f.tier = std::make_unique<DiskCacheStorage>(std::move(owned), o);
 
@@ -383,9 +405,14 @@ TEST(DiskCacheStorageTest, StopIsSerialisedAcrossTheJoinAndWaitFillIdleIsNeverSt
   delete[] data;
 
   f.tier->startFillWorker();
-  // The worker dequeues name1 and blocks ~150ms inside its (slow) chunk
-  // read. stopFillWorker() below is called within microseconds of start, so
-  // it signals well before that read returns -- name2 is left in the queue.
+  // Wait for the worker to actually dequeue name1 and enter its (slow)
+  // chunk read before requesting a stop. Nothing else orders the worker's
+  // fill_queue_.pop_front() ahead of stopFillWorker() setting fill_stop_; a
+  // bare sleep before start races that dequeue and can leave name1 unfilled.
+  // The latch makes the ordering exact, and the ~150ms delay then just holds
+  // the worker inside the read long enough for the stop and the waiter
+  // thread below to land before that read returns.
+  slow->waitEntered();
   std::thread waiter([&f] { f.tier->waitFillIdle(); });
   f.tier->stopFillWorker();
   waiter.join();  // must return promptly: this is the regression under test
