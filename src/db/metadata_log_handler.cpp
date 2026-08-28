@@ -354,12 +354,15 @@ void MetadataLogHandler::drainCacheEvents() {
     // on the old snapshot may still probe an input: it misses, and its
     // GET on a removed object is the documented transient miss.
     size_t cached_input_blocks = 0;
+    bool log_inputs = !ev.inputs.empty();
     for (auto const& input : ev.inputs) {
       cached_input_blocks += this->lru_cache->invalidateSSTable(input);
+      if (LRUCache::levelSlot(input) != 0) log_inputs = false;
     }
     // Part B: the outputs go to the warm worker, which applies the
-    // policy (enabled, level, budget, affinity = the blocks just dropped).
-    this->lru_cache->onCompactionApplied(ev.outputs, ev.output_bytes, ev.dest_level, cached_input_blocks);
+    // policy (enabled, level, budget, affinity = the blocks just dropped,
+    // or the destination level's lookups when the inputs are log files).
+    this->lru_cache->onCompactionApplied(ev.outputs, ev.output_bytes, ev.dest_level, cached_input_blocks, log_inputs);
   }
 }
 

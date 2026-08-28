@@ -596,10 +596,19 @@ void LRUCache::setLiveFileCheck(std::function<bool(std::string const&)> check) {
   live_file_check_ = std::move(check);
 }
 
-void LRUCache::onCompactionApplied(std::vector<std::string> const& outputs, std::vector<size_t> const& output_bytes, int dest_level, size_t cached_input_blocks) {
+void LRUCache::onCompactionApplied(std::vector<std::string> const& outputs, std::vector<size_t> const& output_bytes, int dest_level, size_t cached_input_blocks, bool log_inputs) {
+  size_t affinity = cached_input_blocks;
+  if (log_inputs) {
+    int const slot = (dest_level > 0 && dest_level < kLevelSlots) ? dest_level : 0;
+    uint64_t const now = level_hits_[slot].load(std::memory_order_relaxed) + level_misses_[slot].load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(warm_mtx_);
+    uint64_t& last = level_lookups_at_last_log_event_[slot];
+    affinity = static_cast<size_t>(now >= last ? now - last : 0);
+    last = now;
+  }
   for (size_t i = 0; i < outputs.size(); ++i) {
     size_t const bytes = i < output_bytes.size() ? output_bytes[i] : 0;
-    switch (warmDecision(warm_policy_, dest_level, bytes, capacity, cached_input_blocks)) {
+    switch (warmDecision(warm_policy_, dest_level, bytes, capacity, affinity)) {
       case WarmSkip::kDisabled: warm_skipped_disabled_.fetch_add(1, std::memory_order_relaxed); continue;
       case WarmSkip::kLevel: warm_skipped_level_.fetch_add(1, std::memory_order_relaxed); continue;
       case WarmSkip::kBudget: warm_skipped_budget_.fetch_add(1, std::memory_order_relaxed); continue;

@@ -247,7 +247,15 @@ class LRUCache {
   // of the inputs' blocks that were cached here (invalidateSSTable's
   // return values, summed). Applies the policy and queues the accepted
   // outputs. Before startWarmWorker every output counts as disabled.
-  void onCompactionApplied(std::vector<std::string> const& outputs, std::vector<size_t> const& output_bytes, int dest_level, size_t cached_input_blocks);
+  //
+  // log_inputs: the compaction's inputs are log files (log -> L1), so no
+  // SSTable block of theirs was ever cached and cached_input_blocks is 0
+  // by construction. The affinity signal is then the number of lookups
+  // this process made on the destination level since the previous such
+  // event: zero during a pure load, hundreds per second under a read
+  // mix. Without this every L1 output was refused by the affinity rule
+  // (cost-20260828-cache: warm files 0, skipped_affinity 248).
+  void onCompactionApplied(std::vector<std::string> const& outputs, std::vector<size_t> const& output_bytes, int dest_level, size_t cached_input_blocks, bool log_inputs = false);
   void startWarmWorker();
   // Joins the worker; queued files are dropped. Idempotent; the
   // destructor calls it.
@@ -404,6 +412,9 @@ class LRUCache {
   bool warm_started_ = false;
   bool warm_stop_ = false;
   bool warm_busy_ = false;
+  // Per-level lookup count at the previous log-input compaction event
+  // (guarded by warm_mtx_); see onCompactionApplied.
+  uint64_t level_lookups_at_last_log_event_[kLevelSlots] = {};
   std::thread warm_thread_;
   void warmLoop();
   void warmOne(std::string const& file_name);

@@ -395,6 +395,46 @@ TEST(LRUCacheTest, WarmWorkerQueueAndSkips) {
   fx.cache.stopWarmWorker();  // idempotent
 }
 
+// A log -> L1 compaction has no cached input blocks by construction; its
+// affinity is the number of L1 lookups since the previous such event.
+TEST(LRUCacheTest, WarmAffinityForLogInputs) {
+  CacheFixture fx;
+  std::string const f_out = "sstable1/out_" + stamp() + ".sst";
+  std::string const f_read = "sstable1/read_" + stamp() + ".sst";
+  buildTable(&fx.storage, f_out, 100, 600);
+  buildTable(&fx.storage, f_read, 100, 600);
+  LRUCache::WarmPolicy p;
+  p.enabled = true;
+  p.max_fraction = 1.0;
+  p.min_input_blocks = 1;
+  fx.cache.setWarmPolicy(p);
+  fx.cache.startWarmWorker();
+  size_t const bytes = fx.storage.size(f_out);
+
+  // No L1 lookup yet (a pure load): refused.
+  fx.cache.onCompactionApplied({f_out}, {bytes}, 1, 0, /*log_inputs=*/true);
+  fx.cache.waitWarmIdle();
+  EXPECT_EQ(fx.cache.stats().warm_skipped_affinity, 1u);
+  EXPECT_EQ(fx.cache.stats().warm_files, 0u);
+
+  // One L1 lookup since the last event: warmed.
+  Table* t = nullptr;
+  fx.cache.getSSTable(f_read, t);
+  ASSERT_NE(t, nullptr);
+  std::shared_ptr<Record> rec;
+  ASSERT_EQ(t->get("key0", rec), Status::kSuccess);
+  fx.cache.onCompactionApplied({f_out}, {bytes}, 1, 0, /*log_inputs=*/true);
+  fx.cache.waitWarmIdle();
+  EXPECT_EQ(fx.cache.stats().warm_files, 1u);
+  EXPECT_EQ(fx.cache.stats().warm_skipped_affinity, 1u);
+
+  // The counter is a delta: no lookup since, refused again.
+  fx.cache.onCompactionApplied({f_out}, {bytes}, 1, 0, /*log_inputs=*/true);
+  fx.cache.waitWarmIdle();
+  EXPECT_EQ(fx.cache.stats().warm_skipped_affinity, 2u);
+  fx.cache.stopWarmWorker();
+}
+
 // The queue is bounded: with max_queue 2, offering 5 files drops the 3
 // oldest. Checked with the worker stopped so nothing is consumed
 // (the entries are dropped by stop; only the counter matters here).
