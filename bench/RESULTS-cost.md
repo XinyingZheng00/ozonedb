@@ -307,7 +307,11 @@ reader holds no lock across the block read. The reader's entry lookup in `readDa
 then failed, `table` became null, and `blockReader` dereferenced it. Fix (`96b9265d`):
 removed Tables are retired for 30 s instead of deleted, `readDataBlocks` falls back to the
 caller's Table and treats a missing Table or a failed block read as a failed fetch
-through the existing cleanup path, and `LRUCache::get` uses lookups only. With the fix the
+through the existing cleanup path, and `LRUCache::get` uses lookups only. Correction
+(2026-08-28): `invalidateLogFile` runs only for log-prefix names (`LogHandler::onRemoteAppend`
+rejects other files), so it cannot have deleted an SSTable's `Table*`; the null `table`
+came from a cache entry without a `Table*`, and the `caller_table` fallback with the null
+guards is the part of the fix that matters. The retired-Table deque is harmless. With the fix the
 600 s cells finish 8/8, the fallback path logs 8 and 27 removed-file misses per cell, and
 YCSB counts 1 and 6 failed reads.
 
@@ -404,12 +408,20 @@ counters agree: `h` = 0.179 under workload a against 0.650 under workload c at 5
 0.010 against 0.231 at 8 MB. The cost model takes `h` from the workload-c sweep, so it
 understates the GET line of a 50 % write mix at high cache ratios; at the projection's
 0.16 % ratio (16 GB on 10 TB) both `h` values are small and the gap is at most 17 % of the
-GET line. Two mechanisms fit the numbers and are not yet separated: the LRU also holds
-parsed log records, and every process indexes every writer's puts (about 1.3 MB/s, 780 MB
-per 600 s cell, more than the 512 MB cache), which evicts blocks; and peer compactions
-replace files whose blocks are cached (a writer publishes its own outputs write-through,
-the other seven see cold files). A split LRU (blocks against log tail) is the measurement
-that separates them.
+GET line. The mechanism, from `src/db/cache.cpp` (corrected 2026-08-28; an earlier version
+of this paragraph blamed the log tail): `current_size`, `capacity` and `lru_list` hold only
+SSTable blocks. Log records live in a per-file map outside the byte budget and leave only
+when their log file is compacted (`invalidateLogFile`), so they cannot evict blocks; they
+do add to RSS. What empties the block cache under writes is compaction itself. Every
+compaction output is cold in the seven processes that did not build it (the builder
+publishes its blocks write-through, `TableBuilder::flush`); the hot keys of a zipfian
+write mix are also the most often updated, so their newest versions sit in the log and in
+the level that is rewritten most often; and a deleted SSTable's blocks are never dropped
+(`invalidateLogFile` runs only for log-prefix names), so they stay in the budget until
+they reach the LRU tail, and its `Table*` is never freed. With 4 KiB blocks a file warms
+16x more slowly than with 64 KiB, and under workload a the L1 files are rewritten faster
+than that. The measurement that separates these: block-cache misses per level, and bytes
+in the budget that belong to files no longer in the View, both printable at DB close.
 
 ### Projection: 10,000 ops/s, 50 % reads, RF=3 (USD per month)
 
@@ -441,8 +453,12 @@ the crossover from 17.8 TB to 14.7 TB. Figure: `results-cost-20260829-rr.png`.
    length)` tested the stream pointer, not the stream. Fixed in `2380ddf0`; found by the
    new truncated-file test. The S3 backend was not affected.
 4. **Under a write-heavy mix the block cache is nearly cold.** `h` 0.18 against 0.65 at a
-   52 % cache ratio. The projection's `h` comes from the read-only sweep; a split LRU is
-   the next measurement, and the next lever after cache bytes.
+   52 % cache ratio. The projection's `h` comes from the read-only sweep. The cause is
+   compaction, not the log tail (the LRU budget holds blocks only): outputs are cold in
+   every process but their builder, and deleted files' blocks are never dropped. The next
+   levers, in order: drop a deleted SSTable's blocks and `Table*` on its REMOVE; warm a
+   compaction output in the peers with one range read per output (the read path that
+   compaction now uses); count misses per level to size the effect first.
 
 ## Method notes and caveats
 
