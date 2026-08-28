@@ -23,7 +23,11 @@ namespace ozonedb {
 // front of the object store that holds them (bench/PLAN-disk-cache.md).
 //
 // Entries are whole files: "<dir>/<name>" is a complete local copy,
-// "<dir>/<name>.part" is one in progress. Only names with `prefix` are
+// "<dir>/<name>.part" is a write-through in progress, "<dir>/<name>.fillpart"
+// is a background fill in progress. The fill never touches the write-through's
+// stream or its .part file (and vice versa) so the two populators can never
+// interleave bytes or race a discard/rename into a truncated "complete" file
+// (found in review of PLAN-disk-cache T3). Only names with `prefix` are
 // cached; everything else passes straight through to the backing store
 // (checkpoint/LATEST is mutable and must never be cached).
 //
@@ -83,8 +87,9 @@ class DiskCacheStorage : public Storage {
   bool cacheable(std::string const& name) const;
   // Drops the local copy (complete or in progress); the object stays.
   void invalidate(std::string const& name);
-  // Scans dir: deletes .part files and complete files for which live(name,
-  // bytes) is false, admits the rest oldest first. Returns the number deleted.
+  // Scans dir: deletes .part and .fillpart files and complete files for which
+  // live(name, bytes) is false, admits the rest oldest first. Returns the
+  // number deleted.
   size_t reconcile(std::function<bool(std::string const&, size_t)> const& live);
   void startFillWorker();
   void stopFillWorker();
@@ -102,6 +107,10 @@ class DiskCacheStorage : public Storage {
 
   std::string localPath(std::string const& name) const { return options_.dir + name; }
   std::string partPath(std::string const& name) const { return options_.dir + name + ".part"; }
+  // The fill's own temp file: never shared with parts_/writePart/discardPart,
+  // so a peer invalidate() or a concurrent write-through can't truncate or
+  // interleave into a fill in progress.
+  std::string fillPartPath(std::string const& name) const { return options_.dir + name + ".fillpart"; }
   // Returns true and moves the entry to the LRU front when a complete copy exists.
   bool touch(std::string const& name);
   bool present(std::string const& name);
@@ -112,6 +121,11 @@ class DiskCacheStorage : public Storage {
   // Closes the .part, renames it into place and admits it; discards it on any failure.
   bool publishPart(std::string const& name);
   void discardPart(std::string const& name);
+  // Shared publish tail for a finished file at `part_path`: verifies its size
+  // (against `expected_size` when nonzero), checks the budget, renames into
+  // place and admits it. False (and the part removed) on any failure,
+  // including the part having vanished or a size mismatch.
+  bool publishPartFile(std::string const& name, std::string const& part_path, size_t expected_size);
   // Under mtx_: evicts until `bytes` fits, then inserts. False when bytes > capacity.
   bool admit(std::string const& name, size_t bytes);
   void evictToFitLocked(size_t bytes);
@@ -133,11 +147,16 @@ class DiskCacheStorage : public Storage {
   std::unordered_set<std::string> poisoned_parts_;
 
   std::mutex fill_mtx_;
+  // Serialises startFillWorker/stopFillWorker across the join: held for the
+  // whole body of each so two stops can't both pass the fill_started_ guard
+  // and both join() the same thread, and so a start can't race a stop's join.
+  std::mutex fill_lifecycle_mtx_;
   std::condition_variable fill_cv_;
   std::deque<std::string> fill_queue_;
   std::unordered_set<std::string> queued_;
   bool fill_started_ = false;
   bool fill_stop_ = false;
+  bool fill_stopping_ = false;  // set for the duration of a stopFillWorker() call
   bool fill_busy_ = false;
   std::thread fill_thread_;
 

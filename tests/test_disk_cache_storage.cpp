@@ -45,6 +45,36 @@ class CountingStorage : public FileStorage {
   int sizes = 0;
 };
 
+// A CountingStorage whose ranged read deletes a path (the fill's private
+// temp file, by construction) after its Nth call, to exercise a part
+// vanishing mid-fill (review finding, PLAN-disk-cache T3 fix 1).
+class PartVanishingStorage : public CountingStorage {
+ public:
+  PartVanishingStorage(std::string const& path, std::string vanish_path, int vanish_on_call)
+      : CountingStorage(path), vanish_path_(std::move(vanish_path)), vanish_on_call_(vanish_on_call) {}
+  Status read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) override {
+    Status s = CountingStorage::read(fileName, data, a, length);
+    if (++calls_ == vanish_on_call_) std::filesystem::remove(vanish_path_);
+    return s;
+  }
+  std::string vanish_path_;
+  int vanish_on_call_;
+  int calls_ = 0;
+};
+
+// A CountingStorage whose ranged read sleeps before delegating, so a test
+// can reliably land on "the worker is mid-fill" (review finding,
+// PLAN-disk-cache T3 fix 2).
+class SlowStorage : public CountingStorage {
+ public:
+  SlowStorage(std::string const& path, std::chrono::milliseconds delay) : CountingStorage(path), delay_(delay) {}
+  Status read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) override {
+    std::this_thread::sleep_for(delay_);
+    return CountingStorage::read(fileName, data, a, length);
+  }
+  std::chrono::milliseconds delay_;
+};
+
 struct TierFixture {
   std::string backing_dir;
   std::string tier_dir;
@@ -296,4 +326,78 @@ TEST(DiskCacheStorageTest, FillQueueIsBoundedAndDeduplicated) {
   EXPECT_FALSE(f.local(names[1]));
   EXPECT_TRUE(f.local(names[2]));
   EXPECT_TRUE(f.local(names[3]));
+}
+
+TEST(DiskCacheStorageTest, FillFailsCleanlyWhenItsPartVanishesMidway) {
+  TierFixture f(1u << 20, /*chunk=*/1024);
+  DiskCacheStorage::Options o = f.tier->options();
+  f.tier.reset();
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  f.seed(name, 3 * 1024 + 1);
+  std::string const fill_part = f.tier_dir + name + ".fillpart";
+  // Call 1 is the outer miss-serving read; calls 2-5 are the fill's own
+  // chunk reads (4 chunks: 3 full + 1 byte). Delete the fill's private temp
+  // file out from under it during its second chunk (overall call 3) --
+  // the write-through's .part is untouched, so this is purely a "the fill's
+  // own part vanished" race, not a shared-stream race.
+  auto owned = std::make_unique<PartVanishingStorage>(f.backing_dir, fill_part, /*vanish_on_call=*/3);
+  f.backing = owned.get();
+  f.tier = std::make_unique<DiskCacheStorage>(std::move(owned), o);
+  f.tier->startFillWorker();
+
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(name, data, 0, 10), Status::kSuccess);
+  delete[] data;
+  f.tier->waitFillIdle();
+
+  // No complete local file appears -- in particular not a truncated one --
+  // and the failure is counted, not silently swallowed or double-counted
+  // against fill_skipped_budget.
+  EXPECT_FALSE(f.local(name));
+  EXPECT_FALSE(std::filesystem::exists(fill_part));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.fill_failed, 1u);
+  EXPECT_EQ(s.fills, 0u);
+  EXPECT_EQ(s.fill_skipped_budget, 0u);
+}
+
+TEST(DiskCacheStorageTest, StopIsSerialisedAcrossTheJoinAndWaitFillIdleIsNeverStranded) {
+  TierFixture f(1u << 20, /*chunk=*/1024);
+  DiskCacheStorage::Options o = f.tier->options();
+  f.tier.reset();
+  auto owned = std::make_unique<SlowStorage>(f.backing_dir, std::chrono::milliseconds(150));
+  f.backing = owned.get();
+  f.tier = std::make_unique<DiskCacheStorage>(std::move(owned), o);
+
+  std::string const name1 = "sstable1/" + stamp() + "_1.sst";
+  std::string const name2 = "sstable1/" + stamp() + "_2.sst";
+  f.seed(name1, 100);
+  f.seed(name2, 100);
+
+  // Two misses queue two fills before the worker runs, so both survive in
+  // the queue for the worker to pick up once started.
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read(name1, data, 0, 10), Status::kSuccess);
+  delete[] data;
+  ASSERT_EQ(f.tier->read(name2, data, 0, 10), Status::kSuccess);
+  delete[] data;
+
+  f.tier->startFillWorker();
+  // The worker dequeues name1 and blocks ~150ms inside its (slow) chunk
+  // read. stopFillWorker() below is called within microseconds of start, so
+  // it signals well before that read returns -- name2 is left in the queue.
+  std::thread waiter([&f] { f.tier->waitFillIdle(); });
+  f.tier->stopFillWorker();
+  waiter.join();  // must return promptly: this is the regression under test
+
+  EXPECT_TRUE(f.local(name1));   // the in-flight fill was allowed to finish
+  EXPECT_FALSE(f.local(name2));  // never started; still sitting in the queue
+
+  // A second stop must not throw std::system_error from a racing join().
+  EXPECT_NO_THROW(f.tier->stopFillWorker());
+
+  // A restart drains what was left over, proving start/stop can cycle.
+  f.tier->startFillWorker();
+  f.tier->waitFillIdle();
+  EXPECT_TRUE(f.local(name2));
 }

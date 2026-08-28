@@ -219,17 +219,25 @@ bool DiskCacheStorage::publishPart(std::string const& name) {
       return false;
     }
   }
+  return publishPartFile(name, partPath(name), /*expected_size=*/0);
+}
+
+bool DiskCacheStorage::publishPartFile(std::string const& name, std::string const& part_path, size_t expected_size) {
   std::error_code ec;
-  auto bytes = fs::file_size(partPath(name), ec);
-  if (ec) return false;
+  auto bytes = fs::file_size(part_path, ec);
+  if (ec) return false;  // the part vanished from under us (raced a discard/invalidate/rename)
+  if (expected_size != 0 && static_cast<size_t>(bytes) != expected_size) {
+    fs::remove(part_path, ec);
+    return false;
+  }
   if (bytes > options_.capacity_bytes) {
-    fs::remove(partPath(name), ec);
+    fs::remove(part_path, ec);
     fill_skipped_budget_.fetch_add(1);
     return false;
   }
-  fs::rename(partPath(name), localPath(name), ec);
+  fs::rename(part_path, localPath(name), ec);
   if (ec) {
-    fs::remove(partPath(name), ec);
+    fs::remove(part_path, ec);
     return false;
   }
   return admit(name, static_cast<size_t>(bytes));  // the caller counts a write-through or a fill
@@ -299,6 +307,7 @@ void DiskCacheStorage::enqueueFill(std::string const& name) {
 }
 
 void DiskCacheStorage::startFillWorker() {
+  std::lock_guard<std::mutex> life(fill_lifecycle_mtx_);  // serialised against a concurrent stop's join
   std::lock_guard<std::mutex> lk(fill_mtx_);
   if (fill_started_) return;
   fill_started_ = true;
@@ -307,20 +316,26 @@ void DiskCacheStorage::startFillWorker() {
 }
 
 void DiskCacheStorage::stopFillWorker() {
+  std::lock_guard<std::mutex> life(fill_lifecycle_mtx_);  // only one stop (or start) proceeds at a time
   {
     std::lock_guard<std::mutex> lk(fill_mtx_);
-    if (!fill_started_) return;
+    if (!fill_started_) return;  // a racing stop already finished under the lifecycle lock
     fill_stop_ = true;
-    fill_cv_.notify_all();
+    fill_stopping_ = true;
+    fill_cv_.notify_all();  // wakes a waitFillIdle() parked on a non-empty queue
   }
   fill_thread_.join();
-  std::lock_guard<std::mutex> lk(fill_mtx_);
-  fill_started_ = false;
+  {
+    std::lock_guard<std::mutex> lk(fill_mtx_);
+    fill_started_ = false;
+    fill_stopping_ = false;
+  }
+  fill_cv_.notify_all();  // wakes anyone whose predicate only became true once fill_started_ cleared
 }
 
 void DiskCacheStorage::waitFillIdle() {
   std::unique_lock<std::mutex> lk(fill_mtx_);
-  fill_cv_.wait(lk, [this] { return !fill_started_ || (fill_queue_.empty() && !fill_busy_); });
+  fill_cv_.wait(lk, [this] { return !fill_started_ || fill_stopping_ || (fill_queue_.empty() && !fill_busy_); });
 }
 
 void DiskCacheStorage::fillLoop() {
@@ -362,20 +377,44 @@ void DiskCacheStorage::fillOne(std::string const& name) {
     fill_skipped_budget_.fetch_add(1);
     return;
   }
+  // The fill owns this stream outright: it never touches parts_/writePart/
+  // discardPart, so a concurrent write-through or a peer invalidate() (which
+  // only ever acts on partPath(name)) can neither truncate nor interleave
+  // into it (review finding, PLAN-disk-cache T3).
+  std::string const tmp = fillPartPath(name);
+  std::error_code ec;
+  fs::create_directories(fs::path(tmp).parent_path(), ec);
+  std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) {
+    fill_failed_.fetch_add(1);
+    return;
+  }
   for (size_t off = 0; off < total; off += options_.chunk_bytes) {
     size_t const len = std::min(options_.chunk_bytes, total - off);
     unsigned char* buf = nullptr;
     Status s = backing_->read(name, buf, off, len);
     fill_gets_.fetch_add(1);
     if (s != Status::kSuccess || buf == nullptr) {
-      discardPart(name);
+      out.close();
+      fs::remove(tmp, ec);
       fill_failed_.fetch_add(1);
       return;
     }
-    writePart(name, buf, len);
+    out.write(reinterpret_cast<char const*>(buf), static_cast<std::streamsize>(len));
     delete[] buf;
   }
-  if (publishPart(name)) {
+  out.flush();
+  bool const write_ok = static_cast<bool>(out);
+  out.close();
+  if (!write_ok) {
+    fs::remove(tmp, ec);
+    fill_failed_.fetch_add(1);
+    return;
+  }
+  // Verify the part's byte count against the backing's before publishing: a
+  // mismatch (or the part having vanished) fails closed instead of admitting
+  // a truncated file as complete.
+  if (publishPartFile(name, tmp, total)) {
     fills_.fetch_add(1);
     fill_bytes_.fetch_add(total);
   } else {
