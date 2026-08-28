@@ -3,7 +3,7 @@
 // Usage:
 //   corfu_stream_stats <corfu-endpoint> <corfu-bridge.jar> <stream-name> [--client jni|native]
 //
-// --client selects the CorfuClient (default jni). The differential test of
+// --client selects the CorfuClient (default native). The differential test of
 // PLAN-native-corfu.md phase 2 runs it once per client on the same stream
 // and compares the replay line, [stats] applied_addr, the entry counts and
 // the file digest below.

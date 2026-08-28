@@ -41,9 +41,10 @@ class Metadata {
   // for the tailer instead; only for A/B measurement.
   bool corfu_fast_ack = true;
   // Which Corfu client drives the stream (PLAN-native-corfu.md §4.7):
-  // "jni" = the embedded JVM + CorfuBridge.java, "native" = the C++
-  // client in src/db/corfu/. The A/B switch for every measurement.
-  std::string corfu_client = "jni";
+  // "native" = the C++ client in src/db/corfu/ (the default), "jni" =
+  // the embedded JVM + CorfuBridge.java. The A/B switch for every
+  // measurement.
+  std::string corfu_client = "native";
   // Native client tuning. Defaults mirror the Java runtime as the bridge
   // configures it. Ignored by the JNI client.
   int corfu_read_batch = 1000;             // addresses per ReadLogRequest

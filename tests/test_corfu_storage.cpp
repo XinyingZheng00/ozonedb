@@ -25,12 +25,12 @@ class CorfuStorageEnv {
     char const* j = std::getenv("CORFU_BRIDGE_JAR");
     return j ? std::string(j) : std::string();
   }
-  // CORFU_TEST_CLIENT selects the CorfuClient the suite runs on: "jni"
-  // (default) or "native". The whole suite runs once per value
+  // CORFU_TEST_CLIENT selects the CorfuClient the suite runs on: "native"
+  // (default) or "jni". The whole suite runs once per value
   // (PLAN-native-corfu.md phase 3). The jar is needed for jni only.
   static std::string client() {
     char const* c = std::getenv("CORFU_TEST_CLIENT");
-    return c && *c ? std::string(c) : std::string("jni");
+    return c && *c ? std::string(c) : std::string("native");
   }
   static bool available() {
     if (endpoint().empty()) return false;

@@ -166,8 +166,16 @@ def log_trim_corfu_settings(corfu_settings):
 
 # The two Corfu clients of CorfuDBStorage (src/include/ozonedb/corfu_client.h).
 CORFU_CLIENTS = ("jni", "native")
+# What Metadata and the base config select when neither --corfu-client nor
+# corfu.client says otherwise. Must match src/config/corfu/shared_config_base.json.
+DEFAULT_CORFU_CLIENT = "native"
 # Suffix appended to the result-file engine token on the native client.
 NATIVE_LABEL_SUFFIX = "-native"
+
+
+def effective_corfu_client(corfu_settings):
+    """The client a run actually uses: corfu.client, else the default."""
+    return (corfu_settings or {}).get("client") or DEFAULT_CORFU_CLIENT
 
 
 def corfu_client_corfu_settings(corfu_settings, client):
@@ -310,9 +318,11 @@ def result_label(db_name, corfu_settings, cassandra_settings=None, lru_cache_byt
         (corfu_settings or {}).get("linearizable_reads")
     ):
         label += LINEARIZABLE_LABEL_SUFFIX
-    # The Corfu client (--corfu-client, or corfu.client): `native` gets a
-    # token, `jni` (the default) keeps every earlier result file's name.
-    if db_name == "ozonedb-corfu" and (corfu_settings or {}).get("client") == "native":
+    # The Corfu client (--corfu-client, corfu.client, else the default):
+    # `native` gets a token, `jni` keeps the name every result file had
+    # before the native client existed. Derived from the EFFECTIVE client,
+    # so a run that takes the default is labelled ozonedb-corfu-native too.
+    if db_name == "ozonedb-corfu" and effective_corfu_client(corfu_settings) == "native":
         label += NATIVE_LABEL_SUFFIX
     if db_name == "cassandra":
         return db_name + "-" + cassandra_mode(cassandra_settings)
@@ -349,7 +359,7 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         if "jvm_opts" in corfu_settings:
             data["corfu_jvm_opts"] = corfu_settings["jvm_opts"]
         # The Corfu client (--corfu-client): jni or native. Metadata
-        # rejects anything else. Absent => the base config's value (jni).
+        # rejects anything else. Absent => the base config's value (native).
         if corfu_settings.get("client"):
             data["corfu_client"] = str(corfu_settings["client"])
         # Compaction-tuning passthrough — used by the compaction-contention
@@ -859,8 +869,8 @@ if __name__ == "__main__":
         choices=CORFU_CLIENTS,
         default=None,
         help="ozonedb-corfu only: which Corfu client every writer runs, written as "
-             "corfu_client into each generated shared_config. jni = the embedded JVM + "
-             "CorfuBridge (default), native = the C++ client (PLAN-native-corfu.md); "
+             "corfu_client into each generated shared_config. native = the C++ client "
+             "(PLAN-native-corfu.md, default), jni = the embedded JVM + CorfuBridge; "
              "native result files get a -native token. Prefer this over a ycsb.yaml edit.",
     )
     parser.add_argument(

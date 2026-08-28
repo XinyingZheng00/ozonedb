@@ -53,7 +53,7 @@ Usage: $(basename "$0") [options]
                     bucket: snapshot the bucket together with /mnt/corfu/load.
   --record-cnt N    dataset size in records, forwarded as --record_cnt
   --corfu-client C  forward --corfu-client jni|native to the loader (the
-                    C++ client is `native`, PLAN-native-corfu.md)
+                    C++ client `native` is the default, PLAN-native-corfu.md)
   --corfu-dir PATH  corfu repo on the log node (default: $CORFU_DIR)
   --dry-run         print the plan; no ssh
   -h | --help

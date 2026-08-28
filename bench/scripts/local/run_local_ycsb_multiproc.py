@@ -410,8 +410,8 @@ if __name__ == "__main__":
         choices=CORFU_CLIENTS,
         default=None,
         help="ozonedb-corfu only: which Corfu client every writer runs, written as "
-             "corfu_client into each generated shared_config. jni = the embedded JVM + "
-             "CorfuBridge (default), native = the C++ client (PLAN-native-corfu.md); "
+             "corfu_client into each generated shared_config. native = the C++ client "
+             "(PLAN-native-corfu.md, default), jni = the embedded JVM + CorfuBridge; "
              "native result files get a -native token. Prefer this over a ycsb.yaml edit.",
     )
     parser.add_argument(

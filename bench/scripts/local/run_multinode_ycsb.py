@@ -552,8 +552,8 @@ def main():
         "--corfu-client",
         choices=CORFU_CLIENTS,
         default=None,
-        help="Pass-through to per-host runner (ozonedb-corfu only): jni (embedded JVM + "
-             "CorfuBridge, default) or native (the C++ client); native result files "
+        help="Pass-through to per-host runner (ozonedb-corfu only): native (the C++ "
+             "client, default) or jni (embedded JVM + CorfuBridge); native result files "
              "are labelled ozonedb-corfu-native.",
     )
     parser.add_argument(

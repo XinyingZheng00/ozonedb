@@ -122,9 +122,9 @@ Usage: $(basename "$0") [options]
                             trust_background_tail=false, and result files
                             are labelled ozonedb-corfu-linearizable instead
                             of ozonedb-corfu. Use this, never a ycsb.yaml edit.
-  --corfu-client jni|native the Corfu client every writer runs: jni (the
-                            embedded JVM + CorfuBridge, default) or native
-                            (the C++ client, PLAN-native-corfu.md). native
+  --corfu-client jni|native the Corfu client every writer runs: native (the
+                            C++ client, PLAN-native-corfu.md, default) or
+                            jni (the embedded JVM + CorfuBridge). native
                             result files are labelled ozonedb-corfu-native.
   --log-trim                log trimming: global writer 0 checkpoints the
                             Corfu stream to the bucket and trims behind the

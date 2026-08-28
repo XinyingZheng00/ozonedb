@@ -15,9 +15,10 @@ namespace ozonedb {
 struct CorfuClientOptions {
   std::string endpoint;      // "host:port" of the single Corfu node
   std::string stream_name;   // the OzoneDB stream (corfu_stream_name)
-  // "jni": the embedded JVM + CorfuBridge.java (corfu_client_jni.cpp).
-  // "native": the C++ client in src/db/corfu/ (PLAN-native-corfu.md).
-  std::string client = "jni";
+  // "native": the C++ client in src/db/corfu/ (PLAN-native-corfu.md), the
+  // default since the phase 5 campaign of 2026-08-27. "jni": the embedded
+  // JVM + CorfuBridge.java (corfu_client_jni.cpp), kept for A/B runs.
+  std::string client = "native";
   std::string jar_path;      // jni only: the corfu-bridge fat jar
   std::string jvm_opts;      // jni only: extra -X / -D options
   // native only. Defaults mirror the Java runtime as the bridge sets it.
