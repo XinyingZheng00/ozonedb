@@ -357,6 +357,7 @@ void MetadataLogHandler::drainCacheEvents() {
     bool log_inputs = !ev.inputs.empty();
     for (auto const& input : ev.inputs) {
       cached_input_blocks += this->lru_cache->invalidateSSTable(input);
+      if (this->sstable_removed_listener_) this->sstable_removed_listener_(input);
       if (LRUCache::levelSlot(input) != 0) log_inputs = false;
     }
     // Part B: the outputs go to the warm worker, which applies the

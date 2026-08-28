@@ -1,4 +1,5 @@
 #include "db.h"
+#include "disk_cache_storage.h"
 #include "helper.h"
 #include "thread_pool.h"
 #ifdef OZONEDB_ENABLE_CORFU
@@ -75,6 +76,22 @@ DB::DB(std::string const& shared_config_path) {
                                         *this->metadata, /*for_sstables=*/true,
                                         /*checkpoint_store=*/nullptr);
   }
+  // Disk-backed read-through tier in front of the SSTable object store
+  // (bench/PLAN-disk-cache.md). Metadata's constructor already rejects
+  // disk_cache_dir without sstable_backend, so sstable_storage above is
+  // guaranteed non-null here whenever this fires.
+  if (!this->metadata->disk_cache_dir.empty()) {
+    DiskCacheStorage::Options o;
+    o.dir = this->metadata->disk_cache_dir;
+    o.capacity_bytes = this->metadata->disk_cache_bytes;
+    o.prefix = this->metadata->sstable_level_prefix;
+    o.chunk_bytes = static_cast<size_t>(this->metadata->disk_cache_chunk_bytes);
+    o.drop_pages = this->metadata->disk_cache_drop_pages;
+    o.max_queue = static_cast<size_t>(this->metadata->disk_cache_fill_queue);
+    auto* tier = new DiskCacheStorage(std::unique_ptr<Storage>(this->sstable_storage), o);
+    this->sstable_storage = tier;
+    this->disk_cache = tier;
+  }
   this->log_storage = makeStorage(this->metadata->backend_kind,
                                   *this->metadata, /*for_sstables=*/false,
                                   /*checkpoint_store=*/this->sstable_storage);
@@ -93,6 +110,10 @@ DB::DB(std::string const& shared_config_path) {
                                  this->log_storage, this->sstable_storage);
   this->metadata_log = new MetadataLogHandler(this->metadata->metadata_log, this->log_storage, this->tail_cache);
   this->metadata_log->setLRUCache(this->lru_cache);
+  if (this->disk_cache != nullptr) {
+    DiskCacheStorage* tier = this->disk_cache;
+    this->metadata_log->setSSTableRemovedListener([tier](std::string const& file_name) { tier->invalidate(file_name); });
+  }
   this->metadata_log->setMetadata(this->metadata);
   {
     // Compaction-aware block cache (bench/PLAN-compaction-cache.md, part
@@ -183,6 +204,16 @@ Status DB::openDB(DB*& db, std::string const& shared_config_path) {
   db->log_handler->setLatestView(view_ptr);
   db->lru_cache->setLatestView(view_ptr);
   db->lru_cache->startWarmWorker();
+  if (db->disk_cache != nullptr) {
+    std::shared_ptr<View const> view = db->latest_view_snapshot;
+    size_t const removed = db->disk_cache->reconcile([view](std::string const& name, size_t bytes) {
+      if (!view || view->key_range.find(name) == view->key_range.end()) return false;
+      auto sz = view->file_size.find(name);
+      return sz == view->file_size.end() || sz->second == bytes;
+    });
+    std::cerr << "[disk_cache] reconciled " << db->disk_cache->stats().files << " files, removed " << removed << "\n";
+    db->disk_cache->startFillWorker();
+  }
   db->log_handler->warmKeyIndex();
   if (db->metadata->compaction_policy == CompactionPolicy::kHoAl) {
     // only use in the case of HoAl and HeAl
@@ -223,7 +254,9 @@ Status DB::closeDB(DB*& db) {
   // Join the warm worker before the counters print, so a warm in flight
   // is counted and no thread touches the stores after this point.
   db->lru_cache->stopWarmWorker();
+  if (db->disk_cache != nullptr) db->disk_cache->stopFillWorker();
   db->lru_cache->printCacheStats();
+  if (db->disk_cache != nullptr) db->disk_cache->printStats();
   delete db;
   return Status::kSuccess;
 }

@@ -7,6 +7,7 @@
 #include "protobuf_serializer.h"
 #include "storage.h"
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <queue>
@@ -54,6 +55,9 @@ class MetadataLogHandler {
   Storage* storage = nullptr;
   TailCache* tail_cache = nullptr;
   LRUCache* lru_cache = nullptr;
+  // Called with each COMPACT input after the RAM cache dropped it, outside
+  // view_mutex (drainCacheEvents). The DB wires the disk tier here.
+  std::function<void(std::string const&)> sstable_removed_listener_;
   std::thread* update_view_thread = nullptr;
   View latest_view;
   // Immutable snapshot of latest_view, swapped atomically by
@@ -133,6 +137,10 @@ class MetadataLogHandler {
   
   // set lru cache
   void setLRUCache(LRUCache* lru_cache) { this->lru_cache = lru_cache; }
+
+  // Called with each COMPACT input after the RAM cache dropped it, outside
+  // view_mutex (drainCacheEvents). The DB wires the disk tier here.
+  void setSSTableRemovedListener(std::function<void(std::string const&)> listener) { this->sstable_removed_listener_ = std::move(listener); }
 
   // set metadata
   void setMetadata(Metadata* metadata) { this->metadata = metadata; }

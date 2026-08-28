@@ -15,6 +15,8 @@
 #include "metadata.h"
 #include "storage.h"
 
+#include <stdexcept>
+
 using namespace ozonedb;
 
 namespace {
@@ -552,4 +554,70 @@ TEST(DiskCacheStorageTest, ReconcileDropsPartsDeadFilesAndForeignNames) {
   ASSERT_EQ(f.tier->read("sstable1/live.sst", data, 0, 10), Status::kSuccess);
   delete[] data;
   EXPECT_EQ(f.tier->stats().hits, 1u);
+}
+
+TEST(DiskCacheStorageTest, MetadataParsesTheDiskCacheKeys) {
+  std::string const dir = kRoot + "cfg_" + stamp() + "/";
+  std::filesystem::create_directories(dir);
+  // parseJSON (src/util/read_json.cpp) is line-oriented: it skips a whole
+  // line whenever it starts with '{' or '}', so it expects one key per
+  // line with '{'/'}' each on their own line -- exactly how every real
+  // config under src/config/ is pretty-printed. Writing the object as one
+  // long line (as a literal `{"a": 1, "b": 2}` would) makes the entire
+  // body land on a single line whose first character is '{', so the whole
+  // thing is skipped and every key comes back missing. `write` below
+  // wraps a body of one "key": value per line instead.
+  auto write = [&](std::string const& body) {
+    std::string const path = dir + "cfg.json";
+    std::ofstream(path) << "{\n" << body << "\n}\n";
+    return path;
+  };
+  // Every key Metadata's constructor requires unconditionally (copied from
+  // src/config/local/shared_config_base.json), plus sstable_backend /
+  // sstable_dir / lru_cache_bytes for the disk-cache keys under test.
+  std::string const base =
+      "\"backend\": \"local\",\n"
+      "\"db_path\": \"" + dir + "db/\",\n"
+      "\"mode\": 1,\n"
+      "\"log_file_size_limit\": 33554432,\n"
+      "\"base_file_number_limit\": 2,\n"
+      "\"level_size\": \"[268435456, 2684354560]\",\n"
+      "\"level_file_size_limit\": \"[67108864, 67108864]\",\n"
+      "\"max_level\": 2,\n"
+      "\"compaction_policy\": 0,\n"
+      "\"sstable_backend\": \"local\",\n"
+      "\"sstable_dir\": \"" + dir + "sst/\",\n"
+      "\"lru_cache_bytes\": 1048576";
+  {
+    Metadata md(write(base +
+        ",\n\"disk_cache_dir\": \"/tank/cache/w0\",\n"
+        "\"disk_cache_bytes\": \"2147483648\",\n"
+        "\"disk_cache_drop_pages\": \"false\""));
+    EXPECT_EQ(md.disk_cache_dir, "/tank/cache/w0/");  // slash appended
+    EXPECT_EQ(md.disk_cache_bytes, 2147483648ull);
+    EXPECT_FALSE(md.disk_cache_drop_pages);
+    EXPECT_EQ(md.disk_cache_chunk_bytes, 67108864ull);
+    EXPECT_EQ(md.disk_cache_fill_queue, 256ull);
+  }
+  {
+    Metadata md(write(base));
+    EXPECT_TRUE(md.disk_cache_dir.empty());
+    EXPECT_TRUE(md.disk_cache_drop_pages);
+  }
+  EXPECT_THROW(Metadata(write(base + ",\n\"disk_cache_dir\": \"/tank/cache/w0\"")),
+               std::runtime_error);  // bytes missing
+  std::string const no_backend =
+      "\"backend\": \"local\",\n"
+      "\"db_path\": \"" + dir + "db/\",\n"
+      "\"mode\": 1,\n"
+      "\"log_file_size_limit\": 33554432,\n"
+      "\"base_file_number_limit\": 2,\n"
+      "\"level_size\": \"[268435456, 2684354560]\",\n"
+      "\"level_file_size_limit\": \"[67108864, 67108864]\",\n"
+      "\"max_level\": 2,\n"
+      "\"compaction_policy\": 0,\n"
+      "\"disk_cache_dir\": \"/tank/cache/w0\",\n"
+      "\"disk_cache_bytes\": \"1\"";
+  EXPECT_THROW(Metadata(write(no_backend)), std::runtime_error);  // no sstable_backend
+  std::filesystem::remove_all(dir);
 }

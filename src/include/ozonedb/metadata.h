@@ -108,6 +108,14 @@ class Metadata {
   // not warm it, and a pure load warms nothing.
   uint64_t cache_warm_min_input_blocks = 1;
 
+  // Disk-backed read-through tier for SSTables (bench/PLAN-disk-cache.md).
+  // Empty dir = off. The dir gets a trailing '/'. Requires sstable_backend.
+  std::string disk_cache_dir;
+  uint64_t disk_cache_bytes = 0;
+  uint64_t disk_cache_chunk_bytes = 67108864;
+  bool disk_cache_drop_pages = true;
+  uint64_t disk_cache_fill_queue = 256;
+
   // When true, log reads trust the in-memory key index (kept fresh by
   // local addRecord and, on Corfu, the tailer's remote-append listener)
   // and skip the synchronous log-file scan entirely. Removes the
@@ -268,6 +276,29 @@ class Metadata {
     }
     if (auto it = result.find("cache_warm_min_input_blocks"); it != result.end()) {
       cache_warm_min_input_blocks = std::stoull(it->second);
+    }
+
+    if (auto it = result.find("disk_cache_dir"); it != result.end() && !it->second.empty()) {
+      disk_cache_dir = it->second;
+      if (disk_cache_dir.back() != '/') disk_cache_dir += '/';
+    }
+    if (auto it = result.find("disk_cache_bytes"); it != result.end()) {
+      disk_cache_bytes = std::stoull(it->second);
+    }
+    if (auto it = result.find("disk_cache_chunk_bytes"); it != result.end()) {
+      disk_cache_chunk_bytes = std::stoull(it->second);
+    }
+    if (auto it = result.find("disk_cache_drop_pages"); it != result.end()) {
+      disk_cache_drop_pages = !(it->second == "false" || it->second == "0");
+    }
+    if (auto it = result.find("disk_cache_fill_queue"); it != result.end()) {
+      disk_cache_fill_queue = std::stoull(it->second);
+    }
+    if (!disk_cache_dir.empty() && !sstable_backend_set) {
+      throw std::runtime_error("disk_cache_dir requires sstable_backend: the tier fronts the object store that holds the SSTables");
+    }
+    if (!disk_cache_dir.empty() && disk_cache_bytes == 0) {
+      throw std::runtime_error("disk_cache_dir requires disk_cache_bytes > 0");
     }
 
     auto tbt_it = result.find("trust_background_tail");

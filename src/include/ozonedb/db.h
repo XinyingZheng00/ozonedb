@@ -37,6 +37,7 @@ enum class Mode {
   MultipleProcesses,
 };
 class LogTrimmer;
+class DiskCacheStorage;
 class DB {
  private:
   /**
@@ -58,6 +59,9 @@ class DB {
    */
   Storage* log_storage = nullptr;
   Storage* sstable_storage = nullptr;
+  // The disk tier in front of sstable_storage when disk_cache_dir is set;
+  // then sstable_storage IS this object and owns the backing store. Non-owning.
+  DiskCacheStorage* disk_cache = nullptr;
   Metadata* metadata;
   CompactionWatcher* watcher = nullptr;
   // Only when Metadata::log_trim_enabled and the log backend is Corfu:
