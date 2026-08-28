@@ -1,0 +1,30 @@
+---
+# bench/ansible/disk_cache.yml -- format and mount the disk-cache SSD on the
+# clients (bench/PLAN-disk-cache.md, Task 7). Idempotent; re-run at will.
+#
+#   ansible-playbook bench/ansible/disk_cache.yml                 # auto-detect
+#   ansible-playbook bench/ansible/disk_cache.yml -e device=/dev/sdb
+- name: Format and mount the disk-cache SSD on the CloudLab clients
+  hosts: "{{ target | default('clients') }}"
+  gather_facts: false
+  strategy: free
+  vars:
+    device: ""
+    mount: /tank/cache
+    extra_args: ""
+  tasks:
+    - name: Resolve the repository location on the node
+      ansible.builtin.include_tasks: tasks/resolve_dest.yml
+
+    - name: Run setup_disk_cache.sh
+      ansible.builtin.shell: >-
+        bash -lc 'cd {{ repo_dest | quote }} &&
+        bash bench/scripts/setup_disk_cache.sh
+        {{ ("--device " ~ device) if device else "" }}
+        --mount {{ mount | quote }} {{ extra_args }}'
+      register: disk_cache
+      changed_when: "'formatting' in disk_cache.stdout"
+
+    - name: Report
+      ansible.builtin.debug:
+        var: disk_cache.stdout_lines

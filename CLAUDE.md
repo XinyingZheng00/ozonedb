@@ -24,6 +24,7 @@ bash bench/scripts/setup.sh --role client         # apt deps, JDK, python, /tank
 bash bench/scripts/setup.sh --role corfu-server   # CorfuDB + /mnt/corfu/{load,run_batch}
 bash bench/scripts/setup.sh --role minio          # minio + bucket (sstable_backend defaults to s3)
 bash bench/scripts/setup_zfs.sh --device /dev/sdXN
+bash bench/scripts/setup_disk_cache.sh --device /dev/sdb   # ext4 label ozcache at /tank/cache (disk-cache tier)
 ```
 
 - It writes `~/.ozonedb.env` and wires a marker-guarded include into `~/.profile` **and**

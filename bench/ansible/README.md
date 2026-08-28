@@ -77,6 +77,17 @@ ansible-playbook sync.yml \
 `src` is relative to this directory (or absolute); `dest` is relative to the
 remote user's home (or absolute).
 
+## Disk cache
+
+`disk_cache.yml` runs `bench/scripts/setup_disk_cache.sh` on every client to format and
+mount the unused local SSD as the disk-cache tier at `/tank/cache` (ext4, label
+`ozcache`); it is idempotent, so re-running is safe once a host is already mounted.
+
+```bash
+ansible-playbook sync.yml           # ship the script first
+ansible-playbook disk_cache.yml -e device=/dev/sdb
+```
+
 ## Where the hosts come from
 
 `inventory.py` goes through `bench/scripts/ycsb_config.py`, the same loader the
