@@ -546,6 +546,14 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
             "disk_fill_bytes": disk_sums["fill_bytes"],
             "disk_fill_gets": disk_sums["fill_gets"],
             "disk_fill_gets_per_op": round(disk_sums["fill_gets"] / ops, 5) if ops else "",
+            # A fill that fails leaves no local copy and no eviction, so a
+            # non-zero disk_fill_failed silently flattens disk_h and every
+            # coefficient read off it; disk_fill_dropped is the queue bound
+            # biting; disk_passthrough is the non-SSTable traffic the tier
+            # forwards untouched (checkpoint/LATEST, datalog*).
+            "disk_fill_failed": disk_sums["fill_failed"],
+            "disk_fill_dropped": disk_sums["fill_dropped"],
+            "disk_passthrough": disk_sums["passthrough"],
             "disk_evictions": disk_sums["evictions"],
             "disk_invalidated": disk_sums["invalidated"],
             "disk_files": disk_sums["files"],
@@ -690,6 +698,7 @@ COLUMNS = [
     "cache_hits", "cache_misses", "h", "cache_capacity", "cache_ratio",
     "disk_hits", "disk_misses", "disk_h", "disk_hit_bytes", "disk_miss_bytes",
     "disk_fills", "disk_fill_bytes", "disk_fill_gets", "disk_fill_gets_per_op",
+    "disk_fill_failed", "disk_fill_dropped", "disk_passthrough",
     "disk_evictions", "disk_invalidated", "disk_files", "disk_bytes", "disk_capacity",
     "disk_ratio", "h_total",
     "hits_l1", "hits_l2", "hits_l3", "hits_l4plus",

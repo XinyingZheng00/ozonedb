@@ -265,13 +265,21 @@ def disk_cache_label_token(corfu_settings):
 
 
 def require_disk_cache_mount(path):
-    """Refuses a disk-cache dir that lives on the root filesystem: the
-    experiment measures the SSD, not the OS disk. OZONEDB_DISK_CACHE_ANY_FS=1
-    overrides (single-node tests).
+    """Refuses a disk-cache tier root that is not the SSD `setup_disk_cache.sh`
+    mounts. `path` is the ROOT (`--disk-cache-dir`, default /tank/cache); the
+    per-writer `<root>/w{i}/` directories are created by the caller.
 
-    Checks the nearest existing ancestor's filesystem BEFORE creating
-    anything -- a root-fs path must be refused without leaving a directory
-    tree behind."""
+    Two conditions, because either one alone lets the experiment measure the
+    wrong disk:
+
+    1. Not the root filesystem -- the experiment measures the SSD, not the OS
+       disk. Checked on the nearest existing ancestor, BEFORE creating
+       anything, so a root-fs path is refused without leaving a tree behind.
+    2. The root is itself a mount point. On these nodes /tank is its own
+       filesystem, so condition 1 passes even when the SSD was never mounted
+       and the tier would quietly land on /tank.
+
+    OZONEDB_DISK_CACHE_ANY_FS=1 overrides both (single-node tests)."""
     if os.environ.get("OZONEDB_DISK_CACHE_ANY_FS") != "1":
         probe = os.path.normpath(path)
         while not os.path.exists(probe):
@@ -282,6 +290,8 @@ def require_disk_cache_mount(path):
             probe = parent
         if os.stat(probe).st_dev == os.stat("/").st_dev:
             sys.exit(f"disk cache dir {path} is on the root filesystem; run bench/scripts/setup_disk_cache.sh (or set OZONEDB_DISK_CACHE_ANY_FS=1)")
+        if not os.path.ismount(os.path.normpath(path)):
+            sys.exit(f"disk cache root {path} is not a mount point; run bench/scripts/setup_disk_cache.sh (or set OZONEDB_DISK_CACHE_ANY_FS=1)")
     os.makedirs(path, exist_ok=True)
 
 

@@ -211,20 +211,23 @@ class Coefficients:
         # the cells as measured, kept for callers that want the raw curve. Both
         # come from the same workload as h. The -kp cell is the page-cache A/B
         # of the largest budget, not another ratio, so it is excluded.
-        dpts, rpts = [], []
+        dpts = {}
         for r in tier:
             if r["workload"] != h_workload or r["label"].endswith("-kp"):
                 continue
             ratio = fnum(r.get("disk_ratio"))
             if not ratio or ratio <= 0:
                 continue
-            ht, dh = fnum(r.get("h_total")), fnum(r.get("disk_h"))
-            if ht is not None:
-                dpts.append((ratio, ht))
-            if dh is not None:
-                rpts.append((ratio, dh))
-        self.h_disk_points = sorted(dpts)
-        self.disk_h_points = sorted(rpts)
+            # One point per ratio, the cell with the smallest RAM cache, so
+            # the tier is what was varied -- the same rule as full_tier() and
+            # fill_points. Without it a second trial of a cell would put two
+            # points at one ratio and _interp would pick whichever sorted
+            # first.
+            cap = fnum(r.get("cache_capacity")) or 0.0
+            if ratio not in dpts or cap < dpts[ratio][0]:
+                dpts[ratio] = (cap, fnum(r.get("h_total")), fnum(r.get("disk_h")))
+        self.h_disk_points = sorted((ratio, ht) for ratio, (_, ht, _) in dpts.items() if ht is not None)
+        self.disk_h_points = sorted((ratio, dh) for ratio, (_, _, dh) in dpts.items() if dh is not None)
 
         def full_tier(workload):
             """The largest tier budget measured on `workload`. On a tie, the
@@ -314,10 +317,13 @@ class Coefficients:
         return self._interp(self.disk_h_points, ratio)
 
     def fill_get_per_op(self, ratio):
-        """S3 GETs per read spent refilling the tier, at a tier budget of
-        `ratio` times the dataset. A partial tier evicts what it has just
-        fetched and fetches it again: 0.0175 GETs per op at a 0.52 ratio
-        against 0.00022 at a full tier, so this cannot be a constant."""
+        """S3 GETs per op spent refilling the tier, at a tier budget of
+        `ratio` times the dataset. Per *op*, not per read: the extractor's
+        disk_fill_gets_per_op is fill_gets / (reads + writes + scans), and
+        both fills and evictions are driven by the write mix as much as by
+        the reads. A partial tier evicts what it has just fetched and fetches
+        it again: 0.0175 GETs per op at a 0.52 ratio against 0.00022 at a
+        full tier, so this cannot be a constant."""
         return self._interp(self.fill_points, ratio)
 
     def report(self):
@@ -408,7 +414,10 @@ class Model:
             # it pays for the fills it keeps evicting -- so only a tier that
             # holds the dataset may be charged less than the baseline.
             cpu = self.c.cpu_O_disk if ratio_disk >= 1.0 else max(self.c.cpu_O, self.c.cpu_O_disk)
-            fill = self.R * self.c.fill_get_per_op(ratio_disk) * self.S
+            # Per op, not per read: fill_get_per_op is measured as
+            # fill_gets / (reads + writes + scans), so charging it on the
+            # read rate alone would bill half the refills at a 50 % mix.
+            fill = self.ops * self.c.fill_get_per_op(ratio_disk) * self.S
         else:
             h_tier = 0.0
             h = h_ram
