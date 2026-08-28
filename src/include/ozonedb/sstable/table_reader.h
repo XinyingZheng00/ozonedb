@@ -11,6 +11,7 @@
 #include "storage.h"
 #include <memory>
 #include <stdint.h>
+#include <unordered_map>
 namespace ozonedb {
 class LRUCache;
 // A Table is a sorted map from strings to strings.  Tables are
@@ -35,9 +36,25 @@ class Table {
                      Table*& table);
   Status get(std::string const& key, std::shared_ptr<Record>& record);
   // Status getBlockPosition(std::string const& key, std::string& index_value);
-  // Returns freshly-allocated shared_ptr<Record>s for every key in the
-  // table. Caller (compaction) co-owns; cache is not involved.
-  std::unordered_map<std::string, std::shared_ptr<Record>> getAll();
+  // Every record in the table, for compaction. Caller co-owns the
+  // Records; the cache is not involved.
+  //
+  // The data section is read in ranged reads of at most max_read_bytes
+  // each, and the blocks are sliced out of every chunk and parsed. A
+  // chunk is a run of consecutive index entries, so no block is ever
+  // split across two reads; a block larger than the limit gets its own
+  // read. With the default, one SSTable is one read. Reading one block
+  // per storage call cost 16,384 GETs per 64 MiB file of 4 KiB blocks on
+  // S3 (bench/PLAN-compaction-range-read.md).
+  //
+  // The index is validated before the first read: offsets ascending and
+  // non-overlapping, every block inside the file. A bad index, a failed
+  // read, or a block or record that does not parse returns kFailure (or
+  // the storage status) and leaves `out` empty. Nothing here dereferences
+  // a null iterator: the point-read path (blockReader) is unchanged.
+  static constexpr size_t kDefaultScanReadBytes = 64u << 20;
+  Status getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& out,
+                size_t max_read_bytes = kDefaultScanReadBytes);
 
   ~Table();
 
@@ -46,6 +63,9 @@ class Table {
   // for testing
   // set rep_ filter reader to nullptr
   void setFilterReaderToNull();
+  // for testing: pretend the file is `size` bytes long so getAll's index
+  // validation can be exercised without a hand-built corrupt index.
+  void setFileSizeForTesting(uint64_t size);
 
  private:
   struct Rep;

@@ -85,6 +85,10 @@ class Metadata {
   // the pre-config behavior; bump to hundreds of MB / GBs when the
   // working set is bigger than the default.
   uint64_t lru_cache_bytes = 33554432;
+  // Largest ranged read that compaction issues for one SSTable input
+  // (Table::getAll). The default equals level_file_size_limit, so one
+  // input is one read; lower it to bound memory per in-flight compaction.
+  uint64_t compaction_read_bytes = 67108864;
 
   // When true, log reads trust the in-memory key index (kept fresh by
   // local addRecord and, on Corfu, the tailer's remote-append listener)
@@ -230,6 +234,10 @@ class Metadata {
     auto lru_it = result.find("lru_cache_bytes");
     if (lru_it != result.end()) {
       lru_cache_bytes = std::stoull(lru_it->second);
+    }
+
+    if (auto it = result.find("compaction_read_bytes"); it != result.end()) {
+      compaction_read_bytes = std::stoull(it->second);
     }
 
     auto tbt_it = result.find("trust_background_tail");

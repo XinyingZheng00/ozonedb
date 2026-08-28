@@ -319,10 +319,39 @@ Status CompactionWatcher::doCompactionWork(Compaction* compaction) {
       std::shared_mutex& file_mutex = this->file_mutex_manager->getMutexForFile(input);
       std::shared_lock file_lock(file_mutex);
 
-      Table::open(this->sstable_storage, input, table);
-      auto records_tmp = table->getAll();
+      // One ranged read per compaction_read_bytes of the input instead of
+      // one GET per block (bench/PLAN-compaction-range-read.md).
+      std::unordered_map<std::string, std::shared_ptr<Record>> records_tmp;
+      Status read_status = Table::open(this->sstable_storage, input, table);
+      if (read_status == Status::kSuccess && table == nullptr) read_status = Status::kFailure;
+      if (read_status == Status::kSuccess) {
+        read_status = table->getAll(records_tmp, this->metadata->compaction_read_bytes);
+      }
 
       file_lock.unlock();
+      delete table;
+      table = nullptr;
+      if (read_status != Status::kSuccess) {
+        // An input that is gone was removed by a peer's compaction after
+        // this task was scheduled: skip it, the rollforward reconciles
+        // (same race as the log branch above). An input that is still
+        // there but unreadable must NOT be skipped: the task would then
+        // publish a COMPACT without its records and delete the file.
+        // Abandon the task instead; the claim lapses and it is retried.
+        if (!this->sstable_storage->exist(input)) {
+          ++inputs_skipped;
+          std::cerr << "[compaction] input " << input << " removed under us (status="
+                    << static_cast<int>(read_status) << "), skipped\n";
+          continue;
+        }
+        std::cerr << "[compaction] input " << input << " unreadable (status="
+                  << static_cast<int>(read_status) << "), abandoning task; inputs kept\n";
+        compaction->finished = false;
+        return Status::kFailure;
+      }
+      if (records_tmp.empty()) {
+        continue;  // nothing to merge, and begin() below would be end()
+      }
       records_in += records_tmp.size();
       // print the range of records_tmp
       std::string key_start = records_tmp.begin()->first;

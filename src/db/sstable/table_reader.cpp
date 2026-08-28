@@ -9,6 +9,7 @@
 #include "sstable/block_handler.h"
 #include "sstable/filter_block.h"
 #include "sstable/filter_policy.h"
+#include <vector>
 namespace ozonedb {
 #define FOOTER_BLOCK_SIZE 50
 struct Table::Rep {
@@ -17,6 +18,7 @@ struct Table::Rep {
   LRUCache* lru_cache = nullptr;
   Comparator* comparator = nullptr;
   std::string fileName;
+  uint64_t file_size = 0;  // as reported by storage->size() at open; bounds getAll's reads
   Iterator* index_iter = nullptr;
   FilterPolicy const* filter_policy = nullptr;
   filterBlockReader* filter_block_reader = nullptr;
@@ -59,6 +61,7 @@ Status Table::open(Storage* storage,
     Rep* rep = new Table::Rep;
     rep->storage = storage;
     rep->fileName = fileName;
+    rep->file_size = size;
     rep->comparator = newBytewiseComparator();  // set to default for now
     rep->index_iter = newIterator(index_block, rep->comparator);
     rep->filter_policy = newBloomFilterPolicy(10);
@@ -206,27 +209,83 @@ Status Table::getBlockPosition(std::string const& key, std::string& index_value)
 }
 */
 
-std::unordered_map<std::string, std::shared_ptr<Record>> Table::getAll() {
-  std::unordered_map<std::string, std::shared_ptr<Record>> result;
-  assert(this->rep_ != nullptr);
-  assert(this->rep_->index_iter != nullptr);
-  this->rep_->index_iter->seekToFirst();
-  Iterator* block_iter = nullptr;
-  while (this->rep_->index_iter->valid()) {
-    block_iter = blockReader(this, this->rep_->index_iter->value());
-    block_iter->seekToFirst();
-    while (block_iter->valid()) {
-      std::string const& value = block_iter->value();
-      auto record = std::make_shared<Record>();
-      record->ParseFromString(value);
-      result[block_iter->key()] = std::move(record);
-      block_iter->next();
-    }
-    this->rep_->index_iter->next();
-    delete block_iter;
-    block_iter = nullptr;
+void Table::setFileSizeForTesting(uint64_t size) {
+  rep_->file_size = size;
+}
+
+Status Table::getAll(std::unordered_map<std::string, std::shared_ptr<Record>>& out,
+                     size_t max_read_bytes) {
+  out.clear();
+  if (rep_ == nullptr || rep_->index_iter == nullptr || rep_->storage == nullptr) {
+    return Status::kFailure;
   }
-  return result;
+
+  // 1. Collect the block identifiers in index order and validate them
+  //    before touching storage: ascending, non-overlapping, inside the
+  //    file. TableBuilder::writeBlock lays data blocks out contiguously,
+  //    so a violation means a corrupt or foreign index, not a layout we
+  //    should try to serve.
+  std::vector<BlockIdentifier> blocks;
+  uint64_t prev_end = 0;
+  for (rep_->index_iter->seekToFirst(); rep_->index_iter->valid(); rep_->index_iter->next()) {
+    BlockIdentifier id;
+    if (!id.ParseFromString(rep_->index_iter->value())) return Status::kFailure;
+    if (id.length() == 0 || id.offset() < prev_end || id.offset() + id.length() > rep_->file_size) {
+      return Status::kFailure;
+    }
+    prev_end = id.offset() + id.length();
+    blocks.push_back(id);
+  }
+
+  // 2. Read block-aligned chunks of at most max_read_bytes and slice the
+  //    blocks out of each. Every parsed block goes through the same
+  //    deserializer and iterator as readBlock/blockReader.
+  size_t i = 0;
+  while (i < blocks.size()) {
+    uint64_t const base = blocks[i].offset();
+    size_t j = i + 1;
+    while (j < blocks.size() && blocks[j].offset() + blocks[j].length() - base <= max_read_bytes) {
+      ++j;
+    }
+    size_t const len = static_cast<size_t>(blocks[j - 1].offset() + blocks[j - 1].length() - base);
+    unsigned char* buf = nullptr;
+    Status s = rep_->storage->read(rep_->fileName, buf, static_cast<size_t>(base), len);
+    if (s != Status::kSuccess || buf == nullptr) {
+      delete[] buf;
+      out.clear();
+      return s == Status::kSuccess ? Status::kFailure : s;
+    }
+    for (size_t k = i; k < j; ++k) {
+      std::vector<google::protobuf::Message*> parsed;
+      s = protobuf::deserializeMessages(buf + (blocks[k].offset() - base), blocks[k].length(), parsed,
+                                        []() { return new BlockData(); });
+      // A block is one serialized BlockData; anything past [0] is
+      // unexpected and freed, as readBlock does implicitly.
+      for (size_t m = 1; m < parsed.size(); ++m) delete parsed[m];
+      if (s != Status::kSuccess || parsed.empty() || parsed[0] == nullptr) {
+        if (!parsed.empty()) delete parsed[0];
+        delete[] buf;
+        out.clear();
+        return Status::kFailure;
+      }
+      // The iterator owns the BlockData (BlockIter::~BlockIter deletes it).
+      Iterator* block_iter = newIterator(static_cast<BlockData*>(parsed[0]), rep_->comparator);
+      for (block_iter->seekToFirst(); block_iter->valid(); block_iter->next()) {
+        auto record = std::make_shared<Record>();
+        if (!record->ParseFromString(block_iter->value())) {
+          delete block_iter;
+          delete[] buf;
+          out.clear();
+          return Status::kFailure;
+        }
+        out[block_iter->key()] = std::move(record);
+      }
+      delete block_iter;
+    }
+    delete[] buf;
+    i = j;
+  }
+  return Status::kSuccess;
 }
 
 }  // namespace ozonedb
