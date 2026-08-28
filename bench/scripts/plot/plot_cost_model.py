@@ -214,13 +214,13 @@ class Coefficients:
         # The full tier: the largest budget measured. Its client CPU per op is
         # what an op costs when the object store is off the read path, and its
         # fill GETs per op are what the tier still pays to stay full.
-        full = max(((fnum(r["disk_ratio"]), r) for r in tier
+        full = max(((fnum(r.get("disk_ratio")), r) for r in tier
                     if r["workload"] == h_workload and not r["label"].endswith("-kp")
-                    and fnum(r.get("disk_ratio"))), default=(None, None))[1]
+                    and fnum(r.get("disk_ratio"))), default=(None, None), key=lambda p: p[0])[1]
         if self.h_disk_points and full is not None:
             self.src["h_disk"] = (f"measured, workload {h_workload}, "
                                   f"{len(self.h_disk_points)} tier ratios")
-            self.cpu_O_disk = fnum(full["client_cpu_s_per_op"]) or self.cpu_O
+            self.cpu_O_disk = fnum(full.get("client_cpu_s_per_op")) or self.cpu_O
             self.src["cpu_s_per_op_O_disk"] = f"measured ({full['label']})"
             self.fill_get_per_op = fnum(full.get("disk_fill_gets_per_op")) or 0.0
             self.src["fill_get_per_op"] = f"measured ({full['label']})"
