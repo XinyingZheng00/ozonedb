@@ -161,6 +161,9 @@ class LRUCache {
   // are freed on the next invalidateLogFile and in the destructor.
   static constexpr int64_t kRetiredTableGraceMs = 30000;
   std::deque<std::pair<std::chrono::steady_clock::time_point, Table*>> retired_tables_;
+  // Delete the retired Tables whose grace period has passed. Caller
+  // holds `mutex` exclusively.
+  void freeRetiredLocked(std::chrono::steady_clock::time_point now);
 
   // Steady-state counters for diagnosing cache behavior. Printed at
   // LRUCache destruction. A healthy zipfian workload should show
@@ -302,6 +305,16 @@ class LRUCache {
   // they only deallocate once every borrower (readers, the LogKeyIndex)
   // has released them. Called when a log file is compacted away.
   void invalidateLogFile(std::string const& file_name);
+  // Drop an SSTable that a COMPACT removed from the View: every cached
+  // block leaves the LRU list and the byte budget, the Table* is
+  // retired (a reader may still hold it, see retired_tables_), the entry
+  // is erased. Returns the number of blocks that were cached, which is
+  // what the warm policy reads as this process's interest in the region
+  // (bench/PLAN-compaction-cache.md, parts A and B). A log entry (records
+  // only) is left alone: LogHandler::invalidateCompactedLog owns those.
+  // Never call this under view_mutex; MetadataLogHandler queues the
+  // event and drains it after the lock.
+  size_t invalidateSSTable(std::string const& file_name);
   // Copy the per-file records map into `out`. Cache and `out` co-own
   // each Record via shared_ptr. Used by LogKeyIndex::warm to seed
   // itself from already-cached log files on startup.

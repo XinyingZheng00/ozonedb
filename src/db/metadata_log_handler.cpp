@@ -285,6 +285,7 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       latest_view.file_size[output_file] =
           (i < record->output_bytes_size()) ? record->output_bytes(i) : 0;
     }
+    queueCacheEventLocked(record);
     logCompactionCommitted(record);
     delete record;
     return input_prefix;
@@ -318,11 +319,46 @@ std::string MetadataLogHandler::rollforwardSingleOperationRecord(OperationRecord
       latest_view.file_size[output_file] =
           (i < record->output_bytes_size()) ? record->output_bytes(i) : 0;
     }
+    queueCacheEventLocked(record);
     logCompactionCommitted(record);
     delete record;
     return "";
   }
   return "";
+}
+
+void MetadataLogHandler::queueCacheEventLocked(OperationRecord const* record) {
+  if (this->lru_cache == nullptr || record->output_file_size() == 0) return;
+  CompactionEvent ev;
+  ev.inputs.assign(record->input_files().begin(), record->input_files().end());
+  ev.outputs.assign(record->output_file().begin(), record->output_file().end());
+  for (int i = 0; i < record->output_file_size(); ++i) {
+    ev.output_bytes.push_back(i < record->output_bytes_size() ? static_cast<size_t>(record->output_bytes(i)) : 0);
+  }
+  ev.dest_level = getNumberInTheEnd(getPrefix(record->output_file(0)));
+  pending_cache_events_.push_back(std::move(ev));
+  has_pending_cache_events_.store(true, std::memory_order_release);
+}
+
+void MetadataLogHandler::drainCacheEvents() {
+  if (!has_pending_cache_events_.load(std::memory_order_acquire)) return;
+  std::vector<CompactionEvent> events;
+  {
+    std::unique_lock<std::shared_mutex> lock(view_mutex);
+    events.swap(pending_cache_events_);
+    has_pending_cache_events_.store(false, std::memory_order_release);
+  }
+  if (this->lru_cache == nullptr) return;
+  for (auto const& ev : events) {
+    // The View dropped the inputs already; now the cache does. A reader
+    // on the old snapshot may still probe an input: it misses, and its
+    // GET on a removed object is the documented transient miss.
+    size_t cached_input_blocks = 0;
+    for (auto const& input : ev.inputs) {
+      cached_input_blocks += this->lru_cache->invalidateSSTable(input);
+    }
+    (void)cached_input_blocks;
+  }
 }
 
 // Roll forward the metadata log to get the latest view.
@@ -356,6 +392,7 @@ void MetadataLogHandler::rollForwardMetadataLogPeriodically(std::atomic<bool> co
       markAppliedLocked(batch_start, observed);
       publishSnapshotLocked();
     }
+    drainCacheEvents();  // outside the view_mutex scope, by design
     refreshTailSizeUnlocked();
     if (this->event_listener != nullptr)
       this->event_listener->onViewUpdate();
@@ -410,6 +447,8 @@ size_t MetadataLogHandler::syncView() {
       target = observed;
       have_target = true;
     }
+    bool reached = false;
+    size_t applied = 0;
     {
       std::unique_lock<std::shared_mutex> lock(view_mutex);
       for (auto const& record : records) {
@@ -435,8 +474,17 @@ size_t MetadataLogHandler::syncView() {
       // the offset before its caller applies the batch, and in that
       // window the view lags the offset. A racing winner applies within
       // microseconds; the loop just re-checks until it has.
-      if (applied_offset_ >= target) return applied_offset_;
+      if (applied_offset_ >= target) {
+        reached = true;
+        applied = applied_offset_;
+      }
     }
+    // Cache work for the COMPACTs this pass applied, after the lock and
+    // before the caller sees the new view (the compactor calls this right
+    // after its own append, so its inputs' blocks go now, not 100 ms
+    // later on the periodic thread).
+    drainCacheEvents();
+    if (reached) return applied;
   }
   {
     std::shared_lock<std::shared_mutex> lock(view_mutex);

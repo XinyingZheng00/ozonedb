@@ -491,11 +491,41 @@ void LRUCache::invalidateLogFile(std::string const& file_name) {
   auto const now = std::chrono::steady_clock::now();
   if (it->second.table != nullptr) retired_tables_.emplace_back(now, it->second.table);
   file_to_entry_map.erase(it);
+  freeRetiredLocked(now);
+}
+
+void LRUCache::freeRetiredLocked(std::chrono::steady_clock::time_point now) {
   while (!retired_tables_.empty() &&
          std::chrono::duration_cast<std::chrono::milliseconds>(now - retired_tables_.front().first).count() > kRetiredTableGraceMs) {
     delete retired_tables_.front().second;
     retired_tables_.pop_front();
   }
+}
+
+size_t LRUCache::invalidateSSTable(std::string const& file_name) {
+  std::unique_lock lock(mutex);
+  auto const now = std::chrono::steady_clock::now();
+  freeRetiredLocked(now);
+  auto it = file_to_entry_map.find(file_name);
+  if (it == file_to_entry_map.end()) return 0;
+  CacheEntry& entry = it->second;
+  if (entry.table == nullptr && entry.block_records.empty()) return 0;  // a log entry
+  size_t blocks = 0;
+  for (auto& block : entry.block_records) {
+    delete block.second;
+    ++blocks;
+    auto itr = entry.lru_itr.find(block.first);
+    if (itr != entry.lru_itr.end()) lru_list.erase(itr->second);
+    auto size_it = entry.block_size.find(block.first);
+    if (size_it != entry.block_size.end() && current_size >= size_it->second) {
+      current_size -= size_it->second;
+    }
+  }
+  // Same rule as invalidateLogFile: a reader that took the raw Table*
+  // from getSSTable may be inside Table::get on it right now.
+  if (entry.table != nullptr) retired_tables_.emplace_back(now, entry.table);
+  file_to_entry_map.erase(it);
+  return blocks;
 }
 
 void LRUCache::snapshotLogFileRecords(std::string const& file_name,

@@ -100,6 +100,26 @@ class MetadataLogHandler {
   // latest_view. Caller must hold view_mutex as a unique_lock.
   void publishSnapshotLocked();
 
+  // Cache work owed for COMPACT records applied to the view
+  // (bench/PLAN-compaction-cache.md, parts A and B). The apply runs under
+  // unique_lock<view_mutex>, and the cache mutex must never be taken
+  // there: the Corfu tailer's listener takes the cache mutex, and a
+  // foreground thread may hold it while fencing on the tailer. So both
+  // COMPACT branches queue an event (guarded by view_mutex) and the two
+  // callers drain the queue once their lock scope has ended. The atomic
+  // flag lets syncView, which strict reads call per get, skip the
+  // unique_lock when there is nothing to drain.
+  struct CompactionEvent {
+    std::vector<std::string> inputs;
+    std::vector<std::string> outputs;
+    std::vector<size_t> output_bytes;
+    int dest_level = 0;
+  };
+  std::vector<CompactionEvent> pending_cache_events_;
+  std::atomic<bool> has_pending_cache_events_{false};
+  void queueCacheEventLocked(OperationRecord const* record);
+  void drainCacheEvents();
+
  public:
   EventListener* event_listener = nullptr;
   MetadataLogHandler(std::string metadata_log, Storage* storage, TailCache* tail_cache) {
