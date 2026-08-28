@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "frequency_sketch.h"
 #include "storage.h"
 
 namespace ozonedb {
@@ -58,9 +59,12 @@ namespace ozonedb {
 //   * fill_lifecycle_mtx_ - serialises startFillWorker/stopFillWorker; held
 //                   across fill_thread_.join(), which is why it is the
 //                   outermost of the four.
+//   * sketch_mtx_ - sketch_ (the TinyLFU counters). A leaf: taken under mtx_
+//                   by mayTakeLocked(), and alone by recordAccess(). Never
+//                   held across any I/O.
 // Order: fill_lifecycle_mtx_ -> fill_mtx_ (start/stop take both, in that
 // order). parts_mtx_ and mtx_ are never nested, in either direction, and
-// neither is ever taken under fill_mtx_.
+// neither is ever taken under fill_mtx_. mtx_ -> sketch_mtx_ (leaf).
 // Nothing here takes a cache or view mutex; the DB calls the tier only
 // outside view_mutex.
 //
@@ -69,6 +73,8 @@ namespace ozonedb {
 // degrade into a pure pass-through that still charges the SSD's cost.
 class DiskCacheStorage : public Storage {
  public:
+  enum class Admission { kAlways, kFrequency };
+
   struct Options {
     std::string dir;                 // local directory, "/" appended if missing
     uint64_t capacity_bytes = 0;     // 0 = cache nothing (pure pass-through)
@@ -76,6 +82,8 @@ class DiskCacheStorage : public Storage {
     size_t chunk_bytes = 64u << 20;  // ranged-read size of the fill worker
     bool drop_pages = true;          // POSIX_FADV_DONTNEED after each tier read
     size_t max_queue = 256;          // fill queue bound; the oldest is dropped
+    Admission admission = Admission::kAlways;  // kFrequency: TinyLFU contest for non-free budget
+    uint64_t admit_window = 0;                 // sketch aging window in samples; 0 = 8 x the entries the budget holds
   };
 
   struct Stats {
@@ -84,6 +92,7 @@ class DiskCacheStorage : public Storage {
     uint64_t fill_skipped_budget = 0, fill_skipped_present = 0, fill_gone = 0, fill_failed = 0, fill_dropped = 0;
     uint64_t writethrough_files = 0, evictions = 0, evicted_bytes = 0, invalidated = 0;
     uint64_t files = 0, bytes = 0, capacity = 0;
+    uint64_t fetch_bytes = 0, admit_rejected = 0;
   };
 
   // Throws std::runtime_error when options.dir cannot be created or is not
@@ -133,6 +142,29 @@ class DiskCacheStorage : public Storage {
     std::list<std::string>::iterator lru;
   };
 
+  // How a candidate takes budget that is not free (bench/PLAN-disk-cache-2.md, Task 2).
+  //   kForce    evict until it fits: the round-1 behaviour. reconcile(), and every
+  //             path under Admission::kAlways.
+  //   kContest  only if the candidate's sketch frequency is strictly above the
+  //             victim's: fills under Admission::kFrequency.
+  //   kFreeOnly never: write-throughs under Admission::kFrequency, because a
+  //             compaction output has no access history to contest with.
+  // Free budget is always taken without a contest. A refusal can be counted
+  // twice when the budget changes between a fill's check and its publish; that
+  // is accepted, not fixed.
+  enum class AdmitMode { kForce, kContest, kFreeOnly };
+  AdmitMode fillMode() const { return options_.admission == Admission::kFrequency ? AdmitMode::kContest : AdmitMode::kForce; }
+  AdmitMode writeThroughMode() const { return options_.admission == Admission::kFrequency ? AdmitMode::kFreeOnly : AdmitMode::kForce; }
+  void recordAccess(std::string const& key);
+  uint32_t frequency(std::string const& key);  // 0 without a sketch
+  // Under mtx_. Decides whether `bytes` more for `key` is allowed under `how`,
+  // given `victim` (empty = none). Counts a refusal in admit_rejected_.
+  bool mayTakeLocked(std::string const& key, size_t bytes, std::string const& victim, AdmitMode how);
+  // backing_->size() memoised per cacheable name (objects are immutable);
+  // dropped by eraseLocked/invalidate. Used by the fill path only: the public
+  // size() keeps its round-1 behaviour for a file the builder is appending.
+  size_t sizeOf(std::string const& name);
+
   std::string localPath(std::string const& name) const { return options_.dir + name; }
   std::string partPath(std::string const& name) const { return options_.dir + name + ".part"; }
   // The fill's own temp file: never shared with parts_/writePart/discardPart,
@@ -160,9 +192,9 @@ class DiskCacheStorage : public Storage {
   // (against `expected_size` when nonzero), checks the budget, renames into
   // place and admits it. False (and the part removed) on any failure,
   // including the part having vanished or a size mismatch.
-  bool publishPartFile(std::string const& name, std::string const& part_path, size_t expected_size);
+  bool publishPartFile(std::string const& name, std::string const& part_path, size_t expected_size, AdmitMode how);
   // Under mtx_: evicts until `bytes` fits, then inserts. False when bytes > capacity.
-  bool admit(std::string const& name, size_t bytes);
+  bool admit(std::string const& name, size_t bytes, AdmitMode how);
   void evictToFitLocked(size_t bytes);
   void eraseLocked(std::string const& name, bool count_as_invalidated);
   void enqueueFill(std::string const& name);
@@ -176,6 +208,12 @@ class DiskCacheStorage : public Storage {
   std::unordered_map<std::string, Entry> index_;
   std::list<std::string> lru_;  // front = most recently used
   uint64_t current_bytes_ = 0;
+  std::unordered_map<std::string, size_t> sizes_;  // under mtx_
+
+  // Leaf lock for sketch_: taken under mtx_ by mayTakeLocked(), and alone by
+  // recordAccess(). Never held across any I/O.
+  std::mutex sketch_mtx_;
+  std::unique_ptr<FrequencySketch> sketch_;
 
   std::mutex parts_mtx_;
   std::unordered_map<std::string, std::unique_ptr<std::ofstream>> parts_;
@@ -199,6 +237,7 @@ class DiskCacheStorage : public Storage {
   std::atomic<uint64_t> fills_{0}, fill_bytes_{0}, fill_gets_{0};
   std::atomic<uint64_t> fill_skipped_budget_{0}, fill_skipped_present_{0}, fill_gone_{0}, fill_failed_{0}, fill_dropped_{0};
   std::atomic<uint64_t> writethrough_files_{0}, evictions_{0}, evicted_bytes_{0}, invalidated_{0};
+  std::atomic<uint64_t> fetch_bytes_{0}, admit_rejected_{0};
 };
 
 }  // namespace ozonedb

@@ -117,7 +117,8 @@ struct TierFixture {
   CountingStorage* backing;  // owned by the tier
   std::unique_ptr<DiskCacheStorage> tier;
 
-  explicit TierFixture(uint64_t capacity, size_t chunk = 64u << 20, bool drop_pages = true) {
+  explicit TierFixture(uint64_t capacity, size_t chunk = 64u << 20, bool drop_pages = true,
+                       DiskCacheStorage::Admission admission = DiskCacheStorage::Admission::kAlways) {
     std::string const s = stamp();
     backing_dir = kRoot + "backing_" + s + "/";
     tier_dir = kRoot + "tier_" + s + "/";
@@ -131,6 +132,7 @@ struct TierFixture {
     o.capacity_bytes = capacity;
     o.chunk_bytes = chunk;
     o.drop_pages = drop_pages;
+    o.admission = admission;
     tier = std::make_unique<DiskCacheStorage>(std::move(owned), o);
   }
   ~TierFixture() {
@@ -146,6 +148,13 @@ struct TierFixture {
     std::ofstream out(backing_dir + name, std::ios::binary);
     out.write(reinterpret_cast<char const*>(bytes.data()), static_cast<std::streamsize>(n));
     return bytes;
+  }
+  // A 10-byte ranged read at offset 0, then wait for the fill worker.
+  void touch(std::string const& name) {
+    unsigned char* d = nullptr;
+    ASSERT_EQ(tier->read(name, d, 0, 10), Status::kSuccess);
+    delete[] d;
+    tier->waitFillIdle();
   }
   bool local(std::string const& name) const { return std::filesystem::exists(tier_dir + name); }
   bool part(std::string const& name) const { return std::filesystem::exists(tier_dir + name + ".part"); }
@@ -690,4 +699,87 @@ TEST(DiskCacheStorageTest, MetadataParsesTheDiskCacheKeys) {
       "\"disk_cache_bytes\": \"1\"";
   EXPECT_THROW(Metadata(write(no_backend)), std::runtime_error);  // no sstable_backend
   std::filesystem::remove_all(dir);
+}
+
+TEST(DiskCacheStorageTest, FrequencyAdmissionRefusesAFillThatWouldEvictAnEquallyUsedFile) {
+  TierFixture f(2500, /*chunk=*/1024, /*drop_pages=*/true, DiskCacheStorage::Admission::kFrequency);
+  f.tier->startFillWorker();
+  std::string const a = "sstable1/" + stamp() + "_a.sst";
+  std::string const b = "sstable1/" + stamp() + "_b.sst";
+  std::string const c = "sstable1/" + stamp() + "_c.sst";
+  f.seed(a, 1000);
+  f.seed(b, 1000);
+  f.seed(c, 1000);
+  f.touch(a);  // free budget: filled without a contest
+  f.touch(b);
+  EXPECT_TRUE(f.local(a));
+  EXPECT_TRUE(f.local(b));
+  f.touch(c);  // 3000 > 2500, and c (one access) is not above the LRU victim a (one access)
+  EXPECT_FALSE(f.local(c));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.admit_rejected, 1u);
+  EXPECT_EQ(s.evictions, 0u);
+  EXPECT_EQ(s.fill_bytes, 2000u);         // the refused fill moved no bytes
+  EXPECT_EQ(s.fetch_bytes, 2000u + 30u);  // two fills plus three 10-byte misses
+  EXPECT_EQ(s.files, 2u);
+}
+
+TEST(DiskCacheStorageTest, FrequencyAdmissionLetsAHotterFileDisplaceTheColdestOne) {
+  TierFixture f(2500, /*chunk=*/1024, /*drop_pages=*/true, DiskCacheStorage::Admission::kFrequency);
+  f.tier->startFillWorker();
+  std::string const a = "sstable1/" + stamp() + "_a.sst";
+  std::string const b = "sstable1/" + stamp() + "_b.sst";
+  std::string const c = "sstable1/" + stamp() + "_c.sst";
+  f.seed(a, 1000);
+  f.seed(b, 1000);
+  f.seed(c, 1000);
+  f.touch(a);
+  f.touch(b);
+  f.touch(c);  // c = 1, victim a = 1: refused
+  f.touch(c);  // c = 2 > a = 1: admitted, a evicted
+  EXPECT_TRUE(f.local(c));
+  EXPECT_FALSE(f.local(a));
+  EXPECT_TRUE(f.local(b));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.admit_rejected, 1u);
+  EXPECT_EQ(s.evictions, 1u);
+  EXPECT_EQ(s.files, 2u);
+}
+
+TEST(DiskCacheStorageTest, WriteThroughUnderFrequencyAdmissionTakesOnlyFreeBudget) {
+  TierFixture f(2500, /*chunk=*/64u << 20, /*drop_pages=*/true, DiskCacheStorage::Admission::kFrequency);
+  auto put = [&](std::string const& name, size_t n) {
+    std::vector<unsigned char> v(n, 'x');
+    ASSERT_EQ(f.tier->appendNoFlush(name, v.data(), static_cast<int>(n)), Status::kSuccess);
+    ASSERT_EQ(f.tier->flush(name), Status::kSuccess);
+  };
+  std::string const a = "sstable1/" + stamp() + "_a.sst";
+  std::string const b = "sstable1/" + stamp() + "_b.sst";
+  std::string const c = "sstable1/" + stamp() + "_c.sst";
+  put(a, 1000);
+  put(b, 1000);
+  put(c, 1000);  // no free budget and no history: refused, nothing evicted
+  EXPECT_TRUE(f.local(a));
+  EXPECT_TRUE(f.local(b));
+  EXPECT_FALSE(f.local(c));
+  EXPECT_FALSE(f.part(c));
+  EXPECT_TRUE(f.backing->exist(c));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.admit_rejected, 1u);
+  EXPECT_EQ(s.evictions, 0u);
+  EXPECT_EQ(s.writethrough_files, 2u);
+}
+
+TEST(DiskCacheStorageTest, FillUsesTheMemoisedObjectSize) {
+  TierFixture f(1u << 20, /*chunk=*/1024);
+  f.tier->startFillWorker();
+  std::string const a = "sstable1/" + stamp() + "_a.sst";
+  f.seed(a, 3000);
+  f.touch(a);  // miss + fill: one size() on the backing
+  EXPECT_EQ(f.backing->sizes, 1);
+  f.touch(a);  // hit: none
+  EXPECT_EQ(f.backing->sizes, 1);
+  f.tier->invalidate(a);  // drops the memo with the copy
+  f.touch(a);
+  EXPECT_EQ(f.backing->sizes, 2);
 }

@@ -43,6 +43,14 @@ DiskCacheStorage::DiskCacheStorage(std::unique_ptr<Storage> backing, Options opt
     }
   }
   fs::remove(probe, ec);
+  if (options_.admission == Admission::kFrequency) {
+    // Sized from the entries the budget holds: a file-mode entry is about one
+    // SSTable, taken as 64 MiB here (Task 4 uses entry_bytes in chunk mode).
+    uint64_t const unit = 64u << 20;
+    uint64_t const expected = std::max<uint64_t>(16, options_.capacity_bytes / unit);
+    uint64_t const window = options_.admit_window ? options_.admit_window : 8 * expected;
+    sketch_ = std::make_unique<FrequencySketch>(static_cast<size_t>(std::min<uint64_t>(4 * expected, 1u << 22)), window);
+  }
 }
 
 DiskCacheStorage::~DiskCacheStorage() {
@@ -104,6 +112,7 @@ Status DiskCacheStorage::read(std::string const& fileName, unsigned char*& data,
     passthrough_.fetch_add(1);
     return backing_->read(fileName, data, size);
   }
+  recordAccess(fileName);
   if (touch(fileName)) {
     std::error_code ec;
     auto n = fs::file_size(localPath(fileName), ec);
@@ -119,6 +128,7 @@ Status DiskCacheStorage::read(std::string const& fileName, unsigned char*& data,
   misses_.fetch_add(1);
   if (s == Status::kSuccess) {
     miss_bytes_.fetch_add(size);
+    fetch_bytes_.fetch_add(size);
     enqueueFill(fileName);
   }
   return s;
@@ -129,6 +139,7 @@ Status DiskCacheStorage::read(std::string const& fileName, unsigned char*& data,
     passthrough_.fetch_add(1);
     return backing_->read(fileName, data, a, length);
   }
+  recordAccess(fileName);
   if (touch(fileName)) {
     if (readLocal(fileName, data, a, length)) {
       hits_.fetch_add(1);
@@ -141,6 +152,7 @@ Status DiskCacheStorage::read(std::string const& fileName, unsigned char*& data,
   misses_.fetch_add(1);
   if (s == Status::kSuccess) {
     miss_bytes_.fetch_add(length);
+    fetch_bytes_.fetch_add(length);
     enqueueFill(fileName);
   }
   return s;
@@ -243,10 +255,10 @@ bool DiskCacheStorage::publishPart(std::string const& name) {
       return false;
     }
   }
-  return publishPartFile(name, partPath(name), /*expected_size=*/0);
+  return publishPartFile(name, partPath(name), /*expected_size=*/0, writeThroughMode());
 }
 
-bool DiskCacheStorage::publishPartFile(std::string const& name, std::string const& part_path, size_t expected_size) {
+bool DiskCacheStorage::publishPartFile(std::string const& name, std::string const& part_path, size_t expected_size, AdmitMode how) {
   std::error_code ec;
   auto bytes = fs::file_size(part_path, ec);
   if (ec) return false;  // the part vanished from under us (raced a discard/invalidate/rename)
@@ -264,7 +276,11 @@ bool DiskCacheStorage::publishPartFile(std::string const& name, std::string cons
     fs::remove(part_path, ec);
     return false;
   }
-  return admit(name, static_cast<size_t>(bytes));  // the caller counts a write-through or a fill
+  if (!admit(name, static_cast<size_t>(bytes), how)) {
+    fs::remove(localPath(name), ec);  // refused: nothing indexes the copy, so it must not stay
+    return false;
+  }
+  return true;  // the caller counts a write-through or a fill
 }
 
 void DiskCacheStorage::discardPart(std::string const& name) {
@@ -285,7 +301,41 @@ void DiskCacheStorage::discardPart(std::string const& name) {
   if (had_stream || had_file) poisoned_parts_.insert(name);
 }
 
-bool DiskCacheStorage::admit(std::string const& name, size_t bytes) {
+void DiskCacheStorage::recordAccess(std::string const& key) {
+  if (!sketch_) return;
+  std::lock_guard<std::mutex> lk(sketch_mtx_);
+  sketch_->record(key);
+}
+
+uint32_t DiskCacheStorage::frequency(std::string const& key) {
+  if (!sketch_) return 0;
+  std::lock_guard<std::mutex> lk(sketch_mtx_);
+  return sketch_->estimate(key);
+}
+
+bool DiskCacheStorage::mayTakeLocked(std::string const& key, size_t bytes, std::string const& victim, AdmitMode how) {
+  if (current_bytes_ + bytes <= options_.capacity_bytes) return true;  // free budget: no contest
+  if (how == AdmitMode::kForce) return true;
+  bool const allowed = how == AdmitMode::kContest && !victim.empty() && frequency(key) > frequency(victim);
+  if (!allowed) admit_rejected_.fetch_add(1);
+  return allowed;
+}
+
+size_t DiskCacheStorage::sizeOf(std::string const& name) {
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = sizes_.find(name);
+    if (it != sizes_.end()) return it->second;
+  }
+  size_t const n = backing_->size(name);
+  if (n > 0) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    sizes_.emplace(name, n);
+  }
+  return n;
+}
+
+bool DiskCacheStorage::admit(std::string const& name, size_t bytes, AdmitMode how) {
   std::lock_guard<std::mutex> lk(mtx_);
   if (bytes > options_.capacity_bytes) return false;
   auto old = index_.find(name);
@@ -294,6 +344,7 @@ bool DiskCacheStorage::admit(std::string const& name, size_t bytes) {
     lru_.erase(old->second.lru);
     index_.erase(old);
   }
+  if (!mayTakeLocked(name, bytes, lru_.empty() ? std::string() : lru_.back(), how)) return false;
   evictToFitLocked(bytes);
   lru_.push_front(name);
   index_[name] = Entry{bytes, lru_.begin()};
@@ -311,6 +362,7 @@ void DiskCacheStorage::evictToFitLocked(size_t bytes) {
 }
 
 void DiskCacheStorage::eraseLocked(std::string const& name, bool count_as_invalidated) {
+  sizes_.erase(name);
   auto it = index_.find(name);
   if (it == index_.end()) return;
   current_bytes_ -= it->second.bytes;
@@ -407,7 +459,7 @@ void DiskCacheStorage::fillOne(std::string const& name) {
     std::lock_guard<std::mutex> lk(parts_mtx_);
     if (parts_.count(name)) return;  // the builder is writing it through right now
   }
-  size_t const total = backing_->size(name);
+  size_t const total = sizeOf(name);
   if (total == 0) {
     fill_gone_.fetch_add(1);
     return;
@@ -415,6 +467,10 @@ void DiskCacheStorage::fillOne(std::string const& name) {
   if (total > options_.capacity_bytes) {
     fill_skipped_budget_.fetch_add(1);
     return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!mayTakeLocked(name, total, lru_.empty() ? std::string() : lru_.back(), fillMode())) return;  // refused before a byte moves
   }
   // The fill owns this stream outright: it never touches parts_/writePart/
   // discardPart, so a concurrent write-through or a peer invalidate() (which
@@ -439,6 +495,7 @@ void DiskCacheStorage::fillOne(std::string const& name) {
       fill_failed_.fetch_add(1);
       return;
     }
+    fetch_bytes_.fetch_add(len);
     out.write(reinterpret_cast<char const*>(buf), static_cast<std::streamsize>(len));
     delete[] buf;
   }
@@ -453,7 +510,7 @@ void DiskCacheStorage::fillOne(std::string const& name) {
   // Verify the part's byte count against the backing's before publishing: a
   // mismatch (or the part having vanished) fails closed instead of admitting
   // a truncated file as complete.
-  if (publishPartFile(name, tmp, total)) {
+  if (publishPartFile(name, tmp, total, fillMode())) {
     fills_.fetch_add(1);
     fill_bytes_.fetch_add(total);
   } else {
@@ -492,7 +549,7 @@ size_t DiskCacheStorage::reconcile(std::function<bool(std::string const&, size_t
   }
   std::sort(keep.begin(), keep.end(), [](Found const& a, Found const& b) { return a.mtime < b.mtime; });
   for (Found const& k : keep) {
-    if (!admit(k.name, k.bytes)) {  // larger than the capacity
+    if (!admit(k.name, k.bytes, AdmitMode::kForce)) {  // larger than the capacity
       fs::remove(localPath(k.name), ec);
       ++removed;
     }
@@ -519,6 +576,8 @@ DiskCacheStorage::Stats DiskCacheStorage::stats() {
   s.evictions = evictions_.load();
   s.evicted_bytes = evicted_bytes_.load();
   s.invalidated = invalidated_.load();
+  s.fetch_bytes = fetch_bytes_.load();
+  s.admit_rejected = admit_rejected_.load();
   std::lock_guard<std::mutex> lk(mtx_);
   s.files = index_.size();
   s.bytes = current_bytes_;
@@ -539,7 +598,8 @@ void DiskCacheStorage::printStats() {
             << " writethrough_files=" << s.writethrough_files
             << " evictions=" << s.evictions << " evicted_bytes=" << s.evicted_bytes
             << " invalidated=" << s.invalidated << " files=" << s.files
-            << " bytes=" << s.bytes << " capacity=" << s.capacity << "\n";
+            << " bytes=" << s.bytes << " capacity=" << s.capacity
+            << " fetch_bytes=" << s.fetch_bytes << " admit_rejected=" << s.admit_rejected << "\n";
 }
 
 }  // namespace ozonedb
