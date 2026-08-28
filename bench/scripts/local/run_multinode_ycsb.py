@@ -16,6 +16,7 @@ from load_local_ycsb_multiproc import (
     linearizable_corfu_settings,
     lru_cache_corfu_settings,
     cache_warm_corfu_settings,
+    disk_cache_corfu_settings,
     result_label,
     write_aggregate,
 )
@@ -215,7 +216,9 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
                          linearizable=False, log_trim=False, db_name=None,
                          cassandra_consistency=None, lru_cache_bytes=None,
                          record_cnt=None, cache_warm=False,
-                         cache_warm_max_level=None, cache_warm_max_fraction=None):
+                         cache_warm_max_level=None, cache_warm_max_fraction=None,
+                         disk_cache_bytes=None, disk_cache_dir=None,
+                         disk_cache_keep_pages=False):
     parts = [
         f"export OZONEDB_RUN_TAG={shlex.quote(run_tag)}",
         f"cd {shlex.quote(remote_home)}",
@@ -245,6 +248,9 @@ def build_remote_command(remote_home, run_tag, host_offset, host_writers,
             + (["--cassandra_consistency", cassandra_consistency] if cassandra_consistency else [])
             + (["--lru-cache-bytes", str(int(lru_cache_bytes))] if lru_cache_bytes is not None else [])
             + (["--record_cnt", str(int(record_cnt))] if record_cnt is not None else [])
+            + (["--disk-cache-bytes", str(int(disk_cache_bytes))] if disk_cache_bytes is not None else [])
+            + (["--disk-cache-dir", disk_cache_dir] if disk_cache_dir else [])
+            + (["--disk-cache-keep-pages"] if disk_cache_keep_pages else [])
         ),
     ]
     return " && ".join(parts)
@@ -276,6 +282,8 @@ def cell_label(config, args):
         corfu = cache_warm_corfu_settings(
             corfu, args.cache_warm_max_level, args.cache_warm_max_fraction
         )
+    if args.disk_cache_bytes is not None:
+        corfu = disk_cache_corfu_settings(corfu, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages)
     cass = config.get("cassandra")
     if args.cassandra_consistency:
         cass = cassandra_mode_settings(cass, args.cassandra_consistency)
@@ -544,6 +552,15 @@ def main():
         help="Pass-through with --cache-warm: output bytes at most this fraction of "
              "lru_cache_bytes (engine default 0.25); label token -wf<percent>.",
     )
+    parser.add_argument("--disk-cache-bytes", type=int, default=None,
+                        help="Pass-through to per-host runner: disk-cache tier capacity per "
+                             "writer in bytes (bench/PLAN-disk-cache.md); off when absent")
+    parser.add_argument("--disk-cache-dir", default=None,
+                        help="Pass-through to per-host runner: root of the per-writer "
+                             "disk-cache dirs (default /tank/cache)")
+    parser.add_argument("--disk-cache-keep-pages", action="store_true",
+                        help="Pass-through to per-host runner: do not drop the page cache "
+                             "after tier reads (A/B of the SSD cost)")
     parser.add_argument(
         "--db_name",
         help="Pass-through to per-host runner: comma-separated backends "
@@ -670,6 +687,7 @@ def main():
         f"cassandra_consistency={args.cassandra_consistency or 'yaml'} "
         f"lru_cache_bytes={args.lru_cache_bytes or 'base'} "
         f"cache_warm={'on' if args.cache_warm else 'yaml'} "
+        f"disk_cache_bytes={args.disk_cache_bytes or 'off'} "
         f"record_cnt={args.record_cnt or 'yaml'} "
         f"label={label} server_sample={sample_hosts or 'off'}"
     )
@@ -689,6 +707,8 @@ def main():
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
             cache_warm=args.cache_warm, cache_warm_max_level=args.cache_warm_max_level,
             cache_warm_max_fraction=args.cache_warm_max_fraction,
+            disk_cache_bytes=args.disk_cache_bytes, disk_cache_dir=args.disk_cache_dir,
+            disk_cache_keep_pages=args.disk_cache_keep_pages,
         )
         print(f"[orchestrator] per-host command (first host): {sample}")
         if sample_hosts:
@@ -718,6 +738,8 @@ def main():
             lru_cache_bytes=args.lru_cache_bytes, record_cnt=args.record_cnt,
             cache_warm=args.cache_warm, cache_warm_max_level=args.cache_warm_max_level,
             cache_warm_max_fraction=args.cache_warm_max_fraction,
+            disk_cache_bytes=args.disk_cache_bytes, disk_cache_dir=args.disk_cache_dir,
+            disk_cache_keep_pages=args.disk_cache_keep_pages,
         )
         log_path = host_log_name(p["host"], log_dir)
         try:

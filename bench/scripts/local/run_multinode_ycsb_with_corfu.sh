@@ -79,6 +79,9 @@ LRU_CACHE_BYTES=""  # --lru-cache-bytes N: per-process block cache, label -lru64
 CACHE_WARM=0      # --cache-warm: warm compaction outputs into the block cache, label -warm
 CACHE_WARM_MAX_LEVEL=""     # --cache-warm-max-level N (engine default 1), label -wlN
 CACHE_WARM_MAX_FRACTION=""  # --cache-warm-max-fraction F (engine default 0.25), label -wf<pct>
+DISK_CACHE_BYTES=""      # --disk-cache-bytes N: disk-cache tier capacity per writer, label -dc<size>
+DISK_CACHE_DIR=""        # --disk-cache-dir DIR: root of the per-writer tier dirs (default /tank/cache)
+DISK_CACHE_KEEP_PAGES=0  # --disk-cache-keep-pages: keep the page cache after tier reads, label -kp
 RECORD_CNT=""     # --record-cnt N: dataset size, forwarded as --record_cnt
 RUN_TAG=""        # --run-tag: bench/results/local/<tag> on every host and here
 DRY_RUN=0
@@ -145,6 +148,9 @@ Usage: $(basename "$0") [options]
                             with --cache-warm: warm an output only if its
                             bytes are at most F x lru_cache_bytes (engine
                             default 0.25); label -wf<percent>.
+  --disk-cache-bytes N     Disk-cache tier capacity per writer (bytes); label token -dc<size>
+  --disk-cache-dir DIR     Root of the per-writer tier dirs (default /tank/cache)
+  --disk-cache-keep-pages  Keep the page cache after tier reads (label -kp)
   --record-cnt N            dataset size in records, forwarded to every
                             client as --record_cnt (must match the load).
   --run-tag TAG             results dir bench/results/local/TAG on every host
@@ -183,6 +189,9 @@ while [[ $# -gt 0 ]]; do
   --cache-warm)     CACHE_WARM=1; shift ;;
   --cache-warm-max-level)    CACHE_WARM_MAX_LEVEL="$2"; shift 2 ;;
   --cache-warm-max-fraction) CACHE_WARM_MAX_FRACTION="$2"; shift 2 ;;
+  --disk-cache-bytes) DISK_CACHE_BYTES="$2"; shift 2 ;;
+  --disk-cache-dir) DISK_CACHE_DIR="$2"; shift 2 ;;
+  --disk-cache-keep-pages) DISK_CACHE_KEEP_PAGES=1; shift ;;
   --record-cnt)     RECORD_CNT="$2"; shift 2 ;;
   --run-tag)        RUN_TAG="$2"; shift 2 ;;
   --dry-run)        DRY_RUN=1; shift ;;
@@ -229,6 +238,10 @@ if [[ -n "$RUN_TAG" ]] && ! [[ "$RUN_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 if [[ -n "$LRU_CACHE_BYTES" ]] && ! [[ "$LRU_CACHE_BYTES" =~ ^[1-9][0-9]*$ ]]; then
   echo "--lru-cache-bytes must be a positive integer (got: $LRU_CACHE_BYTES)" >&2
+  exit 1
+fi
+if [[ -n "$DISK_CACHE_BYTES" ]] && ! [[ "$DISK_CACHE_BYTES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--disk-cache-bytes must be a positive integer (got: $DISK_CACHE_BYTES)" >&2
   exit 1
 fi
 if [[ -n "$RECORD_CNT" ]] && ! [[ "$RECORD_CNT" =~ ^[1-9][0-9]*$ ]]; then
@@ -368,9 +381,12 @@ COMMON_ARGS=(--config "$CONFIG" --run_tag "$OZONEDB_RUN_TAG")
 [[ "$CACHE_WARM" -eq 1 ]] && COMMON_ARGS+=(--cache-warm)
 [[ "$CACHE_WARM" -eq 1 && -n "$CACHE_WARM_MAX_LEVEL" ]] && COMMON_ARGS+=(--cache-warm-max-level "$CACHE_WARM_MAX_LEVEL")
 [[ "$CACHE_WARM" -eq 1 && -n "$CACHE_WARM_MAX_FRACTION" ]] && COMMON_ARGS+=(--cache-warm-max-fraction "$CACHE_WARM_MAX_FRACTION")
+[[ -n "$DISK_CACHE_BYTES" ]] && COMMON_ARGS+=(--disk-cache-bytes "$DISK_CACHE_BYTES")
+[[ -n "$DISK_CACHE_BYTES" && -n "$DISK_CACHE_DIR" ]] && COMMON_ARGS+=(--disk-cache-dir "$DISK_CACHE_DIR")
+[[ -n "$DISK_CACHE_BYTES" && "$DISK_CACHE_KEEP_PAGES" -eq 1 ]] && COMMON_ARGS+=(--disk-cache-keep-pages)
 [[ -n "$RECORD_CNT"      ]] && COMMON_ARGS+=(--record_cnt "$RECORD_CNT")
 
-echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} cache_warm=$CACHE_WARM record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
+echo "=== sweep: workloads=(${WORKLOADS_ARR[*]}) writers_per_host=(${WRITERS_ARR[*]}) trials=(${TRIAL_SEQ[*]}) read_mode=$READ_MODE log_trim=$LOG_TRIM lru_cache_bytes=${LRU_CACHE_BYTES:-base} cache_warm=$CACHE_WARM disk_cache_bytes=${DISK_CACHE_BYTES:-off} record_cnt=${RECORD_CNT:-yaml} duration=${DURATION:-yaml} run_tag=$OZONEDB_RUN_TAG ==="
 echo "=== corfu server: $CORFU_TARGET:$CORFU_PORT ==="
 if [[ -n "$CLIENT_HOSTS" ]]; then
   echo "=== client hosts (override): $CLIENT_HOSTS ==="

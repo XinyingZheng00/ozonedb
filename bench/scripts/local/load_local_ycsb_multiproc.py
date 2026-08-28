@@ -5,6 +5,7 @@ import argparse
 import yaml
 import json
 import re
+import shutil
 import sqlite3
 import time
 from datetime import datetime
@@ -216,18 +217,62 @@ def cache_warm_label_token(corfu_settings):
     return token
 
 
-def lru_label_token(lru_cache_bytes):
-    """`lru512m`, `lru64m`, `lru128k`, `lru1000b`: the cache size as a
-    filename token. Exact powers of 1024 stay short; anything else is bytes,
-    so two different sizes can never share a label."""
-    n = int(lru_cache_bytes)
+DEFAULT_DISK_CACHE_DIR = "/tank/cache"
+
+
+def size_label_token(n):
+    """`512m`, `2g`, `128k`, `1000b`: a byte count as a filename token. Exact
+    powers of 1024 stay short; anything else is bytes, so two different sizes
+    can never share a label."""
+    n = int(n)
     if n % (1 << 30) == 0:
-        return f"lru{n >> 30}g"
+        return f"{n >> 30}g"
     if n % (1 << 20) == 0:
-        return f"lru{n >> 20}m"
+        return f"{n >> 20}m"
     if n % (1 << 10) == 0:
-        return f"lru{n >> 10}k"
-    return f"lru{n}b"
+        return f"{n >> 10}k"
+    return f"{n}b"
+
+
+def lru_label_token(lru_cache_bytes):
+    """`lru512m`, `lru64m`, `lru128k`, `lru1000b` (see size_label_token)."""
+    return "lru" + size_label_token(lru_cache_bytes)
+
+
+def disk_cache_corfu_settings(corfu_settings, disk_cache_bytes, disk_cache_dir=None, keep_pages=False):
+    """`--disk-cache-bytes N [--disk-cache-dir DIR] [--disk-cache-keep-pages]`
+    as corfu settings. Every writer gets `<DIR>/w{i}/`, wiped before each
+    phase (bench/PLAN-disk-cache.md, Task 8)."""
+    n = int(disk_cache_bytes)
+    if n <= 0:
+        raise ValueError("--disk-cache-bytes must be a positive byte count")
+    s = dict(corfu_settings or {})
+    s["disk_cache_bytes"] = n
+    s["disk_cache_dir"] = disk_cache_dir or s.get("disk_cache_dir") or DEFAULT_DISK_CACHE_DIR
+    s["disk_cache_drop_pages"] = not keep_pages
+    return s
+
+
+def disk_cache_label_token(corfu_settings):
+    """`-dc512m`, `-dc2g-kp` (page cache kept), or `` when the tier is off."""
+    s = corfu_settings or {}
+    if not s.get("disk_cache_bytes"):
+        return ""
+    token = "-dc" + size_label_token(s["disk_cache_bytes"])
+    if not _truthy(s.get("disk_cache_drop_pages", True)):
+        token += "-kp"
+    return token
+
+
+def require_disk_cache_mount(path):
+    """Refuses a disk-cache dir that lives on the root filesystem: the
+    experiment measures the SSD, not the OS disk. OZONEDB_DISK_CACHE_ANY_FS=1
+    overrides (single-node tests)."""
+    if os.environ.get("OZONEDB_DISK_CACHE_ANY_FS") == "1":
+        return
+    os.makedirs(path, exist_ok=True)
+    if os.stat(path).st_dev == os.stat("/").st_dev:
+        sys.exit(f"disk cache dir {path} is on the root filesystem; run bench/scripts/setup_disk_cache.sh (or set OZONEDB_DISK_CACHE_ANY_FS=1)")
 
 
 def parse_lru_label_token(token):
@@ -332,6 +377,9 @@ def result_label(db_name, corfu_settings, cassandra_settings=None, lru_cache_byt
         # Warm outputs on (--cache-warm, or corfu.cache_warm): `-warm`,
         # plus the policy knobs when they differ from the engine defaults.
         label += cache_warm_label_token(corfu_settings)
+        # Disk-cache tier on (--disk-cache-bytes, or corfu.disk_cache_bytes):
+        # `-dc512m`, plus `-kp` when the page cache is kept after tier reads.
+        label += disk_cache_label_token(corfu_settings)
     return label
 
 
@@ -390,6 +438,23 @@ def _make_corfu_config_per_writer(writer_idx, db_path, corfu_settings, s3_settin
         for k in ("cache_warm_max_level", "cache_warm_max_fraction", "cache_warm_min_input_blocks"):
             if corfu_settings.get(k) is not None:
                 data[k] = str(corfu_settings[k])
+        # Disk-cache tier (--disk-cache-bytes; bench/PLAN-disk-cache.md).
+        dc_bytes = int(corfu_settings.get("disk_cache_bytes") or 0)
+        if dc_bytes > 0:
+            # One directory per writer process, cold at every phase: the
+            # bucket is restored between cells, so a copy from the previous
+            # cell may carry a name the new cell re-creates with other bytes.
+            dc_root = corfu_settings.get("disk_cache_dir") or DEFAULT_DISK_CACHE_DIR
+            require_disk_cache_mount(dc_root)
+            dc_dir = os.path.join(dc_root, f"w{writer_idx}") + "/"
+            shutil.rmtree(dc_dir, ignore_errors=True)
+            os.makedirs(dc_dir, exist_ok=True)
+            data["disk_cache_dir"] = dc_dir
+            data["disk_cache_bytes"] = dc_bytes
+            data["disk_cache_drop_pages"] = "true" if _truthy(corfu_settings.get("disk_cache_drop_pages", True)) else "false"
+        else:
+            for key in ("disk_cache_dir", "disk_cache_bytes", "disk_cache_drop_pages", "disk_cache_chunk_bytes", "disk_cache_fill_queue"):
+                data.pop(key, None)
         # Log trimming (PLAN-trimming.md): exactly one trimmer per cluster,
         # global writer 0. writer_idx is global (offset + local index), so
         # on a multi-host run only the first host's first writer trims.
@@ -888,6 +953,12 @@ if __name__ == "__main__":
         help="With --cache-warm: warm an output only if its bytes are at most this "
              "fraction of lru_cache_bytes (engine default 0.25); label token -wf<percent>.",
     )
+    parser.add_argument("--disk-cache-bytes", type=int, default=None,
+                        help="Disk-cache tier capacity per writer in bytes (bench/PLAN-disk-cache.md); off when absent")
+    parser.add_argument("--disk-cache-dir", default=None,
+                        help=f"Root of the per-writer disk-cache dirs (default {DEFAULT_DISK_CACHE_DIR}, the SSD mounted by setup_disk_cache.sh)")
+    parser.add_argument("--disk-cache-keep-pages", action="store_true",
+                        help="Do not drop the page cache after tier reads (A/B of the SSD cost)")
     parser.add_argument(
         "--db_name",
         type=str,
@@ -956,6 +1027,8 @@ if __name__ == "__main__":
         corfu_settings = cache_warm_corfu_settings(
             corfu_settings, args.cache_warm_max_level, args.cache_warm_max_fraction
         )
+    if args.disk_cache_bytes is not None:
+        corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages)
     s3_settings = config.get("s3")
     os.makedirs(ycsb_data_path, exist_ok=True)
 
@@ -963,7 +1036,8 @@ if __name__ == "__main__":
           f" (db={db_names}, record_cnt={record_cnts}, "
           f"log_trim={'on' if args.log_trim else 'yaml'}, "
           f"cache_warm={'on' if args.cache_warm else 'yaml'}, "
-          f"lru_cache_bytes={args.lru_cache_bytes or 'base config'})")
+          f"lru_cache_bytes={args.lru_cache_bytes or 'base config'}, "
+          f"disk_cache={disk_cache_label_token(corfu_settings) or 'off'})")
     load_ycsb(
         record_cnts,
         key_sizes,

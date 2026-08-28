@@ -19,6 +19,8 @@ from load_local_ycsb_multiproc import (
     cache_warm_corfu_settings,
     cassandra_mode_settings,
     cassandra_ycsb_props,
+    disk_cache_corfu_settings,
+    disk_cache_label_token,
     linearizable_corfu_settings,
     log_trim_corfu_settings,
     lru_cache_corfu_settings,
@@ -422,6 +424,12 @@ if __name__ == "__main__":
         help="With --cache-warm: warm an output only if its bytes are at most this "
              "fraction of lru_cache_bytes (engine default 0.25); label token -wf<percent>.",
     )
+    parser.add_argument("--disk-cache-bytes", type=int, default=None,
+                        help="Disk-cache tier capacity per writer in bytes (bench/PLAN-disk-cache.md); off when absent")
+    parser.add_argument("--disk-cache-dir", default=None,
+                        help="Root of the per-writer disk-cache dirs (default /tank/cache, the SSD mounted by setup_disk_cache.sh)")
+    parser.add_argument("--disk-cache-keep-pages", action="store_true",
+                        help="Do not drop the page cache after tier reads (A/B of the SSD cost)")
     parser.add_argument(
         "--db_name",
         type=str,
@@ -495,6 +503,8 @@ if __name__ == "__main__":
         corfu_settings = cache_warm_corfu_settings(
             corfu_settings, args.cache_warm_max_level, args.cache_warm_max_fraction
         )
+    if args.disk_cache_bytes is not None:
+        corfu_settings = disk_cache_corfu_settings(corfu_settings, args.disk_cache_bytes, args.disk_cache_dir, args.disk_cache_keep_pages)
     s3_settings = config.get("s3")
     max_exec_time = (
         args.max_exec_time
@@ -515,7 +525,8 @@ if __name__ == "__main__":
         f"cache_warm={'on' if args.cache_warm else 'yaml'}, "
         f"cassandra_consistency={args.cassandra_consistency or 'yaml'}, "
         f"record_cnt={record_cnts}, "
-        f"lru_cache_bytes={args.lru_cache_bytes or 'base config'})"
+        f"lru_cache_bytes={args.lru_cache_bytes or 'base config'}, "
+        f"disk_cache={disk_cache_label_token(corfu_settings) or 'off'})"
     )
     run_ycsb(
         workload_names,
