@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
+
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -139,6 +141,7 @@ Status DiskCacheStorage::read(std::string const& fileName, unsigned char*& data,
     passthrough_.fetch_add(1);
     return backing_->read(fileName, data, a, length);
   }
+  if (options_.mode == Mode::kChunk) return readChunked(fileName, data, a, length);
   recordAccess(fileName);
   if (touch(fileName)) {
     if (readLocal(fileName, data, a, length)) {
@@ -161,8 +164,15 @@ Status DiskCacheStorage::read(std::string const& fileName, unsigned char*& data,
 size_t DiskCacheStorage::size(std::string fileName) {
   if (cacheable(fileName)) {
     std::lock_guard<std::mutex> lk(mtx_);
-    auto it = index_.find(fileName);
-    if (it != index_.end()) return it->second.bytes;
+    if (options_.mode == Mode::kChunk) {
+      // chunks_ never holds a file under construction, so a builder appending
+      // to a name still sees the backing's growing size.
+      auto it = chunks_.find(fileName);
+      if (it != chunks_.end()) return it->second.size;
+    } else {
+      auto it = index_.find(fileName);
+      if (it != index_.end()) return it->second.bytes;
+    }
   }
   return backing_->size(fileName);
 }
@@ -381,6 +391,12 @@ void DiskCacheStorage::invalidate(std::string const& name) {
   if (!cacheable(name)) return;
   discardPart(name);
   std::lock_guard<std::mutex> lk(mtx_);
+  if (options_.mode == Mode::kChunk) {
+    // dropChunkFileLocked subtracts only the present chunks: the writer of
+    // each pending chunk subtracts its own bytes when it finds no entry.
+    dropChunkFileLocked(name, /*unlink=*/true, /*count_as_invalidated=*/true);
+    return;
+  }
   eraseLocked(name, /*count_as_invalidated=*/true);
 }
 
@@ -398,6 +414,7 @@ void DiskCacheStorage::enqueueFill(std::string const& name) {
 }
 
 void DiskCacheStorage::startFillWorker() {
+  if (options_.mode == Mode::kChunk) return;  // the miss path is the fill
   std::lock_guard<std::mutex> life(fill_lifecycle_mtx_);  // serialised against a concurrent stop's join
   std::lock_guard<std::mutex> lk(fill_mtx_);
   if (fill_started_) return;
@@ -522,6 +539,25 @@ size_t DiskCacheStorage::reconcile(std::function<bool(std::string const&, size_t
   size_t removed = 0;
   std::error_code ec;
   if (!fs::exists(options_.dir, ec)) return 0;
+  if (options_.mode == Mode::kChunk) {
+    // Which chunks of a leftover sparse file hold data is not recorded, so a
+    // warm restart is not possible: start cold and drop every local file.
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      chunks_.clear();
+      ring_.clear();
+      hand_file_ = hand_chunk_ = 0;
+      present_chunks_ = 0;
+      current_bytes_ = 0;
+      sizes_.clear();
+    }
+    for (auto it = fs::recursive_directory_iterator(options_.dir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+      if (!it->is_regular_file(ec)) continue;
+      fs::remove(it->path(), ec);
+      ++removed;
+    }
+    return removed;
+  }
   auto ends_with = [](std::string const& s, std::string const& suffix) {
     return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
   };
@@ -578,8 +614,15 @@ DiskCacheStorage::Stats DiskCacheStorage::stats() {
   s.invalidated = invalidated_.load();
   s.fetch_bytes = fetch_bytes_.load();
   s.admit_rejected = admit_rejected_.load();
+  s.punch_failed = punch_failed_.load();
   std::lock_guard<std::mutex> lk(mtx_);
-  s.files = index_.size();
+  if (options_.mode == Mode::kChunk) {
+    s.files = chunks_.size();
+    s.entries = present_chunks_;
+  } else {
+    s.files = index_.size();
+    s.entries = index_.size();
+  }
   s.bytes = current_bytes_;
   s.capacity = options_.capacity_bytes;
   return s;
@@ -599,7 +642,240 @@ void DiskCacheStorage::printStats() {
             << " evictions=" << s.evictions << " evicted_bytes=" << s.evicted_bytes
             << " invalidated=" << s.invalidated << " files=" << s.files
             << " bytes=" << s.bytes << " capacity=" << s.capacity
-            << " fetch_bytes=" << s.fetch_bytes << " admit_rejected=" << s.admit_rejected << "\n";
+            << " fetch_bytes=" << s.fetch_bytes << " admit_rejected=" << s.admit_rejected
+            << " entries=" << s.entries
+            << " mode=" << (options_.mode == Mode::kChunk ? "chunk" : "file")
+            << " entry_bytes=" << (options_.mode == Mode::kChunk ? options_.entry_bytes : 0u)
+            << " punch_failed=" << s.punch_failed << "\n";
+}
+
+Status DiskCacheStorage::readChunked(std::string const& fileName, unsigned char*& data, size_t a, size_t length) {
+  size_t const E = options_.entry_bytes;
+  recordAccess(chunkKey(fileName, a / E));
+  bool hit = false;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = chunks_.find(fileName);
+    if (it != chunks_.end() && a + length <= it->second.size && chunksPresentLocked(it->second, a / E, (a + length + E - 1) / E)) hit = true;
+  }
+  if (hit) {
+    if (readLocal(fileName, data, a, length)) {
+      hits_.fetch_add(1);
+      hit_bytes_.fetch_add(length);
+      return Status::kSuccess;
+    }
+    invalidate(fileName);  // the copy is unreadable: drop it
+  }
+  misses_.fetch_add(1);
+  size_t const total = sizeOf(fileName);
+  if (total == 0 || a + length > total) {  // unknown object, or a read past its end: the backing decides
+    Status s = backing_->read(fileName, data, a, length);
+    if (s == Status::kSuccess) {
+      miss_bytes_.fetch_add(length);
+      fetch_bytes_.fetch_add(length);
+    }
+    return s;
+  }
+  size_t const c0 = a / E, c1 = (a + length + E - 1) / E;
+  size_t const off = c0 * E;
+  size_t const len = std::min(c1 * E, total) - off;
+  unsigned char* buf = nullptr;
+  Status s = backing_->read(fileName, buf, off, len);
+  if (s != Status::kSuccess || buf == nullptr) {
+    delete[] buf;
+    return s == Status::kSuccess ? Status::kFailure : s;
+  }
+  miss_bytes_.fetch_add(length);
+  fetch_bytes_.fetch_add(len);
+  data = new unsigned char[length];
+  std::memcpy(data, buf + (a - off), length);
+
+  // Reserve the absent chunks under mtx_, write them outside it, then flip
+  // kPending to kPresent under mtx_ again.
+  std::vector<size_t> to_write;
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    ChunkFile& cf = chunks_[fileName];
+    if (cf.state.empty()) {
+      cf.size = total;
+      cf.state.assign(chunkCount(total), 0);
+      cf.ring = ring_.size();
+      ring_.push_back(fileName);
+    }
+    for (size_t c = c0; c < c1; ++c) {
+      if (cf.state[c] & (kPresent | kPending)) {
+        fill_skipped_present_.fetch_add(1);
+        continue;
+      }
+      if (reserveChunkLocked(fileName, cf, c, fillMode())) to_write.push_back(c);
+    }
+    if (cf.present == 0 && cf.pending == 0) dropChunkFileLocked(fileName, /*unlink=*/false, false);  // nothing kept: no empty entry
+  }
+  uint64_t written = 0, wrote = 0;
+  for (size_t c : to_write) {
+    size_t const n = chunkBytes(total, c);
+    bool const ok = pwriteLocal(fileName, c * E, buf + (c * E - off), n);
+    std::lock_guard<std::mutex> lk(mtx_);
+    auto it = chunks_.find(fileName);
+    if (it == chunks_.end()) {  // invalidated meanwhile: the pwrite re-created a dead file
+      std::error_code ec;
+      fs::remove(localPath(fileName), ec);
+      current_bytes_ -= n;
+      continue;
+    }
+    ChunkFile& cf = it->second;
+    cf.state[c] &= static_cast<uint8_t>(~kPending);
+    --cf.pending;
+    if (ok) {
+      cf.state[c] |= kPresent | kReferenced;
+      ++cf.present;
+      ++present_chunks_;
+      ++wrote;
+      written += n;
+    } else {
+      current_bytes_ -= n;
+      fill_failed_.fetch_add(1);
+      if (cf.present == 0 && cf.pending == 0) dropChunkFileLocked(fileName, /*unlink=*/true, false);
+    }
+  }
+  delete[] buf;
+  fills_.fetch_add(wrote);
+  fill_bytes_.fetch_add(written);
+  return Status::kSuccess;
+}
+
+bool DiskCacheStorage::chunksPresentLocked(ChunkFile& cf, size_t c0, size_t c1) {
+  if (c1 > cf.state.size()) return false;
+  for (size_t c = c0; c < c1; ++c) {
+    if (!(cf.state[c] & kPresent)) return false;
+  }
+  for (size_t c = c0; c < c1; ++c) cf.state[c] |= kReferenced;
+  return true;
+}
+
+bool DiskCacheStorage::reserveChunkLocked(std::string const& name, ChunkFile& cf, size_t c, AdmitMode how) {
+  size_t const need = chunkBytes(cf.size, c);
+  if (need > options_.capacity_bytes) {
+    fill_skipped_budget_.fetch_add(1);
+    return false;
+  }
+  // Reserve first: while this chunk is kPending its file cannot be dropped
+  // by an eviction below, so `cf` stays valid.
+  cf.state[c] |= kPending;
+  ++cf.pending;
+  current_bytes_ += need;
+  while (current_bytes_ > options_.capacity_bytes) {
+    std::string vname;
+    size_t vchunk = 0;
+    if (!clockVictimLocked(vname, vchunk) || !mayTakeLocked(chunkKey(name, c), 0, chunkKey(vname, vchunk), how)) {
+      cf.state[c] &= static_cast<uint8_t>(~kPending);
+      --cf.pending;
+      current_bytes_ -= need;
+      if (vname.empty()) admit_rejected_.fetch_add(1);  // nothing evictable: counted here, mayTakeLocked did not run
+      return false;
+    }
+    evictChunkLocked(vname, vchunk);
+  }
+  return true;
+}
+
+bool DiskCacheStorage::clockVictimLocked(std::string& name, size_t& chunk) {
+  size_t wraps = 0;
+  while (wraps < 3 && !ring_.empty()) {
+    if (hand_file_ >= ring_.size()) {
+      hand_file_ = 0;
+      hand_chunk_ = 0;
+      ++wraps;
+      continue;
+    }
+    ChunkFile& cf = chunks_[ring_[hand_file_]];
+    if (cf.present == 0) {
+      ++hand_file_;
+      hand_chunk_ = 0;
+      continue;
+    }
+    for (; hand_chunk_ < cf.state.size(); ++hand_chunk_) {
+      uint8_t& st = cf.state[hand_chunk_];
+      if (!(st & kPresent)) continue;
+      if (st & kReferenced) {
+        st &= static_cast<uint8_t>(~kReferenced);
+        continue;
+      }
+      name = ring_[hand_file_];
+      chunk = hand_chunk_++;
+      return true;
+    }
+    ++hand_file_;
+    hand_chunk_ = 0;
+  }
+  return false;
+}
+
+void DiskCacheStorage::evictChunkLocked(std::string const& name, size_t c) {
+  auto it = chunks_.find(name);
+  if (it == chunks_.end()) return;
+  ChunkFile& cf = it->second;
+  size_t const n = chunkBytes(cf.size, c);
+  if (!punchHole(name, c * options_.entry_bytes, n)) punch_failed_.fetch_add(1);  // the state byte is what says "absent"
+  cf.state[c] &= static_cast<uint8_t>(~(kPresent | kReferenced));
+  --cf.present;
+  --present_chunks_;
+  current_bytes_ -= n;
+  evictions_.fetch_add(1);
+  evicted_bytes_.fetch_add(n);
+  if (cf.present == 0 && cf.pending == 0) dropChunkFileLocked(name, /*unlink=*/true, false);
+}
+
+void DiskCacheStorage::dropChunkFileLocked(std::string const& name, bool unlink, bool count_as_invalidated) {
+  sizes_.erase(name);
+  auto it = chunks_.find(name);
+  if (it == chunks_.end()) return;
+  ChunkFile& cf = it->second;
+  for (size_t c = 0; c < cf.state.size(); ++c) {
+    if (cf.state[c] & kPresent) current_bytes_ -= chunkBytes(cf.size, c);
+  }
+  present_chunks_ -= cf.present;
+  // Swap-remove the ring slot. The hand tolerates it: at worst the moved
+  // file gets one extra second chance.
+  size_t const slot = cf.ring;
+  size_t const last = ring_.size() - 1;
+  if (slot != last) {
+    ring_[slot] = ring_[last];
+    chunks_[ring_[slot]].ring = slot;
+  }
+  ring_.pop_back();
+  if (hand_file_ == slot) hand_chunk_ = 0;
+  chunks_.erase(it);
+  if (unlink) {
+    std::error_code ec;
+    fs::remove(localPath(name), ec);
+  }
+  if (count_as_invalidated) invalidated_.fetch_add(1);
+}
+
+bool DiskCacheStorage::pwriteLocal(std::string const& name, size_t off, unsigned char const* buf, size_t len) {
+  std::error_code ec;
+  fs::create_directories(fs::path(localPath(name)).parent_path(), ec);
+  int fd = ::open(localPath(name).c_str(), O_WRONLY | O_CREAT, 0644);
+  if (fd < 0) return false;
+  size_t done = 0;
+  while (done < len) {
+    ssize_t n = ::pwrite(fd, buf + done, len - done, static_cast<off_t>(off + done));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    done += static_cast<size_t>(n);
+  }
+  if (options_.drop_pages) ::posix_fadvise(fd, static_cast<off_t>(off), static_cast<off_t>(len), POSIX_FADV_DONTNEED);
+  ::close(fd);
+  return done == len;
+}
+
+bool DiskCacheStorage::punchHole(std::string const& name, size_t off, size_t len) {
+  int fd = ::open(localPath(name).c_str(), O_WRONLY);
+  if (fd < 0) return false;
+  int const rc = ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(off), static_cast<off_t>(len));
+  ::close(fd);
+  return rc == 0;
 }
 
 }  // namespace ozonedb

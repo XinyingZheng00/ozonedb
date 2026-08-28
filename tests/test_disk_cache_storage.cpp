@@ -7,6 +7,8 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <cstring>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,6 +25,9 @@ namespace {
 
 std::string const kRoot = "/tank/test/disk_cache/";
 
+using Mode = DiskCacheStorage::Mode;
+using Adm = DiskCacheStorage::Admission;
+
 std::string stamp() {
   auto ns = std::chrono::steady_clock::now().time_since_epoch().count();
   return std::to_string(getpid()) + "_" + std::to_string(ns);
@@ -34,6 +39,8 @@ class CountingStorage : public FileStorage {
   explicit CountingStorage(std::string const& path) : FileStorage(path) {}
   Status read(std::string const& fileName, unsigned char*& data, size_t a, size_t length) override {
     ++ranged_reads;
+    last_a = a;
+    last_len = length;
     return FileStorage::read(fileName, data, a, length);
   }
   Status read(std::string const& fileName, unsigned char*& data, size_t& size) override {
@@ -47,6 +54,8 @@ class CountingStorage : public FileStorage {
   int ranged_reads = 0;
   int full_reads = 0;
   int sizes = 0;
+  size_t last_a = 0;
+  size_t last_len = 0;
 };
 
 // A CountingStorage whose ranged read deletes a path (the fill's private
@@ -118,7 +127,8 @@ struct TierFixture {
   std::unique_ptr<DiskCacheStorage> tier;
 
   explicit TierFixture(uint64_t capacity, size_t chunk = 64u << 20, bool drop_pages = true,
-                       DiskCacheStorage::Admission admission = DiskCacheStorage::Admission::kAlways) {
+                       DiskCacheStorage::Admission admission = DiskCacheStorage::Admission::kAlways,
+                       DiskCacheStorage::Mode mode = DiskCacheStorage::Mode::kFile, size_t entry = 65536) {
     std::string const s = stamp();
     backing_dir = kRoot + "backing_" + s + "/";
     tier_dir = kRoot + "tier_" + s + "/";
@@ -133,6 +143,8 @@ struct TierFixture {
     o.chunk_bytes = chunk;
     o.drop_pages = drop_pages;
     o.admission = admission;
+    o.mode = mode;
+    o.entry_bytes = entry;
     tier = std::make_unique<DiskCacheStorage>(std::move(owned), o);
   }
   ~TierFixture() {
@@ -155,6 +167,13 @@ struct TierFixture {
     ASSERT_EQ(tier->read(name, d, 0, 10), Status::kSuccess);
     delete[] d;
     tier->waitFillIdle();
+  }
+  // A ranged read of `n` bytes at `off`, checked against `bytes`.
+  void readAt(std::string const& name, std::vector<unsigned char> const& bytes, size_t off, size_t n) {
+    unsigned char* d = nullptr;
+    ASSERT_EQ(tier->read(name, d, off, n), Status::kSuccess);
+    EXPECT_EQ(0, memcmp(d, bytes.data() + off, n));
+    delete[] d;
   }
   bool local(std::string const& name) const { return std::filesystem::exists(tier_dir + name); }
   bool part(std::string const& name) const { return std::filesystem::exists(tier_dir + name + ".part"); }
@@ -782,4 +801,173 @@ TEST(DiskCacheStorageTest, FillUsesTheMemoisedObjectSize) {
   f.tier->invalidate(a);  // drops the memo with the copy
   f.touch(a);
   EXPECT_EQ(f.backing->sizes, 2);
+}
+
+TEST(DiskCacheStorageTest, ChunkMissFetchesTheCoveringChunksAndTheNextReadHits) {
+  TierFixture f(1u << 20, 64u << 20, true, Adm::kAlways, Mode::kChunk, /*entry=*/1024);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 3 * 1024 + 1);
+  f.readAt(name, bytes, 5, 10);  // chunk 0
+  EXPECT_EQ(f.backing->ranged_reads, 1);
+  EXPECT_EQ(f.backing->last_a, 0u);
+  EXPECT_EQ(f.backing->last_len, 1024u);
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.misses, 1u);
+  EXPECT_EQ(s.miss_bytes, 10u);
+  EXPECT_EQ(s.fetch_bytes, 1024u);
+  EXPECT_EQ(s.fills, 1u);
+  EXPECT_EQ(s.fill_bytes, 1024u);
+  EXPECT_EQ(s.fill_gets, 0u);  // the fill is the demand read
+  EXPECT_EQ(s.entries, 1u);
+  EXPECT_EQ(s.bytes, 1024u);
+  EXPECT_EQ(s.files, 1u);
+  f.readAt(name, bytes, 100, 200);  // inside chunk 0: a hit
+  EXPECT_EQ(f.backing->ranged_reads, 1);
+  EXPECT_EQ(f.tier->stats().hits, 1u);
+  f.readAt(name, bytes, 1020, 10);  // straddles chunks 0 and 1; chunk 1 is absent
+  EXPECT_EQ(f.backing->ranged_reads, 2);
+  EXPECT_EQ(f.backing->last_a, 0u);  // the whole covering range, present chunk included
+  EXPECT_EQ(f.backing->last_len, 2048u);
+  s = f.tier->stats();
+  EXPECT_EQ(s.entries, 2u);
+  EXPECT_EQ(s.fills, 2u);
+  EXPECT_EQ(s.fill_skipped_present, 1u);
+  EXPECT_EQ(s.fetch_bytes, 1024u + 2048u);
+  f.readAt(name, bytes, 3 * 1024, 1);  // the short last chunk
+  EXPECT_EQ(f.backing->last_a, 3072u);
+  EXPECT_EQ(f.backing->last_len, 1u);
+  EXPECT_EQ(f.tier->stats().bytes, 2048u + 1u);
+  // The local copy holds each fetched chunk at its own offset; chunk 2 is a hole.
+  std::ifstream in(f.tier_dir + name, std::ios::binary);
+  std::vector<unsigned char> copy((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  ASSERT_EQ(copy.size(), bytes.size());
+  EXPECT_EQ(0, memcmp(copy.data(), bytes.data(), 2048));
+  EXPECT_EQ(copy[3072], bytes[3072]);
+}
+
+TEST(DiskCacheStorageTest, ChunkBudgetEvictsWithClockAndTheVictimIsFetchedAgain) {
+  TierFixture f(2048, 64u << 20, true, Adm::kAlways, Mode::kChunk, /*entry=*/1024);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 4096);
+  auto chunk = [&](size_t c) { f.readAt(name, bytes, c * 1024 + 1, 8); };
+  chunk(0);
+  chunk(1);  // 2048 of 2048
+  EXPECT_EQ(f.tier->stats().entries, 2u);
+  chunk(2);  // hand: 0 referenced -> cleared, 1 cleared, wrap, 0 evicted
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.entries, 2u);
+  EXPECT_EQ(s.evictions, 1u);
+  EXPECT_EQ(s.evicted_bytes, 1024u);
+  EXPECT_EQ(s.bytes, 2048u);
+  EXPECT_EQ(s.punch_failed, 0u);
+  int const before = f.backing->ranged_reads;
+  chunk(0);  // absent again: fetched; this time chunk 1 is the victim
+  EXPECT_EQ(f.backing->ranged_reads, before + 1);
+  s = f.tier->stats();
+  EXPECT_EQ(s.evictions, 2u);
+  EXPECT_EQ(s.entries, 2u);
+  chunk(2);  // still present: a hit
+  EXPECT_EQ(f.backing->ranged_reads, before + 1);
+  EXPECT_EQ(f.tier->stats().hits, 1u);
+  EXPECT_TRUE(f.local(name));  // the sparse file stays while any chunk is present
+}
+
+TEST(DiskCacheStorageTest, ChunkEvictingTheLastChunkDropsTheFile) {
+  TierFixture f(1024, 64u << 20, true, Adm::kAlways, Mode::kChunk, /*entry=*/1024);
+  std::string const a = "sstable1/" + stamp() + "_a.sst";
+  std::string const b = "sstable1/" + stamp() + "_b.sst";
+  auto ba = f.seed(a, 1024);
+  auto bb = f.seed(b, 1024);
+  f.readAt(a, ba, 0, 8);
+  f.readAt(b, bb, 0, 8);  // evicts a's only chunk
+  EXPECT_FALSE(f.local(a));
+  EXPECT_TRUE(f.local(b));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.files, 1u);
+  EXPECT_EQ(s.entries, 1u);
+  EXPECT_EQ(s.bytes, 1024u);
+}
+
+TEST(DiskCacheStorageTest, ChunkInvalidateAndRemoveDropTheCopy) {
+  TierFixture f(1u << 20, 64u << 20, true, Adm::kAlways, Mode::kChunk, /*entry=*/1024);
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 2048);
+  f.readAt(name, bytes, 0, 8);
+  EXPECT_TRUE(f.local(name));
+  f.tier->invalidate(name);
+  EXPECT_FALSE(f.local(name));
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.invalidated, 1u);
+  EXPECT_EQ(s.entries, 0u);
+  EXPECT_EQ(s.bytes, 0u);
+  EXPECT_TRUE(f.backing->exist(name));
+  f.readAt(name, bytes, 0, 8);  // fetched again
+  EXPECT_EQ(f.backing->ranged_reads, 2);
+  f.tier->remove(name);
+  EXPECT_FALSE(f.local(name));
+  EXPECT_FALSE(f.backing->exist(name));
+  EXPECT_EQ(f.tier->stats().entries, 0u);
+}
+
+TEST(DiskCacheStorageTest, ChunkModeHasNoFillWorkerAndReconcileStartsCold) {
+  TierFixture f(1u << 20, 64u << 20, true, Adm::kAlways, Mode::kChunk, /*entry=*/1024);
+  f.tier->startFillWorker();  // a no-op in chunk mode
+  f.tier->waitFillIdle();     // returns at once
+  std::string const name = "sstable1/" + stamp() + ".sst";
+  auto bytes = f.seed(name, 2048);
+  f.readAt(name, bytes, 0, 8);
+  f.tier->stopFillWorker();
+  EXPECT_EQ(f.tier->stats().fill_gets, 0u);
+  // reconcile() in chunk mode deletes every local file: which chunks of a
+  // leftover sparse file are data is not recorded.
+  std::filesystem::create_directories(f.tier_dir + "sstable1");
+  std::ofstream(f.tier_dir + "sstable1/leftover.sst") << "x";
+  EXPECT_EQ(f.tier->reconcile([](std::string const&, size_t) { return true; }), 2u);
+  EXPECT_FALSE(f.local(name));
+  EXPECT_EQ(f.tier->stats().entries, 0u);
+}
+
+// Two threads miss on the same chunk while the first fetch is still in the
+// backing. Both fetch, both return the right bytes, and exactly one of them
+// writes the chunk: the other finds it kPending or kPresent and skips.
+TEST(DiskCacheStorageTest, ChunkTwoConcurrentMissesFetchTwiceAndWriteOnce) {
+  std::string const s = stamp();
+  std::string const backing_dir = kRoot + "backing_" + s + "/";
+  std::string const tier_dir = kRoot + "tier_" + s + "/";
+  std::filesystem::create_directories(backing_dir + "sstable1");
+  std::filesystem::create_directories(tier_dir);
+  auto owned = std::make_unique<SlowStorage>(backing_dir, std::chrono::milliseconds(300));
+  SlowStorage* slow = owned.get();
+  DiskCacheStorage::Options o;
+  o.dir = tier_dir;
+  o.capacity_bytes = 1u << 20;
+  o.mode = DiskCacheStorage::Mode::kChunk;
+  o.entry_bytes = 1024;
+  auto tier = std::make_unique<DiskCacheStorage>(std::move(owned), o);
+  std::string const name = "sstable1/" + s + ".sst";
+  std::vector<unsigned char> bytes(2048);
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<unsigned char>(i % 251);
+  std::ofstream(backing_dir + name, std::ios::binary).write(reinterpret_cast<char const*>(bytes.data()), 2048);
+
+  unsigned char* d1 = nullptr;
+  Status s1 = Status::kFailure;
+  std::thread t([&] { s1 = tier->read(name, d1, 0, 8); });
+  ASSERT_TRUE(slow->waitForReadsAtLeast(1, std::chrono::seconds(5)));  // the first read is inside the backing
+  unsigned char* d2 = nullptr;
+  ASSERT_EQ(tier->read(name, d2, 4, 8), Status::kSuccess);  // chunk 0 is not present: a second miss
+  t.join();
+  ASSERT_EQ(s1, Status::kSuccess);
+  EXPECT_EQ(0, memcmp(d1, bytes.data(), 8));
+  EXPECT_EQ(0, memcmp(d2, bytes.data() + 4, 8));
+  delete[] d1;
+  delete[] d2;
+  EXPECT_EQ(slow->reads(), 2);
+  auto st = tier->stats();
+  EXPECT_EQ(st.misses, 2u);
+  EXPECT_EQ(st.entries, 1u);
+  EXPECT_EQ(st.bytes, 1024u);
+  EXPECT_EQ(st.fills + st.fill_skipped_present, 2u);
+  tier.reset();
+  std::filesystem::remove_all(backing_dir);
+  std::filesystem::remove_all(tier_dir);
 }

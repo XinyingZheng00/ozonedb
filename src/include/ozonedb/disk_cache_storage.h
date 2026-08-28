@@ -1,6 +1,7 @@
 // src/include/ozonedb/disk_cache_storage.h
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "frequency_sketch.h"
 #include "storage.h"
@@ -45,9 +47,12 @@ namespace ozonedb {
 // reconcile() at open. Nothing reads a file the view no longer names.
 //
 // Lock order and what each mutex covers:
-//   * mtx_        - index_, lru_, current_bytes_ (the budget). Held across an
-//                   unlink in eviction/erase, never across a backing-store
-//                   call or any other file I/O.
+//   * mtx_        - index_, lru_, current_bytes_ (the budget), and in chunk
+//                   mode chunks_, ring_, the CLOCK hand and present_chunks_.
+//                   Held across an unlink in eviction/erase, and in chunk mode
+//                   across punchHole() (one fallocate syscall, like that
+//                   unlink); never across pwriteLocal(), a backing-store call
+//                   or any other file I/O.
 //   * parts_mtx_  - parts_ (the write-through streams) and poisoned_parts_.
 //                   Deliberately held across the part's create_directories,
 //                   ofstream open, write, flush and remove, because those are
@@ -74,16 +79,19 @@ namespace ozonedb {
 class DiskCacheStorage : public Storage {
  public:
   enum class Admission { kAlways, kFrequency };
+  enum class Mode { kFile, kChunk };
 
   struct Options {
     std::string dir;                 // local directory, "/" appended if missing
     uint64_t capacity_bytes = 0;     // 0 = cache nothing (pure pass-through)
     std::string prefix = "sstable";  // names starting with this are cached
-    size_t chunk_bytes = 64u << 20;  // ranged-read size of the fill worker
+    size_t chunk_bytes = 64u << 20;  // file mode only: ranged-read size of the fill worker
     bool drop_pages = true;          // POSIX_FADV_DONTNEED after each tier read
     size_t max_queue = 256;          // fill queue bound; the oldest is dropped
     Admission admission = Admission::kAlways;  // kFrequency: TinyLFU contest for non-free budget
     uint64_t admit_window = 0;                 // sketch aging window in samples; 0 = 8 x the entries the budget holds
+    Mode mode = Mode::kFile;                   // kChunk: sub-file entries, no fill worker (PLAN-disk-cache-2)
+    size_t entry_bytes = 64u << 10;            // chunk mode: entry size, a power of two >= 4096
   };
 
   struct Stats {
@@ -93,6 +101,7 @@ class DiskCacheStorage : public Storage {
     uint64_t writethrough_files = 0, evictions = 0, evicted_bytes = 0, invalidated = 0;
     uint64_t files = 0, bytes = 0, capacity = 0;
     uint64_t fetch_bytes = 0, admit_rejected = 0;
+    uint64_t entries = 0, punch_failed = 0;
   };
 
   // Throws std::runtime_error when options.dir cannot be created or is not
@@ -165,6 +174,39 @@ class DiskCacheStorage : public Storage {
   // size() keeps its round-1 behaviour for a file the builder is appending.
   size_t sizeOf(std::string const& name);
 
+  // Chunk mode (bench/PLAN-disk-cache-2.md, Task 3). One sparse local file per
+  // SSTable under localPath(name); one state byte per chunk. A chunk is
+  // charged chunkBytes() of budget while kPresent or kPending. kPending is a
+  // reservation: the bytes are on their way to the file, so a reader must
+  // not treat the chunk as a hit (a hole reads as zeros), and the CLOCK hand
+  // must not evict it. Only the thread that set kPending clears it.
+  static constexpr uint8_t kPresent = 1, kReferenced = 2, kPending = 4;
+  struct ChunkFile {
+    size_t size = 0;             // object size
+    std::vector<uint8_t> state;  // chunkCount(size) bytes
+    size_t present = 0;          // chunks with kPresent
+    size_t pending = 0;          // chunks with kPending
+    size_t ring = 0;             // this file's slot in ring_
+  };
+  size_t chunkCount(size_t size) const { return (size + options_.entry_bytes - 1) / options_.entry_bytes; }
+  size_t chunkBytes(size_t size, size_t c) const { return std::min(options_.entry_bytes, size - c * options_.entry_bytes); }
+  std::string chunkKey(std::string const& name, size_t c) const { return name + '#' + std::to_string(c); }
+  Status readChunked(std::string const& fileName, unsigned char*& data, size_t a, size_t length);
+  // Under mtx_. True when every chunk of [c0, c1) is kPresent; sets kReferenced on them.
+  bool chunksPresentLocked(ChunkFile& cf, size_t c0, size_t c1);
+  // Under mtx_. Marks chunk c kPending and charges its bytes, evicting through the
+  // CLOCK hand as needed under `how`. False (nothing changed) when refused.
+  bool reserveChunkLocked(std::string const& name, ChunkFile& cf, size_t c, AdmitMode how);
+  // Under mtx_. Advances the hand to the next kPresent chunk without kReferenced,
+  // clearing kReferenced on the way. False after two idle rotations.
+  bool clockVictimLocked(std::string& name, size_t& chunk);
+  void evictChunkLocked(std::string const& name, size_t chunk);
+  // Under mtx_. Forgets the file's accounting and its ring slot. `unlink`
+  // also removes the local file.
+  void dropChunkFileLocked(std::string const& name, bool unlink, bool count_as_invalidated);
+  bool pwriteLocal(std::string const& name, size_t off, unsigned char const* buf, size_t len);
+  bool punchHole(std::string const& name, size_t off, size_t len);
+
   std::string localPath(std::string const& name) const { return options_.dir + name; }
   std::string partPath(std::string const& name) const { return options_.dir + name + ".part"; }
   // The fill's own temp file: never shared with parts_/writePart/discardPart,
@@ -209,6 +251,10 @@ class DiskCacheStorage : public Storage {
   std::list<std::string> lru_;  // front = most recently used
   uint64_t current_bytes_ = 0;
   std::unordered_map<std::string, size_t> sizes_;  // under mtx_
+  std::unordered_map<std::string, ChunkFile> chunks_;  // chunk mode, under mtx_
+  std::vector<std::string> ring_;                      // CLOCK order of the chunks_ keys
+  size_t hand_file_ = 0, hand_chunk_ = 0;              // the CLOCK hand: ring_ slot, chunk
+  uint64_t present_chunks_ = 0;                        // under mtx_
 
   // Leaf lock for sketch_: taken under mtx_ by mayTakeLocked(), and alone by
   // recordAccess(). Never held across any I/O.
@@ -237,7 +283,7 @@ class DiskCacheStorage : public Storage {
   std::atomic<uint64_t> fills_{0}, fill_bytes_{0}, fill_gets_{0};
   std::atomic<uint64_t> fill_skipped_budget_{0}, fill_skipped_present_{0}, fill_gone_{0}, fill_failed_{0}, fill_dropped_{0};
   std::atomic<uint64_t> writethrough_files_{0}, evictions_{0}, evicted_bytes_{0}, invalidated_{0};
-  std::atomic<uint64_t> fetch_bytes_{0}, admit_rejected_{0};
+  std::atomic<uint64_t> fetch_bytes_{0}, admit_rejected_{0}, punch_failed_{0};
 };
 
 }  // namespace ozonedb
