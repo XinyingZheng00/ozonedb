@@ -77,6 +77,19 @@ LEVELS_RE = re.compile(
     r" skipped_affinity=(?P<skipped_affinity>\d+) skipped_gone=(?P<skipped_gone>\d+)"
     r" skipped_built=(?P<skipped_built>\d+) dropped=(?P<dropped>\d+) warm_hits=(?P<warm_hits>\d+)"
 )
+# Disk-cache tier stats line (bench/PLAN-disk-cache.md), printed after the
+# [lru_cache] lines when disk_cache_dir is set. All twenty fields are parsed;
+# only a subset become TSV columns (build_row).
+DISK_RE = re.compile(
+    r"\[disk_cache\] hits=(?P<hits>\d+) misses=(?P<misses>\d+) hit_bytes=(?P<hit_bytes>\d+)"
+    r" miss_bytes=(?P<miss_bytes>\d+) passthrough=(?P<passthrough>\d+) fills=(?P<fills>\d+)"
+    r" fill_bytes=(?P<fill_bytes>\d+) fill_gets=(?P<fill_gets>\d+)"
+    r" fill_skipped_budget=(?P<fill_skipped_budget>\d+) fill_skipped_present=(?P<fill_skipped_present>\d+)"
+    r" fill_gone=(?P<fill_gone>\d+) fill_failed=(?P<fill_failed>\d+) fill_dropped=(?P<fill_dropped>\d+)"
+    r" writethrough_files=(?P<writethrough_files>\d+) evictions=(?P<evictions>\d+)"
+    r" evicted_bytes=(?P<evicted_bytes>\d+) invalidated=(?P<invalidated>\d+) files=(?P<files>\d+)"
+    r" bytes=(?P<bytes>\d+) capacity=(?P<capacity>\d+)"
+)
 LEVEL_COLUMNS = ("l1", "l2", "l3", "l4plus")
 
 
@@ -147,7 +160,7 @@ def parse_writer(path, window):
     w = {
         "ops": {}, "failed": 0, "runtime_ms": None,
         "cache_hits": None, "cache_misses": None, "cache_capacity": None,
-        "levels": None,
+        "levels": None, "disk": None,
         "replay": None, "restore": None, "ckpts": [], "ack_fast": None, "ack_slow": None,
         "user_s": None, "sys_s": None, "rss_kb": None,
     }
@@ -178,6 +191,10 @@ def parse_writer(path, window):
                 d["hits"] = level_buckets(level_pairs(m.group("hits")))
                 d["misses"] = level_buckets(level_pairs(m.group("misses")))
                 w["levels"] = d
+                continue
+            m = DISK_RE.search(line)
+            if m:
+                w["disk"] = {k: int(v) for k, v in m.groupdict().items()}
                 continue
             m = REPLAY_RE.search(line)
             if m:
@@ -495,6 +512,33 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
             row[dst] = sum(lv[src] for lv in levels)
         wb = row["warm_blocks"]
         row["warm_hit_frac"] = round(row["warm_hits"] / wb, 4) if wb else ""
+    # Disk-cache tier: sums over the writers that printed the line. Absent on
+    # cells run without disk_cache_dir, so every disk_* column stays "".
+    disks = [w["disk"] for w in ws if w["disk"]]
+    if disks:
+        disk_sums = {k: sum(d[k] for d in disks) for k in disks[0]}
+        disk_denom = disk_sums["hits"] + disk_sums["misses"]
+        disk_h = round(disk_sums["hits"] / disk_denom, 5) if disk_denom else ""
+        h_val = row["h"]
+        h_total = round(1 - (1 - h_val) * (1 - disk_h), 5) if h_val != "" and disk_h != "" else ""
+        row.update({
+            "disk_hits": disk_sums["hits"],
+            "disk_misses": disk_sums["misses"],
+            "disk_h": disk_h,
+            "disk_hit_bytes": disk_sums["hit_bytes"],
+            "disk_miss_bytes": disk_sums["miss_bytes"],
+            "disk_fills": disk_sums["fills"],
+            "disk_fill_bytes": disk_sums["fill_bytes"],
+            "disk_fill_gets": disk_sums["fill_gets"],
+            "disk_fill_gets_per_op": round(disk_sums["fill_gets"] / ops, 5) if ops else "",
+            "disk_evictions": disk_sums["evictions"],
+            "disk_invalidated": disk_sums["invalidated"],
+            "disk_files": disk_sums["files"],
+            "disk_bytes": disk_sums["bytes"],
+            "disk_capacity": disk_sums["capacity"],
+            "disk_ratio": round(disks[0]["capacity"] / (rc * record_bytes), 7) if rc else "",
+            "h_total": h_total,
+        })
     # Server samples: request deltas, bytes, du, bucket, CPU.
     agg = {"get": 0.0, "head": 0.0, "put": 0.0, "list": 0.0, "delete": 0.0, "other": 0.0,
            "bytes_in": 0.0, "bytes_out": 0.0}
@@ -623,6 +667,10 @@ COLUMNS = [
     "tag", "label", "workload", "writers", "have", "trial", "record_cnt", "dataset_bytes",
     "ops", "reads", "writes", "failed", "run_s", "steady_ops_s",
     "cache_hits", "cache_misses", "h", "cache_capacity", "cache_ratio",
+    "disk_hits", "disk_misses", "disk_h", "disk_hit_bytes", "disk_miss_bytes",
+    "disk_fills", "disk_fill_bytes", "disk_fill_gets", "disk_fill_gets_per_op",
+    "disk_evictions", "disk_invalidated", "disk_files", "disk_bytes", "disk_capacity",
+    "disk_ratio", "h_total",
     "hits_l1", "hits_l2", "hits_l3", "hits_l4plus",
     "misses_l1", "misses_l2", "misses_l3", "misses_l4plus",
     "cache_dead_files", "cache_dead_blocks", "cache_dead_bytes", "cache_retired_tables",
