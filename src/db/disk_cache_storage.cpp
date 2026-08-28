@@ -425,8 +425,44 @@ void DiskCacheStorage::fillOne(std::string const& name) {
   }
 }
 
-// --- tier API stubs completed in Tasks 4-5 ---
-size_t DiskCacheStorage::reconcile(std::function<bool(std::string const&, size_t)> const&) { return 0; }
+size_t DiskCacheStorage::reconcile(std::function<bool(std::string const&, size_t)> const& live) {
+  size_t removed = 0;
+  std::error_code ec;
+  if (!fs::exists(options_.dir, ec)) return 0;
+  auto ends_with = [](std::string const& s, std::string const& suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+  struct Found {
+    std::string name;
+    size_t bytes;
+    fs::file_time_type mtime;
+  };
+  std::vector<Found> keep;
+  for (auto it = fs::recursive_directory_iterator(options_.dir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    std::string const rel = fs::relative(it->path(), options_.dir, ec).generic_string();
+    if (ec) continue;
+    // Both the write-through's ".part" and the fill's own ".fillpart" are
+    // in-progress leftovers from before the last close and are dropped
+    // unconditionally, without asking `live` (Task 3 review decision).
+    bool const is_part = ends_with(rel, ".part") || ends_with(rel, ".fillpart");
+    size_t const bytes = static_cast<size_t>(it->file_size(ec));
+    if (is_part || !cacheable(rel) || !live(rel, bytes)) {
+      fs::remove(it->path(), ec);
+      ++removed;
+      continue;
+    }
+    keep.push_back({rel, bytes, it->last_write_time(ec)});
+  }
+  std::sort(keep.begin(), keep.end(), [](Found const& a, Found const& b) { return a.mtime < b.mtime; });
+  for (Found const& k : keep) {
+    if (!admit(k.name, k.bytes)) {  // larger than the capacity
+      fs::remove(localPath(k.name), ec);
+      ++removed;
+    }
+  }
+  return removed;
+}
 
 DiskCacheStorage::Stats DiskCacheStorage::stats() {
   Stats s;

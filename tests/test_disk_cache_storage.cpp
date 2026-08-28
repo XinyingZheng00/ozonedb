@@ -514,3 +514,42 @@ TEST(DiskCacheStorageTest, InvalidateDropsOnlyTheCopy) {
   ASSERT_EQ(f.tier->flush(other), Status::kSuccess);  // the backing still flushes
   EXPECT_FALSE(f.local(other));                        // but nothing is published
 }
+
+TEST(DiskCacheStorageTest, ReconcileDropsPartsDeadFilesAndForeignNames) {
+  TierFixture f(1u << 20);
+  auto write = [&](std::string const& rel, size_t n) {
+    std::filesystem::create_directories(std::filesystem::path(f.tier_dir + rel).parent_path());
+    std::ofstream out(f.tier_dir + rel, std::ios::binary);
+    std::string s(n, 'z');
+    out.write(s.data(), static_cast<std::streamsize>(n));
+  };
+  write("sstable1/live.sst", 300);
+  write("sstable1/dead.sst", 300);
+  write("sstable1/wrongsize.sst", 300);
+  write("sstable1/inflight.sst.part", 50);
+  std::string const fillpart = "sstable1/" + stamp() + "_x.fillpart";
+  write(fillpart, 50);
+  write("checkpoint/LATEST", 8);  // not cacheable: a leftover of another config
+  std::vector<std::string> asked;
+  size_t const removed = f.tier->reconcile([&](std::string const& name, size_t bytes) {
+    asked.push_back(name);
+    if (name == "sstable1/live.sst") return bytes == 300;
+    if (name == "sstable1/wrongsize.sst") return bytes == 999;
+    return false;
+  });
+  EXPECT_EQ(removed, 5u);
+  EXPECT_TRUE(f.local("sstable1/live.sst"));
+  EXPECT_FALSE(f.local("sstable1/dead.sst"));
+  EXPECT_FALSE(f.local("sstable1/wrongsize.sst"));
+  EXPECT_FALSE(f.part("sstable1/inflight.sst"));
+  EXPECT_FALSE(std::filesystem::exists(f.tier_dir + fillpart));
+  EXPECT_FALSE(f.local("checkpoint/LATEST"));
+  EXPECT_EQ(asked.size(), 3u);  // the part, the fillpart and the foreign name are not asked
+  auto s = f.tier->stats();
+  EXPECT_EQ(s.files, 1u);
+  EXPECT_EQ(s.bytes, 300u);
+  unsigned char* data = nullptr;
+  ASSERT_EQ(f.tier->read("sstable1/live.sst", data, 0, 10), Status::kSuccess);
+  delete[] data;
+  EXPECT_EQ(f.tier->stats().hits, 1u);
+}
