@@ -511,6 +511,21 @@ Exit:
 - RSS per writer at most 1.5 GB plus the cache (the 5 GiB cell holds 5 GiB of blocks).
 - Linearizable workload c within 3 % of the default throughput, every linearizable READ OK.
 
+**Finding 2026-08-28 (Task 5, first two cells).** A writer's block cache fills at that
+writer's own miss rate, not the cluster's: about 475 GETs/s × 4 KiB = 1.9 MB/s per writer
+at 10 GB. The 5 GiB cell closed with `current_size` at 25 % of `capacity` after 600 s
+(`h` 0.45, the hit rate of a 13 % cache), and the cumulative-against-steady test does not
+see a slow linear fill. The 640 MiB cell was full (`h` 0.42–0.43 at 6.5 %). The extractor
+now writes `cache_fill` (bytes at close over capacity); a RAM cell counts only when it is
+above 0.9, and a tier cell when `disk_bytes` is near `disk_capacity`. The same arithmetic
+sizes the tier cells: the fill is the miss rate × 64 KiB, about 30 MB/s per writer, so
+20 GiB needs 11 min, 25 GiB 14 min and 50 GiB 28 min plus the slowdown as the hit rate
+rises. Durations changed: 20 GiB tier at 10 GB rerun at 1,800 s (`chain_oz10c.sh`), at
+100 GB the 800 MiB RAM cell 900 s, the 25 GiB tier 1,800 s, the 50 GiB tier 2,700 s, the
+zipf 25 GiB tier 1,800 s. The 52 % RAM point at 10 GB needs a cell of about 4,800 s and
+is deferred to the end of the campaign, if time allows; the projection reads `h` at
+ratios below 0.2 %, where the cache fills in seconds.
+
 ### Task 6. Tier cells at 10 GB
 
 The five cells of `disk2-20260828`, scaled tenfold, on the native client:
