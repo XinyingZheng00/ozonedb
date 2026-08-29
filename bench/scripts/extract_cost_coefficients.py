@@ -63,6 +63,11 @@ SERIES_RE = re.compile(r"^(\d+) (\w+)(\{[^}]*\})? ([-+0-9.eE]+)$")
 YCSB_RE = re.compile(r"^\[([A-Z\-]+)\],\s*([^,]+?),\s*(.+?)\s*$")
 CACHE_RE = re.compile(
     r"\[lru_cache\] sstable hits=(\d+) misses=(\d+) hit_rate=([\d.]+)% capacity=(\d+)"
+    # Bytes held at close. cache_fill = current_size / capacity tells a cell
+    # whose per-writer cache never filled (a 5 GiB cache fills at the writer's
+    # own miss rate, ~1.9 MB/s at 10 GB, so a 600 s cell closes 25 % full and
+    # its h is the hit rate of a much smaller cache; PLAN-cost-2 Task 5).
+    r"(?: current_size=(\d+) files=(\d+))?"
 )
 # Second stats line (bench/PLAN-compaction-cache.md part C): hits and misses
 # per SSTable level as "<level>:<count>" pairs, blocks of files no longer in
@@ -167,7 +172,7 @@ def parse_writer(path, window):
     """Everything one per-writer .result file says."""
     w = {
         "ops": {}, "failed": 0, "runtime_ms": None,
-        "cache_hits": None, "cache_misses": None, "cache_capacity": None,
+        "cache_hits": None, "cache_misses": None, "cache_capacity": None, "cache_size_end": None,
         "levels": None, "disk": None,
         "replay": None, "restore": None, "ckpts": [], "ack_fast": None, "ack_slow": None,
         "user_s": None, "sys_s": None, "rss_kb": None,
@@ -192,6 +197,7 @@ def parse_writer(path, window):
                 w["cache_hits"] = int(m.group(1))
                 w["cache_misses"] = int(m.group(2))
                 w["cache_capacity"] = int(m.group(4))
+                w["cache_size_end"] = int(m.group(5)) if m.group(5) else None
                 continue
             m = LEVELS_RE.search(line)
             if m:
@@ -491,6 +497,7 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
     hits = [w["cache_hits"] for w in ws if w["cache_hits"] is not None]
     misses = [w["cache_misses"] for w in ws if w["cache_misses"] is not None]
     caps = [w["cache_capacity"] for w in ws if w["cache_capacity"] is not None]
+    size_end = [w["cache_size_end"] for w in ws if w.get("cache_size_end") is not None]
     users = [w["user_s"] for w in ws if w["user_s"] is not None]
     syss = [w["sys_s"] for w in ws if w["sys_s"] is not None]
     rss = [w["rss_kb"] for w in ws if w["rss_kb"] is not None]
@@ -514,6 +521,7 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
         "h": round(sum(hits) / (sum(hits) + sum(misses)), 5) if hits and (sum(hits) + sum(misses)) else "",
         "cache_capacity": caps[0] if caps else "",
         "cache_ratio": round(caps[0] / (rc * record_bytes), 7) if caps and rc else "",
+        "cache_fill": round(sum(size_end) / sum(caps), 4) if size_end and caps and sum(caps) else "",
     }
     # Second cache line: sums over the writers that printed it. Absent on
     # result files from builds before part C, so every column stays "".
@@ -714,7 +722,7 @@ def build_row(key, writers, samples, shared, record_bytes, window=60, tag=""):
 COLUMNS = [
     "tag", "label", "workload", "writers", "have", "trial", "record_cnt", "dataset_bytes",
     "ops", "reads", "writes", "failed", "run_s", "steady_ops_s",
-    "cache_hits", "cache_misses", "h", "cache_capacity", "cache_ratio",
+    "cache_hits", "cache_misses", "h", "cache_capacity", "cache_ratio", "cache_fill",
     "disk_hits", "disk_misses", "disk_h", "disk_hit_bytes", "disk_miss_bytes",
     "disk_fills", "disk_fill_bytes", "disk_fill_gets", "disk_fill_gets_per_op",
     "disk_fill_failed", "disk_fill_dropped", "disk_passthrough",
