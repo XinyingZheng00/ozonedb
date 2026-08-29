@@ -65,7 +65,13 @@ filterBlockReader::filterBlockReader(FilterPolicy const* policy, FilterBlock* bl
 bool filterBlockReader::keyMayMatch(uint64_t block_offset, std::string const& key) {
   uint64_t index = block_offset >> block_->lg_base();
   if (index < block_->filters_size()) {
-    std::string filter = block_->filters(index);
+    // Borrow the filter bytes; never copy them. The file-level filter
+    // (Table::open -> readFileFilter) is one bloom filter over every key
+    // of the file, ~10 bits per key: 712 KB for a 570 MB SSTable, and
+    // Table::get probes it for every candidate file of every get. A copy
+    // here was an mmap + memcpy + munmap per probe, ~6 ms of client CPU
+    // per get at 100 GB (campaign cost2-20260828, perf on amd189).
+    std::string const& filter = block_->filters(index);
     return policy_->keyMayMatch(key, filter);
   }
   return true;  // Errors are treated as potential matches
