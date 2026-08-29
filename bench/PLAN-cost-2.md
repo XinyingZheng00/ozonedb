@@ -317,8 +317,10 @@ About 45 min on the laptop. It changes no file that the merge in Task 0 conflict
    pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' || true
    /tank/cassandra/cassandra_ctl.sh stop
    sudo mkdir -p /tank/ssd && sudo chown $USER /tank/ssd
-   # MinIO: the unit's ExecStart keeps the path /tank/minio, which becomes a symlink
-   mv /tank/minio /tank/ssd/minio && ln -s /tank/ssd/minio /tank/minio
+   # MinIO: the unit's ExecStart keeps the path /tank/minio. NOT a symlink: MinIO
+   # lstat()s its drive path and refuses one ("Drives are not directories"). Bind-mount.
+   sudo mv /tank/minio /tank/ssd/minio && sudo mkdir /tank/minio
+   echo "/tank/ssd/minio /tank/minio none bind,nofail 0 0" | sudo tee -a /etc/fstab && sudo mount /tank/minio
    # Corfu: keep load, load-bucket and the two -zstd-20260827 snapshots for now; drop the rest
    mkdir /tank/ssd/corfu
    for d in load load-bucket load-zstd-20260827 load-bucket-zstd-20260827; do mv /mnt/corfu/$d /tank/ssd/corfu/; done
@@ -329,6 +331,8 @@ About 45 min on the laptop. It changes no file that the merge in Task 0 conflict
    /tank/cassandra/cassandra_ctl.sh start && /tank/cassandra/cassandra_ctl.sh wait && /tank/cassandra/cassandra_ctl.sh stop
    df -h /tank/ssd
    ```
+   Done 2026-08-28 17:56-18:04 (the symlink form broke MinIO; fixed to the bind mount above,
+   Cassandra came up in 15 s through its symlink, 25 GB on `/tank/ssd`).
    Every consumer reaches the state through the old paths: the MinIO unit, the runner's
    `/mnt/corfu/{load,run_batch,load-bucket}`, `cassandra.install_dir`, and the sampler's
    `du` on `/tank/minio` and `/tank/cassandra/data`. `du` follows an intermediate symlink
