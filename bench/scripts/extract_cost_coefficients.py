@@ -122,8 +122,10 @@ def level_buckets(counts):
         elif lvl >= 4:
             b["l4plus"] += n
     return b
+# The optional "(jni)" / "(native)" token names the Corfu client
+# (PLAN-native-corfu.md); older result files have none.
 REPLAY_RE = re.compile(
-    r"\[corfu\] initial replay drained (\d+) entries in (\d+) batches, (\d+) ms.*?"
+    r"\[corfu\] initial replay (?:\([a-z]+\) )?drained (\d+) entries in (\d+) batches, (\d+) ms.*?"
     r"stream_MB=(\d+) live_files=(\d+) live_MB=(\d+)"
 )
 RESTORE_RE = re.compile(r"\[corfu\] restoring checkpoint C=(\d+) files=(\d+) live_MB=(\d+)")

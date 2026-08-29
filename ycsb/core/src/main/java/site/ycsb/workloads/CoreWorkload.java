@@ -252,7 +252,9 @@ public class CoreWorkload extends Workload {
 
   /**
    * The name of the property for the the distribution of requests across the keyspace. Options are
-   * "uniform", "zipfian" and "latest"
+   * "uniform", "zipfian", "zipfian_keyspace", "latest", "exponential", "sequential" and "hotspot".
+   * "zipfian" is a scrambled zipfian over 10^10 items folded onto the key space, which is close to
+   * uniform beyond a few hundred hot keys; "zipfian_keyspace" is a zipfian over the loaded keys.
    */
   public static final String REQUEST_DISTRIBUTION_PROPERTY = "requestdistribution";
 
@@ -517,6 +519,22 @@ public class CoreWorkload extends Workload {
       int expectednewkeys = (int) ((opcount) * insertproportion * 2.0); // 2 is fudge factor
 
       keychooser = new ScrambledZipfianGenerator(insertstart, insertstart + insertcount + expectednewkeys);
+    } else if (requestdistrib.compareTo("zipfian_keyspace") == 0) {
+      // A zipfian (theta 0.99) over THIS key space, hottest at insertstart. The
+      // "zipfian" branch above is a ScrambledZipfianGenerator over 10^10 items
+      // folded onto the key space by fnvhash64, which is close to uniform beyond
+      // a few hundred hot keys (bench/PLAN-cost-2.md, Task 0b). Same bounds as
+      // that branch; a key number past the last insert is rejected by
+      // nextKeynum(). With the default insertorder=hashed the hot key numbers
+      // hash to key strings scattered over the whole key range, so the skew
+      // is in the request stream only, never in the on-disk layout. The
+      // normalizer is one loop over N at construction (seconds at 10^8 keys).
+      final double insertproportion = Double.parseDouble(
+          p.getProperty(INSERT_PROPORTION_PROPERTY, INSERT_PROPORTION_PROPERTY_DEFAULT));
+      int opcount = Integer.parseInt(p.getProperty(Client.OPERATION_COUNT_PROPERTY));
+      int expectednewkeys = (int) ((opcount) * insertproportion * 2.0); // 2 is fudge factor
+
+      keychooser = new ZipfianGenerator(insertstart, insertstart + insertcount + expectednewkeys - 1);
     } else if (requestdistrib.compareTo("latest") == 0) {
       keychooser = new SkewedLatestGenerator(transactioninsertkeysequence);
     } else if (requestdistrib.equals("hotspot")) {

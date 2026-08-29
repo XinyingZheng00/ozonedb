@@ -5,20 +5,18 @@
 #include <cstring>
 #include <iostream>
 #include <random>
-#include <sstream>
 #include <stdexcept>
 
 namespace ozonedb {
 
 namespace {
-constexpr char const* kBridgeClass = "site/ycsb/db/corfu/CorfuBridge";
-constexpr long kPollTimeoutMs = 100;
-// Max entries per pollBatch JNI round-trip. Bigger amortizes JNI and
-// Java-side fixed overhead over more entries, smaller bounds the time
-// we spend out of the running_ check. 256 is a compromise: with a
-// warm Corfu cache (~1 ms/entry) one batch takes ~256 ms worst case;
-// with a cold cache (50-400 ms/entry) we'll return partial batches
-// via the in-Java short-circuit.
+constexpr int kPollTimeoutMs = 100;
+// Max entries per pollBatch client round-trip. Bigger amortizes the
+// per-call fixed overhead (one JNI crossing + one byte[] copy on the JNI
+// client) over more entries, smaller bounds the time we spend out of the
+// running_ check. 256 is a compromise: with a warm Corfu cache
+// (~1 ms/entry) one batch takes ~256 ms worst case; with a cold cache
+// (50-400 ms/entry) the client returns partial batches.
 constexpr int kPollBatchSize = 256;
 // Batch size for the open-time replay (drainInitialEntries). Larger than
 // the tailer's: the replay is a bulk read of a log that already exists,
@@ -27,12 +25,17 @@ constexpr int kPollBatchSize = 256;
 // drain take ~43 us per entry — 49 s for a 1 M-entry loaded log.
 constexpr int kDrainBatchSize = 4096;
 
-std::vector<std::string> splitJvmOpts(std::string const& opts) {
-  std::vector<std::string> out;
-  std::istringstream iss(opts);
-  std::string tok;
-  while (iss >> tok) out.push_back(tok);
-  return out;
+CorfuClientOptions legacyOptions(std::string const& endpoint,
+                                 std::string const& jar_path,
+                                 std::string const& jvm_opts,
+                                 std::string const& stream_name) {
+  CorfuClientOptions o;
+  o.endpoint = endpoint;
+  o.jar_path = jar_path;
+  o.jvm_opts = jvm_opts;
+  o.stream_name = stream_name;
+  o.client = "jni";
+  return o;
 }
 }  // namespace
 
@@ -44,15 +47,22 @@ CorfuDBStorage::CorfuDBStorage(std::string const& endpoint,
                                Storage* checkpoint_store,
                                std::string const& checkpoint_dir,
                                bool fast_ack)
-    : Storage(db_path), fast_ack_(fast_ack) {
+    : CorfuDBStorage(legacyOptions(endpoint, jar_path, jvm_opts, stream_name),
+                     db_path, checkpoint_store, checkpoint_dir, fast_ack) {}
+
+CorfuDBStorage::CorfuDBStorage(CorfuClientOptions const& client_options,
+                               std::string const& db_path,
+                               Storage* checkpoint_store,
+                               std::string const& checkpoint_dir,
+                               bool fast_ack)
+    : Storage(db_path), client_name_(client_options.client), fast_ack_(fast_ack) {
   {
     std::random_device rd;
     std::mt19937_64 rng(rd());
     client_id_ = rng();
     if (client_id_ == 0) client_id_ = 1;  // reserve 0 as "unset / legacy entry"
   }
-  startJvm(jar_path, jvm_opts);
-  loadBridge(endpoint, stream_name);
+  client_ = makeCorfuClient(client_options);
   last_commited_time_ = std::chrono::system_clock::now();
   // Synchronously bring local state up to the stream tail before returning
   // so reads issued immediately after construction (e.g. by DB::openDB ->
@@ -83,20 +93,14 @@ CorfuDBStorage::~CorfuDBStorage() {
       cached_file_.clear();
       lock.unlock();
 
-      JNIEnv* env = attachThread();
-      if (env) {
-        for (auto& kv : drained) {
-          long addr = jniAppendEntry(env, kv.first, ::CorfuEntry_Op_APPEND,
-                                     kv.second.data(),
-                                     static_cast<int>(kv.second.size()));
-          if (addr < 0) {
-            std::cerr << "[corfu] destructor flush failed for " << kv.first << "\n";
-          } else {
-            long prev = last_written_addr_.load(std::memory_order_acquire);
-            while (addr > prev &&
-                   !last_written_addr_.compare_exchange_weak(prev, addr, std::memory_order_acq_rel)) {
-            }
-          }
+      for (auto& kv : drained) {
+        long addr = appendEntry(kv.first, ::CorfuEntry_Op_APPEND,
+                                kv.second.data(),
+                                static_cast<int>(kv.second.size()));
+        if (addr < 0) {
+          std::cerr << "[corfu] destructor flush failed for " << kv.first << "\n";
+        } else {
+          publishWrittenAddr(addr);
         }
       }
     }
@@ -127,113 +131,11 @@ CorfuDBStorage::~CorfuDBStorage() {
               << " sealed_after_wait=" << sealed_after_wait_.load(std::memory_order_relaxed)
               << "\n";
   }
-  JNIEnv* env = attachThread();
-  if (env && bridge_global_ && mid_close_) {
-    env->CallVoidMethod(bridge_global_, mid_close_);
-    if (env->ExceptionCheck()) env->ExceptionClear();
-  }
-  if (env) {
-    if (bridge_global_) env->DeleteGlobalRef(bridge_global_);
-    if (bridge_class_global_) env->DeleteGlobalRef(bridge_class_global_);
-  }
-  // Intentionally do not destroy the JVM: HotSpot only allows one JVM per
-  // process and DestroyJavaVM is unreliable with live threads.
-}
-
-void CorfuDBStorage::startJvm(std::string const& jar_path, std::string const& jvm_opts) {
-  JavaVM* existing[1];
-  jsize nvms = 0;
-  if (JNI_GetCreatedJavaVMs(existing, 1, &nvms) == JNI_OK && nvms > 0) {
-    jvm_ = existing[0];
-    owns_jvm_ = false;
-    return;
-  }
-
-  std::string classpath_opt = "-Djava.class.path=" + jar_path;
-  std::vector<std::string> extra = splitJvmOpts(jvm_opts);
-
-  std::vector<JavaVMOption> options;
-  options.push_back({const_cast<char*>(classpath_opt.c_str()), nullptr});
-  for (auto& e : extra) {
-    options.push_back({const_cast<char*>(e.c_str()), nullptr});
-  }
-
-  JavaVMInitArgs args;
-  args.version = JNI_VERSION_1_8;
-  args.nOptions = static_cast<jint>(options.size());
-  args.options = options.data();
-  args.ignoreUnrecognized = JNI_FALSE;
-
-  JNIEnv* env = nullptr;
-  jint rc = JNI_CreateJavaVM(&jvm_, reinterpret_cast<void**>(&env), &args);
-  if (rc != JNI_OK) {
-    throw std::runtime_error("Failed to create JVM for CorfuDBStorage (rc=" + std::to_string(rc) + ")");
-  }
-  owns_jvm_ = true;
-}
-
-JNIEnv* CorfuDBStorage::attachThread() {
-  if (!jvm_) return nullptr;
-  JNIEnv* env = nullptr;
-  jint rc = jvm_->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8);
-  if (rc == JNI_EDETACHED) {
-    rc = jvm_->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr);
-    if (rc != JNI_OK) return nullptr;
-  } else if (rc != JNI_OK) {
-    return nullptr;
-  }
-  return env;
+  client_->close();
 }
 
 void CorfuDBStorage::detachThread() {
-  if (jvm_) jvm_->DetachCurrentThread();
-}
-
-void CorfuDBStorage::loadBridge(std::string const& endpoint, std::string const& stream_name) {
-  JNIEnv* env = attachThread();
-  if (!env) throw std::runtime_error("Failed to attach JVM thread");
-
-  jclass local_class = env->FindClass(kBridgeClass);
-  if (!local_class) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    throw std::runtime_error(std::string("CorfuBridge class not found on classpath: ") + kBridgeClass);
-  }
-  bridge_class_global_ = static_cast<jclass>(env->NewGlobalRef(local_class));
-  env->DeleteLocalRef(local_class);
-
-  jmethodID ctor = env->GetMethodID(bridge_class_global_, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V");
-  if (!ctor) throw std::runtime_error("CorfuBridge(String,String) not found");
-
-  jstring jendpoint = env->NewStringUTF(endpoint.c_str());
-  jstring jstream = env->NewStringUTF(stream_name.c_str());
-  jobject local_bridge = env->NewObject(bridge_class_global_, ctor, jendpoint, jstream);
-  env->DeleteLocalRef(jendpoint);
-  env->DeleteLocalRef(jstream);
-  if (!local_bridge || env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    throw std::runtime_error("CorfuBridge constructor failed");
-  }
-  bridge_global_ = env->NewGlobalRef(local_bridge);
-  env->DeleteLocalRef(local_bridge);
-
-  mid_append_ = env->GetMethodID(bridge_class_global_, "append", "([B)J");
-  mid_appendChecked_ = env->GetMethodID(bridge_class_global_, "appendChecked", "([BJ[B[B)[J");
-  mid_globalTail_ = env->GetMethodID(bridge_class_global_, "globalTail", "()J");
-  mid_pollNext_ = env->GetMethodID(bridge_class_global_, "pollNext", "(J)[B");
-  mid_pollBatch_ = env->GetMethodID(bridge_class_global_, "pollBatch", "(JI)[B");
-  mid_tailAddress_ = env->GetMethodID(bridge_class_global_, "tailAddress", "()J");
-  mid_gcPollView_ = env->GetMethodID(bridge_class_global_, "gcPollView", "(J)V");
-  mid_prefixTrim_ = env->GetMethodID(bridge_class_global_, "prefixTrim", "(J)J");
-  mid_trimMark_ = env->GetMethodID(bridge_class_global_, "trimMark", "()J");
-  mid_seekPollView_ = env->GetMethodID(bridge_class_global_, "seekPollView", "(J)V");
-  mid_close_ = env->GetMethodID(bridge_class_global_, "close", "()V");
-  if (!mid_append_ || !mid_appendChecked_ || !mid_globalTail_ || !mid_pollNext_ ||
-      !mid_pollBatch_ || !mid_tailAddress_ || !mid_gcPollView_ || !mid_prefixTrim_ ||
-      !mid_trimMark_ || !mid_seekPollView_ || !mid_close_) {
-    throw std::runtime_error("CorfuBridge method lookup failed");
-  }
+  if (client_) client_->detachThread();
 }
 
 std::string CorfuDBStorage::serializeEntry(std::string const& file_name, int op,
@@ -250,76 +152,21 @@ std::string CorfuDBStorage::serializeEntry(std::string const& file_name, int op,
   return serialized;
 }
 
-long CorfuDBStorage::jniAppendEntry(JNIEnv* env, std::string const& file_name, int op,
-                                    unsigned char const* data, int length) {
+long CorfuDBStorage::appendEntry(std::string const& file_name, int op,
+                                 unsigned char const* data, int length) {
   std::string serialized = serializeEntry(file_name, op, data, length);
-  jbyteArray jbuf = env->NewByteArray(static_cast<jsize>(serialized.size()));
-  env->SetByteArrayRegion(jbuf, 0, static_cast<jsize>(serialized.size()),
-                          reinterpret_cast<jbyte const*>(serialized.data()));
-  jlong addr = env->CallLongMethod(bridge_global_, mid_append_, jbuf);
-  env->DeleteLocalRef(jbuf);
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    return -1;
-  }
-  return static_cast<long>(addr);
+  return static_cast<long>(client_->append(serialized));
 }
 
-CorfuDBStorage::CheckedAppend CorfuDBStorage::jniAppendChecked(
-    JNIEnv* env, std::string const& file_name, int op,
+CorfuDBStorage::CheckedAppend CorfuDBStorage::appendChecked(
+    std::string const& file_name, int op,
     unsigned char const* data, int length,
     long snapshot, bool read_key, bool write_key) {
-  CheckedAppend out;
   std::string serialized = serializeEntry(file_name, op, data, length);
-  jbyteArray jbuf = env->NewByteArray(static_cast<jsize>(serialized.size()));
-  env->SetByteArrayRegion(jbuf, 0, static_cast<jsize>(serialized.size()),
-                          reinterpret_cast<jbyte const*>(serialized.data()));
-  jbyteArray jkey = env->NewByteArray(static_cast<jsize>(file_name.size()));
-  env->SetByteArrayRegion(jkey, 0, static_cast<jsize>(file_name.size()),
-                          reinterpret_cast<jbyte const*>(file_name.data()));
-  jobject res = env->CallObjectMethod(bridge_global_, mid_appendChecked_, jbuf,
-                                      static_cast<jlong>(snapshot),
-                                      read_key ? jkey : nullptr,
-                                      write_key ? jkey : nullptr);
-  env->DeleteLocalRef(jbuf);
-  env->DeleteLocalRef(jkey);
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    if (res) env->DeleteLocalRef(res);
-    out.abort = kAbortOther;
-    return out;
-  }
-  if (!res) {
-    out.abort = kAbortOther;
-    return out;
-  }
-  jlong pair[2] = {-1, -1};
-  env->GetLongArrayRegion(static_cast<jlongArray>(res), 0, 2, pair);
-  env->DeleteLocalRef(res);
-  if (env->ExceptionCheck()) {
-    env->ExceptionClear();
-    out.abort = kAbortOther;
-    return out;
-  }
-  if (pair[0] >= 0) {
-    out.addr = static_cast<long>(pair[0]);
-  } else {
-    out.abort = static_cast<long>(pair[0]);
-    out.offending = static_cast<long>(pair[1]);
-  }
-  return out;
-}
-
-long CorfuDBStorage::jniGlobalTail(JNIEnv* env) {
-  jlong tail = env->CallLongMethod(bridge_global_, mid_globalTail_);
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    return -1;
-  }
-  return static_cast<long>(tail);
+  std::string_view key(file_name);
+  return client_->appendChecked(serialized, snapshot,
+                                read_key ? &key : nullptr,
+                                write_key ? &key : nullptr);
 }
 
 // SEAL and REMOVE must reach the sequencer's conflict cache, or a peer's
@@ -327,15 +174,15 @@ long CorfuDBStorage::jniGlobalTail(JNIEnv* env) {
 // pass the sequencer's sanity checks (epoch, trim mark, bootstrap tail,
 // cache eviction mark); the tailer's position normally does, and the
 // global tail always does.
-long CorfuDBStorage::jniAppendKeyed(JNIEnv* env, std::string const& file_name, int op) {
+long CorfuDBStorage::appendKeyed(std::string const& file_name, int op) {
   long snapshot = last_applied_addr_.load(std::memory_order_acquire);
   long last_abort = 0;
   for (int attempt = 0; attempt < 3; ++attempt) {
-    CheckedAppend r = jniAppendChecked(env, file_name, op, nullptr, 0, snapshot,
-                                       /*read_key=*/false, /*write_key=*/true);
-    if (r.addr >= 0) return r.addr;
-    last_abort = r.abort;
-    snapshot = jniGlobalTail(env);
+    CheckedAppend r = appendChecked(file_name, op, nullptr, 0, snapshot,
+                                    /*read_key=*/false, /*write_key=*/true);
+    if (r.addr >= 0) return static_cast<long>(r.addr);
+    last_abort = static_cast<long>(r.abort);
+    snapshot = static_cast<long>(client_->globalTail());
     if (snapshot < 0) break;
   }
   std::cerr << "[corfu] keyed op " << op << " of " << file_name
@@ -351,16 +198,9 @@ void CorfuDBStorage::publishWrittenAddr(long addr) {
   }
 }
 
-bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
-  if (len < 8) return false;
-
-  long addr = 0;
-  for (int i = 0; i < 8; ++i) {
-    addr = (addr << 8) | data[i];
-  }
-
+bool CorfuDBStorage::applyEntry(long addr, unsigned char const* data, size_t len) {
   ::CorfuEntry entry;
-  if (!entry.ParseFromArray(data + 8, static_cast<int>(len - 8))) {
+  if (!entry.ParseFromArray(data, static_cast<int>(len))) {
     std::cerr << "[corfu] failed to parse entry at addr=" << addr << "\n";
     return false;
   }
@@ -515,108 +355,45 @@ bool CorfuDBStorage::applyEntryBytes(unsigned char const* data, size_t len) {
   return true;
 }
 
-bool CorfuDBStorage::applyEntryFromJava(JNIEnv* env, jbyteArray jbuf) {
-  jsize len = env->GetArrayLength(jbuf);
-  if (len < 8) {
-    env->DeleteLocalRef(jbuf);
-    return false;
-  }
-  std::vector<unsigned char> raw(len);
-  env->GetByteArrayRegion(jbuf, 0, len, reinterpret_cast<jbyte*>(raw.data()));
-  env->DeleteLocalRef(jbuf);
-  return applyEntryBytes(raw.data(), raw.size());
-}
-
-// Parse the pollBatch wire format (big-endian int32 count followed by
-// `count` length-prefixed entries, each in the same addr+payload
-// layout as pollNext) and apply each entry. This is the steady-state
-// tailer hot path — a single JNI crossing delivers up to
-// kPollBatchSize entries, amortizing JNI+Java fixed overhead across
-// the batch and letting a healthy Corfu client cache stream entries
-// at tens-of-thousands per second.
-int CorfuDBStorage::applyBatchFromJava(JNIEnv* env, jbyteArray jbuf) {
-  jsize total_len = env->GetArrayLength(jbuf);
-  if (total_len < 4) {
-    env->DeleteLocalRef(jbuf);
-    return 0;
-  }
-  std::vector<unsigned char> raw(total_len);
-  env->GetByteArrayRegion(jbuf, 0, total_len,
-                          reinterpret_cast<jbyte*>(raw.data()));
-  env->DeleteLocalRef(jbuf);
-
-  size_t pos = 0;
-  auto read_be32 = [&]() -> int32_t {
-    uint32_t v = (static_cast<uint32_t>(raw[pos]) << 24) |
-                 (static_cast<uint32_t>(raw[pos + 1]) << 16) |
-                 (static_cast<uint32_t>(raw[pos + 2]) << 8) |
-                 static_cast<uint32_t>(raw[pos + 3]);
-    pos += 4;
-    return static_cast<int32_t>(v);
-  };
-
-  int32_t count = read_be32();
-  int applied = 0;
-  for (int i = 0; i < count; ++i) {
-    if (pos + 4 > raw.size()) break;
-    int32_t entry_len = read_be32();
-    if (entry_len < 0 ||
-        pos + static_cast<size_t>(entry_len) > raw.size()) {
-      break;  // truncated / malformed — drop the rest of the batch
-    }
-    if (applyEntryBytes(raw.data() + pos, static_cast<size_t>(entry_len))) {
-      ++applied;
-    }
-    pos += entry_len;
-  }
-  return applied;
-}
-
 CorfuDBStorage::DrainResult CorfuDBStorage::drainInitialEntries() {
-  JNIEnv* env = attachThread();
-  if (!env) return DrainResult::kError;
-  // Same batch path as the tailer (pollBatch + applyBatchFromJava). A
-  // zero timeout makes pollBatch return null as soon as the stream view
-  // has nothing ready and the batch is empty, i.e. at the current tail.
+  // Same batch path as the tailer (pollBatch + applyEntry). A zero
+  // timeout makes pollBatch report kIdle as soon as the stream has
+  // nothing ready and the batch is empty, i.e. at the current tail.
   using clock = std::chrono::steady_clock;
   auto const t0 = clock::now();
   long drained = 0;
   long batches = 0;
-  long long stream_bytes = 0;  // raw pollBatch bytes: every entry, live or dead
-  long long poll_us = 0;   // inside CorfuBridge.pollBatch (stream read + payload decode)
-  long long apply_us = 0;  // applyBatchFromJava (JNI copy + protobuf parse + apply under mtx_)
+  long long stream_bytes = 0;  // raw entry bytes: every entry, live or dead
+  long long total_us = 0;      // inside pollBatch, sink included
+  long long apply_us = 0;      // inside the sink (protobuf parse + apply under mtx_)
   bool trimmed = false;
   bool failed = false;
+  auto sink = [&](int64_t addr, unsigned char const* data, size_t len) {
+    auto const ta = clock::now();
+    stream_bytes += static_cast<long long>(len);
+    if (applyEntry(static_cast<long>(addr), data, len)) ++drained;
+    apply_us += std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - ta).count();
+  };
   while (true) {
     auto const tp = clock::now();
-    jbyteArray jbuf = static_cast<jbyteArray>(
-        env->CallObjectMethod(bridge_global_, mid_pollBatch_,
-                              static_cast<jlong>(0),
-                              static_cast<jint>(kDrainBatchSize)));
-    auto const ta = clock::now();
-    poll_us += std::chrono::duration_cast<std::chrono::microseconds>(ta - tp).count();
-    if (env->ExceptionCheck()) {
-      // A Java exception other than TrimmedException (the bridge turns
-      // that one into the marker). The state is partial; say so.
-      env->ExceptionDescribe();
-      env->ExceptionClear();
+    CorfuClient::Poll r = client_->pollBatch(0, kDrainBatchSize, sink);
+    total_us += std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - tp).count();
+    if (r == CorfuClient::Poll::kError) {
+      // A client failure other than a trimmed address (that one is the
+      // marker below). The state is partial; say so.
       failed = true;
       break;
     }
-    if (jbuf == nullptr) break;
-    jsize len = env->GetArrayLength(jbuf);
-    if (len == 0) {
-      // The bridge's TRIMMED marker: the next address is below the trim
-      // mark. Nothing applied from this call.
-      env->DeleteLocalRef(jbuf);
+    if (r == CorfuClient::Poll::kIdle) break;
+    if (r == CorfuClient::Poll::kTrimmed) {
+      // The next address is below the trim mark. Nothing applied from
+      // this call.
       trimmed = true;
       break;
     }
-    stream_bytes += len;
-    drained += applyBatchFromJava(env, jbuf);
-    apply_us += std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - ta).count();
     ++batches;
   }
+  long long const poll_us = total_us - apply_us;  // the client's own share
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
   // Live fraction: what a checkpoint would carry. Top-level files (no '/'
   // in the name: metadata.log, task.log) are listed by name because they
@@ -634,7 +411,7 @@ CorfuDBStorage::DrainResult CorfuDBStorage::drainInitialEntries() {
       }
     }
   }
-  std::cerr << "[corfu] initial replay drained " << drained << " entries in "
+  std::cerr << "[corfu] initial replay (" << client_name_ << ") drained " << drained << " entries in "
             << batches << " batches, " << ms << " ms"
             << (ms > 0 ? " (" + std::to_string(drained * 1000 / ms) + " entries/s)" : "")
             << "; poll " << poll_us / 1000 << " ms, apply " << apply_us / 1000 << " ms"
@@ -661,12 +438,10 @@ void CorfuDBStorage::resetStateLocked() {
 }
 
 long CorfuDBStorage::appendTrimMarker(long addr) {
-  JNIEnv* env = attachThread();
-  if (!env) return -1;
   std::string payload = std::to_string(addr);
-  return jniAppendEntry(env, ".trim", ::CorfuEntry_Op_TRIM,
-                        reinterpret_cast<unsigned char const*>(payload.data()),
-                        static_cast<int>(payload.size()));
+  return appendEntry(".trim", ::CorfuEntry_Op_TRIM,
+                     reinterpret_cast<unsigned char const*>(payload.data()),
+                     static_cast<int>(payload.size()));
 }
 
 void CorfuDBStorage::restoreSnapshot(checkpoint::State&& state) {
@@ -682,15 +457,7 @@ void CorfuDBStorage::restoreSnapshot(checkpoint::State&& state) {
 }
 
 bool CorfuDBStorage::seekPollView(long addr) {
-  JNIEnv* env = attachThread();
-  if (!env) return false;
-  env->CallVoidMethod(bridge_global_, mid_seekPollView_, static_cast<jlong>(addr));
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    return false;
-  }
-  return true;
+  return client_->seek(addr);
 }
 
 // Constructor-time replay (PLAN-trimming.md §3.5).
@@ -856,33 +623,17 @@ checkpoint::State CorfuDBStorage::takeSnapshot() {
 
 bool CorfuDBStorage::prefixTrim(long addr) {
   if (addr < 0) return false;
-  JNIEnv* env = attachThread();
-  if (!env) return false;
   // The marker goes in BEFORE the trim, so no process can observe a
   // trimmed stream without also being able to observe the marker.
   if (appendTrimMarker(addr) < 0) {
     std::cerr << "[corfu] prefixTrim(" << addr << "): TRIM marker append failed; not trimming\n";
     return false;
   }
-  env->CallLongMethod(bridge_global_, mid_prefixTrim_, static_cast<jlong>(addr));
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    return false;
-  }
-  return true;
+  return client_->prefixTrim(addr) >= 0;
 }
 
 long CorfuDBStorage::trimMark() {
-  JNIEnv* env = attachThread();
-  if (!env) return -1;
-  jlong mark = env->CallLongMethod(bridge_global_, mid_trimMark_);
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    return -1;
-  }
-  return static_cast<long>(mark);
+  return static_cast<long>(client_->trimMark());
 }
 
 long CorfuDBStorage::streamTail() {
@@ -890,11 +641,6 @@ long CorfuDBStorage::streamTail() {
 }
 
 void CorfuDBStorage::tailerLoop() {
-  JNIEnv* env = attachThread();
-  if (!env) {
-    std::cerr << "[corfu] tailer failed to attach JVM thread\n";
-    return;
-  }
   // Diagnostic counters — 1-second rolling window. rate = entries
   // applied per second, gap = how many Corfu addresses behind our
   // own last local write we are. A growing gap means production
@@ -914,52 +660,41 @@ void CorfuDBStorage::tailerLoop() {
   // bounded by ~kGcTrimInterval * (applied rate / gc rate).
   uint64_t entries_since_gc = 0;
   constexpr uint64_t kGcTrimInterval = 50000;
+  uint64_t applied = 0;  // entries applied by the current pollBatch
+  auto sink = [&](int64_t addr, unsigned char const* data, size_t len) {
+    if (applyEntry(static_cast<long>(addr), data, len)) ++applied;
+  };
   while (running_) {
+    applied = 0;
     auto poll_before = std::chrono::steady_clock::now();
-    jbyteArray jbuf = static_cast<jbyteArray>(
-        env->CallObjectMethod(bridge_global_, mid_pollBatch_,
-                              static_cast<jlong>(kPollTimeoutMs),
-                              static_cast<jint>(kPollBatchSize)));
+    CorfuClient::Poll r = client_->pollBatch(kPollTimeoutMs, kPollBatchSize, sink);
     auto poll_after = std::chrono::steady_clock::now();
     auto poll_us = std::chrono::duration_cast<std::chrono::microseconds>(
                        poll_after - poll_before)
                        .count();
     // Only log unusually-slow polls (>50 ms) so steady-state runs
-    // don't drown in output. A null jbuf with poll_us ~ 100 ms is
-    // just the timeout; log "null=1" so we can tell at a glance.
+    // don't drown in output. An idle poll with poll_us ~ 100 ms is
+    // just the timeout; log "idle=1" so we can tell at a glance.
     if (poll_us > 50000) {
-      std::cerr << "[corfu-tailer] slow pollBatch " << poll_us << "us null="
-                << (jbuf == nullptr ? 1 : 0) << "\n";
+      std::cerr << "[corfu-tailer] slow pollBatch " << poll_us << "us idle="
+                << (r == CorfuClient::Poll::kIdle ? 1 : 0) << "\n";
     }
-    if (env->ExceptionCheck()) {
-      env->ExceptionDescribe();
-      env->ExceptionClear();
+    if (r == CorfuClient::Poll::kError) {
       continue;
     }
-    if (jbuf != nullptr && env->GetArrayLength(jbuf) == 0) {
-      // TRIMMED marker (see CorfuBridge): the next address this tailer
-      // needs is gone. Skipping it would build a state that no other
-      // process has, so stop instead. The thread exits; the destructor's
-      // join still returns because running_ is left alone.
-      env->DeleteLocalRef(jbuf);
+    if (r == CorfuClient::Poll::kTrimmed) {
+      // The next address this tailer needs is gone. Skipping it would
+      // build a state that no other process has, so stop instead. The
+      // thread exits; the destructor's join still returns because
+      // running_ is left alone.
       failStop("tailer hit the trim mark");
       break;
     }
-    if (jbuf != nullptr) {
-      int applied = applyBatchFromJava(env, jbuf);
-      stat_entries += applied;
-      entries_since_gc += applied;
-    }
+    stat_entries += applied;
+    entries_since_gc += applied;
     if (entries_since_gc >= kGcTrimInterval) {
       long trim = last_applied_addr_.load(std::memory_order_acquire);
-      if (trim >= 0) {
-        env->CallVoidMethod(bridge_global_, mid_gcPollView_,
-                            static_cast<jlong>(trim));
-        if (env->ExceptionCheck()) {
-          env->ExceptionDescribe();
-          env->ExceptionClear();
-        }
-      }
+      if (trim >= 0) client_->gc(trim);
       entries_since_gc = 0;
     }
     auto now = std::chrono::steady_clock::now();
@@ -1003,7 +738,7 @@ void CorfuDBStorage::tailerLoop() {
   detachThread();
 }
 
-// Drain remote-append events enqueued by applyEntryFromJava and
+// Drain remote-append events enqueued by applyEntry and
 // invoke the registered listener off the tailer thread. Exits when
 // running_ is false and the queue is fully drained — the destructor
 // joins the tailer first, so at that point no more events can be
@@ -1064,19 +799,13 @@ void CorfuDBStorage::drainDispatchQueue() {
 long CorfuDBStorage::globalFenceTarget() {
   // For multi-writer reads: the fence target must include both our own
   // writes (last_written_addr_) AND any remote writer's commits that
-  // have already been sequenced. CorfuBridge::tailAddress() returns the
+  // have already been sequenced. CorfuClient::streamTail() returns the
   // highest address currently in the stream. max() ensures we never
   // regress the target if our own in-flight write hasn't been sequenced
   // yet but a remote write has a higher address.
   long local = last_written_addr_.load(std::memory_order_acquire);
-  JNIEnv* env = attachThread();
-  if (!env) return local;
-  jlong global = env->CallLongMethod(bridge_global_, mid_tailAddress_);
-  if (env->ExceptionCheck()) {
-    env->ExceptionClear();
-    return local;
-  }
-  return std::max(local, static_cast<long>(global));
+  long global = static_cast<long>(client_->streamTail());
+  return std::max(local, global);
 }
 
 // Wait until the local tailer has applied everything up to `target`.
@@ -1179,10 +908,10 @@ void CorfuDBStorage::finishBatchLocked(std::string const& fileName,
 // address. The sequencer can answer that at token time: the token request
 // carries key(fileName) in its read set at snapshot S = last_applied_addr_,
 // and every SEAL / REMOVE carries the same key in its write set
-// (jniAppendKeyed), recorded by the sequencer when their token is issued.
+// (appendKeyed), recorded by the sequencer when their token is issued.
 // A granted token at addr therefore proves that no SEAL / REMOVE of
 // fileName was tokened in (S, addr]. The tailer applied every entry <= S
-// before S was published (applyEntryBytes stores last_applied_addr_ last,
+// before S was published (applyEntry stores last_applied_addr_ last,
 // under mtx_), so sealed_at_addr_ / removed_files_ decide the rest
 // exactly. The bytes at addr belong to fileName in every process, and the
 // batch is acked before the tailer reaches addr: one token + one write,
@@ -1199,7 +928,7 @@ void CorfuDBStorage::finishBatchLocked(std::string const& fileName,
 // sequencer cannot vouch for: stale epoch, below the tail at sequencer
 // bootstrap, below the conflict cache's eviction mark or the trim mark)
 // sends the batch to the slow path, which is always correct.
-bool CorfuDBStorage::submitBatchFast(JNIEnv* env, std::string const& fileName,
+bool CorfuDBStorage::submitBatchFast(std::string const& fileName,
                                      std::shared_ptr<Batch> const& batch) {
   constexpr int kAttempts = 3;
   constexpr auto kConflictWait = std::chrono::seconds(1);
@@ -1221,19 +950,19 @@ bool CorfuDBStorage::submitBatchFast(JNIEnv* env, std::string const& fileName,
       snapshot = last_applied_addr_.load(std::memory_order_acquire);
     }
 
-    CheckedAppend r = jniAppendChecked(env, fileName, ::CorfuEntry_Op_APPEND,
-                                       batch->payload.data(),
-                                       static_cast<int>(batch->payload.size()),
-                                       snapshot, /*read_key=*/true, /*write_key=*/false);
+    CheckedAppend r = appendChecked(fileName, ::CorfuEntry_Op_APPEND,
+                                    batch->payload.data(),
+                                    static_cast<int>(batch->payload.size()),
+                                    snapshot, /*read_key=*/true, /*write_key=*/false);
     if (r.addr >= 0) {
-      publishWrittenAddr(r.addr);
+      publishWrittenAddr(static_cast<long>(r.addr));
       std::lock_guard<std::mutex> lk(mtx_);
       if (batch->done) return true;  // a peer REMOVE settled it meanwhile
       if (removed_files_.count(fileName)) {
         finishBatchLocked(fileName, batch, Status::kFailure);
         return true;
       }
-      batch->addr = r.addr;
+      batch->addr = static_cast<long>(r.addr);
       finishBatchLocked(fileName, batch, Status::kSuccess);
       fast_acks_.fetch_add(1, std::memory_order_relaxed);
       return true;
@@ -1252,7 +981,9 @@ bool CorfuDBStorage::submitBatchFast(JNIEnv* env, std::string const& fileName,
     conflict_aborts_.fetch_add(1, std::memory_order_relaxed);
     std::unique_lock<std::mutex> lock(mtx_);
     bool reached = true;
-    if (r.offending >= 0) reached = waitForTailerLocked(lock, r.offending, kConflictWait);
+    if (r.offending >= 0) {
+      reached = waitForTailerLocked(lock, static_cast<long>(r.offending), kConflictWait);
+    }
     if (batch->done) return true;
     if (sealed_at_addr_.count(fileName)) {
       finishBatchLocked(fileName, batch, Status::kSealed);
@@ -1276,8 +1007,8 @@ bool CorfuDBStorage::submitBatchFast(JNIEnv* env, std::string const& fileName,
   return false;
 }
 
-// JNI submit, then wait for the tailer to pass the new address and read
-// the outcome under mtx_. mtx_ must NOT be held on entry: the JNI
+// Client submit, then wait for the tailer to pass the new address and
+// read the outcome under mtx_. mtx_ must NOT be held on entry: the Corfu
 // round-trip runs unlocked so it does not block readers, the tailer, or
 // writers on other files. The fast path (submitBatchFast) runs first when
 // enabled; what follows it is the slow path.
@@ -1290,8 +1021,7 @@ Status CorfuDBStorage::submitBatch(std::string const& fileName,
     finishBatchLocked(fileName, batch, Status::kFailure);
     return Status::kFailure;
   }
-  JNIEnv* env = attachThread();
-  if (env && fast_ack_ && submitBatchFast(env, fileName, batch)) {
+  if (fast_ack_ && submitBatchFast(fileName, batch)) {
     batch_flushed_cv_.notify_all();
     if (batch->result == Status::kSuccess) last_append_addr_ = batch->addr;
     return batch->result;
@@ -1301,17 +1031,14 @@ Status CorfuDBStorage::submitBatch(std::string const& fileName,
   // address and read the outcome. Taken when the fast path is off, or
   // when the sequencer could not answer for the snapshot (right after a
   // sequencer restart, a trim, or a conflict-cache eviction).
-  long addr = -1;
-  if (env) {
-    addr = jniAppendEntry(env, fileName, ::CorfuEntry_Op_APPEND,
+  long addr = appendEntry(fileName, ::CorfuEntry_Op_APPEND,
                           batch->payload.data(),
                           static_cast<int>(batch->payload.size()));
-  }
 
   {
     std::unique_lock<std::mutex> lock(mtx_);
     if (batch->done) {
-      // A peer REMOVE settled this batch while the JNI call was in
+      // A peer REMOVE settled this batch while the client call was in
       // flight. Do not resurrect it.
     } else if (addr < 0) {
       finishBatchLocked(fileName, batch, Status::kFailure);
@@ -1612,12 +1339,10 @@ void CorfuDBStorage::seal(std::string fileName) {
     std::cerr << "[corfu] seal: pre-seal flush failed for " << fileName << "\n";
   }
 
-  JNIEnv* env = attachThread();
-  if (!env) return;
   // Keyed: the sequencer records key(fileName) at this address, which is
   // what lets every writer's fast path (submitBatchFast) see the seal at
   // token time. A SEAL without the key would be invisible to it.
-  long addr = jniAppendKeyed(env, fileName, ::CorfuEntry_Op_SEAL);
+  long addr = appendKeyed(fileName, ::CorfuEntry_Op_SEAL);
   if (addr < 0) return;
   {
     std::lock_guard<std::mutex> lk(mtx_);
@@ -1645,11 +1370,9 @@ bool CorfuDBStorage::isSealed(std::string fileName) {
 void CorfuDBStorage::remove(std::string fileName) {
   std::shared_lock<std::shared_mutex> gate(write_gate_);
   if (trimmed_out_.load()) return;
-  JNIEnv* env = attachThread();
-  if (!env) return;
   // Keyed for the same reason as the SEAL in seal(): a peer's fast path
   // must see the REMOVE at token time.
-  long addr = jniAppendKeyed(env, fileName, ::CorfuEntry_Op_REMOVE);
+  long addr = appendKeyed(fileName, ::CorfuEntry_Op_REMOVE);
   if (addr < 0) return;
   publishWrittenAddr(addr);
   std::lock_guard<std::mutex> lk(mtx_);

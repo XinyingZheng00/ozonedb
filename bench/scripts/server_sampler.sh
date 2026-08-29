@@ -67,7 +67,7 @@ snapshot() {
   local d
   for d in $DIRS; do
     if [[ -d "$d" ]]; then
-      du -sk "$d" 2>/dev/null | awk '{printf "du %s %s\n", $2, $1}'
+      du -skD "$d" 2>/dev/null | awk '{printf "du %s %s\n", $2, $1}'
     fi
   done
   if command -v mc >/dev/null 2>&1 && [[ -n "$BUCKET" ]]; then
