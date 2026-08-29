@@ -221,6 +221,18 @@ Rules 1–5 of `PLAN-cost.md` hold. Add:
 
 ## 5. Tasks
 
+**Status 2026-08-29.** Tasks 0 to 6 and the 10 GB half of 7b are done (`bench/RESULTS-cost.md`,
+"Campaign 2"). Task 7's load completed. The CloudLab lease ended at 04:17 during the
+first 100 GB cell, so the 100 GB RAM, tier and zipfian cells and the Cassandra `cz` / `az`
+pair did not run. Task 8 ran on the 10 GB corpus with the 100 GB load's space
+coefficients. To finish on a new experiment: `setup.sh` on every node,
+`setup_disk_cache.sh` on the clients, the server relayout (MinIO needs a bind mount), the
+Cassandra install and 10 GB load, the OzoneDB 100 GB load with 16 writers, then
+`bench/scripts/campaign-cost2/chain_oz100.sh` from its RAM-cells step. Findings that
+change the method are in Task 5's "Finding" block (per-writer cache fill) and in the
+results write-up.
+
+
 ### Task 0. Merge the native client into `visibility`
 
 Do this on the laptop, in a worktree cut from `visibility`. The user runs the build.

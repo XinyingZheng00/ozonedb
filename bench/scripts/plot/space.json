@@ -1,9 +1,9 @@
 {
-  "_comment": "Phase 1 measurements of bench/PLAN-cost.md, campaign cost-20260827 (1M x 1 KB, 8 writers, dataset_bytes 1.024e9). sC = Cassandra 'Space used (live)' after drain+compact 1,091,949,066 B / 1.024e9. sO = OzoneDB SSTable objects 1,145 MiB (1,200,619,520 B) / 1.024e9, checkpoints (44 MiB) excluded since they are the k term. L_gb = trimmed Corfu log dir 187 MiB in GiB. L0_kb_per_put = untrimmed log growth per put (PLAN-trimming: ~1.1 GB for 1M puts). trim_interval_s = log_trim_interval_ms of the shared config. wa = MinIO bytes_in during the load / dataset bytes (2.34 incl. checkpoints; 2.2 compaction only).",
-  "sC": 1.066,
-  "sO": 1.172,
-  "L_gb": 0.183,
-  "L0_kb_per_put": 1.1,
+  "_comment": "Campaign cost2-20260828 (bench/PLAN-cost-2.md). 100 GB values from the 16-writer trimmed load's server sample (_server/amd127.../ozonedb-corfu-native_workloadload_w16_rc100000000_trial0.{before,after}.txt). sC = Cassandra data dir after the 100 GB load once compaction settled, 106,889,724 KB / 1.024e11. sO = bucket 121,986 MB (mc du) minus the 172 MB checkpoint prefix, over 1.024e11 (10 GB gave 1.186). L_gb = /mnt/corfu/run_batch at the end of the load, 2,773,908 KB, in GiB (10 GB: 361 MiB with 16 writers). L0_kb_per_put = the untrimmed native reload of 2026-08-27 (PLAN-native-corfu.md, 1.3 GB per 1 M puts). trim_interval_s = log_trim_interval_ms of the shared config. wa = MinIO bytes received during the load, (5.548e11 - 8.00e10) / 1.024e11 (10 GB: 3.39). The previous file is space-disk2.json.",
+  "sC": 1.069,
+  "sO": 1.190,
+  "L_gb": 2.645,
+  "L0_kb_per_put": 1.3,
   "trim_interval_s": 30,
-  "wa": 2.34
+  "wa": 4.64
 }

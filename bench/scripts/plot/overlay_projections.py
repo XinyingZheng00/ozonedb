@@ -54,6 +54,8 @@ def main():
     ap.add_argument("--base-name", default="YCSB zipfian")
     ap.add_argument("--other-name", default="key-space zipfian")
     ap.add_argument("--title", default="")
+    ap.add_argument("--no-other-tier", action="store_true",
+                    help="do not draw the second table's tier line (its corpus has no tier cells, so the line is the model's fallback)")
     args = ap.parse_args()
 
     base, other = read_table(args.base_tsv), read_table(args.other_tsv)
@@ -67,6 +69,8 @@ def main():
         ax.plot(tab["D"], tab["ozone_lo_cache"], color="#1f618d", lw=1.0, ls=ls)
         ax.fill_between(tab["D"], tab["ozone_hi_cache"], tab["ozone_lo_cache"], color="#1f618d",
                         alpha=0.25 if ls == "-" else 0.10)
+        if tab is other and args.no_other_tier:
+            continue
         if "ozone_disk_cache" in tab and any(v > 0 for v in tab["disk_gb"]):
             ax.plot(tab["D"], tab["ozone_disk_cache"], color="#117864", lw=1.6, ls=ls,
                     label=f"OzoneDB + disk tier, {name}")
