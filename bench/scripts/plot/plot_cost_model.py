@@ -136,9 +136,19 @@ class Coefficients:
         # inferred from the S3 request rate, and behind a tier that rate is
         # the tier's residual, not the RAM cache's.
         pts = {}
-        n_steady = n_cum = 0
+        n_steady = n_cum = n_unfilled = 0
         for r in ozone:
             if r["workload"] != h_workload:
+                continue
+            # A writer's cache fills at that writer's own miss rate (about
+            # 1.9 MB/s at 10 GB), so a large cache can close a cell far from
+            # full and its hit rate is that of a smaller cache. cache_fill is
+            # the LRU's bytes at close over its capacity (PLAN-cost-2 Task 5);
+            # a cell below 0.9 is not a point on the curve. Older TSVs have
+            # no column and keep every cell.
+            fill = fnum(r.get("cache_fill"))
+            if fill is not None and fill < 0.9 and not fnum(r.get("disk_capacity")):
+                n_unfilled += 1
                 continue
             h, ratio = fnum(r.get("h_steady")), fnum(r["cache_ratio"])
             if fnum(r.get("disk_capacity")):
@@ -159,7 +169,8 @@ class Coefficients:
         self.h_points = sorted((ratio, max(v)[2]) for ratio, v in pts.items())
         if self.h_points:
             self.src["h"] = (f"measured, workload {h_workload}, {len(self.h_points)} ratios "
-                             f"from {n_steady + n_cum} cells ({n_steady} steady-state, {n_cum} cumulative)")
+                             f"from {n_steady + n_cum} cells ({n_steady} steady-state, {n_cum} cumulative"
+                             + (f", {n_unfilled} unfilled cells skipped" if n_unfilled else "") + ")")
         else:
             # Pessimistic straight line: every miss is a miss until the cache
             # holds the whole dataset.
@@ -246,11 +257,14 @@ class Coefficients:
             # fill_points. Without it a second trial of a cell would put two
             # points at one ratio and _interp would pick whichever sorted
             # first.
+            # On a tie (a rerun of the same cell), the fuller tier: a longer
+            # cell that reached more of its budget (PLAN-cost-2 Task 6).
             cap = fnum(r.get("cache_capacity")) or 0.0
-            if ratio not in dpts or cap < dpts[ratio][0]:
-                dpts[ratio] = (cap, fnum(r.get("h_total")), fnum(r.get("disk_h")))
-        self.h_disk_points = sorted((ratio, ht) for ratio, (_, ht, _) in dpts.items() if ht is not None)
-        self.disk_h_points = sorted((ratio, dh) for ratio, (_, _, dh) in dpts.items() if dh is not None)
+            held = fnum(r.get("disk_bytes")) or 0.0
+            if ratio not in dpts or (cap, -held) < (dpts[ratio][0], -dpts[ratio][3]):
+                dpts[ratio] = (cap, fnum(r.get("h_total")), fnum(r.get("disk_h")), held)
+        self.h_disk_points = sorted((ratio, ht) for ratio, (_, ht, _, _) in dpts.items() if ht is not None)
+        self.disk_h_points = sorted((ratio, dh) for ratio, (_, _, dh, _) in dpts.items() if dh is not None)
 
         def full_tier(workload):
             """The largest tier budget measured on `workload`. On a tie, the
@@ -261,7 +275,7 @@ class Coefficients:
                 return None
             best = max(fnum(r["disk_ratio"]) for r in cands)
             return min((r for r in cands if fnum(r["disk_ratio"]) == best),
-                       key=lambda r: fnum(r.get("cache_capacity")) or 0.0)
+                       key=lambda r: (fnum(r.get("cache_capacity")) or 0.0, -(fnum(r.get("disk_bytes")) or 0.0)))
 
         # The CPU per op and the fill rate must both come from the same workload
         # as the baseline cpu_O, or the tier line would compare two workloads.
@@ -279,9 +293,10 @@ class Coefficients:
             # One point per ratio: the cell with the smallest RAM cache, so the
             # tier is what was varied. Same rule as full_tier().
             cap = fnum(r.get("cache_capacity")) or 0.0
-            if ratio not in fpts or cap < fpts[ratio][0]:
-                fpts[ratio] = (cap, f)
-        self.fill_points = sorted((ratio, f) for ratio, (_, f) in fpts.items())
+            held = fnum(r.get("disk_bytes")) or 0.0
+            if ratio not in fpts or (cap, -held) < (fpts[ratio][0], -fpts[ratio][2]):
+                fpts[ratio] = (cap, f, held)
+        self.fill_points = sorted((ratio, f) for ratio, (_, f, _) in fpts.items())
         if self.disk_h_points and full_cpu is not None and self.fill_points:
             variant = f", variant '{tier_variant_filter}'"
             self.src["h_disk"] = (f"measured, workload {h_workload}, "
