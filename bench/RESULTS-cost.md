@@ -254,21 +254,24 @@ uv run --with matplotlib python3 bench/scripts/plot/paper_cost_figure.py \
   --cassandra-mode serial --read-fraction 0.10 --out bench/fig_cost
 ```
 
-Four series — OzoneDB with the 16 GB cache as one line (the 4 GB line is at most $350
-above it and is left to the text), OzoneDB with the 2 TB tier, Cassandra EBS, Cassandra
-NVMe as the gray context line — filled markers at the two measured sizes and none
-beyond, the tier regime shaded to 1 TB (the last grid point where the tier's own hit
-rate is at least 0.95), and one "cheaper from" marker per OzoneDB line at the smallest
-size from which the line *stays* below the cheaper Cassandra layout. At 10 % reads both
-markers fall on the same grid point, **1.3 TB**, which is the NVMe layout's fourth-node
-step, so the figure draws one. Numbers at this mix: OzoneDB $1,645 at 100 GB and $1,732
-at 1 TB against Cassandra EBS $2,402 and NVMe $1,565; the tier $1,539 at 100 GB and
-$1,579 at 1 TB; at 10 TB OzoneDB $2,073 (GETs $759, the log tier $614, clients $420,
-S3 storage $274) against EBS $4,742; at 100 TB $4,646 against $45,302. The tier line
-crosses *above* the RAM line near 2 TB and reads $2,388 at 10 TB: with 1,000 reads/s
-there is little left for a tier to serve, and its $480 of gp3 is not recovered. Panel
-(b) drops the NVMe bar ($12,587 at 10 TB) so the OzoneDB segments stay legible; the
-projection carries the NVMe blow-up.
+Three series — OzoneKV (the paper's name for the system) with the 16 GB cache as one
+line (the 4 GB line is at most $350 above it and is left to the text), Cassandra EBS,
+Cassandra NVMe as the gray context line — filled markers at the two measured sizes and
+none beyond, and one "cheaper from" marker at the smallest size from which the OzoneKV
+line *stays* below the cheaper Cassandra layout: at 10 % reads **1.3 TB**, the NVMe
+layout's fourth-node step. Numbers at this mix: OzoneKV $1,645 at 100 GB and $1,732 at
+1 TB against Cassandra EBS $2,402 and NVMe $1,565; at 10 TB OzoneKV $2,073 (GETs $759,
+the log tier $614, clients $420, S3 storage $274) against EBS $4,742; at 100 TB $4,646
+against $45,302. Panel (b) shows the 10 TB bill of the two lines the text argues from.
+
+The SSD tier is **not drawn** (`--tier` puts it back, with its bar and its own marker).
+At this mix the tier line crosses *above* the RAM line near 2 TB and reads $2,388 at
+10 TB: with 1,000 reads/s there is little left for a tier to serve, and its $480 of
+gp3 is not recovered. Below 1 TB it matches NVMe Cassandra ($1,539 against $1,565).
+The 2 TB per writer is the price parameter `disk_gb_per_client` (it mirrors the i4i
+node's 1.875 TB); the measured cells used budgets of 2.5 GiB to 50 GiB on a 447 GB
+SSD, and the model reads the measured hit-rate-against-ratio curve at the projected
+ratio. With a 447 GB tier the line helps only below 1 TB.
 
 Caveats the caption must carry: the campaign measured no cell below 50 % reads, so the
 client CPU per op is workload a's (0.83 ms; the loads measured 0.71 to 0.77 ms per put,

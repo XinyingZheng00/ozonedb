@@ -10,11 +10,11 @@ Writes <out>.{pdf,png} (double-column: panel (a) the projection, panel (b) the
 bill at 10 TB) and <out>_col.{pdf,png} (single column: panel (a) alone).
 
 Panel (a) is plot_cost_model.py's figure cut to what the text argues from:
-four series (OzoneKV with the high RAM cache, OzoneKV with a disk tier per
-client, Cassandra on EBS, Cassandra on local NVMe as the gray context line),
-the x-axis from the smallest measured dataset, filled markers on the measured
-sizes and none beyond, the tier regime shaded, one "cheaper from" marker per
-OzoneKV line, and four value labels. --read-fraction overrides
+three series (OzoneKV with the high RAM cache, Cassandra on EBS, Cassandra on
+local NVMe as the gray context line; --tier adds OzoneKV with an SSD tier per
+writer), the x-axis from the smallest measured dataset, filled markers on the
+measured sizes and none beyond, one "cheaper from" marker per OzoneKV line,
+and the 10 TB and 100 TB value labels. --read-fraction overrides
 prices.json's projection.read_fraction (the offered mix; writes are blind
 puts, so this is the insert workload `ai` of PLAN-cost-2, not workload a).
 Panel (b) is one decade of the same model split into its cost lines.
@@ -97,7 +97,7 @@ def cheaper_from(ds, ozone, cass):
     return ds[last_dearer + 1] if last_dearer + 1 < len(ds) else None
 
 
-def series(coef, model, prices):
+def series(coef, model, prices, tier=False):
     pr = prices["projection"]
     # The x-axis starts at the decade of the smallest measured dataset
     # (10.24 GB -> 10 GB); everything to its right is the model.
@@ -105,7 +105,9 @@ def series(coef, model, prices):
     if coef.measured_d:
         d_min_gb = 10 ** int(round(pcm.math.log10(min(coef.measured_d) / GB)))
     ds = pcm.grid(d_min_gb, pr["d_max_gb"], per_decade=48)
-    disk_gb = float(pr.get("disk_gb_per_client", 0))
+    # The SSD tier is opt-in (--tier): off, disk_gb is 0 and every tier
+    # series, marker, label and bar is skipped.
+    disk_gb = float(pr.get("disk_gb_per_client", 0)) if tier else 0.0
     hi, lo = pr["cache_gb_high"], pr["cache_gb_low"]
     s = {
         "ds": ds,
@@ -213,30 +215,30 @@ def panel_a(ax, coef, model, prices, s, single):
         fontsize=fs,
         color=INK,
     )
-    if s["disk_gb"]:
-        d1 = 1 * TB
-        oz1 = model.ozonedb(d1, s["hi"], disk_gb=s["disk_gb"])["total"]
-        ce1 = model.cassandra(d1, "ebs")["total"]
-        ax.annotate(
-            fmt_usd(oz1),
-            (d1 / GB, oz1),
-            xytext=(-5, -3),
-            textcoords="offset points",
-            ha="right",
-            va="top",
-            fontsize=fs,
-            color=INK,
-        )
-        ax.annotate(
-            fmt_usd(ce1),
-            (d1 / GB, ce1),
-            xytext=(-3, -3),
-            textcoords="offset points",
-            ha="right",
-            va="top",
-            fontsize=fs,
-            color=INK,
-        )
+    # The 10 TB pair, the decade panel (b) splits.
+    d10 = 10 * TB
+    oz10 = model.ozonedb(d10, s["hi"])["total"]
+    ce10 = model.cassandra(d10, "ebs")["total"]
+    ax.annotate(
+        fmt_usd(oz10),
+        (d10 / GB, oz10),
+        xytext=(4, -5),
+        textcoords="offset points",
+        ha="left",
+        va="top",
+        fontsize=fs,
+        color=INK,
+    )
+    ax.annotate(
+        fmt_usd(ce10),
+        (d10 / GB, ce10),
+        xytext=(-4, 4),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=fs,
+        color=INK,
+    )
 
     # Marker labels along the top.
     ytop = ymax / 1.25
@@ -245,7 +247,7 @@ def panel_a(ax, coef, model, prices, s, single):
     # its left, the later one to its right, so the labels never meet.
     marks = [(s["x_disk"], AQUA, "tier"), (s["x_oz"], BLUE, f"{s['hi']} GB cache")]
     marks = sorted((d, c, n) for d, c, n in marks if d)
-    if len(marks) == 2 and abs(marks[0][0] - marks[1][0]) < 1e-6 * marks[0][0]:
+    if len(marks) == 1 or (len(marks) == 2 and abs(marks[0][0] - marks[1][0]) < 1e-6 * marks[0][0]):
         marks = [(marks[0][0], INK2, "OzoneKV")]
     for i, (d, col, name) in enumerate(marks):
         ax.axvline(d / GB, color=col, lw=0.8, ls=(0, (1.5, 1.5)), alpha=0.9)
@@ -317,7 +319,10 @@ def panel_b(ax, model, prices, s, d_bytes):
     ] + ([("SSD tier", o["disk_cost"], AQUA)] if tier else [])
     bars = [
         (f"OzoneKV, {hi} GB cache", oz_lines(oz, False)),
-        (f"OzoneKV + {s['disk_gb'] / 1000:g} TB tier", oz_lines(ozd, True)),
+    ]
+    if s["disk_gb"]:
+        bars.append((f"OzoneKV + {s['disk_gb'] / 1000:g} TB tier", oz_lines(ozd, True)))
+    bars += [
         (
             "Cassandra SERIAL, EBS",
             [
@@ -336,7 +341,7 @@ def panel_b(ax, model, prices, s, d_bytes):
                 y,
                 v,
                 left=left,
-                height=0.62,
+                height=0.42 if len(bars) <= 2 else 0.62,
                 color=col,
                 lw=0,
                 edgecolor="none",
@@ -355,6 +360,7 @@ def panel_b(ax, model, prices, s, d_bytes):
                 )
             left += v + 0.004 * total_max  # a hairline surface gap between segments
     ax.set_yticks(ys)
+    ax.set_ylim(-0.85, len(bars) - 0.15)
     ax.set_yticklabels(
         [f"{label}\n{fmt_usd(sum(v for _, v, _ in segs))}" for label, segs in bars],
         fontsize=fs,
@@ -398,6 +404,11 @@ def main():
     ap.add_argument("--tier-variant", default="")
     ap.add_argument("--cassandra-mode", default="serial", choices=("serial", "quorum"))
     ap.add_argument(
+        "--tier",
+        action="store_true",
+        help="draw the SSD-tier line (prices.json projection.disk_gb_per_client per writer); off by default",
+    )
+    ap.add_argument(
         "--read-fraction",
         type=float,
         default=None,
@@ -428,7 +439,7 @@ def main():
         }
     )
     coef, model, prices = build(args)
-    s = series(coef, model, prices)
+    s = series(coef, model, prices, tier=args.tier)
     m = pcm.re.match(r"^\s*([\d.]+)\s*(GB|TB)\s*$", args.breakdown_at)
     if not m:
         raise SystemExit(f"--breakdown-at: cannot parse {args.breakdown_at!r}")
