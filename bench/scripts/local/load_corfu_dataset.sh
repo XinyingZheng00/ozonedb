@@ -57,7 +57,7 @@ Usage: $(basename "$0") [options]
                     (bench/PLAN-compaction-cache.md). Result label gets -warm.
   --record-cnt N    dataset size in records, forwarded as --record_cnt
   --corfu-client C  forward --corfu-client jni|native to the loader (the
-                    C++ client `native` is the default, PLAN-native-corfu.md)
+                    C++ client "native" is the default, PLAN-native-corfu.md)
   --corfu-dir PATH  corfu repo on the log node (default: $CORFU_DIR)
   --dry-run         print the plan; no ssh
   -h | --help
@@ -151,6 +151,11 @@ SAMPLE_RC="${RECORD_CNT:-$(cd "$OZONEDB_HOME" && python3 bench/scripts/ycsb_conf
 # wrong load rows (the first --cache-warm load overwrote the plain load's
 # sample under the plain name).
 SAMPLE_LABEL="ozonedb-corfu"
+# Same token order as result_label(): engine, -native, -warm. The native client
+# is the default, so an empty --corfu-client is native too; without this the
+# sample is named ozonedb-corfu_… and the extractor never pairs it with the
+# ozonedb-corfu-native load row (PLAN-cost-2 Task 4).
+[[ "${CORFU_CLIENT:-native}" == "native" ]] && SAMPLE_LABEL="${SAMPLE_LABEL}-native"
 [[ "$CACHE_WARM" -eq 1 ]] && SAMPLE_LABEL="${SAMPLE_LABEL}-warm"
 SAMPLE_CELL="${SAMPLE_LABEL}_workloadload_w${WRITERS}_rc${SAMPLE_RC}_trial0"
 SAMPLE_LOCAL="$OZONEDB_HOME/bench/results/local/_server/$(echo "$CORFU_SSH" | sed 's/^.*@//; s/[^A-Za-z0-9._-]/_/g')"

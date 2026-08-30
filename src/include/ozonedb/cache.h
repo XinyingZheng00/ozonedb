@@ -193,6 +193,15 @@ class LRUCache {
   static constexpr int kLevelSlots = 16;
   std::atomic<uint64_t> level_hits_[kLevelSlots] = {};
   std::atomic<uint64_t> level_misses_[kLevelSlots] = {};
+  // Probe outcomes per level (Table::get, one probe per candidate file
+  // of a get): pruned = a bloom filter said no before any block was
+  // touched; absent = a block was looked up (cache hit or GET) and the
+  // key was not in it. probes - pruned - absent = found. Campaign
+  // cost2-20260828 saw 1.35 block fetches per read on workload a
+  // against 1.02 on c; these say which level fetches for nothing.
+  std::atomic<uint64_t> level_probes_[kLevelSlots] = {};
+  std::atomic<uint64_t> level_pruned_[kLevelSlots] = {};
+  std::atomic<uint64_t> level_absent_[kLevelSlots] = {};
   // Warm-worker counters (part B). All zero until the worker exists.
   std::atomic<uint64_t> warm_files_{0};
   std::atomic<uint64_t> warm_blocks_{0};
@@ -286,6 +295,9 @@ class LRUCache {
     uint64_t misses = 0;
     uint64_t level_hits[kLevelSlots] = {};
     uint64_t level_misses[kLevelSlots] = {};
+    uint64_t level_probes[kLevelSlots] = {};
+    uint64_t level_pruned[kLevelSlots] = {};
+    uint64_t level_absent[kLevelSlots] = {};
     size_t capacity = 0;
     size_t current_size = 0;
     size_t files = 0;
@@ -352,6 +364,10 @@ class LRUCache {
   void readDataLog(std::string const& file_name, size_t cached_offset, size_t size);
   void getSSTable(std::string const& file_name, Table*& table);
   void needReadBlock(std::string const& file_name, bool& read_more, std::string const& index_value);
+  // Probe accounting for Table::get: kind 0 = a probe of this file
+  // started, 1 = a filter pruned it, 2 = a block was consulted and the
+  // key was not in it. See level_probes_.
+  void noteProbe(std::string const& file_name, int kind);
   // caller_table: the Table the caller is already reading through
   // (Table::get passes `this`). Used when the file's cache entry has
   // no Table* — populated by the compaction write-through before any

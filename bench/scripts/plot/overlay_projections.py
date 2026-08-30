@@ -54,19 +54,27 @@ def main():
     ap.add_argument("--base-name", default="YCSB zipfian")
     ap.add_argument("--other-name", default="key-space zipfian")
     ap.add_argument("--title", default="")
+    ap.add_argument("--no-other-tier", action="store_true",
+                    help="do not draw the second table's tier line (its corpus has no tier cells, so the line is the model's fallback)")
     args = ap.parse_args()
 
     base, other = read_table(args.base_tsv), read_table(args.other_tsv)
     fig, ax = plt.subplots(figsize=(6.0, 3.8))
     x = base["D"]
-    ax.plot(x, base["cass_nvme"], color="#b03a2e", lw=1.8, label="Cassandra RF=3, NVMe (i4i)")
-    ax.plot(x, base["cass_ebs"], color="#e59866", lw=1.8, ls="-.", label="Cassandra RF=3, EBS gp3")
+    # The Cassandra consistency mode the table was priced against
+    # (plot_cost_model.py --cassandra-mode); older tables carry no column.
+    mode = base.get("cass_mode", ["?"])[0]
+    cass_name = {"serial": "Cassandra SERIAL (LWT)", "quorum": "Cassandra QUORUM"}.get(mode, "Cassandra")
+    ax.plot(x, base["cass_nvme"], color="#b03a2e", lw=1.8, label=f"{cass_name} RF=3, NVMe (i4i)")
+    ax.plot(x, base["cass_ebs"], color="#e59866", lw=1.8, ls="-.", label=f"{cass_name} RF=3, EBS gp3")
     for tab, name, ls in ((base, args.base_name, "-"), (other, args.other_name, "--")):
         ax.plot(tab["D"], tab["ozone_hi_cache"], color="#1f618d", lw=1.6, ls=ls,
                 label=f"OzoneDB, {name} (high .. low RAM cache)")
         ax.plot(tab["D"], tab["ozone_lo_cache"], color="#1f618d", lw=1.0, ls=ls)
         ax.fill_between(tab["D"], tab["ozone_hi_cache"], tab["ozone_lo_cache"], color="#1f618d",
                         alpha=0.25 if ls == "-" else 0.10)
+        if tab is other and args.no_other_tier:
+            continue
         if "ozone_disk_cache" in tab and any(v > 0 for v in tab["disk_gb"]):
             ax.plot(tab["D"], tab["ozone_disk_cache"], color="#117864", lw=1.6, ls=ls,
                     label=f"OzoneDB + disk tier, {name}")

@@ -166,8 +166,10 @@ Status Table::get(std::string const& key, std::shared_ptr<Record>& record) {
   if (rep_ == nullptr || rep_->index_iter == nullptr || rep_->lru_cache == nullptr) {
     return Status::kNotFound;
   }
+  this->rep_->lru_cache->noteProbe(rep_->fileName, 0);
   // check file filter first
   if (rep_->filter_block_for_file_reader != nullptr && !rep_->filter_block_for_file_reader->keyMayMatch(0, key)) {
+    this->rep_->lru_cache->noteProbe(rep_->fileName, 1);
     return Status::kNotFound;
   }
   Status s;
@@ -177,6 +179,7 @@ Status Table::get(std::string const& key, std::shared_ptr<Record>& record) {
     BlockIdentifier identifier;
     bool s = identifier.ParseFromString(identifier_value);
     if (rep_->filter_block_reader != nullptr && !rep_->filter_block_reader->keyMayMatch(identifier.offset(), key)) {
+      this->rep_->lru_cache->noteProbe(rep_->fileName, 1);
       return Status::kNotFound;
     }
     Status status;
@@ -190,8 +193,15 @@ Status Table::get(std::string const& key, std::shared_ptr<Record>& record) {
       if (record) {
         return Status::kSuccess;
       }
+      // A block was consulted (cache hit or GET) and the key is not in
+      // it: a filter false positive, or a file without a usable filter.
+      this->rep_->lru_cache->noteProbe(rep_->fileName, 2);
+      return Status::kNotFound;
     }
   }
+  // Key past the last index entry, or an unparseable identifier: no
+  // block touched. Counted as pruned.
+  this->rep_->lru_cache->noteProbe(rep_->fileName, 1);
   return Status::kNotFound;
 }
 

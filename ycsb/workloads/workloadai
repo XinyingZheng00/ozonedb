@@ -1,0 +1,34 @@
+# Yahoo! Cloud System Benchmark
+# Workload AI: workload A with blind inserts in place of read-modify-write updates
+#
+# Why this file exists (bench/PLAN-cost-2.md, campaign cost2-20260828): the
+# ozonedb binding's update() is a read-modify-write, because a record is one
+# opaque blob and YCSB updates one field of ten (OzoneDBClient.java:64). So
+# workload a issues a get on EVERY operation, and the measured 0.71 GETs per op
+# is twice what the cost model prices (it charges GETs on reads only). insert()
+# is a blind put (OzoneDBClient.java:94). This workload keeps workload a's
+# 50/50 split and its request distribution and swaps the update for an insert,
+# which isolates the cost of the read-modify-write.
+#
+# Caveat for multi-writer cells: the run phase passes no insertstart, and
+# CoreWorkload seeds transactioninsertkeysequence from recordcount, so every
+# writer process generates the same new keys. The inserted keys are therefore
+# written once per writer. The write path is unaffected (each is a blind put);
+# only the dataset growth is 1/N of the total inserts.
+#
+#   Read/insert ratio: 50/50
+#   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
+#   Request distribution: zipfian (scrambled, as in workload a)
+
+recordcount=1000
+operationcount=1000
+workload=site.ycsb.workloads.CoreWorkload
+
+readallfields=true
+
+readproportion=0.5
+updateproportion=0
+scanproportion=0
+insertproportion=0.5
+
+requestdistribution=zipfian

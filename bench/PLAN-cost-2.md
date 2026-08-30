@@ -221,6 +221,29 @@ Rules 1–5 of `PLAN-cost.md` hold. Add:
 
 ## 5. Tasks
 
+**Status 2026-08-30. The campaign is complete.** Tasks 0 to 8 are done and written up
+in `bench/RESULTS-cost.md`, "Campaign 2". The first cluster's lease ended at 04:17 on
+2026-08-29, during the first 100 GB cell; a second experiment (amd197 + amd189..amd200)
+reran every OzoneDB cell on the build with the SSTable filter fix (`3b28a2cd`), so the
+corpus is one build at both sizes. Beyond the plan as written:
+
+- **`3b28a2cd`** — `filterBlockReader::keyMayMatch` copied the whole-file Bloom filter
+  (712 KB per 570 MB SSTable) on every probe. It cost 6.7 ms of client CPU per get at
+  100 GB and was invisible at 1 GB. The 10 GB corpus was re-measured after it; the
+  pre-fix cells are `results-cost2-20260828-prefix.tsv`.
+- **`1662446b`** — per-level probe counters (probes / pruned / absent). They show the
+  filters prune 99.3 % of candidate files, which ruled out wasted fetches as the cause of
+  workload a's GET rate.
+- **`workloadai`** — workload a with a blind insert in place of the read-modify-write
+  update, run on both systems at both sizes. This is finding 2 of the write-up and the
+  single largest cost lever found: it halves the GET bill and restores the block cache.
+
+Still open, in the order that pays: lazy per-file index and filter loading (a writer
+holds 1.75 GB per 100 GB outside the cache budget, linear in the dataset, so the
+projection above 1 TB describes a client that cannot open the data);
+`level_file_size_limit` honored below `max_level` (`compaction.cpp:400`, why L4 files are
+570 MB); a second trial of the headline cells.
+
 ### Task 0. Merge the native client into `visibility`
 
 Do this on the laptop, in a worktree cut from `visibility`. The user runs the build.
@@ -317,8 +340,10 @@ About 45 min on the laptop. It changes no file that the merge in Task 0 conflict
    pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' || true
    /tank/cassandra/cassandra_ctl.sh stop
    sudo mkdir -p /tank/ssd && sudo chown $USER /tank/ssd
-   # MinIO: the unit's ExecStart keeps the path /tank/minio, which becomes a symlink
-   mv /tank/minio /tank/ssd/minio && ln -s /tank/ssd/minio /tank/minio
+   # MinIO: the unit's ExecStart keeps the path /tank/minio. NOT a symlink: MinIO
+   # lstat()s its drive path and refuses one ("Drives are not directories"). Bind-mount.
+   sudo mv /tank/minio /tank/ssd/minio && sudo mkdir /tank/minio
+   echo "/tank/ssd/minio /tank/minio none bind,nofail 0 0" | sudo tee -a /etc/fstab && sudo mount /tank/minio
    # Corfu: keep load, load-bucket and the two -zstd-20260827 snapshots for now; drop the rest
    mkdir /tank/ssd/corfu
    for d in load load-bucket load-zstd-20260827 load-bucket-zstd-20260827; do mv /mnt/corfu/$d /tank/ssd/corfu/; done
@@ -329,6 +354,8 @@ About 45 min on the laptop. It changes no file that the merge in Task 0 conflict
    /tank/cassandra/cassandra_ctl.sh start && /tank/cassandra/cassandra_ctl.sh wait && /tank/cassandra/cassandra_ctl.sh stop
    df -h /tank/ssd
    ```
+   Done 2026-08-28 17:56-18:04 (the symlink form broke MinIO; fixed to the bind mount above,
+   Cassandra came up in 15 s through its symlink, 25 GB on `/tank/ssd`).
    Every consumer reaches the state through the old paths: the MinIO unit, the runner's
    `/mnt/corfu/{load,run_batch,load-bucket}`, `cassandra.install_dir`, and the sampler's
    `du` on `/tank/minio` and `/tank/cassandra/data`. `du` follows an intermediate symlink
@@ -506,6 +533,21 @@ Exit:
 - `cpuO` on workload a at 5 GiB at most 0.65 ms, and at least 35 % below the JNI control.
 - RSS per writer at most 1.5 GB plus the cache (the 5 GiB cell holds 5 GiB of blocks).
 - Linearizable workload c within 3 % of the default throughput, every linearizable READ OK.
+
+**Finding 2026-08-28 (Task 5, first two cells).** A writer's block cache fills at that
+writer's own miss rate, not the cluster's: about 475 GETs/s × 4 KiB = 1.9 MB/s per writer
+at 10 GB. The 5 GiB cell closed with `current_size` at 25 % of `capacity` after 600 s
+(`h` 0.45, the hit rate of a 13 % cache), and the cumulative-against-steady test does not
+see a slow linear fill. The 640 MiB cell was full (`h` 0.42–0.43 at 6.5 %). The extractor
+now writes `cache_fill` (bytes at close over capacity); a RAM cell counts only when it is
+above 0.9, and a tier cell when `disk_bytes` is near `disk_capacity`. The same arithmetic
+sizes the tier cells: the fill is the miss rate × 64 KiB, about 30 MB/s per writer, so
+20 GiB needs 11 min, 25 GiB 14 min and 50 GiB 28 min plus the slowdown as the hit rate
+rises. Durations changed: 20 GiB tier at 10 GB rerun at 1,800 s (`chain_oz10c.sh`), at
+100 GB the 800 MiB RAM cell 900 s, the 25 GiB tier 1,800 s, the 50 GiB tier 2,700 s, the
+zipf 25 GiB tier 1,800 s. The 52 % RAM point at 10 GB needs a cell of about 4,800 s and
+is deferred to the end of the campaign, if time allows; the projection reads `h` at
+ratios below 0.2 %, where the cache fills in seconds.
 
 ### Task 6. Tier cells at 10 GB
 

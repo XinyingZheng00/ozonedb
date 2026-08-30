@@ -4,6 +4,7 @@
   plot_cost_model.py coefficients.tsv prices.json [--space space.json]
                      [--out-dir DIR] [--table out.tsv] [--h-workload c]
                      [--cpu-workload a] [--tier-variant ch64k-adm]
+                     [--cassandra-mode serial|quorum]
 
 coefficients.tsv is what extract_cost_coefficients.py writes. prices.json
 holds the list prices, the instance roles and the projection parameters.
@@ -104,7 +105,7 @@ class Coefficients:
     """Everything the model needs, with a source tag per value."""
 
     def __init__(self, rows, space, h_workload, read_fraction=0.5, tier_variant_filter="",
-                 cpu_workload=None):
+                 cpu_workload=None, cassandra_mode="serial"):
         self.src = {}
         self.read_fraction = float(read_fraction)
         ozone = [r for r in rows if r["label"].startswith("ozonedb-corfu")
@@ -127,7 +128,14 @@ class Coefficients:
         if not tier and any(fnum(r.get("disk_capacity")) for r in ozone):
             print(f"no disk-cache rows for --tier-variant '{tier_variant_filter}'")
         ozone_s3 = [r for r in ozone if not fnum(r.get("disk_capacity"))]
-        cass = [r for r in rows if r["label"].startswith("cassandra")]
+        # One Cassandra consistency mode feeds the Cassandra line. `serial`
+        # (SERIAL reads + LWT writes, label cassandra-serial) is the
+        # linearizable mode and the like-for-like point for OzoneDB's reads;
+        # `quorum` is the default YCSB binding. The two differ 1.4x in client
+        # CPU per op and 2.7x in ops per busy server-second, so a median over
+        # both would price neither system.
+        self.cassandra_mode = cassandra_mode
+        cass = [r for r in rows if r["label"] == f"cassandra-{cassandra_mode}"]
 
         # h(ratio): the cache sweep, one workload. h_steady (the last window
         # of the run, from the MinIO request-rate series) when the cell has
@@ -136,9 +144,19 @@ class Coefficients:
         # inferred from the S3 request rate, and behind a tier that rate is
         # the tier's residual, not the RAM cache's.
         pts = {}
-        n_steady = n_cum = 0
+        n_steady = n_cum = n_unfilled = 0
         for r in ozone:
             if r["workload"] != h_workload:
+                continue
+            # A writer's cache fills at that writer's own miss rate (about
+            # 1.9 MB/s at 10 GB), so a large cache can close a cell far from
+            # full and its hit rate is that of a smaller cache. cache_fill is
+            # the LRU's bytes at close over its capacity (PLAN-cost-2 Task 5);
+            # a cell below 0.9 is not a point on the curve. Older TSVs have
+            # no column and keep every cell.
+            fill = fnum(r.get("cache_fill"))
+            if fill is not None and fill < 0.9 and not fnum(r.get("disk_capacity")):
+                n_unfilled += 1
                 continue
             h, ratio = fnum(r.get("h_steady")), fnum(r["cache_ratio"])
             if fnum(r.get("disk_capacity")):
@@ -159,7 +177,8 @@ class Coefficients:
         self.h_points = sorted((ratio, max(v)[2]) for ratio, v in pts.items())
         if self.h_points:
             self.src["h"] = (f"measured, workload {h_workload}, {len(self.h_points)} ratios "
-                             f"from {n_steady + n_cum} cells ({n_steady} steady-state, {n_cum} cumulative)")
+                             f"from {n_steady + n_cum} cells ({n_steady} steady-state, {n_cum} cumulative"
+                             + (f", {n_unfilled} unfilled cells skipped" if n_unfilled else "") + ")")
         else:
             # Pessimistic straight line: every miss is a miss until the cache
             # holds the whole dataset.
@@ -216,8 +235,10 @@ class Coefficients:
                                              if r["workload"] == cpu_wl],
                           DEFAULT_COEF["cpu_s_per_op_O"])
         self.cpu_C = pick("cpu_s_per_op_C", [fnum(r["client_cpu_s_per_op"]) for r in cass
-                                             if "serial" not in r["label"] and r["workload"] == cpu_wl],
+                                             if r["workload"] == cpu_wl],
                           DEFAULT_COEF["cpu_s_per_op_C"])
+        if self.src["cpu_s_per_op_C"] != "ASSUMED":
+            self.src["cpu_s_per_op_C"] += f", cassandra-{cassandra_mode}, workload {cpu_wl}"
         # One Cassandra box: steady ops/s divided by the busy fraction of the
         # box (pidstat), the largest over the scaling cells.
         caps = []
@@ -226,6 +247,8 @@ class Coefficients:
             if ops and busy and busy > 0.02:
                 caps.append(ops / busy)
         self.ops_node_C = pick("ops_node_C", [max(caps)] if caps else [], DEFAULT_COEF["ops_node_C"])
+        if self.src["ops_node_C"] != "ASSUMED":
+            self.src["ops_node_C"] += f", cassandra-{cassandra_mode}, best of {len(caps)} cells"
 
         # Disk-cache tier (bench/PLAN-disk-cache.md, campaign disk-20260829).
         # disk_h(ratio) is the *tier's own* hit rate against the tier budget
@@ -246,11 +269,14 @@ class Coefficients:
             # fill_points. Without it a second trial of a cell would put two
             # points at one ratio and _interp would pick whichever sorted
             # first.
+            # On a tie (a rerun of the same cell), the fuller tier: a longer
+            # cell that reached more of its budget (PLAN-cost-2 Task 6).
             cap = fnum(r.get("cache_capacity")) or 0.0
-            if ratio not in dpts or cap < dpts[ratio][0]:
-                dpts[ratio] = (cap, fnum(r.get("h_total")), fnum(r.get("disk_h")))
-        self.h_disk_points = sorted((ratio, ht) for ratio, (_, ht, _) in dpts.items() if ht is not None)
-        self.disk_h_points = sorted((ratio, dh) for ratio, (_, _, dh) in dpts.items() if dh is not None)
+            held = fnum(r.get("disk_bytes")) or 0.0
+            if ratio not in dpts or (cap, -held) < (dpts[ratio][0], -dpts[ratio][3]):
+                dpts[ratio] = (cap, fnum(r.get("h_total")), fnum(r.get("disk_h")), held)
+        self.h_disk_points = sorted((ratio, ht) for ratio, (_, ht, _, _) in dpts.items() if ht is not None)
+        self.disk_h_points = sorted((ratio, dh) for ratio, (_, _, dh, _) in dpts.items() if dh is not None)
 
         def full_tier(workload):
             """The largest tier budget measured on `workload`. On a tie, the
@@ -261,7 +287,7 @@ class Coefficients:
                 return None
             best = max(fnum(r["disk_ratio"]) for r in cands)
             return min((r for r in cands if fnum(r["disk_ratio"]) == best),
-                       key=lambda r: fnum(r.get("cache_capacity")) or 0.0)
+                       key=lambda r: (fnum(r.get("cache_capacity")) or 0.0, -(fnum(r.get("disk_bytes")) or 0.0)))
 
         # The CPU per op and the fill rate must both come from the same workload
         # as the baseline cpu_O, or the tier line would compare two workloads.
@@ -279,9 +305,10 @@ class Coefficients:
             # One point per ratio: the cell with the smallest RAM cache, so the
             # tier is what was varied. Same rule as full_tier().
             cap = fnum(r.get("cache_capacity")) or 0.0
-            if ratio not in fpts or cap < fpts[ratio][0]:
-                fpts[ratio] = (cap, f)
-        self.fill_points = sorted((ratio, f) for ratio, (_, f) in fpts.items())
+            held = fnum(r.get("disk_bytes")) or 0.0
+            if ratio not in fpts or (cap, -held) < (fpts[ratio][0], -fpts[ratio][2]):
+                fpts[ratio] = (cap, f, held)
+        self.fill_points = sorted((ratio, f) for ratio, (_, f, _) in fpts.items())
         if self.disk_h_points and full_cpu is not None and self.fill_points:
             variant = f", variant '{tier_variant_filter}'"
             self.src["h_disk"] = (f"measured, workload {h_workload}, "
@@ -497,6 +524,9 @@ def main():
                     help="workload whose cells give the client CPU per op and the tier fill rate "
                          "(default: c when projection.read_fraction >= 0.95, else a); "
                          "the key-space zipfian corpus uses --h-workload cz --cpu-workload az")
+    ap.add_argument("--cassandra-mode", default="serial", choices=("serial", "quorum"),
+                    help="which Cassandra consistency mode's cells feed the Cassandra line: serial "
+                         "(SERIAL reads + LWT writes, the linearizable mode; default) or quorum")
     ap.add_argument("--out-dir", default=OUT_DIR)
     ap.add_argument("--table", help="write the projection table as TSV")
     ap.add_argument("--tier-variant", default="",
@@ -514,12 +544,15 @@ def main():
     coef = Coefficients(rows, space, args.h_workload,
                         read_fraction=prices["projection"].get("read_fraction", 0.5),
                         tier_variant_filter=args.tier_variant,
-                        cpu_workload=args.cpu_workload)
+                        cpu_workload=args.cpu_workload,
+                        cassandra_mode=args.cassandra_mode)
     coef.report()
     model = Model(coef, prices)
     pr = prices["projection"]
+    cass_name = "Cassandra SERIAL (LWT)" if args.cassandra_mode == "serial" else "Cassandra QUORUM"
     print(f"projection: {model.ops:.0f} ops/s, read fraction {pr['read_fraction']}, "
-          f"RF={pr['rf']}, {pr['log_units']} log units, prices as of {prices.get('as_of', '?')}")
+          f"RF={pr['rf']}, {pr['log_units']} log units, prices as of {prices.get('as_of', '?')}, "
+          f"against cassandra-{args.cassandra_mode}")
 
     ds = grid(pr["d_min_gb"], pr["d_max_gb"])
     disk_gb = float(pr.get("disk_gb_per_client", 0))
@@ -576,7 +609,8 @@ def main():
                       r1(oz["put_cost"]), r1(oz["ckpt_cost"]), oz["clients"], r1(oz["client_cost"]),
                       r1(ozt["log_tier"]), round(ozt["log_gb"], 1),
                       r1(od), round(ozd["h"], 4), round(ozd["h_tier"], 4), round(disk_gb),
-                      r1(ozd["get_cost"]), ozd["clients"], r1(ozd["client_cost"]), r1(ozd["disk_cost"])))
+                      r1(ozd["get_cost"]), ozd["clients"], r1(ozd["client_cost"]), r1(ozd["disk_cost"]),
+                      args.cassandra_mode))
     print(crossover_note)
     print(disk_note)
     if args.table:
@@ -587,7 +621,7 @@ def main():
                 "ozone_puts_compaction_usd", "ozone_puts_checkpoint_usd", "ozone_clients", "ozone_clients_usd",
                 "ozone_today_log_tier_usd", "ozone_today_log_gb",
                 "ozone_disk_cache", "h_disk_cache", "disk_h_tier", "disk_gb", "ozone_disk_gets_usd",
-                "ozone_disk_clients", "ozone_disk_clients_usd", "ozone_disk_gp3_usd"]
+                "ozone_disk_clients", "ozone_disk_clients_usd", "ozone_disk_gp3_usd", "cass_mode"]
         with open(args.table, "w") as f:
             f.write("\t".join(cols) + "\n")
             for ln in lines:
@@ -598,8 +632,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.0, 3.8))
     x = [d / GB for d in ds]
-    ax.plot(x, series["cass_nvme"], color="#b03a2e", lw=1.8, label="Cassandra RF=3, NVMe (i4i)")
-    ax.plot(x, series["cass_ebs"], color="#e59866", lw=1.8, ls="-.", label="Cassandra RF=3, EBS gp3")
+    ax.plot(x, series["cass_nvme"], color="#b03a2e", lw=1.8, label=f"{cass_name} RF=3, NVMe (i4i)")
+    ax.plot(x, series["cass_ebs"], color="#e59866", lw=1.8, ls="-.", label=f"{cass_name} RF=3, EBS gp3")
     ax.fill_between(x, series["ozone_hi_cache"], series["ozone_lo_cache"], color="#1f618d", alpha=0.25,
                     label=f"OzoneDB + trimming ({pr['cache_gb_high']} GB .. {pr['cache_gb_low']} GB cache per client)")
     ax.plot(x, series["ozone_hi_cache"], color="#1f618d", lw=1.6)

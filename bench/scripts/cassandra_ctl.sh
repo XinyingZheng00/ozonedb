@@ -98,6 +98,16 @@ do_start() {
   fi
   mkdir -p "$DATA_DIR" "$CASSANDRA_LOG_DIR"
   ulimit -n 100000 2>/dev/null || true
+  # `nodetool drain` in do_stop leaves its JMX connection in TIME_WAIT on 7199
+  # for up to 60 s, and the RMI registry of the next JVM cannot bind over it
+  # ("Port already in use: 7199"). restore-load spends that minute copying;
+  # wipe does not, and its start died this way (PLAN-cost-2 Task 2). Wait.
+  local i
+  for i in $(seq 1 90); do
+    ss -tan 2>/dev/null | grep -q ":${JMX_PORT:-7199} " || break
+    [[ $i -eq 1 ]] && log "waiting for JMX port ${JMX_PORT:-7199} to clear (TIME_WAIT after nodetool drain)"
+    sleep 1
+  done
   log "starting $CASSANDRA_HOME (bind=$CASSANDRA_BIND heap=$MAX_HEAP_SIZE) -> $SERVER_LOG"
   # bin/cassandra daemonizes itself without -f; -p records the pid.
   "$CASSANDRA_HOME/bin/cassandra" -p "$PID_FILE" >"$SERVER_LOG" 2>&1 </dev/null
