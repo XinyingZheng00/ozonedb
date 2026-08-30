@@ -265,12 +265,8 @@ def panel_a(ax, coef, model, prices, s, single):
         handlelength=2.0,
         borderaxespad=0.0,
         labelspacing=0.35,
-        title=f"{pr['ops_per_s']:,} ops/s, {pr['read_fraction']:.0%} reads, "
-        f"{1 - pr['read_fraction']:.0%} inserts, RF={pr['rf']}",
-        title_fontsize=fs - 0.5,
-        alignment="left",
     )
-    leg.get_title().set_color(INK2)
+    # The offered load, mix and RF belong to the caption, not the legend.
 
 
 def panel_b(ax, model, prices, s, d_bytes):
