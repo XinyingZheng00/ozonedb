@@ -2,197 +2,246 @@
 
 ## Campaign 2: one engine, both systems, 10 GB and 100 GB (`cost2-20260828`)
 
-**Date:** 2026-08-28 to 2026-08-29. **Plan:** `bench/PLAN-cost-2.md`. **Engine:** the
-`visibility` tree with the native Corfu client merged (`0c73bf28`; YCSB core with the
-`zipfian_keyspace` distribution, `212f2c7b`). **Cluster:** amd127 (Corfu + MinIO +
-Cassandra, all state on one 447 GiB SATA SSD at `/tank/ssd`) + 8 clients (amd160, 126,
-138, 135, 166, 146, 159, 133; the tier on each client's own SATA SSD). **Datasets:**
-10,000,000 and 100,000,000 x 1 KB records. **Client:** one YCSB thread per client node, 8
-nodes, unless a row says 2 or 4. **Trimming:** on, one checkpoint every 30 s. **Metric:**
-steady-state ops/s, mean of the last 60 s per writer, summed. **Failures:** 0 failed
-operations in every cell, 8 of 8 writers in every cell. **Corfu client:** native (C++)
-unless the row says `jni`. **What ran:** Cassandra at 10 GB and 100 GB (10 cells),
-OzoneDB at 10 GB (the load, 17 cells, three reruns) and the OzoneDB 100 GB load. **What
-did not run:** the CloudLab lease ended at 04:17 on 2026-08-29, during the first 100 GB
-OzoneDB cell. The 100 GB RAM, tier and key-space-zipfian cells and the Cassandra
-`cz` / `az` pair are missing. Every 100 GB OzoneDB value below comes from the load's
-server sample, which was on the laptop before the nodes went away.
+**Date:** 2026-08-28 to 2026-08-30. **Plan:** `bench/PLAN-cost-2.md`. **Engine:** the
+`visibility` tree with the native Corfu client merged (`0c73bf28`), the YCSB core with
+the `zipfian_keyspace` distribution (`212f2c7b`), and the SSTable filter fix
+(`3b28a2cd`, finding 1). **Clusters:** the campaign ran on two CloudLab experiments. The
+first (amd127 as Corfu + MinIO + Cassandra, 8 clients) produced the Cassandra corpus and
+a 10 GB OzoneDB corpus, then its lease ended at 04:17 on 2026-08-29 during the first
+100 GB cell. The second (amd197 + amd189, 188, 182, 183, 192, 198, 181, 200; identical
+hardware, all server state on one 447 GiB SATA SSD at `/tank/ssd`, the tier on each
+client's own SSD) reran everything on the fixed build. **Every OzoneDB cell quoted below
+is from the second cluster on the fixed build**; the pre-fix cells are kept in
+`results-cost2-20260828-prefix.tsv` as the before-and-after control. Cassandra control
+cells on the new box reproduce the old box within 2 % (42,376 against 43,237 ops/s on
+workload a), so the two Cassandra corpora are interchangeable.
+
+**Datasets:** 10,000,000 and 100,000,000 x 1 KB records. **Client:** one YCSB thread per
+client node, 8 nodes, unless a row says 2 or 4. **Trimming:** on, one checkpoint every
+30 s. **Metric:** steady-state ops/s, mean of the last 60 s per writer, summed.
+**Failures:** 0 failed operations and 8 of 8 writers in every cell of the campaign.
+**Corfu client:** native (C++) unless the row says `jni`.
 
 Artifacts, all under `bench/`:
 
-- `results-cost2-20260828.tsv` — the main corpus (10 GB and 100 GB, both systems), one
-  row per cell (`extract_cost_coefficients.py`, now with `cache_fill`).
-- `results-cost2-20260828-controls.tsv` — the scaling and JNI cells, kept out of the
-  medians. `results-cost2-20260828-zipf.tsv` — the key-space zipfian corpus.
-- `results-cost2-20260828-projection.tsv`, `-zipf-projection.tsv`, `results-cost2-20260828.png`
-  — the projections and the overlay figure.
+- `results-cost2-20260828.tsv` — the main corpus, one build: OzoneDB at 10 GB and 100 GB
+  (RAM and tier cells) and Cassandra at both sizes.
+- `results-cost2-20260828-controls.tsv` — scaling, the JNI control and the Cassandra
+  control cells, kept out of the medians.
+- `results-cost2-20260828-prefix.tsv` — the same 10 GB cells on the build before the
+  filter fix.
+- `results-cost2-20260828-zipf.tsv` — the key-space zipfian corpus.
+- `results-cost2-20260828-projection.tsv`, `-zipf-projection.tsv`,
+  `results-cost2-20260828.png` — the projections and the overlay figure.
+- `bench/scripts/campaign-cost2/` — every chain that ran, in order.
 
 ### Findings
 
-1. **`h` at a fixed cache-to-data ratio is not scale-free, and the sign depends on the
-   stream.** (10 GB against 1 GB. The 100 GB twins did not run.) Under YCSB's scrambled zipfian the hot set is a few hundred keys, a fixed
-   number of bytes. A ratio-matched cache is ten times larger in bytes at 10 GB than at
-   1 GB, so it holds more of that hot set: steady `h` on workload c is 0.303 at 0.82 %
-   (0.216 at 1 GB), 0.208 at 0.10 % (0.141) and 0.113 at 0.013 % (0.032). The projection
-   reads `h` at 0.16 % and 0.04 %, so its GET line falls with this curve: $5,456 per month
-   at 10 TB with a 16 GB cache against $5,992 from the 1 GB curve.
-2. **A writer's cache fills at that writer's own miss rate, and the plan sized cells by
-   the cluster's.** At 10 GB one writer misses about 475 GETs/s of 4 KiB blocks, 1.9 MB/s,
-   so a 5 GiB cache needs about 45 min to fill. The 600 s cell closed 25 % full and read
-   `h` = 0.47, the hit rate of a 13 % cache, not of a 52 % one. The cumulative-against-
-   steady test does not see a slow linear fill. The extractor now writes `cache_fill` and
-   the model skips RAM cells below 0.9 of capacity. The tier fills at the miss rate x
-   64 KiB, about 30 MB/s per writer, so the 20 GiB tier cells were rerun at 1,800 s and the
-   100 GB tier cells run 1,800 to 2,700 s.
-3. **The native client cuts client CPU by 30 % and raises workload-a throughput by 16 %,
-   at the same dataset and cache.** 0.993 ms per op against 1.418 ms on the JNI client,
-   2,750 against 2,374 ops/s, RSS 3.41 GB against 3.89 GB, replay at open 554 ms against
-   1,220 ms. That is less than the 0.42x to 0.59x of the phase-5 campaign at 1 GB: at 10 GB
-   the client's per-op cost is dominated by the S3 GET path (0.65 GETs per op on
-   workload a), not by the Corfu path.
-4. **The disk-cache tier removes the object store from the read path once it holds the
-   dataset, and the local read is now the cost.** A 20 GiB tier behind 80 MiB of RAM
-   serves workload c at 21,253 ops/s with 0.000 GETs per op in the steady window and
-   0.35 ms of client CPU per op. Without the tier the same RAM cache gives 6,115 ops/s and
-   0.64 ms. Round 2 at 1 GB reached 46,741 ops/s: at 10 GB a read touches more SSTables
-   of a four-level tree, and every tier hit is a physical `pread` (the page cache is dropped
-   after each read by design), so the SSD, not the network, sets the ceiling. Below the
-   dataset size `disk_h` is 0.230 at a ratio of 0.26 and 0.442 at 0.52, with a fetch
-   amplification of 12 to 13.
-5. **Cassandra at 100 GB is disk-bound, not client-bound.** Quorum workload a falls from
-   43,237 ops/s at 10 GB to 23,510 at 100 GB, workload c from 43,534 to 19,772, while the
-   server box is only 12 to 16 % busy in both cases. The 100 GB working set does not fit
-   the 31 GB heap plus page cache, so reads go to the SSD. The model's `ops_node_C` is an
-   ops-per-busy-second figure and takes the 10 GB value. A disk-bound box needs a second
-   term that the model does not have, so the Cassandra line above 10 GB per node is
-   optimistic by that amount.
-6. **Linearizable reads cost nothing measurable on workload c and 2 % on workload a.**
-   7,124 against 7,209 ops/s (c, 600 s, equal cache fill), 2,800 against 2,750 (a). Every
-   linearizable READ returned OK.
-7. **Under a zipfian over the key space, `h` roughly doubles at every ratio, but stays
-   far below the perfect-cache estimate.** Workload `cz` at 10 GB: 0.509 at 1 % (against
-   0.303 for the scrambled stream at 0.82 %), 0.493 at 0.82 %, 0.210 at 0.013 % (against
-   0.113). The plan's estimate for a perfect top-k cache was 0.54 and 0.43. An LRU under
-   churn sits below it. At the projection's 10 TB point `h` is 0.38 instead of 0.23, and
-   OzoneDB with a 16 GB cache costs $4,659 instead of $5,456. The 100 GB `cz` cells, which
-   test the scale effect, did not run.
+1. **One `std::string` copy per Bloom probe cost 92 % of the client CPU of a read at
+   100 GB, and was invisible at 1 GB.** `filterBlockReader::keyMayMatch` copied the
+   filter out of its protobuf before probing it. The file-level filter covers every key
+   of the SSTable at 10 bits per key, so it is 712 KB for a 570 MB L4 file, and
+   `Table::get` probes it once per candidate file. Each get therefore moved about 2.8 MB
+   through `mmap` + `memcpy` + `munmap` to read seven bytes. Client CPU per get was
+   6.7 ms at 100 GB and read latency 8 ms; `perf` put 80 % of the samples in the AVX2
+   `memcpy` loop of libc under `keyMayMatch`. The fix is `std::string const&`
+   (`3b28a2cd`). After it, the same cell costs 0.48 ms per op and runs at 6,872 ops/s
+   against 1,027. At 10 GB the files are 190 MB and the copy was 0.1 ms to 0.2 ms of the
+   0.6 ms, which is why five earlier campaigns did not see it. The hit rates did not
+   move: `h` is a cache property.
+2. **A read-modify-write update doubles the GET bill and empties the block cache; a blind
+   insert does neither.** The YCSB binding's `update()` reads the record, merges one
+   field and writes it back, because a record is one opaque blob
+   (`OzoneDBClient.java:64`); `insert()` is a blind put. Workload a therefore issues a
+   get on every operation, not on half. Swapping the update for an insert (`workloadai`,
+   the same 50/50 split and request distribution) at 100 GB cuts GETs per op from 0.710
+   to 0.335, raises the SSTable hit rate from 0.023 to 0.368 — the value the read-only
+   workload gets — raises throughput by 39 % and cuts client CPU per op by 43 %. The
+   mechanism is that an update writes a new version of a *hot* key, so later reads of it
+   are served from the data log and only the cold tail reaches the SSTable cache. An
+   insert writes a new key, so the read stream keeps its skew. Cassandra moves the other
+   way, losing 11 % (42,376 to 37,679 ops/s at 10 GB), because a YCSB update writes one
+   column of ten and an insert writes all ten. Workload a is the shape that flatters
+   Cassandra most; for a blob store the insert workload is the like-for-like comparison.
+3. **The read path wastes no fetches: the filters prune 99.3 % of candidate files.**
+   Per-level probe counters (`1662446b`) over a 300 s cell at 100 GB: 6.91 M probes,
+   6.87 M pruned by a filter, and 1,124 that fetched a block without finding the key, on
+   33,784 reads. On workload c the false-positive rate is 4.5 % of reads. The GET count
+   per *operation* is the same on both workloads (0.710 and 0.700); only the reason
+   differs.
+4. **`h` at a fixed cache-to-data ratio is not scale-free, and the sign depends on the
+   stream.** Under YCSB's scrambled zipfian the hot set is a few hundred keys, a fixed
+   number of bytes, so a ratio-matched cache is ten times larger in bytes at 100 GB and
+   holds more of it: steady `h` on workload c is 0.334 against 0.302 at 0.82 %, 0.252
+   against 0.206 at 0.10 %, and 0.153 against 0.135 at 0.013 %. Every 100 GB point sits
+   0.02 to 0.05 above its 10 GB twin, inside the 0.06 noise floor the plan set. Under a
+   zipfian over the key space the sign is the same but the mechanism is
+   `zeta(k) / zeta(N)`: 0.505 against 0.493 at 0.82 % and 0.240 against 0.210 at 0.013 %.
+5. **A writer's cache fills at that writer's own miss rate.** At 10 GB one writer misses
+   about 475 GETs/s of 4 KiB blocks, 1.9 MB/s, so a 5 GiB cache needs about 45 minutes.
+   A 600 s cell closed 25 % full and read `h` = 0.47, the hit rate of a 13 % cache. The
+   extractor now writes `cache_fill` and the model skips RAM cells below 0.9 of capacity.
+   The tier fills at the miss rate times 64 KiB, about 30 MB/s per writer, so tier cells
+   run 1,800 s to 2,700 s.
+6. **The disk tier removes the object store from the read path, and once it holds the
+   dataset OzoneDB reads faster than Cassandra on the same hardware.** A 20 GiB tier
+   behind 80 MiB of RAM serves workload c at 10 GB with 0.019 GETs per op at
+   **49,484 ops/s** and 0.10 ms of client CPU, against Cassandra quorum's 43,300 ops/s on
+   the same box. Below the dataset size the tier hit rate is a clean function of the
+   ratio: 0.018 at 0.026, 0.244 at 0.26, 0.464 at 0.52, 0.97 at 2.1. Fill GETs per op are
+   0 in every cell, because in chunk mode the fill is the demand read.
+7. **The native client cuts client CPU by 38 % and raises workload-a throughput by 16 %.**
+   0.831 ms per op against 1.345 ms on the JNI client, 2,968 against 2,557 ops/s, at the
+   same dataset and cache.
+8. **Linearizable reads cost nothing measurable.** 3,024 against 2,968 ops/s on workload a
+   (+2 %) and 9,780 on workload c. Cassandra's comparable mode (SERIAL reads with LWT
+   writes) runs at 32 % of quorum on workload a and 37 % on workload c.
+9. **Cassandra at 100 GB is disk-bound, not client-bound.** Quorum workload a falls from
+   43,237 ops/s at 10 GB to 23,510 at 100 GB and workload c from 43,534 to 19,772, while
+   the server box is only 12 % to 16 % busy. The 100 GB working set does not fit the
+   31 GB heap plus page cache. The model's `ops_node_C` is an ops-per-busy-second figure
+   and takes the 10 GB value, so the Cassandra line above 10 GB per node is optimistic by
+   that amount.
+10. **OzoneDB does not scale with the client count on a write-mixed workload.** Per-node
+    throughput falls from 556 to 371 ops/s between 2 and 8 client nodes while client CPU
+    per op is flat and the server box stays at 10 % busy. Every process tails the whole
+    shared log and its reads fence on that tailer, so the fleet's aggregate write rate
+    sets each node's read latency.
 
 ### Coefficient table
 
-Symbols are those of `bench/PLAN-cost.md`. "Dataset bytes" is records x 1,024. The
-`cost-20260827` column is the previous campaign's 10 GB value where one exists.
+Symbols are those of `bench/PLAN-cost.md`. "Dataset bytes" is records x 1,024.
 
 | Symbol | 10 GB | 100 GB | `cost-20260827` (10 GB) |
 |---|--:|--:|--:|
-| `sC` Cassandra bytes on disk / dataset bytes, drained load after compaction settles | 1.08 (11.0 GB `data` at a cell start) | 1.07 (109.5 GB `data`; the fresh snapshot is 121 GB) | 1.066 |
-| `sO` SSTable objects / dataset bytes (checkpoints excluded) | 1.186 (12.26 GB, 65 objects) | 1.190 (121.99 GB, 288 objects) | 1.168 |
-| Checkpoint bytes kept in the bucket | 111 MB | 172 MB (11 objects) | 104 MB |
-| `L` Corfu log directory, trimming on, at the end of the load | 361 MiB (16 writers) | 2.65 GiB (16 writers) | 171 MiB (8 writers) |
-| `L0` slope, trimming off | 1.3 KB per put (native reload of 2026-08-27) | — | 1.1 |
+| `sC` Cassandra bytes on disk / dataset bytes, drained load | 1.08 | 1.07 (109.5 GB) | 1.066 |
+| `sO` SSTable objects / dataset bytes (checkpoints excluded) | 1.186 (12.26 GB, 65 objects) | 1.190 (121.96 GB, 288 objects) | 1.168 |
+| Checkpoint bytes kept in the bucket | 111 MB | 167 MB (11 objects) | 104 MB |
+| `L` Corfu log directory, trimming on, at the end of the load | 361 MiB | 51 MB | 171 MiB (8 writers) |
+| `L0` slope, trimming off | 1.3 KB per put | — | 1.1 |
 | `wa` MinIO bytes in / dataset bytes, during the load | 3.39 | 4.64 (475 GB in) | 3.41 |
-| GETs per write during the load | 0.00023 | (writer files lost) | 0.032 (before range reads) |
-| PUTs per write | 4.4e-5 | (writer files lost) | 5.1e-5 |
-| `k` objects per checkpoint | 6.08 (146 / 24) | (writer files lost) | 6.2 |
-| `j` join: GETs, files restored, replay at a cell start | 6 GETs, 4 files, 550 to 650 ms | (no cell) | 7 GETs, 1.8 s |
-| `g` GETs per cache miss, workload c | 0.99 to 1.00 | (no cell) | 1.0 |
-| `cpuO` client CPU per op, native, workload a / c | 0.99 to 1.01 ms / 0.59 to 0.74 ms | (no cell) | 2.0 to 2.3 ms / 1.1 ms (JNI) |
-| `cpuO` client CPU per op, JNI control, workload a | 1.42 ms | — | |
+| GETs per write during the load | 0.00023 | 0.00029 | 0.032 (before range reads) |
+| PUTs per write | 4.4e-5 | 4.8e-5 | 5.1e-5 |
+| `k` objects per checkpoint | 6.08 | 6.2 (1,654 / 266) | 6.2 |
+| Checkpoint upload, mean | 481 ms | 856 ms | — |
+| `j` join: GETs, files restored, replay at a cell start | 6 GETs, 4 files, 550 to 650 ms | 4 files, 51 MB, 612 to 730 ms | 7 GETs, 1.8 s |
+| `g` GETs per cache miss, workload c | 0.99 to 1.00 | 0.99 | 1.0 |
+| `cpuO` client CPU per op, native, workload a / c | 0.81 to 0.83 ms / 0.34 to 0.44 ms | 1.09 ms / 0.49 to 0.60 ms | 2.0 to 2.3 ms / 1.1 ms (JNI) |
+| `cpuO` client CPU per op, JNI control, workload a | 1.35 ms | — | |
 | `cpuC` client CPU per op, quorum / serial | 0.060 / 0.080 to 0.089 ms | 0.073 to 0.078 / 0.099 to 0.131 ms | 0.061 / — |
-| Server CPU per op, OzoneDB (Corfu + MinIO), workload a / c | 1.16 to 1.19 ms / 0.66 to 0.96 ms | (no cell) | 1.3 to 1.5 / 1.0 to 1.1 ms |
-| Server CPU per op, Cassandra quorum / serial | 0.12 / 0.27 to 0.32 ms | 0.19 to 0.22 / 0.39 to 0.49 ms | 0.12 |
+| Server CPU per op, Cassandra quorum / serial | 0.13 / 0.27 to 0.32 ms | 0.19 to 0.22 / 0.39 to 0.49 ms | 0.12 |
 | `ops_node_C` one Cassandra box, ops/s at 100 % busy | 271,406 (43,237 at 16 %) | 172,000 (23,510 at 14 %, disk-bound) | 275,000 |
-| Load rate | OzoneDB 14,344 puts/s with 16 writers (0.71 ms client CPU per put), 12.5 min; Cassandra 8 writers | OzoneDB about 12,500 puts/s with 16 writers (2 h 13 min, from the chain log); Cassandra 8 writers, 49 min | OzoneDB 9,627 (8 writers); Cassandra 42,826 |
+| Load rate, 16 writers on one host | 14,344 puts/s, 0.71 ms CPU per put | 12,312 puts/s, 0.77 ms (2 h 15 min) | 9,627 (8 writers) |
 
-### Cache sweep: `h(c / D)`, workload c, 8 writers
+### Cache sweep: `h(c / D)`, workload c, 8 writers, fixed build
 
-| Cache per client | c / D | `h` steady, 10 GB | GETs per op | ops/s | Client CPU per op | Server CPU per op | `h` steady, 100 GB |
+| Cache per client | c / D | `h` steady, 10 GB | ops/s, 10 GB | CPU per op | `h` steady, 100 GB | ops/s, 100 GB | CPU per op |
 |--:|--:|--:|--:|--:|--:|--:|--:|
-| 5 GiB | 52 % | (0.470, cache 26 % full at 600 s) | 0.531 | 7,209 | 0.59 ms | 0.66 ms | — |
-| 640 MiB / 6.4 GiB | 6.5 % | 0.416 | 0.581 | 6,978 | 0.59 ms | 0.68 ms | — |
-| 80 MiB / 800 MiB | 0.82 % | 0.303 | 0.687 | 6,115 | 0.64 ms | 0.79 ms | (not run) |
-| 10 MiB / 100 MiB | 0.10 % | 0.208 | 0.781 | 5,495 | 0.70 ms | 0.88 ms | (not run) |
-| 1.25 MiB / 12.5 MiB | 0.013 % | 0.113 | 0.874 | 5,144 | 0.74 ms | 0.96 ms | (not run) |
+| 640 MiB / 6.4 GiB | 6.5 % | 0.418 | 9,045 | 0.34 ms | — | — | — |
+| 80 MiB / 800 MiB | 0.82 % | 0.302 | 7,804 | 0.37 ms | 0.334 | 6,872 | 0.49 ms |
+| 10 MiB / 100 MiB | 0.10 % | 0.206 | 7,034 | 0.41 ms | 0.252 | 6,330 | 0.54 ms |
+| 1.25 MiB / 12.5 MiB | 0.013 % | 0.135 | 6,267 | 0.44 ms | 0.153 | 5,655 | 0.60 ms |
 
 The 1 GB curve of `cost-20260828-4k` at the same ratios: 0.679, 0.341, 0.216, 0.141,
-0.032. The 5 GiB cell is the unfilled one of finding 2 and is not a point on the curve.
-The `cz` twins (zipfian over the key space): 0.493 at 0.82 %, 0.210 at 0.013 %, and
-0.509 at 1 % (100 MiB).
+0.032. The `cz` twins (zipfian over the key space) at 100 GB: 0.505 at 0.82 %, 0.418 at
+0.10 %, 0.240 at 0.013 %; at 10 GB 0.493 and 0.210 at the two shared ratios.
 
-### Throughput and CPU, 8 writers
+### Throughput and CPU, 8 writers, fixed build
 
-| System, cell | Workload a ops/s | Client CPU per op | Workload c ops/s | Client CPU per op |
+| System, cell | Workload a ops/s | CPU per op | Workload c ops/s | CPU per op |
 |---|--:|--:|--:|--:|
-| OzoneDB native, 5 GiB, 10 GB | 2,750 | 0.99 ms | 7,209 | 0.59 ms |
-| OzoneDB native, 80 MiB, 10 GB | 2,752 | 1.01 ms | 6,115 | 0.64 ms |
-| OzoneDB native, linearizable, 5 GiB, 10 GB | 2,800 (120 s) | 1.06 ms | 7,124 (600 s) | 0.59 ms |
-| OzoneDB JNI, 5 GiB, 10 GB | 2,374 | 1.42 ms | — | — |
-| Cassandra quorum, 10 GB | 43,237 | 0.060 ms | 43,534 | 0.060 ms |
+| OzoneDB native, 5 GiB, 10 GB | 2,968 | 0.83 ms | 9,045 (640 MiB) | 0.34 ms |
+| OzoneDB native, 100 MiB / 80 MiB, 10 GB | 2,997 | 0.81 ms | 7,804 | 0.37 ms |
+| OzoneDB native, linearizable, 5 GiB, 10 GB | 3,024 | 0.77 ms | 9,780 | 0.31 ms |
+| OzoneDB JNI, 5 GiB, 10 GB | 2,557 | 1.35 ms | — | — |
+| OzoneDB native, 100 MiB, 100 GB | 2,756 | 1.09 ms | 6,330 | 0.54 ms |
+| OzoneDB native, 20 GiB tier, 10 GB | 4,211 | 0.73 ms | 49,484 | 0.10 ms |
+| Cassandra quorum, 10 GB | 42,376 | 0.062 ms | 43,300 | 0.060 ms |
 | Cassandra serial, 10 GB | 13,636 | 0.089 ms | 16,076 | 0.080 ms |
 | Cassandra quorum, 100 GB | 23,510 | 0.073 ms | 19,772 | 0.078 ms |
 | Cassandra serial, 100 GB | 8,277 | 0.131 ms | 11,612 | 0.099 ms |
 
-Cassandra serial runs at 32 % (a) and 37 % (c) of quorum at 10 GB, as before. OzoneDB
-workload a is bound by the latency of one YCSB thread per node: a read costs 0.65 S3 GETs
-on average, and the server box is 10 % busy.
+### Insert against read-modify-write update (finding 2)
 
-### Server scaling, workload a, 5 GiB cache, 120 s
+Workload `ai` is workload a with a blind insert in place of the update. Same box, same
+duration, same cache.
 
-| Client nodes | OzoneDB ops/s (per node) | Client CPU per op | Cassandra quorum ops/s (per node) |
+| Cell | ops/s | GETs per op | `h` | CPU per op |
+|---|--:|--:|--:|--:|
+| OzoneDB, 100 GB, 100 MiB, workload a | 2,619 | 0.710 | 0.023 | 1.47 ms |
+| OzoneDB, 100 GB, 100 MiB, workload `ai` | 3,628 | 0.335 | 0.368 | 0.84 ms |
+| OzoneDB, 100 GB, 100 MiB, workload c | 6,270 | 0.700 | 0.337 | 0.61 ms |
+| Cassandra quorum, 10 GB, workload a | 42,376 | — | — | 0.062 ms |
+| Cassandra quorum, 10 GB, workload `ai` | 37,679 | — | — | 0.066 ms |
+| Cassandra quorum, 100 GB, workload a | CASS100A | — | — | CASS100ACPU |
+| Cassandra quorum, 100 GB, workload `ai` | CASS100AI | — | — | CASS100AICPU |
+
+The run phase passes no `insertstart`, so every writer generates the same new key
+sequence. Each inserted key is written once per writer; the write path is unaffected and
+the dataset grows by one eighth of the inserts.
+
+### Server scaling, workload a, 5 GiB cache, fixed build
+
+| Client nodes | OzoneDB ops/s (per node) | CPU per op | Cassandra quorum ops/s (per node) |
 |--:|--:|--:|--:|
-| 2 | 976 (488) | 0.96 ms | 10,358 (5,179) |
-| 4 | 1,663 (416) | 1.04 ms | 22,363 (5,591) |
-| 8 | 2,750 (344) | 0.99 ms | 43,237 (5,405) |
+| 2 | 1,113 (556) | 0.70 ms | 10,358 (5,179) |
+| 4 | 1,765 (441) | 0.80 ms | 22,363 (5,591) |
+| 8 | 2,968 (371) | 0.83 ms | 43,237 (5,405) |
 
-Cassandra scales with the client count, OzoneDB does not: the per-node rate falls by 30 %
-from 2 to 8 nodes while the client CPU per op is flat and the server box stays at 10 %
-busy. Every process tails the whole shared log and its reads fence on that tailer, so
-the aggregate write rate of the fleet sets the read latency of each node. That is the
-mechanism behind campaign 1's finding 3, seen from the throughput side.
+### Disk-cache tier, chunk 64 KiB + frequency admission, fixed build
 
-### Disk-cache tier, 80 MiB RAM cache in front, chunk 64 KiB + frequency admission
+| Tier per client | tier / D | Workload | ops/s | `disk_h` | CPU per op | GETs per op |
+|--:|--:|---|--:|--:|--:|--:|
+| none, 80 MiB RAM, 10 GB | — | c | 7,804 | — | 0.37 ms | 0.667 |
+| 2.5 GiB, 10 GB | 0.26 | c | 9,558 | 0.244 | 0.36 ms | 0.507 |
+| 5 GiB, 10 GB | 0.52 | c | 12,671 | 0.464 | 0.28 ms | 0.360 |
+| 20 GiB, 10 GB | 2.1 | c | 49,484 | 0.97 | 0.10 ms | 0.019 |
+| 5 GiB, 10 GB | 0.52 | a | 3,377 | 0.307 | 0.80 ms | 0.470 |
+| 20 GiB, 10 GB | 2.1 | a | 4,211 | 0.616 | 0.73 ms | 0.298 |
+| none, 800 MiB RAM, 100 GB | — | c | 6,872 | — | 0.49 ms | 0.605 |
+| 2.5 GiB, 100 GB | 0.026 | c | 6,662 | 0.018 | 0.68 ms | 0.588 |
+| 25 GiB, 100 GB | 0.26 | c | 8,031 | 0.213 | 0.49 ms | 0.470 |
+| 50 GiB, 100 GB | 0.52 | c | 10,088 | 0.378 | 0.44 ms | 0.359 |
+| 50 GiB, 100 GB | 0.52 | a | 2,800 | 0.216 | 1.25 ms | 0.559 |
+| 25 GiB, 100 GB, `cz` | 0.26 | cz | 10,024 | 0.340 | 0.46 ms | 0.310 |
 
-| Tier per client | tier / D | Workload | ops/s | `disk_h` | Fetch amplification | Client CPU per op | GETs per op (steady) |
-|--:|--:|---|--:|--:|--:|--:|--:|
-| none | — | c | 6,115 | — | — | 0.64 ms | 0.687 |
-| 2.5 GiB | 0.26 | c | 7,120 | 0.230 | 11.9 | 0.67 ms | 0.495 |
-| 5 GiB | 0.52 | c | 8,752 | 0.442 | 13.1 | 0.59 ms | 0.337 |
-| 20 GiB, 1,800 s | 2.1 | c | 21,253 | 0.935 cumulative, 1.000 steady | 12.7 | 0.35 ms | 0.000 |
-| none | — | a | 2,752 | — | — | 1.01 ms | 0.682 |
-| 5 GiB | 0.52 | a | 3,119 | 0.299 | 8.7 | 1.10 ms | 0.366 |
-| 20 GiB, 1,800 s | 2.1 | a | 3,662 | 0.584 | 8.5 | 0.94 ms | 0.128 |
-
-Fill GETs per op are 0 in every cell: in chunk mode the fill is the demand read. The
-20 GiB cells at 600 s closed with the tier at half the dataset and read 17,900 (c) and
-3,199 (a) ops/s. The 1,800 s reruns above replace them. The 100 GB tier cells
-(2.5 GiB, 25 GiB, 50 GiB behind 800 MiB) did not run.
+`disk_h` at a matched ratio reproduces across the decade within 0.03 (0.244 against
+0.213 at 0.26, 0.464 against 0.378 at 0.52), and the key-space zipfian lifts it by 0.13
+at the same ratio. `disk_punch_failed` is 0 in every cell.
 
 ### Projection: 10,000 ops/s, 50 % reads, RF=3 (USD per month)
 
-From `results-cost2-20260828-projection.tsv`: the 10 GB cells, `space.json` from the
-100 GB load (`sO` 1.190, `wa` 4.64, `L` 2.65 GiB, `sC` 1.069, `L0` 1.3 KB per put), the
-tier coefficients from the three 10 GB tier ratios. The key-space zipfian columns come
-from `results-cost2-20260828-zipf-projection.tsv`: `h` from the three `cz` cells, every
-other coefficient shared with the main run (its `az` and tier cells did not run, so it
-has no tier line).
+From `results-cost2-20260828-projection.tsv`: the fixed-build cells, `space.json` from
+the 100 GB load (`sO` 1.190, `wa` 4.64, `L` 0.05 GiB, `sC` 1.069, `L0` 1.3 KB per put),
+and the tier coefficients from the four measured tier ratios. Where a ratio has cells at
+both sizes the model keeps the longer one, which selects the 100 GB cell. The key-space
+zipfian column comes from `-zipf-projection.tsv`, whose `h` is the `cz` curve and whose
+other coefficients are shared.
 
-| D | Cassandra NVMe | Cassandra EBS | OzoneDB, 16 GB cache | OzoneDB, 4 GB cache | OzoneDB, 16 GB + 2 TB tier | OzoneDB, no trimming | `h` at 16 GB | key-space zipfian, 16 GB / 4 GB | `h` at 16 GB, zipfian |
-|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 100 GB | 1,565 | 2,402 | 4,212 | 4,351 | 2,021 | 4,240 | 0.416 | 3,731 / 3,731 | 0.509 |
-| 1 TB | 1,565 | 2,402 | 4,634 | 4,992 | 2,129 | 4,942 | 0.339 | 3,755 / 4,089 | 0.509 |
-| 10 TB | 12,587 | 4,742 | 5,456 | 5,784 | 5,176 | 8,573 | 0.228 | 4,659 / 5,148 | 0.382 |
-| 100 TB | 122,807 | 45,302 | 8,464 | 8,517 | 8,059 | 39,661 | 0.123 | 7,935 / 8,014 | 0.225 |
+| D | Cassandra NVMe | Cassandra EBS | OzoneDB, 16 GB cache | OzoneDB, 4 GB | OzoneDB + 2 TB tier per client | OzoneDB, no trimming | `h` at 16 GB | zipfian, 16 GB |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 100 GB | 1,565 | 2,402 | 4,056 | 4,160 | **1,605** | 4,085 | 0.418 | 3,622 |
+| 1 TB | 1,565 | 2,402 | 4,378 | 4,665 | **1,695** | 4,688 | 0.361 | 3,646 |
+| 10 TB | 12,587 | 4,742 | 5,097 | 5,421 | 4,753 | 8,215 | 0.270 | 4,286 |
+| 100 TB | 122,807 | 45,302 | **8,112** | 8,168 | 8,516 | 39,310 | 0.163 | 7,665 |
 
-Against `disk2-20260828` (the same engine on the JNI client, with the 1 GB curve and the
-1 GB space coefficients): 5,992 and 6,332 at 10 TB with `h` 0.157, and 5,515 with the
-tier. The crossover of the 4 GB line with the cheaper Cassandra layout stays at 14.7 TB
-(12.1 TB with the tier, 12.1 TB under the key-space zipfian): it sits on the EBS layout's
-node knee, not on OzoneDB's level. Below 1 TB the gap is unchanged in kind: Cassandra
-$1,565 to $2,402 against OzoneDB $4,200 to $5,000, or $2,000 with a 2 TB tier per client
-that holds the dataset. The tier line's 0.23 hit rate at ratio 0.2 is the 10 GB point
-held flat; the 100 GB tier cells that were to confirm it did not run. The 100 GB
-Cassandra cells are in the corpus but the model reads the client CPU as a median over
-both sizes and the box capacity from the largest ops-per-busy-second cell, which is the
-10 GB one.
+At 10 TB the $5,097 is S3 GET requests $3,785 (74 %), the log tier $614, clients $420,
+S3 storage $274 and PUTs $5. The crossover of the 4 GB line with the cheaper Cassandra
+layout is 14.7 TB, and 12.1 TB with the tier; it sits on the EBS layout's node knee, not
+on OzoneDB's level. Two regimes matter more than the crossover:
+
+- **A tier that holds the dataset** (up to about 1.4 TB with 2 TB of gp3 per client)
+  makes OzoneDB the cheapest option measured: $1,605 to $1,695 against Cassandra EBS
+  $2,402 and NVMe $1,565, because `disk_h` is 0.97 and the object store leaves the read
+  path.
+- **Above 10 TB** the node count decides. Cassandra needs 25 NVMe nodes at 10 TB and 58
+  EBS nodes at 100 TB; OzoneDB's cost grows only with storage and requests, so it is 5.6x
+  cheaper at 100 TB.
+
+Between those, at 100 GB to 2 TB with no tier, Cassandra is 1.7x to 1.9x cheaper. The
+projection prices reads at 50 % of operations, which is right for blind writes; a
+read-modify-write update workload issues a get on every operation and doubles the GET
+line (finding 2).
 
 ![projection](results-cost2-20260828.png)
 
@@ -202,19 +251,17 @@ both sizes and the box capacity from the largest ops-per-busy-second cell, which
   bind mount into it: MinIO `lstat`s its drive path and refuses a symlink. `/mnt/corfu`
   and `/tank/cassandra` are symlinks. `server_sampler.sh` runs `du -skD` for that reason.
 - `cassandra_ctl.sh start` waits for the JMX port 7199 to leave `TIME_WAIT` after
-  `nodetool drain`. The wipe-then-start of the 100 GB load died on it once.
-- The load's 16 writer files are not pulled by the orchestrator. They were copied from
-  the load host by hand. The load's server sample is now named with the `-native` token
-  so the extractor pairs it with the load row.
-- The 52 % point at 10 GB needs a cell of about 4,800 s and was not rerun. The 640 MiB
-  cell and every smaller one closed full.
-- The lease ended while the first 100 GB RAM cell restarted Corfu (ssh `rc=255`, then the
-  node answered as CloudLab's FreeBSD reload image). The 100 GB load's 16 writer files
-  were still on the load host and are lost. To finish the plan on a new experiment:
-  `setup.sh` on every node, `setup_disk_cache.sh` on the clients, the server relayout
-  with the MinIO bind mount, the Cassandra install and its 10 GB load, the OzoneDB 100 GB
-  load (2 h 15 min with 16 writers), then `chain_oz100.sh` from its RAM-cells step (about
-  4.5 h) and the Cassandra `cz` / `az` pair.
+  `nodetool drain`.
+- The load's writer files are not pulled by the orchestrator. Each chain copies them from
+  the load host.
+- The 52 % cache point at 10 GB needs a cell of about 4,800 s (finding 5) and was not
+  run. The 640 MiB cell and every smaller one closed full.
+- The 100 GB Cassandra cells of the first cluster are the ones quoted; the second cluster
+  reloaded 100 GB only for the insert pair, without a `data.load` snapshot, because
+  `/tank/ssd` cannot hold the dataset and its copy at that size.
+- One trial per cell. Differences under 5 % are not resolved. The three ratio twins at
+  both sizes are the only repeated measurement, and they agree within 0.05 of `h`.
+
 
 **Date:** 2026-08-27. **Plan:** `bench/PLAN-cost.md`. **Cluster:** CloudLab amd127
 (Corfu + MinIO + Cassandra, 32 cores, 125 GB RAM, one 63 GB root disk) + 8 clients
