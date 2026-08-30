@@ -141,7 +141,7 @@ def panel_a(ax, coef, model, prices, s, single):
     ax.set_yscale("log")
     ymin, ymax = 1000.0, 250000.0
     ax.set_ylim(ymin, ymax)
-    ax.set_xlim(x[0], x[-1] * 1.02)
+    ax.set_xlim(x[0] / 1.12, x[-1] * (5.0 if single else 3.2))
 
     ax.plot(
         x,
@@ -149,7 +149,7 @@ def panel_a(ax, coef, model, prices, s, single):
         color=GRAY,
         lw=1.4,
         ls=(0, (4, 2)),
-        label="Cassandra (SERIAL), NVMe i4i",
+        label="Cassandra, NVMe i4i",
     )
     ax.plot(
         x,
@@ -157,9 +157,9 @@ def panel_a(ax, coef, model, prices, s, single):
         color=ORANGE,
         lw=1.8,
         ls=(0, (4, 2)),
-        label="Cassandra (SERIAL), EBS gp3",
+        label="Cassandra, EBS gp3",
     )
-    ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8, label=f"OzoneKV, {s['hi']} GB RAM cache")
+    ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8, label="OzoneKV")
     if s["disk_gb"]:
         ax.plot(
             x,
@@ -191,54 +191,22 @@ def panel_a(ax, coef, model, prices, s, single):
             )
     ax.plot([], [], "o", color=INK2, ms=3.8, mec="white", mew=0.6, label="measured")
 
-    # Value labels: the two endpoints the text quotes, and the tier point.
-    d_end = ds[-1]
-    oz_end = model.ozonedb(d_end, s["hi"])["total"]
-    ce_end = model.cassandra(d_end, "ebs")["total"]
-    ax.annotate(
-        fmt_usd(oz_end),
-        (d_end / GB, oz_end),
-        xytext=(-2, -9),
-        textcoords="offset points",
-        ha="right",
-        va="top",
-        fontsize=fs,
-        color=INK,
-    )
-    ax.annotate(
-        fmt_usd(ce_end),
-        (d_end / GB, ce_end),
-        xytext=(-2, 4),
-        textcoords="offset points",
-        ha="right",
-        va="bottom",
-        fontsize=fs,
-        color=INK,
-    )
-    # The 10 TB pair, the decade panel (b) splits.
-    d10 = 10 * TB
-    oz10 = model.ozonedb(d10, s["hi"])["total"]
-    ce10 = model.cassandra(d10, "ebs")["total"]
-    ax.annotate(
-        fmt_usd(oz10),
-        (d10 / GB, oz10),
-        xytext=(4, -5),
-        textcoords="offset points",
-        ha="left",
-        va="top",
-        fontsize=fs,
-        color=INK,
-    )
-    ax.annotate(
-        fmt_usd(ce10),
-        (d10 / GB, ce10),
-        xytext=(-4, 4),
-        textcoords="offset points",
-        ha="right",
-        va="bottom",
-        fontsize=fs,
-        color=INK,
-    )
+    # One exact-cost label per line, at its right end (100 TB). The x-axis
+    # runs a little past the last decade so the labels sit in clear space.
+    ends = [("cass_nvme", "Cassandra NVMe"), ("cass_ebs", "Cassandra EBS"), ("oz_hi", "OzoneKV")]
+    if s["disk_gb"]:
+        ends.append(("oz_disk", "OzoneKV + tier"))
+    for key, _ in ends:
+        ax.annotate(
+            fmt_usd(s[key][-1]),
+            (x[-1], s[key][-1]),
+            xytext=(4, 0),
+            textcoords="offset points",
+            ha="left",
+            va="center",
+            fontsize=fs,
+            color=INK,
+        )
 
     # Marker labels along the top.
     ytop = ymax / 1.25
@@ -247,7 +215,9 @@ def panel_a(ax, coef, model, prices, s, single):
     # its left, the later one to its right, so the labels never meet.
     marks = [(s["x_disk"], AQUA, "tier"), (s["x_oz"], BLUE, f"{s['hi']} GB cache")]
     marks = sorted((d, c, n) for d, c, n in marks if d)
-    if len(marks) == 1 or (len(marks) == 2 and abs(marks[0][0] - marks[1][0]) < 1e-6 * marks[0][0]):
+    if len(marks) == 1 or (
+        len(marks) == 2 and abs(marks[0][0] - marks[1][0]) < 1e-6 * marks[0][0]
+    ):
         marks = [(marks[0][0], INK2, "OzoneKV")]
     for i, (d, col, name) in enumerate(marks):
         ax.axvline(d / GB, color=col, lw=0.8, ls=(0, (1.5, 1.5)), alpha=0.9)
@@ -462,7 +432,7 @@ def main():
         1,
         2,
         figsize=(7.0, 2.55),
-        gridspec_kw={"width_ratios": [1.55, 1], "wspace": 0.42},
+        gridspec_kw={"width_ratios": [1.55, 1], "wspace": 0.55},
     )
     panel_a(ax_a, coef, model, prices, s, single=False)
     panel_b(ax_b, model, prices, s, d_b)
@@ -486,7 +456,7 @@ def main():
     # Single column: (a) alone.
     fig, ax = plt.subplots(figsize=(3.35, 2.45))
     panel_a(ax, coef, model, prices, s, single=True)
-    fig.subplots_adjust(left=0.15, right=0.95, top=0.97, bottom=0.16)
+    fig.subplots_adjust(left=0.15, right=0.985, top=0.97, bottom=0.16)
     for ext in ("pdf", "png"):
         fig.savefig(f"{args.out}_col.{ext}")
         print(f"wrote {args.out}_col.{ext}")
