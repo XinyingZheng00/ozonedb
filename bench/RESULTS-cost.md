@@ -173,12 +173,22 @@ duration, same cache.
 | OzoneDB, 100 GB, 100 MiB, workload c | 6,270 | 0.700 | 0.337 | 0.61 ms |
 | Cassandra quorum, 10 GB, workload a | 42,376 | — | — | 0.062 ms |
 | Cassandra quorum, 10 GB, workload `ai` | 37,679 | — | — | 0.066 ms |
-| Cassandra quorum, 100 GB, workload a | CASS100A | — | — | CASS100ACPU |
-| Cassandra quorum, 100 GB, workload `ai` | CASS100AI | — | — | CASS100AICPU |
+| Cassandra quorum, 100 GB, workload a | 34,480 | — | — | 0.065 ms |
+| Cassandra quorum, 100 GB, workload `ai` | 34,321 | — | — | 0.066 ms |
 
-The run phase passes no `insertstart`, so every writer generates the same new key
-sequence. Each inserted key is written once per writer; the write path is unaffected and
-the dataset grows by one eighth of the inserts.
+Cassandra's own insert-against-update difference is a throughput effect, not a
+structural one: 11 % at 10 GB, where the box runs at 43,000 ops/s and the extra nine
+columns of an insert cost something, and 0.5 % at 100 GB, where the box is disk-bound at
+34,000 ops/s and the write path is not the limit. OzoneDB's 39 % gain is structural: the
+update path issues a second get, the insert path does not.
+
+Two caveats. The run phase passes no `insertstart`, so every writer generates the same
+new key sequence; each inserted key is written once per writer, the write path is
+unaffected, and the dataset grows by one eighth of the inserts. And the 100 GB Cassandra
+pair ran on a dataset that had just been written, so the server's page cache held much of
+it: those two cells read 34,000 ops/s where the first cluster's restored 100 GB cells
+read 23,510. The pair is internally consistent, which is what the comparison needs; the
+model keeps the first cluster's 100 GB numbers.
 
 ### Server scaling, workload a, 5 GiB cache, fixed build
 

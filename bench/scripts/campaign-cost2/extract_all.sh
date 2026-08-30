@@ -7,8 +7,11 @@
 #                             and 100 GB (-100g, -100g-tier), Cassandra 10 GB and 100 GB.
 #                             The load rows come from the results root (10 GB: amd127 load
 #                             of 2026-08-28; 100 GB: amd197 load of 2026-08-29).
-#   results-$TAG-controls.tsv scaling + JNI on the fixed build, Cassandra quorum a/c on the
-#                             new box (-cass-10g-rerun).
+#   results-$TAG-controls.tsv scaling + JNI on the fixed build, the Cassandra control
+#                             cells on the new box (-cass-10g-rerun), the probe-counter
+#                             diagnostic cells (-100g-diag: a, ai, c) and the insert
+#                             pair on Cassandra (-cass-ins at 10 GB, -cass-100g-new at
+#                             100 GB). None of these feed the model.
 #   results-$TAG-prefix.tsv   the 2026-08-28 amd127 cells on the build BEFORE the fix
 #                             (-10g, -10g-tier, -scale, -jni): the "before" control.
 #   results-$TAG-zipf.tsv     key-space zipfian: -10g-zipf (old build; h is unaffected),
@@ -28,7 +31,8 @@ SPACE=bench/scripts/plot/space.json
 have() { for d in "$@"; do [[ -d "$d" ]] && printf '%s ' "$d"; done; }
 $EX $(have $R/$TAG-10g-fix $R/$TAG-10g-fix-tier $R/$TAG-100g $R/$TAG-100g-tier $R/$TAG-cass-10g $R/$TAG-cass-100g) $R \
   --window 60 --tsv bench/results-$TAG.tsv
-$EX $(have $R/$TAG-10g-fix-scale $R/$TAG-10g-fix-jni $R/$TAG-cass-10g-rerun) --window 60 --tsv bench/results-$TAG-controls.tsv
+$EX $(have $R/$TAG-10g-fix-scale $R/$TAG-10g-fix-jni $R/$TAG-cass-10g-rerun $R/$TAG-100g-diag \
+  $R/$TAG-cass-ins $R/$TAG-cass-100g-new) --window 60 --tsv bench/results-$TAG-controls.tsv
 $EX $(have $R/$TAG-10g $R/$TAG-10g-tier $R/$TAG-scale $R/$TAG-jni) --window 60 --tsv bench/results-$TAG-prefix.tsv
 $EX $(have $R/$TAG-10g-zipf $R/$TAG-100g-zipf $R/$TAG-cass-zipf $R/$TAG-cass-10g $R/$TAG-10g-fix) $R --window 60 --tsv bench/results-$TAG-zipf.tsv
 

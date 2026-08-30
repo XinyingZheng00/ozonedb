@@ -221,17 +221,28 @@ Rules 1–5 of `PLAN-cost.md` hold. Add:
 
 ## 5. Tasks
 
-**Status 2026-08-29.** Tasks 0 to 6 and the 10 GB half of 7b are done (`bench/RESULTS-cost.md`,
-"Campaign 2"). Task 7's load completed. The CloudLab lease ended at 04:17 during the
-first 100 GB cell, so the 100 GB RAM, tier and zipfian cells and the Cassandra `cz` / `az`
-pair did not run. Task 8 ran on the 10 GB corpus with the 100 GB load's space
-coefficients. To finish on a new experiment: `setup.sh` on every node,
-`setup_disk_cache.sh` on the clients, the server relayout (MinIO needs a bind mount), the
-Cassandra install and 10 GB load, the OzoneDB 100 GB load with 16 writers, then
-`bench/scripts/campaign-cost2/chain_oz100.sh` from its RAM-cells step. Findings that
-change the method are in Task 5's "Finding" block (per-writer cache fill) and in the
-results write-up.
+**Status 2026-08-30. The campaign is complete.** Tasks 0 to 8 are done and written up
+in `bench/RESULTS-cost.md`, "Campaign 2". The first cluster's lease ended at 04:17 on
+2026-08-29, during the first 100 GB cell; a second experiment (amd197 + amd189..amd200)
+reran every OzoneDB cell on the build with the SSTable filter fix (`3b28a2cd`), so the
+corpus is one build at both sizes. Beyond the plan as written:
 
+- **`3b28a2cd`** — `filterBlockReader::keyMayMatch` copied the whole-file Bloom filter
+  (712 KB per 570 MB SSTable) on every probe. It cost 6.7 ms of client CPU per get at
+  100 GB and was invisible at 1 GB. The 10 GB corpus was re-measured after it; the
+  pre-fix cells are `results-cost2-20260828-prefix.tsv`.
+- **`1662446b`** — per-level probe counters (probes / pruned / absent). They show the
+  filters prune 99.3 % of candidate files, which ruled out wasted fetches as the cause of
+  workload a's GET rate.
+- **`workloadai`** — workload a with a blind insert in place of the read-modify-write
+  update, run on both systems at both sizes. This is finding 2 of the write-up and the
+  single largest cost lever found: it halves the GET bill and restores the block cache.
+
+Still open, in the order that pays: lazy per-file index and filter loading (a writer
+holds 1.75 GB per 100 GB outside the cache budget, linear in the dataset, so the
+projection above 1 TB describes a client that cannot open the data);
+`level_file_size_limit` honored below `max_level` (`compaction.cpp:400`, why L4 files are
+570 MB); a second trial of the headline cells.
 
 ### Task 0. Merge the native client into `visibility`
 
