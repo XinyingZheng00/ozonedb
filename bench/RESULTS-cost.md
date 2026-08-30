@@ -256,8 +256,9 @@ uv run --with matplotlib python3 bench/scripts/plot/paper_cost_figure.py \
 
 Three series — OzoneKV (the paper's name for the system) with the 16 GB cache as one
 line (the 4 GB line is at most $350 above it and is left to the text), Cassandra EBS,
-Cassandra NVMe as the gray context line — filled markers at the two measured sizes and
-none beyond, and one "cheaper from" marker at the smallest size from which the OzoneKV
+Cassandra NVMe as the gray context line — solid up to the last measured size (100 GB),
+dotted beyond it where only the model speaks, filled markers at the two measured sizes
+and none beyond, and one "cheaper from" marker at the smallest size from which the OzoneKV
 line *stays* below the cheaper Cassandra layout: at 10 % reads **1.3 TB**, the NVMe
 layout's fourth-node step. Numbers at this mix: OzoneKV $1,645 at 100 GB and $1,732 at
 1 TB against Cassandra EBS $2,402 and NVMe $1,565; at 10 TB OzoneKV $2,073 (GETs $759,

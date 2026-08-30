@@ -12,8 +12,9 @@ bill at 10 TB) and <out>_col.{pdf,png} (single column: panel (a) alone).
 Panel (a) is plot_cost_model.py's figure cut to what the text argues from:
 three series (OzoneKV with the high RAM cache, Cassandra on EBS, Cassandra on
 local NVMe as the gray context line; --tier adds OzoneKV with an SSD tier per
-writer), the x-axis from the smallest measured dataset, filled markers on the
-measured sizes and none beyond, one "cheaper from" marker per OzoneKV line,
+writer), the x-axis from the smallest measured dataset, every line solid across the
+measured decade and dotted beyond it, filled markers on the measured sizes
+and none beyond, one "cheaper from" marker per OzoneKV line,
 and the 10 TB and 100 TB value labels. --read-fraction overrides
 prices.json's projection.read_fraction (the offered mix; writes are blind
 puts, so this is the insert workload `ai` of PLAN-cost-2, not workload a).
@@ -143,26 +144,22 @@ def panel_a(ax, coef, model, prices, s, single):
     ax.set_ylim(ymin, ymax)
     ax.set_xlim(x[0] / 1.12, x[-1] * (5.0 if single else 3.2))
 
-    ax.plot(
-        x,
-        s["cass_nvme"],
-        color=GRAY,
-        lw=1.4,
-        ls=(0, (4, 2)),
-        label="Cassandra, NVMe i4i",
-    )
-    ax.plot(
-        x,
-        s["cass_ebs"],
-        color=ORANGE,
-        lw=1.8,
-        ls=(0, (4, 2)),
-        label="Cassandra, EBS gp3",
-    )
-    ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8, label="OzoneKV")
+    # Solid across the measured decade, dotted where only the model speaks.
+    # The cut sits on the last grid point at or below the largest measured
+    # size; both segments share that point, so each line stays continuous.
+    bx = max(coef.measured_d) / GB
+    cut = max(i for i, v in enumerate(x) if v <= bx)
+
+    def line(y, **kw):
+        label = kw.pop("label", None)
+        ax.plot(x[: cut + 1], y[: cut + 1], ls="-", label=label, **kw)
+        ax.plot(x[cut:], y[cut:], ls=(0, (1, 1.6)), **kw)
+
+    line(s["cass_nvme"], color=GRAY, lw=1.4, label="Cassandra, NVMe i4i")
+    line(s["cass_ebs"], color=ORANGE, lw=1.8, label="Cassandra, EBS gp3")
+    line(s["oz_hi"], color=BLUE, lw=1.8, label="OzoneKV")
     if s["disk_gb"]:
-        ax.plot(
-            x,
+        line(
             s["oz_disk"],
             color=AQUA,
             lw=1.8,
@@ -190,6 +187,7 @@ def panel_a(ax, coef, model, prices, s, single):
                 [d / GB], [y], "o", color=col, ms=3.8, mec="white", mew=0.6, zorder=5
             )
     ax.plot([], [], "o", color=INK2, ms=3.8, mec="white", mew=0.6, label="measured")
+    ax.plot([], [], ls=(0, (1, 1.6)), color=INK2, lw=1.4, label="projected")
 
     # One exact-cost label per line, at its right end (100 TB). The x-axis
     # runs a little past the last decade so the labels sit in clear space.
