@@ -3,18 +3,20 @@
 
   paper_cost_figure.py results.tsv prices.json --space space.json
                        [--tier-variant ch64k-adm] [--cassandra-mode serial]
-                       [--cpu-workload a] [--h-workload c] --out bench/fig_cost
+                       [--cpu-workload a] [--h-workload c] [--read-fraction 0.25]
+                       --out bench/fig_cost
 
 Writes <out>.{pdf,png} (double-column: panel (a) the projection, panel (b) the
 bill at 10 TB) and <out>_col.{pdf,png} (single column: panel (a) alone).
 
 Panel (a) is plot_cost_model.py's figure cut to what the text argues from:
-four series (OzoneDB with a RAM cache as a band from the high to the low
-cache size, OzoneDB with a disk tier per client, Cassandra on EBS, Cassandra
-on local NVMe as the gray context line), the x-axis from the smallest
-measured dataset, filled markers on the measured sizes and none beyond,
-the two regimes shaded (the tier holds the dataset; the crossover band
-between the tier line and the low-cache line), and four value labels.
+four series (OzoneDB with the high RAM cache, OzoneDB with a disk tier per
+client, Cassandra on EBS, Cassandra on local NVMe as the gray context line),
+the x-axis from the smallest measured dataset, filled markers on the measured
+sizes and none beyond, the tier regime shaded, one "cheaper from" marker per
+OzoneDB line, and four value labels. --read-fraction overrides
+prices.json's projection.read_fraction (the offered mix; writes are blind
+puts, so this is the insert workload `ai` of PLAN-cost-2, not workload a).
 Panel (b) is one decade of the same model split into its cost lines.
 Everything is computed here from Coefficients and Model; nothing is typed in.
 """
@@ -60,6 +62,8 @@ def build(args):
     rows = pcm.load_rows(args.coefficients_tsv)
     with open(args.prices_json) as f:
         prices = json.load(f)
+    if args.read_fraction is not None:
+        prices["projection"]["read_fraction"] = args.read_fraction
     space = {}
     if args.space:
         with open(args.space) as f:
@@ -103,12 +107,11 @@ def series(coef, model, prices):
         "cass_nvme": [model.cassandra(d, "nvme")["total"] for d in ds],
         "cass_ebs": [model.cassandra(d, "ebs")["total"] for d in ds],
         "oz_hi": [model.ozonedb(d, hi)["total"] for d in ds],
-        "oz_lo": [model.ozonedb(d, lo)["total"] for d in ds],
         "oz_disk": [model.ozonedb(d, hi, disk_gb=disk_gb)["total"] for d in ds],
         "disk_gb": disk_gb, "hi": hi, "lo": lo,
     }
     cass_min = [min(a, b) for a, b in zip(s["cass_nvme"], s["cass_ebs"])]
-    s["x_lo"] = cheaper_from(ds, s["oz_lo"], cass_min)
+    s["x_oz"] = cheaper_from(ds, s["oz_hi"], cass_min)
     s["x_disk"] = cheaper_from(ds, s["oz_disk"], cass_min) if disk_gb else None
     # The tier holds the dataset while its own hit rate is still that of a
     # full tier: the last grid point at or above 0.95.
@@ -130,16 +133,10 @@ def panel_a(ax, coef, model, prices, s, single):
     # Regimes first, under the lines.
     if s["tier_full_to"]:
         ax.axvspan(x[0], s["tier_full_to"] / GB, color=AQUA, alpha=0.10, lw=0)
-    if s["x_lo"] and s["x_disk"]:
-        lo_x, hi_x = sorted((s["x_lo"], s["x_disk"]))
-        ax.axvspan(lo_x / GB, hi_x / GB, color=GRAY, alpha=0.18, lw=0)
 
     ax.plot(x, s["cass_nvme"], color=GRAY, lw=1.4, ls=(0, (4, 2)), label="Cassandra (SERIAL), NVMe i4i")
     ax.plot(x, s["cass_ebs"], color=ORANGE, lw=1.8, ls=(0, (4, 2)), label="Cassandra (SERIAL), EBS gp3")
-    ax.fill_between(x, s["oz_hi"], s["oz_lo"], color=BLUE, alpha=0.22, lw=0)
-    ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8,
-            label=f"OzoneDB, {s['hi']}–{s['lo']} GB RAM cache")
-    ax.plot(x, s["oz_lo"], color=BLUE, lw=0.8)
+    ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8, label=f"OzoneDB, {s['hi']} GB RAM cache")
     if s["disk_gb"]:
         ax.plot(x, s["oz_disk"], color=AQUA, lw=1.8,
                 label=f"OzoneDB + {s['disk_gb'] / 1000:g} TB SSD tier per client")
@@ -168,17 +165,25 @@ def panel_a(ax, coef, model, prices, s, single):
         ce1 = model.cassandra(d1, "ebs")["total"]
         ax.annotate(fmt_usd(oz1), (d1 / GB, oz1), xytext=(-5, -3), textcoords="offset points",
                     ha="right", va="top", fontsize=fs, color=INK)
-        ax.annotate(fmt_usd(ce1), (d1 / GB, ce1), xytext=(0, 4), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=fs, color=INK)
+        ax.annotate(fmt_usd(ce1), (d1 / GB, ce1), xytext=(-3, -3), textcoords="offset points",
+                    ha="right", va="top", fontsize=fs, color=INK)
 
     # Regime labels along the top.
     ytop = ymax / 1.25
     if s["tier_full_to"]:
         ax.text(x[0] * 1.2, ytop, "tier holds\nthe dataset", fontsize=fs - 0.5, color=INK2, va="top", ha="left")
-    if s["x_lo"] and s["x_disk"]:
-        lo_x, hi_x = sorted((s["x_lo"], s["x_disk"]))
-        ax.text((lo_x * hi_x) ** 0.5 / GB, ytop, f"crossover\n{fmt_d(lo_x, 2)}–{fmt_d(hi_x, 2)}",
-                fontsize=fs - 0.5, color=INK2, va="top", ha="center")
+    # One "cheaper from" marker per OzoneDB line: the size from which the line
+    # stays below the cheaper Cassandra layout. The earlier one is labelled to
+    # its left, the later one to its right, so the labels never meet.
+    marks = [(s["x_disk"], AQUA, "tier"), (s["x_oz"], BLUE, f"{s['hi']} GB cache")]
+    marks = sorted((d, c, n) for d, c, n in marks if d)
+    if len(marks) == 2 and abs(marks[0][0] - marks[1][0]) < 1e-6 * marks[0][0]:
+        marks = [(marks[0][0], INK2, "OzoneDB")]
+    for i, (d, col, name) in enumerate(marks):
+        ax.axvline(d / GB, color=col, lw=0.8, ls=(0, (1.5, 1.5)), alpha=0.9)
+        left = i == 0 and len(marks) > 1
+        ax.text(d / GB * (0.93 if left else 1.07), ytop, f"{name} cheaper\nfrom {fmt_d(d, 2)}",
+                fontsize=fs - 0.5, color=col, va="top", ha="right" if left else "left")
 
     ax.set_xlabel("dataset size", fontsize=fs + 0.5)
     ax.set_ylabel("USD per month", fontsize=fs + 0.5)
@@ -199,8 +204,13 @@ def panel_a(ax, coef, model, prices, s, single):
         ax.spines[side].set_color(INK2)
         ax.spines[side].set_linewidth(0.6)
     ax.tick_params(length=2, color=INK2, labelsize=fs)
-    ax.legend(fontsize=fs - 0.5, loc="upper left", bbox_to_anchor=(0.0, 0.80), frameon=False,
-              handlelength=2.0, borderaxespad=0.0, labelspacing=0.35)
+    pr = prices["projection"]
+    leg = ax.legend(fontsize=fs - 0.5, loc="upper left", bbox_to_anchor=(0.0, 0.80), frameon=False,
+                    handlelength=2.0, borderaxespad=0.0, labelspacing=0.35,
+                    title=f"{pr['ops_per_s']:,} ops/s, {pr['read_fraction']:.0%} reads, "
+                          f"{1 - pr['read_fraction']:.0%} blind writes, RF={pr['rf']}",
+                    title_fontsize=fs - 0.5, alignment="left")
+    leg.get_title().set_color(INK2)
 
 
 def panel_b(ax, model, prices, s, d_bytes):
@@ -210,21 +220,18 @@ def panel_b(ax, model, prices, s, d_bytes):
     oz = model.ozonedb(d_bytes, hi)
     ozd = model.ozonedb(d_bytes, hi, disk_gb=s["disk_gb"])
     ce = model.cassandra(d_bytes, "ebs")
-    cn = model.cassandra(d_bytes, "nvme")
     # (label, [(segment name, value, color), ...]) top to bottom.
     oz_lines = lambda o, tier: [
-        ("S3 GET requests", o["get_cost"], BLUES[0]),
+        ("S3 GETs", o["get_cost"], BLUES[0]),
         ("log tier", o["log_tier"], BLUES[1]),
         ("clients", o["client_cost"], BLUES[2]),
-        ("S3 storage + PUTs", o["bulk"] + o["put_cost"] + o["ckpt_cost"], BLUES[3]),
-    ] + ([("SSD tier (gp3)", o["disk_cost"], AQUA)] if tier else [])
+        ("S3 storage, PUTs", o["bulk"] + o["put_cost"] + o["ckpt_cost"], BLUES[3]),
+    ] + ([("SSD tier", o["disk_cost"], AQUA)] if tier else [])
     bars = [
         (f"OzoneDB, {hi} GB cache", oz_lines(oz, False)),
         (f"OzoneDB + {s['disk_gb'] / 1000:g} TB tier", oz_lines(ozd, True)),
-        ("Cassandra SERIAL, EBS", [("Cassandra nodes (+ EBS)", ce["node_cost"], ORANGES[0]),
+        ("Cassandra SERIAL, EBS", [("Cassandra nodes", ce["node_cost"], ORANGES[0]),
                                   ("Cassandra clients", ce["client_cost"], ORANGES[1])]),
-        ("Cassandra SERIAL, NVMe", [("Cassandra nodes (+ EBS)", cn["node_cost"], ORANGES[0]),
-                                   ("Cassandra clients", cn["client_cost"], ORANGES[1])]),
     ]
     seen = {}
     ys = list(range(len(bars)))[::-1]
@@ -241,9 +248,11 @@ def panel_b(ax, model, prices, s, d_bytes):
             left += v + 0.004 * total_max  # a hairline surface gap between segments
     ax.set_yticks(ys)
     ax.set_yticklabels([f"{label}\n{fmt_usd(sum(v for _, v, _ in segs))}" for label, segs in bars], fontsize=fs)
-    ax.set_xlim(0, total_max * 1.18)
-    ax.xaxis.set_major_locator(FixedLocator([0, 5000, 10000]))
-    ax.set_xticklabels(["$0", "$5k", "$10k"], fontsize=fs)
+    ax.set_xlim(0, total_max * 1.3)
+    step = 5000 if total_max > 8000 else 2000 if total_max > 3500 else 1000
+    ticks = list(range(0, int(total_max * 1.3) + 1, step))
+    ax.xaxis.set_major_locator(FixedLocator(ticks))
+    ax.set_xticklabels([f"${t // 1000}k" if t else "$0" for t in ticks], fontsize=fs)
     ax.set_xlabel(f"USD per month at {fmt_d(d_bytes)}", fontsize=fs + 0.5)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
@@ -253,8 +262,8 @@ def panel_b(ax, model, prices, s, d_bytes):
     ax.tick_params(axis="x", length=2, color=INK2)
     ax.grid(True, axis="x", color=INK2, alpha=0.12, lw=0.6)
     ax.set_axisbelow(True)
-    ax.legend(fontsize=fs - 1, loc="upper right", frameon=False, ncol=1, handlelength=1.0,
-              handleheight=0.9, borderaxespad=0.0, labelspacing=0.3)
+    ax.legend(fontsize=fs - 1, loc="upper right", frameon=False, ncol=1, handlelength=0.9,
+              handleheight=0.9, handletextpad=0.5, borderaxespad=0.0, labelspacing=0.3)
 
 
 def main():
@@ -266,6 +275,8 @@ def main():
     ap.add_argument("--cpu-workload", default=None)
     ap.add_argument("--tier-variant", default="")
     ap.add_argument("--cassandra-mode", default="serial", choices=("serial", "quorum"))
+    ap.add_argument("--read-fraction", type=float, default=None,
+                    help="reads as a fraction of the offered ops (default: prices.json projection.read_fraction)")
     ap.add_argument("--breakdown-at", default="10 TB", help="the decade panel (b) splits (default 10 TB)")
     ap.add_argument("--out", required=True, help="output stem; writes <stem>.{pdf,png} and <stem>_col.{pdf,png}")
     args = ap.parse_args()
@@ -288,8 +299,8 @@ def main():
           f"against cassandra-{args.cassandra_mode}; measured at "
           + ", ".join(fmt_d(d) for d in coef.measured_d))
     print(f"  tier holds the dataset to {fmt_d(s['tier_full_to']) if s['tier_full_to'] else 'n/a'}; "
-          f"crossover low-cache {fmt_d(s['x_lo']) if s['x_lo'] else 'none'}, "
-          f"tier {fmt_d(s['x_disk']) if s['x_disk'] else 'none'}")
+          f"cheaper from: {s['hi']} GB cache {fmt_d(s['x_oz']) if s['x_oz'] else 'never'}, "
+          f"tier {fmt_d(s['x_disk']) if s['x_disk'] else 'never'}")
 
     # Double column: (a) + (b).
     fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(7.0, 2.55), gridspec_kw={"width_ratios": [1.55, 1], "wspace": 0.42})
