@@ -1,8 +1,30 @@
 # Plan: strict-mode throughput sweep at 100 GB, OzoneKV against Cassandra
 
-**Status (2026-08-30):** planned, not run. This plan replaces
+**Status (2026-08-30):** running. Tasks 0 to 6 are complete. This plan replaces
 `bench/PLAN-strict-sweep.md` at a 100 GB dataset with three trials. The 1 GB
 run of that plan is written up in `bench/RESULTS-strict-frontier.md`.
+
+**Execution notes, 2026-08-30**
+
+1. The remote delete of the two 10 GB snapshots in Task 1 Step 1 was refused by
+   the permission layer, so `/tank/ssd` runs the campaign with 98 GB free
+   instead of 110 GB. This is safe. The hard-link snapshot of Task 2 adds no
+   bytes, and `restore-load` wipes the previous cell's compaction output before
+   every cell, so the peak is the snapshot plus one cell of compaction output.
+2. Task 3 confirmed the hard links: free space stayed at 98 GB after a snapshot
+   that `du` reports as 103 GB, and a 58 GB `usertable` SSTable shares one
+   inode with a link count of 2.
+3. The Cassandra corpus holds 99,312,346 partitions and 109.8 GB in 8 SSTables.
+   The OzoneDB bucket snapshot holds 288 objects.
+4. The smoke test of Task 5 exposed a defect in
+   `extract_steady_throughput.py`. YCSB prints one status line per second while
+   it closes the client, so every run ends with three or four samples that
+   report 0 operations, and the extractor averaged those into the trailing
+   window. Commit `99ed79ae` trims that dead tail. The effect is about 3 % at a
+   120 s window on both systems, and 7 % to 14 % at 30 s.
+5. The smoke test measured the tier fill rate directly: 2.44 GB in 120 s, of
+   which the first 38 s were tailer catch-up with no reads. That is 29.8 MB/s
+   of read time, which matches the 30 MB/s below.
 
 ## Goal
 
