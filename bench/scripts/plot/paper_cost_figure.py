@@ -441,7 +441,7 @@ def main():
             va="bottom",
             ha="right",
         )
-    fig.subplots_adjust(left=0.075, right=0.99, top=0.92, bottom=0.21)
+    fig.subplots_adjust(left=0.082, right=0.99, top=0.92, bottom=0.21)
     for ext in ("pdf", "png"):
         fig.savefig(f"{args.out}.{ext}")
         print(f"wrote {args.out}.{ext}")
@@ -450,7 +450,7 @@ def main():
     # Single column: (a) alone.
     fig, ax = plt.subplots(figsize=(3.5, 1.6))
     panel_a(ax, coef, model, prices, s, single=True)
-    fig.subplots_adjust(left=0.143, right=0.985, top=0.962, bottom=0.25)
+    fig.subplots_adjust(left=0.158, right=0.985, top=0.962, bottom=0.25)
     for ext in ("pdf", "png"):
         fig.savefig(f"{args.out}_col.{ext}")
         print(f"wrote {args.out}_col.{ext}")
