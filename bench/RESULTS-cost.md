@@ -241,6 +241,28 @@ coefficient reaches a threshold: one `c6i.large` client serves up to 12,700 ops/
 the throughput comparison, not the cost one, and the projection table carries it as
 the `cass_mode` column. `--cassandra-mode quorum` reproduces the earlier run.
 
+**Paper figure.** `bench/fig_cost.{pdf,png}` (double column: (a) the projection, (b) the
+10 TB bill) and `bench/fig_cost_col.{pdf,png}` ((a) alone, single column) come from
+`bench/scripts/plot/paper_cost_figure.py`, which evaluates the same `Coefficients` and
+`Model` on a 48-per-decade grid from 10 GB:
+
+```bash
+uv run --with matplotlib python3 bench/scripts/plot/paper_cost_figure.py \
+  bench/results-cost2-20260828.tsv bench/scripts/plot/prices.json \
+  --space bench/scripts/plot/space.json --tier-variant ch64k-adm \
+  --cassandra-mode serial --out bench/fig_cost
+```
+
+Four series (Cassandra NVMe is the gray context line), filled markers at the two
+measured sizes and none beyond, the tier regime shaded to 1 TB (the last grid point
+where the tier's own hit rate is at least 0.95), and the crossover as a band. The band
+is **10 TB to 13 TB**, from the smallest size at which each OzoneDB line *stays* cheaper
+than the cheaper Cassandra layout: between 9 TB and 13 TB the tier line and the 4 GB
+line sit within 1 % of the EBS line and dip in and out with its node steps (the tier
+line is $4,753 against $4,742 at exactly 10 TB), so the *first* dip that
+`plot_cost_model.py` reports (12.1 TB and 14.7 TB on its 12-per-decade grid) is a grid
+artefact. The text quotes the band, not either endpoint.
+
 | D | Cassandra NVMe | Cassandra EBS | OzoneDB, 16 GB cache | OzoneDB, 4 GB | OzoneDB + 2 TB tier per client | OzoneDB, no trimming | `h` at 16 GB | zipfian, 16 GB |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | 100 GB | 1,565 | 2,402 | 4,056 | 4,160 | **1,605** | 4,085 | 0.418 | 3,622 |
