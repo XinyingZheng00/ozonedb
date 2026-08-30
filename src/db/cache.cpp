@@ -24,6 +24,15 @@ int LRUCache::levelSlot(std::string const& file_name) {
   return level;
 }
 
+void LRUCache::noteProbe(std::string const& file_name, int kind) {
+  int const slot = levelSlot(file_name);
+  switch (kind) {
+    case 0: level_probes_[slot].fetch_add(1, std::memory_order_relaxed); break;
+    case 1: level_pruned_[slot].fetch_add(1, std::memory_order_relaxed); break;
+    default: level_absent_[slot].fetch_add(1, std::memory_order_relaxed); break;
+  }
+}
+
 // Function to move a key to the front of the LRU list
 void LRUCache::updateLRU(std::string const& file_name, std::string const& index_value) {
   lru_list.erase(file_to_entry_map[file_name].lru_itr[index_value]);
@@ -745,6 +754,9 @@ LRUCache::Stats LRUCache::stats() {
   for (int i = 0; i < kLevelSlots; ++i) {
     s.level_hits[i] = level_hits_[i].load(std::memory_order_relaxed);
     s.level_misses[i] = level_misses_[i].load(std::memory_order_relaxed);
+    s.level_probes[i] = level_probes_[i].load(std::memory_order_relaxed);
+    s.level_pruned[i] = level_pruned_[i].load(std::memory_order_relaxed);
+    s.level_absent[i] = level_absent_[i].load(std::memory_order_relaxed);
   }
   s.warm_files = warm_files_.load(std::memory_order_relaxed);
   s.warm_blocks = warm_blocks_.load(std::memory_order_relaxed);
@@ -813,6 +825,12 @@ void LRUCache::printCacheStats() {
   for (int i = 0; i <= top; ++i) std::cerr << (i ? "," : "") << i << ":" << s.level_hits[i];
   std::cerr << " misses=";
   for (int i = 0; i <= top; ++i) std::cerr << (i ? "," : "") << i << ":" << s.level_misses[i];
+  std::cerr << " probes=";
+  for (int i = 0; i <= top; ++i) std::cerr << (i ? "," : "") << i << ":" << s.level_probes[i];
+  std::cerr << " pruned=";
+  for (int i = 0; i <= top; ++i) std::cerr << (i ? "," : "") << i << ":" << s.level_pruned[i];
+  std::cerr << " absent=";
+  for (int i = 0; i <= top; ++i) std::cerr << (i ? "," : "") << i << ":" << s.level_absent[i];
   std::cerr << " sstable_files=" << s.sstable_files
             << " dead_files=" << s.dead_files
             << " dead_blocks=" << s.dead_blocks
