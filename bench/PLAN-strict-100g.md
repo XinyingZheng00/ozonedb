@@ -1,7 +1,7 @@
 # Plan: strict-mode throughput sweep at 100 GB, OzoneKV against Cassandra
 
 **Status (2026-08-30):** planned, not run. This plan replaces
-`bench/PLAN-strict-sweep.md` at a 100 GB dataset with two trials. The 1 GB
+`bench/PLAN-strict-sweep.md` at a 100 GB dataset with three trials. The 1 GB
 run of that plan is written up in `bench/RESULTS-strict-frontier.md`.
 
 ## Goal
@@ -14,13 +14,13 @@ strict point of the consistency frontier, on a 100 GB dataset:
 - Cassandra with `--consistency serial`. Reads are SERIAL. Every write is an
   `IF [NOT] EXISTS` Paxos round.
 
-Matrix: **5 writer points x 5 workloads x 2 trials x 2 systems = 100 cells.**
+Matrix: **5 writer points x 5 workloads x 3 trials x 2 systems = 150 cells.**
 
 | Axis | Values |
 |---|---|
 | Total writers | 2, 4, 8, 16, 32 |
 | Workloads | a, b, c, f, d (in this order) |
-| Trials | 1, 2 |
+| Trials | 1, 2, 3 |
 | Systems | `ozonedb-corfu-linearizable`, `cassandra-serial` |
 
 Both systems get **300 s cells**. The reported number is a steady-state rate
@@ -131,7 +131,7 @@ cluster.
 | Operation count | unbounded, duration-capped | `local.run.operation_cnt` |
 | Cell duration, both systems | 300 s | `--duration 300` |
 | Steady window | last 120 s | `--window 120` |
-| Trials | 1 and 2 | `--trial N`, one per chain run |
+| Trials | 1, 2 and 3 | `--trial N`, one per chain run |
 | OzoneDB LRU cache | 16 GiB per writer | `--lru-cache-bytes 17179869184` |
 | OzoneDB disk tier | 50 GiB per writer on `/tank/cache` | `--disk-cache-bytes 53687091200 --disk-cache-dir /tank/cache` |
 | Tier mode | chunk, 64 KiB entries, TinyLFU admission | the defaults, written into every label |
@@ -201,7 +201,6 @@ Two facts drive Task 1 and Task 2:
 | Risk | Effect | Handling |
 |---|---|---|
 | Caches never fill in 300 s | OzoneDB looks slow | stated up front, and the write-up must name the regime |
-| Two trials give a weak spread | noise looks like signal | Task 9 Step 3 prints the spread per cell. Flag any cell above 15 % |
 | CloudLab lease ends mid-campaign | partial matrix | trial-major order (Task 7, Task 8) |
 | `/tank/ssd` fills during compaction | Cassandra stops | Task 1 frees 12.4 GB, the chain prints `df` each trial |
 | `/tank/cache` fills at 32 writers | tier writes fail | 200 GiB of 428 GB free, Task 1 Step 5 checks it |
@@ -455,7 +454,7 @@ through Ansible before Task 5.
 ## Task 5: smoke test, one short cell per system
 
 **Why:** the smoke test proves the result labels, the restore path, the tier
-path and the extractor before 12 hours of cells run.
+path and the extractor before 18 hours of cells run.
 
 - [ ] **Step 1: Set the shared variables**
 
@@ -556,7 +555,7 @@ cat > bench/scripts/campaign-strict100/chain_trial.sh <<'CHAIN'
 # run at the same time.
 set -euo pipefail
 trap 'echo "[chain $(date "+%F %T")] CHAIN-FAILED rc=$? line $LINENO"' ERR
-T=${1:?trial number (1 or 2)}
+T=${1:?trial number (1, 2 or 3)}
 
 export OZONEDB_HOME=/Users/oliver/Documents/UIUC/Research/ozone/ozonedb/.claude/worktrees/plan-strict-100g
 cd "$OZONEDB_HOME"
@@ -620,7 +619,7 @@ Expected: `syntax ok`.
 cat > bench/scripts/campaign-strict100/README.md <<'DOC'
 # Campaign strict100-20260830 (bench/PLAN-strict-100g.md)
 
-One trial per invocation, two trials in all. Cassandra first, then OzoneDB,
+One trial per invocation, three trials in all. Cassandra first, then OzoneDB,
 because they share the server box. Edit OZONEDB_HOME at the top before a rerun.
 
 Every cell is 300 s and starts both OzoneDB caches empty. The 16 GiB LRU
@@ -697,7 +696,7 @@ grep -c "Missing writer indices" bench/results/local/strict100-chains/trial1.log
 Expected: 50, which is 25 cells per system. No file without
 `SumWriterThroughput`. A `Missing writer indices` count of 0.
 
-- [ ] **Step 4: Read the trial-1 numbers before trial 2 runs**
+- [ ] **Step 4: Read the trial-1 numbers before 12 more hours run**
 
 ```bash
 python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG --window 120
@@ -707,7 +706,7 @@ Compare the 8-writer rows against the expected values at the top of this plan.
 Cassandra serial must land near 8,277 ops/s on workload a. OzoneDB must land
 between the no-tier row and the warm-tier row, because the caches are 3 % and
 17 % full. If either system is far outside that, stop. Find the cause before
-trial 2. With only two trials there is no third run to outvote a bad one.
+trial 2.
 
 - [ ] **Step 5: Record the tier hit rate of trial 1**
 
@@ -721,7 +720,7 @@ the write-up. It is the direct evidence for the cache-fill statement.
 
 ---
 
-## Task 8: run trial 2
+## Task 8: run trials 2 and 3
 
 - [ ] **Step 1: Run trial 2**
 
@@ -732,14 +731,23 @@ nohup bash bench/scripts/campaign-strict100/chain_trial.sh 2 \
 
 Wait for `CHAIN-DONE`. Repeat Task 7 Step 3 with `trial2`.
 
-- [ ] **Step 2: Check the full matrix**
+- [ ] **Step 2: Run trial 3**
+
+```bash
+nohup bash bench/scripts/campaign-strict100/chain_trial.sh 3 \
+  > bench/results/local/strict100-chains/trial3.log 2>&1 < /dev/null & disown
+```
+
+Wait for `CHAIN-DONE`. Repeat Task 7 Step 3 with `trial3`.
+
+- [ ] **Step 3: Check the full matrix**
 
 ```bash
 TAG=strict100-20260830
-ls bench/results/local/$TAG/*_agg_multinode_*.result | wc -l    # expect 100
+ls bench/results/local/$TAG/*_agg_multinode_*.result | wc -l    # expect 150
 ```
 
-Expected: 100 cells.
+Expected: 150 cells.
 
 ---
 
@@ -758,13 +766,13 @@ python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG \
 wc -l bench/results-strict100-20260830.tsv
 ```
 
-Expected: 101 lines, which is one header and 100 cells.
+Expected: 151 lines, which is one header and 150 cells.
 
 The TSV columns are `label`, `workload`, `writers`, `have`, `steady_ops_per_sec`,
 `failed`, `run_seconds`. There is **no trial column**: the extractor keys a cell
-by trial but does not write the trial out. Two trials therefore give two rows
-with the same first three columns. Step 3 groups on those three columns and
-recovers the two values. Check that the `have` column equals the `writers`
+by trial but does not write the trial out. Three trials therefore give three
+rows with the same first three columns. Step 3 groups on those three columns
+and recovers the three values. Check that the `have` column equals the `writers`
 column on every row. A smaller `have` means a lost writer file, and that row
 under-reports the cell.
 
@@ -779,7 +787,7 @@ cell in the write-up. Never fold a failed operation into throughput.
 
 - [ ] **Step 3: Check the trial spread**
 
-Two trials exist to show the noise. Compute the spread per cell.
+Three trials exist to show the noise. Compute the spread per cell.
 
 ```bash
 python3 - <<'PY'
@@ -795,8 +803,7 @@ for spread, k, v in worst[-10:]:
 PY
 ```
 
-A spread above 15 % on any cell needs a note in the write-up. Two trials give a
-range, not a standard deviation. Plot the range, and call it a range.
+A spread above 15 % on any cell needs a note in the write-up.
 
 - [ ] **Step 4: Plot**
 
@@ -809,8 +816,8 @@ AGG_RE = re.compile(r"_agg(?:_multinode)?_w(\d+)_t\d+(?:_trial\d+)?\.result$")
 ```
 
 One figure, five panels, one per workload. Each panel: x is the total writer
-count on a log-2 axis, y is steady ops/s, two lines, and a range bar over the
-two trials.
+count on a log-2 axis, y is steady ops/s, two lines, and an error bar over the
+three trials.
 
 - [ ] **Step 5: Write `bench/RESULTS-strict-100g.md`**
 
@@ -824,7 +831,7 @@ Follow the shape of `bench/RESULTS-strict-frontier.md`. It must hold:
    will be wrong.
 4. The steady-state table: workload, writers, both systems, and the ratio.
 5. The failed-operation count per cell, or a line that says zero everywhere.
-6. The trial range from Step 3, named as a range over two trials.
+6. The trial spread from Step 3.
 7. A comparison against the 1 GB run in `bench/RESULTS-strict-frontier.md`.
 8. The reproduce block: the chain command and the extractor command.
 
@@ -832,7 +839,7 @@ Follow the shape of `bench/RESULTS-strict-frontier.md`. It must hold:
 
 ```bash
 git add bench/results-strict100-*.tsv bench/RESULTS-strict-100g.md bench/*.png bench/*.pdf
-git commit -m "bench: strict frontier at 100 GB -- 100 cells, 2 trials, write-up"
+git commit -m "bench: strict frontier at 100 GB -- 150 cells, 3 trials, write-up"
 ```
 
 ---
@@ -845,10 +852,10 @@ git commit -m "bench: strict frontier at 100 GB -- 100 cells, 2 trials, write-up
 | Task 5: smoke | 15 min |
 | Task 6: chain scripts and dry run | 20 min |
 | Task 7: trial 1 | 6 h 02 min |
-| Task 8: trial 2 | 6 h 02 min |
+| Task 8: trials 2 and 3 | 12 h 04 min |
 | Task 9: extract, plot, write up | 1 h |
 
-**Total: about 14 hours 30 minutes.**
+**Total: about 20 hours 30 minutes.**
 
 Per-cell arithmetic behind the trial estimate:
 
@@ -859,16 +866,21 @@ The 90 s bucket mirror is the largest single part of the OzoneDB overhead. It is
 not optional: the log and the bucket must be restored together, or `bootstrap`
 throws.
 
-## Levers if 14 hours 30 minutes is too long
+## Levers if 20 hours 30 minutes is too long
 
 Apply these in order. Each one keeps the matrix shape.
 
-1. **Drop workload b.** Workload b sits between a and c and adds little. Saves
-   2 h 25 min.
-2. **Drop the 2-writer point.** The 1 GB run showed it adds no shape. Saves
-   1 h 12 min.
-3. **Cut the cell to 240 s and the window to 90 s.** Saves 1 h 40 min. Do not
+1. **Drop to 2 trials.** Saves 6 h 02 min. Two trials give a range, not a
+   standard deviation, so the write-up must call it a range.
+2. **Drop workload b.** Workload b sits between a and c and adds little. Saves
+   3 h 37 min.
+3. **Drop the 2-writer point.** The 1 GB run showed it adds no shape. Saves
+   1 h 48 min.
+4. **Cut the cell to 240 s and the window to 90 s.** Saves 2 h 30 min. Do not
    go below 240 s. At 180 s the tier reaches only 10 % of its budget.
+
+The campaign does not fit in one working day. Run trial 1, check it with Task 7
+Step 4, then run trials 2 and 3 overnight.
 
 ## Follow-ups (not in this sweep)
 
@@ -888,7 +900,6 @@ Apply these in order. Each one keeps the matrix shape.
 
   In 2700 s the tier reaches its full 50 GiB and the 16 GiB LRU reaches about
   5 GiB. Expect workload c near 10,088 ops/s and workload a near 2,800 ops/s.
-- A third trial, with `chain_trial.sh 3`. The chain takes any trial number.
 - The relaxed points of the frontier: Cassandra `--consistency quorum` and
   OzoneDB without `--linearizable`, same matrix. That completes a
   two-point-per-system frontier figure.
