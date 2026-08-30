@@ -194,21 +194,42 @@ do_schema() {
   log "schema ready: $keyspace.usertable count=$n"
 }
 
+# The snapshot uses hard links. Cassandra never rewrites an SSTable in place:
+# a compaction writes new files and unlinks old ones, so the snapshot's link
+# keeps the old inode alive and the live tree is free to move on. This is what
+# `nodetool snapshot` does. The commit log, the saved caches and the hints ARE
+# rewritten in place, so those three get a real copy.
+LINKED_EXCLUDE="commitlog saved_caches hints"
+
+relink_volatile() {
+  local src="$1" dst="$2" d
+  for d in $LINKED_EXCLUDE; do
+    [[ -d "$src/$d" ]] || continue
+    rm -rf "${dst:?}/$d"
+    cp -a "$src/$d" "$dst/$d"
+  done
+}
+
 do_save_load() {
   do_stop
   [[ -d "$DATA_DIR" ]] || die "save-load: $DATA_DIR does not exist -- nothing was loaded"
-  log "snapshot $DATA_DIR -> $LOAD_DIR"
+  log "snapshot $DATA_DIR -> $LOAD_DIR (hard links)"
   rm -rf "$LOAD_DIR"
-  cp -a "$DATA_DIR" "$LOAD_DIR"
+  cp -al "$DATA_DIR" "$LOAD_DIR"
+  relink_volatile "$DATA_DIR" "$LOAD_DIR"
+  # du counts a shared inode once per tree, so this prints the logical size,
+  # not the bytes the snapshot added. Read `df` for the bytes.
   du -sh "$LOAD_DIR" | sed 's/^/[cassandra_ctl]   /'
+  df -h "$INSTALL_DIR" | tail -1 | sed 's/^/[cassandra_ctl]   /'
 }
 
 do_restore_load() {
   do_stop
   [[ -d "$LOAD_DIR" ]] || die "restore-load: $LOAD_DIR missing -- run load_multinode_cassandra.sh first (or pass --no-restore to the sweep)"
-  log "restore $LOAD_DIR -> $DATA_DIR"
+  log "restore $LOAD_DIR -> $DATA_DIR (hard links)"
   rm -rf "$DATA_DIR"
-  cp -a "$LOAD_DIR" "$DATA_DIR"
+  cp -al "$LOAD_DIR" "$DATA_DIR"
+  relink_volatile "$LOAD_DIR" "$DATA_DIR"
 }
 
 # Bytes on disk. Two views: what Cassandra counts as live SSTable bytes
