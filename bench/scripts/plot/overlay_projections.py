@@ -61,8 +61,12 @@ def main():
     base, other = read_table(args.base_tsv), read_table(args.other_tsv)
     fig, ax = plt.subplots(figsize=(6.0, 3.8))
     x = base["D"]
-    ax.plot(x, base["cass_nvme"], color="#b03a2e", lw=1.8, label="Cassandra RF=3, NVMe (i4i)")
-    ax.plot(x, base["cass_ebs"], color="#e59866", lw=1.8, ls="-.", label="Cassandra RF=3, EBS gp3")
+    # The Cassandra consistency mode the table was priced against
+    # (plot_cost_model.py --cassandra-mode); older tables carry no column.
+    mode = base.get("cass_mode", ["?"])[0]
+    cass_name = {"serial": "Cassandra SERIAL (LWT)", "quorum": "Cassandra QUORUM"}.get(mode, "Cassandra")
+    ax.plot(x, base["cass_nvme"], color="#b03a2e", lw=1.8, label=f"{cass_name} RF=3, NVMe (i4i)")
+    ax.plot(x, base["cass_ebs"], color="#e59866", lw=1.8, ls="-.", label=f"{cass_name} RF=3, EBS gp3")
     for tab, name, ls in ((base, args.base_name, "-"), (other, args.other_name, "--")):
         ax.plot(tab["D"], tab["ozone_hi_cache"], color="#1f618d", lw=1.6, ls=ls,
                 label=f"OzoneDB, {name} (high .. low RAM cache)")

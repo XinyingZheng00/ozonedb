@@ -37,9 +37,10 @@ $EX $(have $R/$TAG-10g $R/$TAG-10g-tier $R/$TAG-scale $R/$TAG-jni) --window 60 -
 $EX $(have $R/$TAG-10g-zipf $R/$TAG-100g-zipf $R/$TAG-cass-zipf $R/$TAG-cass-10g $R/$TAG-10g-fix) $R --window 60 --tsv bench/results-$TAG-zipf.tsv
 
 $PY bench/scripts/plot/plot_cost_model.py bench/results-$TAG.tsv $PRICES --space $SPACE \
-  --tier-variant ch64k-adm --out-dir bench/scripts/plot/out --table bench/results-$TAG-projection.tsv
+  --tier-variant ch64k-adm --cassandra-mode serial \
+  --out-dir bench/scripts/plot/out --table bench/results-$TAG-projection.tsv
 $PY bench/scripts/plot/plot_cost_model.py bench/results-$TAG-zipf.tsv $PRICES --space $SPACE \
-  --tier-variant ch64k-adm --h-workload cz --cpu-workload a \
+  --tier-variant ch64k-adm --h-workload cz --cpu-workload a --cassandra-mode serial \
   --out-dir bench/scripts/plot/out-zipf --table bench/results-$TAG-zipf-projection.tsv
 $PY bench/scripts/plot/overlay_projections.py bench/results-$TAG-projection.tsv \
   bench/results-$TAG-zipf-projection.tsv --out bench/results-$TAG.png --no-other-tier

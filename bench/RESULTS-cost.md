@@ -228,6 +228,19 @@ both sizes the model keeps the longer one, which selects the 100 GB cell. The ke
 zipfian column comes from `-zipf-projection.tsv`, whose `h` is the `cz` curve and whose
 other coefficients are shared.
 
+**The Cassandra lines are priced against `cassandra-serial`** (SERIAL reads + LWT
+writes, the linearizable mode), through `plot_cost_model.py --cassandra-mode serial`,
+which is now the default. That is the like-for-like point for OzoneDB, whose reads are
+linearizable at no measured cost (finding 8). The serial cells give `cpuC` 0.11 ms per
+op (the median of 0.089 ms at 10 GB and 0.131 ms at 100 GB) and `ops_node_C` 117,085
+ops per busy server-second, against 0.06 ms and 271,406 for quorum. The dollar lines
+are the same as a quorum projection to the dollar, because at 10,000 ops/s neither
+coefficient reaches a threshold: one `c6i.large` client serves up to 12,700 ops/s at
+0.11 ms, and the server count is storage-bound above the three-node floor at every size
+(serial would need a fourth node for CPU only above 246,000 ops/s). The mode changes
+the throughput comparison, not the cost one, and the projection table carries it as
+the `cass_mode` column. `--cassandra-mode quorum` reproduces the earlier run.
+
 | D | Cassandra NVMe | Cassandra EBS | OzoneDB, 16 GB cache | OzoneDB, 4 GB | OzoneDB + 2 TB tier per client | OzoneDB, no trimming | `h` at 16 GB | zipfian, 16 GB |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | 100 GB | 1,565 | 2,402 | 4,056 | 4,160 | **1,605** | 4,085 | 0.418 | 3,622 |
