@@ -20,6 +20,7 @@ puts, so this is the insert workload `ai` of PLAN-cost-2, not workload a).
 Panel (b) is one decade of the same model split into its cost lines.
 Everything is computed here from Coefficients and Model; nothing is typed in.
 """
+
 import argparse
 import json
 import os
@@ -68,11 +69,15 @@ def build(args):
     if args.space:
         with open(args.space) as f:
             space = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
-    coef = pcm.Coefficients(rows, space, args.h_workload,
-                            read_fraction=prices["projection"].get("read_fraction", 0.5),
-                            tier_variant_filter=args.tier_variant,
-                            cpu_workload=args.cpu_workload,
-                            cassandra_mode=args.cassandra_mode)
+    coef = pcm.Coefficients(
+        rows,
+        space,
+        args.h_workload,
+        read_fraction=prices["projection"].get("read_fraction", 0.5),
+        tier_variant_filter=args.tier_variant,
+        cpu_workload=args.cpu_workload,
+        cassandra_mode=args.cassandra_mode,
+    )
     coef.report()
     return coef, pcm.Model(coef, prices), prices
 
@@ -108,14 +113,20 @@ def series(coef, model, prices):
         "cass_ebs": [model.cassandra(d, "ebs")["total"] for d in ds],
         "oz_hi": [model.ozonedb(d, hi)["total"] for d in ds],
         "oz_disk": [model.ozonedb(d, hi, disk_gb=disk_gb)["total"] for d in ds],
-        "disk_gb": disk_gb, "hi": hi, "lo": lo,
+        "disk_gb": disk_gb,
+        "hi": hi,
+        "lo": lo,
     }
     cass_min = [min(a, b) for a, b in zip(s["cass_nvme"], s["cass_ebs"])]
     s["x_oz"] = cheaper_from(ds, s["oz_hi"], cass_min)
     s["x_disk"] = cheaper_from(ds, s["oz_disk"], cass_min) if disk_gb else None
     # The tier holds the dataset while its own hit rate is still that of a
     # full tier: the last grid point at or above 0.95.
-    full = [d for d in ds if model.ozonedb(d, hi, disk_gb=disk_gb)["h_tier"] >= 0.95] if disk_gb else []
+    full = (
+        [d for d in ds if model.ozonedb(d, hi, disk_gb=disk_gb)["h_tier"] >= 0.95]
+        if disk_gb
+        else []
+    )
     s["tier_full_to"] = max(full) if full else None
     return s
 
@@ -130,48 +141,105 @@ def panel_a(ax, coef, model, prices, s, single):
     ax.set_ylim(ymin, ymax)
     ax.set_xlim(x[0], x[-1] * 1.02)
 
-    # Regimes first, under the lines.
-    if s["tier_full_to"]:
-        ax.axvspan(x[0], s["tier_full_to"] / GB, color=AQUA, alpha=0.10, lw=0)
-
-    ax.plot(x, s["cass_nvme"], color=GRAY, lw=1.4, ls=(0, (4, 2)), label="Cassandra (SERIAL), NVMe i4i")
-    ax.plot(x, s["cass_ebs"], color=ORANGE, lw=1.8, ls=(0, (4, 2)), label="Cassandra (SERIAL), EBS gp3")
+    ax.plot(
+        x,
+        s["cass_nvme"],
+        color=GRAY,
+        lw=1.4,
+        ls=(0, (4, 2)),
+        label="Cassandra (SERIAL), NVMe i4i",
+    )
+    ax.plot(
+        x,
+        s["cass_ebs"],
+        color=ORANGE,
+        lw=1.8,
+        ls=(0, (4, 2)),
+        label="Cassandra (SERIAL), EBS gp3",
+    )
     ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8, label=f"OzoneKV, {s['hi']} GB RAM cache")
     if s["disk_gb"]:
-        ax.plot(x, s["oz_disk"], color=AQUA, lw=1.8,
-                label=f"OzoneKV + {s['disk_gb'] / 1000:g} TB SSD tier per client")
+        ax.plot(
+            x,
+            s["oz_disk"],
+            color=AQUA,
+            lw=1.8,
+            label=f"OzoneKV + {s['disk_gb'] / 1000:g} TB SSD tier per writer",
+        )
 
     # Measured sizes: filled markers on every line, none beyond.
     for d in coef.measured_d:
-        for key, col in (("oz_hi", BLUE), ("oz_disk", AQUA), ("cass_ebs", ORANGE), ("cass_nvme", GRAY)):
+        for key, col in (
+            ("oz_hi", BLUE),
+            ("oz_disk", AQUA),
+            ("cass_ebs", ORANGE),
+            ("cass_nvme", GRAY),
+        ):
             if key == "oz_disk" and not s["disk_gb"]:
                 continue
-            y = (model.ozonedb(d, s["hi"], disk_gb=s["disk_gb"] if key == "oz_disk" else 0)["total"]
-                 if key.startswith("oz") else model.cassandra(d, "ebs" if key == "cass_ebs" else "nvme")["total"])
-            ax.plot([d / GB], [y], "o", color=col, ms=3.8, mec="white", mew=0.6, zorder=5)
+            y = (
+                model.ozonedb(
+                    d, s["hi"], disk_gb=s["disk_gb"] if key == "oz_disk" else 0
+                )["total"]
+                if key.startswith("oz")
+                else model.cassandra(d, "ebs" if key == "cass_ebs" else "nvme")["total"]
+            )
+            ax.plot(
+                [d / GB], [y], "o", color=col, ms=3.8, mec="white", mew=0.6, zorder=5
+            )
     ax.plot([], [], "o", color=INK2, ms=3.8, mec="white", mew=0.6, label="measured")
 
     # Value labels: the two endpoints the text quotes, and the tier point.
     d_end = ds[-1]
     oz_end = model.ozonedb(d_end, s["hi"])["total"]
     ce_end = model.cassandra(d_end, "ebs")["total"]
-    ax.annotate(fmt_usd(oz_end), (d_end / GB, oz_end), xytext=(-2, -9), textcoords="offset points",
-                ha="right", va="top", fontsize=fs, color=INK)
-    ax.annotate(fmt_usd(ce_end), (d_end / GB, ce_end), xytext=(-2, 4), textcoords="offset points",
-                ha="right", va="bottom", fontsize=fs, color=INK)
+    ax.annotate(
+        fmt_usd(oz_end),
+        (d_end / GB, oz_end),
+        xytext=(-2, -9),
+        textcoords="offset points",
+        ha="right",
+        va="top",
+        fontsize=fs,
+        color=INK,
+    )
+    ax.annotate(
+        fmt_usd(ce_end),
+        (d_end / GB, ce_end),
+        xytext=(-2, 4),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=fs,
+        color=INK,
+    )
     if s["disk_gb"]:
         d1 = 1 * TB
         oz1 = model.ozonedb(d1, s["hi"], disk_gb=s["disk_gb"])["total"]
         ce1 = model.cassandra(d1, "ebs")["total"]
-        ax.annotate(fmt_usd(oz1), (d1 / GB, oz1), xytext=(-5, -3), textcoords="offset points",
-                    ha="right", va="top", fontsize=fs, color=INK)
-        ax.annotate(fmt_usd(ce1), (d1 / GB, ce1), xytext=(-3, -3), textcoords="offset points",
-                    ha="right", va="top", fontsize=fs, color=INK)
+        ax.annotate(
+            fmt_usd(oz1),
+            (d1 / GB, oz1),
+            xytext=(-5, -3),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            fontsize=fs,
+            color=INK,
+        )
+        ax.annotate(
+            fmt_usd(ce1),
+            (d1 / GB, ce1),
+            xytext=(-3, -3),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            fontsize=fs,
+            color=INK,
+        )
 
-    # Regime labels along the top.
+    # Marker labels along the top.
     ytop = ymax / 1.25
-    if s["tier_full_to"]:
-        ax.text(x[0] * 1.2, ytop, "tier holds\nthe dataset", fontsize=fs - 0.5, color=INK2, va="top", ha="left")
     # One "cheaper from" marker per OzoneKV line: the size from which the line
     # stays below the cheaper Cassandra layout. The earlier one is labelled to
     # its left, the later one to its right, so the labels never meet.
@@ -182,8 +250,15 @@ def panel_a(ax, coef, model, prices, s, single):
     for i, (d, col, name) in enumerate(marks):
         ax.axvline(d / GB, color=col, lw=0.8, ls=(0, (1.5, 1.5)), alpha=0.9)
         left = i == 0 and len(marks) > 1
-        ax.text(d / GB * (0.93 if left else 1.07), ytop, f"{name} cheaper\nfrom {fmt_d(d, 2)}",
-                fontsize=fs - 0.5, color=col, va="top", ha="right" if left else "left")
+        ax.text(
+            d / GB * (0.93 if left else 1.07),
+            ytop,
+            f"{name} cheaper\nfrom {fmt_d(d, 2)}",
+            fontsize=fs - 0.5,
+            color=col,
+            va="top",
+            ha="right" if left else "left",
+        )
 
     ax.set_xlabel("dataset size", fontsize=fs + 0.5)
     ax.set_ylabel("USD per month", fontsize=fs + 0.5)
@@ -206,12 +281,23 @@ def panel_a(ax, coef, model, prices, s, single):
     ax.tick_params(length=2, color=INK2, labelsize=fs)
     pr = prices["projection"]
     # A white backing: the "cheaper from" marker can fall under the legend.
-    leg = ax.legend(fontsize=fs - 0.5, loc="upper left", bbox_to_anchor=(0.0, 0.80), frameon=True,
-                    facecolor="white", edgecolor="none", framealpha=0.92, borderpad=0.3,
-                    handlelength=2.0, borderaxespad=0.0, labelspacing=0.35,
-                    title=f"{pr['ops_per_s']:,} ops/s, {pr['read_fraction']:.0%} reads, "
-                          f"{1 - pr['read_fraction']:.0%} blind writes, RF={pr['rf']}",
-                    title_fontsize=fs - 0.5, alignment="left")
+    leg = ax.legend(
+        fontsize=fs - 0.5,
+        loc="upper left",
+        bbox_to_anchor=(0.0, 0.80),
+        frameon=True,
+        facecolor="white",
+        edgecolor="none",
+        framealpha=0.92,
+        borderpad=0.3,
+        handlelength=2.0,
+        borderaxespad=0.0,
+        labelspacing=0.35,
+        title=f"{pr['ops_per_s']:,} ops/s, {pr['read_fraction']:.0%} reads, "
+        f"{1 - pr['read_fraction']:.0%} inserts, RF={pr['rf']}",
+        title_fontsize=fs - 0.5,
+        alignment="left",
+    )
     leg.get_title().set_color(INK2)
 
 
@@ -232,8 +318,13 @@ def panel_b(ax, model, prices, s, d_bytes):
     bars = [
         (f"OzoneKV, {hi} GB cache", oz_lines(oz, False)),
         (f"OzoneKV + {s['disk_gb'] / 1000:g} TB tier", oz_lines(ozd, True)),
-        ("Cassandra SERIAL, EBS", [("Cassandra nodes", ce["node_cost"], ORANGES[0]),
-                                  ("Cassandra clients", ce["client_cost"], ORANGES[1])]),
+        (
+            "Cassandra SERIAL, EBS",
+            [
+                ("Cassandra nodes", ce["node_cost"], ORANGES[0]),
+                ("Cassandra clients", ce["client_cost"], ORANGES[1]),
+            ],
+        ),
     ]
     seen = {}
     ys = list(range(len(bars)))[::-1]
@@ -241,15 +332,33 @@ def panel_b(ax, model, prices, s, d_bytes):
     for y, (label, segs) in zip(ys, bars):
         left = 0.0
         for name, v, col in segs:
-            ax.barh(y, v, left=left, height=0.62, color=col, lw=0, edgecolor="none",
-                    label=None if name in seen else name)
+            ax.barh(
+                y,
+                v,
+                left=left,
+                height=0.62,
+                color=col,
+                lw=0,
+                edgecolor="none",
+                label=None if name in seen else name,
+            )
             seen[name] = True
             if v >= 0.09 * total_max:
-                ax.text(left + v / 2, y, fmt_usd(v), ha="center", va="center", fontsize=fs - 1,
-                        color="white")
+                ax.text(
+                    left + v / 2,
+                    y,
+                    fmt_usd(v),
+                    ha="center",
+                    va="center",
+                    fontsize=fs - 1,
+                    color="white",
+                )
             left += v + 0.004 * total_max  # a hairline surface gap between segments
     ax.set_yticks(ys)
-    ax.set_yticklabels([f"{label}\n{fmt_usd(sum(v for _, v, _ in segs))}" for label, segs in bars], fontsize=fs)
+    ax.set_yticklabels(
+        [f"{label}\n{fmt_usd(sum(v for _, v, _ in segs))}" for label, segs in bars],
+        fontsize=fs,
+    )
     ax.set_xlim(0, total_max * 1.3)
     step = 5000 if total_max > 8000 else 2000 if total_max > 3500 else 1000
     ticks = list(range(0, int(total_max * 1.3) + 1, step))
@@ -264,12 +373,23 @@ def panel_b(ax, model, prices, s, d_bytes):
     ax.tick_params(axis="x", length=2, color=INK2)
     ax.grid(True, axis="x", color=INK2, alpha=0.12, lw=0.6)
     ax.set_axisbelow(True)
-    ax.legend(fontsize=fs - 1, loc="upper right", frameon=False, ncol=1, handlelength=0.9,
-              handleheight=0.9, handletextpad=0.5, borderaxespad=0.0, labelspacing=0.3)
+    ax.legend(
+        fontsize=fs - 1,
+        loc="upper right",
+        frameon=False,
+        ncol=1,
+        handlelength=0.9,
+        handleheight=0.9,
+        handletextpad=0.5,
+        borderaxespad=0.0,
+        labelspacing=0.3,
+    )
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("coefficients_tsv")
     ap.add_argument("prices_json")
     ap.add_argument("--space")
@@ -277,18 +397,36 @@ def main():
     ap.add_argument("--cpu-workload", default=None)
     ap.add_argument("--tier-variant", default="")
     ap.add_argument("--cassandra-mode", default="serial", choices=("serial", "quorum"))
-    ap.add_argument("--read-fraction", type=float, default=None,
-                    help="reads as a fraction of the offered ops (default: prices.json projection.read_fraction)")
-    ap.add_argument("--breakdown-at", default="10 TB", help="the decade panel (b) splits (default 10 TB)")
-    ap.add_argument("--out", required=True, help="output stem; writes <stem>.{pdf,png} and <stem>_col.{pdf,png}")
+    ap.add_argument(
+        "--read-fraction",
+        type=float,
+        default=None,
+        help="reads as a fraction of the offered ops (default: prices.json projection.read_fraction)",
+    )
+    ap.add_argument(
+        "--breakdown-at",
+        default="10 TB",
+        help="the decade panel (b) splits (default 10 TB)",
+    )
+    ap.add_argument(
+        "--out",
+        required=True,
+        help="output stem; writes <stem>.{pdf,png} and <stem>_col.{pdf,png}",
+    )
     args = ap.parse_args()
 
-    plt.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Helvetica", "Arial", "DejaVu Sans"],
-        "font.size": 7, "pdf.fonttype": 42, "ps.fonttype": 42,
-        "axes.titlesize": 7, "figure.dpi": 300,
-    })
+    plt.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Helvetica", "Arial", "DejaVu Sans"],
+            "font.size": 7,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "axes.titlesize": 7,
+            "figure.dpi": 600,
+            "savefig.dpi": 600,
+        }
+    )
     coef, model, prices = build(args)
     s = series(coef, model, prices)
     m = pcm.re.match(r"^\s*([\d.]+)\s*(GB|TB)\s*$", args.breakdown_at)
@@ -297,19 +435,37 @@ def main():
     d_b = float(m.group(1)) * (TB if m.group(2) == "TB" else GB)
 
     pr = prices["projection"]
-    print(f"panel (a): {pr['ops_per_s']:,} ops/s, {pr['read_fraction']:.0%} reads, RF={pr['rf']}, "
-          f"against cassandra-{args.cassandra_mode}; measured at "
-          + ", ".join(fmt_d(d) for d in coef.measured_d))
-    print(f"  tier holds the dataset to {fmt_d(s['tier_full_to']) if s['tier_full_to'] else 'n/a'}; "
-          f"cheaper from: {s['hi']} GB cache {fmt_d(s['x_oz']) if s['x_oz'] else 'never'}, "
-          f"tier {fmt_d(s['x_disk']) if s['x_disk'] else 'never'}")
+    print(
+        f"panel (a): {pr['ops_per_s']:,} ops/s, {pr['read_fraction']:.0%} reads, RF={pr['rf']}, "
+        f"against cassandra-{args.cassandra_mode}; measured at "
+        + ", ".join(fmt_d(d) for d in coef.measured_d)
+    )
+    print(
+        f"  tier holds the dataset to {fmt_d(s['tier_full_to']) if s['tier_full_to'] else 'n/a'}; "
+        f"cheaper from: {s['hi']} GB cache {fmt_d(s['x_oz']) if s['x_oz'] else 'never'}, "
+        f"tier {fmt_d(s['x_disk']) if s['x_disk'] else 'never'}"
+    )
 
     # Double column: (a) + (b).
-    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(7.0, 2.55), gridspec_kw={"width_ratios": [1.55, 1], "wspace": 0.42})
+    fig, (ax_a, ax_b) = plt.subplots(
+        1,
+        2,
+        figsize=(7.0, 2.55),
+        gridspec_kw={"width_ratios": [1.55, 1], "wspace": 0.42},
+    )
     panel_a(ax_a, coef, model, prices, s, single=False)
     panel_b(ax_b, model, prices, s, d_b)
     for ax, tag in ((ax_a, "(a)"), (ax_b, "(b)")):
-        ax.text(-0.02, 1.02, tag, transform=ax.transAxes, fontsize=8, fontweight="bold", va="bottom", ha="right")
+        ax.text(
+            -0.02,
+            1.02,
+            tag,
+            transform=ax.transAxes,
+            fontsize=8,
+            fontweight="bold",
+            va="bottom",
+            ha="right",
+        )
     fig.subplots_adjust(left=0.075, right=0.99, top=0.93, bottom=0.17)
     for ext in ("pdf", "png"):
         fig.savefig(f"{args.out}.{ext}")
