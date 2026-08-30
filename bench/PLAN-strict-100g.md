@@ -9,7 +9,8 @@ run of that plan is written up in `bench/RESULTS-strict-frontier.md`.
 One throughput-against-writers curve for each (system, workload) pair at the
 strict point of the consistency frontier, on a 100 GB dataset:
 
-- OzoneDB on Corfu with `--linearizable`.
+- OzoneDB on Corfu with `--linearizable`, a 16 GiB per-writer block cache and a
+  50 GiB per-writer disk-cache tier.
 - Cassandra with `--consistency serial`. Reads are SERIAL. Every write is an
   `IF [NOT] EXISTS` Paxos round.
 
@@ -22,44 +23,90 @@ Matrix: **5 writer points x 5 workloads x 3 trials x 2 systems = 150 cells.**
 | Trials | 1, 2, 3 |
 | Systems | `ozonedb-corfu-linearizable`, `cassandra-serial` |
 
-The 1 GB run answered the question at 2 to 14 writers on a 1 GB corpus.
-Cassandra won every point. At 100 GB the Cassandra box is disk-bound and its
-advantage falls. Campaign `cost2-20260828` measured both systems at 8 writers
-on this exact corpus. Those numbers are the expected values below.
+Both systems get **180 s cells**. The reported number is a steady-state rate
+over the last 60 s of each writer.
+
+---
+
+## Read this first: what a 180 s cell measures
+
+Every cell starts both OzoneDB caches **empty**, and they cannot fill in 180 s.
+This is not a defect of the plan. It is a property of the configuration, and the
+write-up must state it.
+
+**Why the caches start empty.** Each cell is a fresh YCSB process, so the
+in-process LRU block cache starts at zero bytes.
+`load_local_ycsb_multiproc.py:543` calls `shutil.rmtree` on each writer's tier
+directory before the cell, so the disk tier starts at zero bytes too. Chunk mode
+also starts cold by design: a leftover sparse file does not record which chunks
+hold data.
+
+**How far they get in 180 s.** Campaign `cost2-20260828` measured the fill rates
+at 100 GB, per writer.
+
+| Cache | Fill rate | Reached in 180 s | Fraction of budget |
+|---|--:|--:|--:|
+| LRU block cache, 16 GiB budget | 1.9 MB/s | about 340 MB | 2 % |
+| Disk tier, 50 GiB budget | 30 MB/s | about 5.4 GB | 10 % |
+
+So the sweep measures OzoneDB **in its cache-fill phase**, not at the steady
+state that the 16 GiB and 50 GiB budgets describe. Three consequences:
+
+1. The budgets are not the binding constraint at 180 s. The fill rate is. A
+   32 GiB tier and a 50 GiB tier give the same 180 s number.
+2. The numbers will land near the no-tier, small-cache values of
+   `bench/RESULTS-cost.md`, not near its warm-tier values.
+3. Cassandra is measured the same way. It restarts from the restored data
+   directory each cell, so its page cache is also cold.
+
+**This is a real and reportable regime.** It is the elastic case that OzoneDB
+claims: a writer joins by opening the log and starts serving at once. Report it
+under that name.
+
+**Task 9 covers the other regime.** It runs two long cells that let the tier
+fill, so the write-up can hold both points. Do not skip it. Without it the sweep
+reports a 16 GiB cache and a 50 GiB tier that were never more than 10 % full.
+
+---
 
 ## Expected values (8 writers, 100 GB, from `bench/RESULTS-cost.md`)
 
-| System | Workload a | Workload c |
+| Configuration | Workload a | Workload c |
 |---|--:|--:|
-| OzoneDB native, 100 MiB cache, default reads | 2,756 ops/s | 6,330 ops/s |
 | Cassandra serial | 8,277 ops/s | 11,612 ops/s |
+| OzoneDB, 100 MiB cache, no tier, default reads | 2,756 ops/s | 6,330 ops/s |
+| OzoneDB, 800 MiB cache, no tier | — | 6,872 ops/s |
+| OzoneDB, 800 MiB cache, **warm** 50 GiB tier | 2,800 ops/s | 10,088 ops/s |
 
-At 10 GB the linearizable read mode cost nothing against the default mode
-(3,024 against 2,968 on workload a). The fence is cheap next to an S3 GET.
-Expect the same at 100 GB for a small writer count. Expect a loss at 32
-writers, where the Corfu sequencer serializes every append.
+Expect the 180 s cells of this sweep to sit near the second row, and expect
+Task 9 to sit near the fourth. At 10 GB the linearizable read mode cost nothing
+against the default mode (3,024 against 2,968 on workload a), because the fence
+is cheap next to an S3 GET. Expect a loss at 32 writers, where the Corfu
+sequencer serializes every append.
 
 ---
 
 ## Decisions taken for you
 
-The request named the matrix only. These knobs were set from the measured
-history of this cluster. Change them before Task 1 if you disagree.
+The request named the matrix, the cell duration, the tier and the cache size.
+These remaining knobs come from the measured history of this cluster.
 
 1. **No reload.** The 100 GB corpora already exist on the cluster (Task 1
    checks them). A reload costs 2 h 15 min for OzoneDB alone.
-2. **Cell duration: 300 s for OzoneDB, 180 s for Cassandra.** The reported
-   number is a rate, so unequal durations are comparable. OzoneDB needs the
-   longer cell because its per-writer block cache must fill first.
-3. **Per-writer LRU cache: 100 MiB.** This is the ratio measured at 100 GB in
-   `cost2-20260828`, so the new curve joins the existing table.
-4. **No disk-cache tier on the main curves.** Task 9 adds an optional parity
-   control with a tier.
-5. **Log trimming on (`--log-trim`).** Without it a writer replays the whole
+2. **Tier size: 50 GiB per writer, chunk mode, TinyLFU admission** (the
+   defaults). 50 GiB is the size measured at 100 GB in `cost2-20260828`, so
+   Task 9 joins the existing table. At 32 writers this is 4 writers x 50 GiB =
+   200 GiB per host, inside the 428 GB free on `/tank/cache`.
+3. **LRU cache: 16 GiB per writer**, as requested. At 32 writers this is
+   4 x 16 GiB = 64 GiB of a client's 125 GB. The cache fills on demand, so the
+   180 s cells never reach that. The Task 9 cells run one writer per host.
+4. **Log trimming on (`--log-trim`).** Without it a writer replays the whole
    100 GB log before its first fenced read. With it the join costs 612 ms to
    730 ms.
-6. **Native Corfu client** (the default). The JNI client costs 1.7x the client
+5. **Native Corfu client** (the default). The JNI client costs 1.7x the client
    CPU per operation.
+6. **One run tag.** Both systems use 180 s cells, so one extractor call with one
+   window covers the whole campaign.
 7. **Trial-major order.** Each trial runs both systems end to end. If the
    CloudLab lease ends early, the result is a whole number of trials.
 8. **Cassandra snapshots become hard links** (Task 2). A full copy of the
@@ -77,25 +124,29 @@ history of this cluster. Change them before Task 1 if you disagree.
 | Dataset | 100,000,000 records x 1 KB (10 fields x 100 B) | `--record-cnt 100000000` |
 | Threads per writer process | 1 | `local.run.threads: [1]` |
 | Operation count | unbounded, duration-capped | `local.run.operation_cnt` |
-| OzoneDB cache | 100 MiB per writer | `--lru-cache-bytes 104857600` |
-| Run tags | `strict100-20260830-oz`, `strict100-20260830-cass` | `--run-tag` |
+| Cell duration, both systems | 180 s | `--duration 180` |
+| Steady window | last 60 s | `--window 60` |
+| OzoneDB LRU cache | 16 GiB per writer | `--lru-cache-bytes 17179869184` |
+| OzoneDB disk tier | 50 GiB per writer on `/tank/cache` | `--disk-cache-bytes 53687091200 --disk-cache-dir /tank/cache` |
+| Tier mode | chunk, 64 KiB entries, TinyLFU admission | the defaults, written into every label |
+| Run tag | `strict100-20260830` | `--run-tag` |
 
 A writer is one YCSB process with one thread on one client host. The number of
 outstanding requests equals the writer count, for both systems.
 
 Writer points spread across hosts before a host takes a second writer:
 
-| Total writers | Client hosts | `--writers-list` (per host) |
-|--:|--:|--:|
-| 2 | first 2 | 1 |
-| 4 | first 4 | 1 |
-| 8 | all 8 | 1 |
-| 16 | all 8 | 2 |
-| 32 | all 8 | 4 |
+| Total writers | Client hosts | `--writers-list` (per host) | Tier per host | LRU per host |
+|--:|--:|--:|--:|--:|
+| 2 | first 2 | 1 | 50 GiB | 16 GiB |
+| 4 | first 4 | 1 | 50 GiB | 16 GiB |
+| 8 | all 8 | 1 | 50 GiB | 16 GiB |
+| 16 | all 8 | 2 | 100 GiB | 32 GiB |
+| 32 | all 8 | 4 | 200 GiB | 64 GiB |
 
-Each client has 32 cores and 125 GB of RAM. One writer process uses about 0.57
-cores. Four writers use 2.3 of 32 cores. The clients are not the limit at any
-point of this sweep.
+Each client has 32 cores, 125 GB of RAM and 428 GB free on `/tank/cache`. One
+writer process uses about 0.57 cores. Four writers use 2.3 of 32 cores. The
+clients are not the limit at any point of this sweep.
 
 ---
 
@@ -111,6 +162,8 @@ point of this sweep.
    orchestrator wall time, which includes SSH and JVM start.
 5. Report failed operations separately. A Paxos write timeout is a failure, not
    throughput.
+6. Report the cache-fill state with every OzoneDB number. See the section
+   "Read this first".
 
 ---
 
@@ -126,9 +179,11 @@ point of this sweep.
 | `/tank/cassandra/data.load` | **absent** | the snapshot is missing |
 | `/tank/ssd` | 440 GB, 98 GB free | holds all of the above and MinIO |
 
-Only MinIO runs. No Corfu server and no Cassandra daemon are up.
+On client `amd189`: 32 cores, 125 GB of RAM, `/tank/cache` 440 GB with 428 GB
+free. Only MinIO runs on the server. No Corfu server and no Cassandra daemon
+are up.
 
-Two consequences drive Task 1 and Task 2:
+Two facts drive Task 1 and Task 2:
 
 - The Cassandra load snapshot is gone. `restore-load` fails without it.
 - A `cp -a` snapshot needs 103 GB. Only 98 GB is free. Hard links fix this.
@@ -139,8 +194,10 @@ Two consequences drive Task 1 and Task 2:
 
 | Risk | Effect | Handling |
 |---|---|---|
+| Caches never fill in 180 s | OzoneDB looks slow | stated up front, Task 9 gives the warm point |
 | CloudLab lease ends mid-campaign | partial matrix | trial-major order (Task 7, Task 8) |
-| `/tank/ssd` fills during compaction | Cassandra stops | Task 1 frees 12.4 GB, Task 10 checks free space each trial |
+| `/tank/ssd` fills during compaction | Cassandra stops | Task 1 frees 12.4 GB, the chain prints `df` each trial |
+| `/tank/cache` fills at 32 writers | tier writes fail | 200 GiB of 428 GB free, Task 1 Step 5 checks it |
 | Another session uses the cluster | both runs corrupt | Task 0 guard, and the guard repeats in every chain |
 | Paxos timeouts at 32 writers | throughput looks high | `extract_steady_throughput.py` counts `*-FAILED` operations |
 | Corfu sequencer saturates at 32 writers | flat OzoneDB curve | this is a result, not a fault. Record it |
@@ -176,7 +233,7 @@ If any process belongs to another session, stop. Do not kill it.
 
 ## Task 1: free disk space and check the corpora
 
-**Files:** none. This task runs on the server only.
+**Files:** none. This task runs on the cluster only.
 
 - [ ] **Step 1: Delete the 10 GB snapshots**
 
@@ -206,7 +263,7 @@ That load takes 2 h 15 min.
 
 ```bash
 ssh -o BatchMode=yes $SRV '/tank/cassandra/cassandra_ctl.sh start && /tank/cassandra/cassandra_ctl.sh wait'
-ssh -o BatchMode=yes $SRV '/tank/cassandra/env.sh 2>/dev/null; nodetool tablestats ycsb.usertable | grep -iE "partitions|space used"'
+ssh -o BatchMode=yes $SRV 'nodetool tablestats ycsb.usertable | grep -iE "partitions|space used"'
 ```
 
 Expected: an estimated partition count near 100,000,000, and a live space near
@@ -218,6 +275,22 @@ reload with `bash bench/scripts/local/load_multinode_cassandra.sh --writers 16 -
 ```bash
 ssh -o BatchMode=yes $SRV '/tank/cassandra/cassandra_ctl.sh stop'
 ```
+
+- [ ] **Step 5: Check tier space and RAM on every client**
+
+The 32-writer point puts 4 writers on each host. Each writer takes up to 50 GiB
+of `/tank/cache` and up to 16 GiB of RAM.
+
+```bash
+python3 bench/scripts/ycsb_config.py --list clients --field ssh | while read -r h; do
+  echo -n "$h: "; ssh -o BatchMode=yes -o ConnectTimeout=8 "oliverr3@$h" \
+    'df -h --output=avail /tank/cache | tail -1 | tr -d "\n"; echo -n " cache, "; free -g | awk "/^Mem:/ {print \$7\" GB RAM available\"}"'
+done
+```
+
+Expected on every host: at least 210 GB free on `/tank/cache`, and at least
+70 GB of available RAM. If a host reports less, clear stale tier directories
+with `rm -rf /tank/cache/w*` on that host.
 
 ---
 
@@ -374,8 +447,8 @@ through Ansible before Task 5.
 
 ## Task 5: smoke test, one short cell per system
 
-**Why:** the smoke test proves the result labels, the restore path and the
-extractor before 15 hours of cells run.
+**Why:** the smoke test proves the result labels, the restore path, the tier
+path and the extractor before 13 hours of cells run.
 
 - [ ] **Step 1: Set the shared variables**
 
@@ -384,6 +457,8 @@ export OZONEDB_HOME=$PWD
 TAG=strict100-smoke
 SRV=oliverr3@amd197.utah.cloudlab.us
 RC=100000000
+CACHE=17179869184     # 16 GiB
+TIER=53687091200      # 50 GiB
 HOSTS=$(python3 bench/scripts/ycsb_config.py --list clients --field ssh | paste -s -d, -)
 H2=$(echo "$HOSTS" | tr ',' '\n' | head -n 2 | paste -s -d, -)
 ```
@@ -401,8 +476,10 @@ ssh -o BatchMode=yes $SRV '/tank/cassandra/cassandra_ctl.sh stop'
 
 ```bash
 bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --linearizable --log-trim \
-  --record-cnt $RC --lru-cache-bytes 104857600 --workloads c --writers-list 1 \
-  --client-hosts "$H2" --trial 1 --duration 120 --run-tag $TAG
+  --record-cnt $RC --lru-cache-bytes $CACHE \
+  --disk-cache-bytes $TIER --disk-cache-dir /tank/cache \
+  --workloads c --writers-list 1 --client-hosts "$H2" \
+  --trial 1 --duration 120 --run-tag $TAG
 ssh -o BatchMode=yes $SRV "pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' || true"
 ```
 
@@ -410,17 +487,19 @@ ssh -o BatchMode=yes $SRV "pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuSer
 
 ```bash
 ls bench/results/local/$TAG/
-grep -c "" bench/results/local/$TAG/*_agg_multinode_w2_t1_trial1.result
 grep -h "FAILED" bench/results/local/$TAG/*_w*of*_t1_trial1.result || echo "no failed operations"
+grep -h "disk_cache" bench/results/local/$TAG/*_w*of*_t1_trial1.result
 python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG --window 30
 ```
 
-Pass criteria, all four:
+Pass criteria, all five:
 
 1. Two `*_agg_multinode_w2_t1_trial1.result` files, one per system.
 2. Four per-writer files, two per system.
 3. `no failed operations`.
-4. The extractor prints two rows with a non-zero rate.
+4. A `[disk_cache] hits=... misses=... fills=...` line in each OzoneDB writer
+   file, with a non-zero `fills` count. A zero count means the tier is off.
+5. The extractor prints two rows with a non-zero rate.
 
 - [ ] **Step 5: Record the exact engine labels**
 
@@ -429,8 +508,18 @@ ls bench/results/local/$TAG/ | sed -E 's/.*-workload[a-z]+-(.*)_agg_multinode_.*
 ```
 
 Write the two labels into `bench/RESULTS-strict-100g.md` later. Do not guess
-them. The OzoneDB label carries both the `-native` token and the
-`-linearizable` token, and the exact order comes from this command.
+them. The OzoneDB label carries the `-native` token, the `-linearizable` token
+and a tier token of the form `-dc50g-ch64k-adm`. The exact order comes from
+this command.
+
+- [ ] **Step 6: Check that the tier directory was wiped and rebuilt**
+
+```bash
+ssh -o BatchMode=yes "oliverr3@$(echo "$H2" | cut -d, -f1)" 'du -sh /tank/cache/w* 2>/dev/null; df -h /tank/cache | tail -1'
+```
+
+Expected: one `w0` directory holding a few GB. The runner wipes it before every
+cell, so it never grows across the campaign.
 
 ---
 
@@ -440,13 +529,13 @@ them. The OzoneDB label carries both the `-native` token and the
 - Create: `bench/scripts/campaign-strict100/chain_trial.sh`
 - Create: `bench/scripts/campaign-strict100/README.md`
 
-**Why:** one trial takes about 5.2 hours. The chain runs detached, so the
+**Why:** one trial takes about 4 h 25 min. The chain runs detached, so the
 harness cannot kill it when a turn ends.
 
 **Interfaces:**
 - Consumes: `run_multinode_ycsb_with_cassandra.sh`, `run_multinode_ycsb_with_corfu.sh`.
-- Produces: results under `bench/results/local/strict100-20260830-cass` and
-  `bench/results/local/strict100-20260830-oz`, on every client and on this laptop.
+- Produces: results under `bench/results/local/strict100-20260830`, on every
+  client and on this laptop.
 
 - [ ] **Step 1: Write the chain**
 
@@ -468,7 +557,9 @@ cd "$OZONEDB_HOME"
 TAG=strict100-20260830
 SRV=oliverr3@amd197.utah.cloudlab.us
 RC=100000000
-CACHE=104857600            # 100 MiB per writer
+DUR=180
+CACHE=17179869184          # 16 GiB LRU block cache per writer
+TIER=53687091200           # 50 GiB disk-cache tier per writer
 WORKLOADS="a b c f d"      # d last: it is the only workload that inserts keys
 POINTS="2:1 4:1 8:1 8:2 8:4"   # hosts:writers_per_host -> 2 4 8 16 32 writers
 CASS=bench/scripts/local/run_multinode_ycsb_with_cassandra.sh
@@ -481,25 +572,32 @@ step() { echo "[chain $(date '+%F %T')] $*"; }
 step "trial $T: guard -- nothing else may hold the server"
 ssh -o BatchMode=yes "$SRV" '/tank/cassandra/cassandra_ctl.sh stop >/dev/null 2>&1 || true; pkill -KILL -f "org.corfudb.infrastructure.[C]orfuServer" || true; sleep 2; if pgrep -af "[C]assandraDaemon|[C]orfuServer"; then echo "server busy"; exit 1; fi; echo "server clear"; df -h /tank/ssd | tail -1'
 
-step "trial $T: Cassandra serial, 25 cells, 180 s each"
+step "trial $T: Cassandra serial, 25 cells, ${DUR} s each"
 for point in $POINTS; do
   n=${point%%:*}; w=${point##*:}
   step "  cassandra point ${n}x${w}"
   bash $CASS --consistency serial --record-cnt $RC \
     --workloads "$WORKLOADS" --writers-list "$w" --client-hosts "$(hosts_n "$n")" \
-    --trial "$T" --duration 180 --run-tag $TAG-cass
+    --trial "$T" --duration $DUR --run-tag $TAG
 done
 ssh -o BatchMode=yes "$SRV" '/tank/cassandra/cassandra_ctl.sh stop; df -h /tank/ssd | tail -1'
 
-step "trial $T: OzoneDB linearizable, 25 cells, 300 s each"
+step "trial $T: OzoneDB linearizable, 16 GiB cache + 50 GiB tier, 25 cells, ${DUR} s each"
 for point in $POINTS; do
   n=${point%%:*}; w=${point##*:}
   step "  ozonedb point ${n}x${w}"
-  bash $OZ --linearizable --log-trim --record-cnt $RC --lru-cache-bytes $CACHE \
+  bash $OZ --linearizable --log-trim --record-cnt $RC \
+    --lru-cache-bytes $CACHE --disk-cache-bytes $TIER --disk-cache-dir /tank/cache \
     --workloads "$WORKLOADS" --writers-list "$w" --client-hosts "$(hosts_n "$n")" \
-    --trial "$T" --duration 300 --run-tag $TAG-oz
+    --trial "$T" --duration $DUR --run-tag $TAG
 done
 ssh -o BatchMode=yes "$SRV" "pkill -KILL -f 'org.corfudb.infrastructure.[C]orfuServer' || true; df -h /tank/ssd | tail -1"
+
+step "trial $T: client tier space after the run"
+for h in $(echo "$HOSTS" | tr ',' ' '); do
+  echo -n "$h: "
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "oliverr3@$h" 'df -h --output=avail /tank/cache | tail -1'
+done
 
 step "CHAIN-DONE trial $T"
 CHAIN
@@ -518,6 +616,10 @@ cat > bench/scripts/campaign-strict100/README.md <<'DOC'
 One trial per invocation. Cassandra first, then OzoneDB, because they share
 the server box. Edit OZONEDB_HOME at the top before a rerun.
 
+Every cell is 180 s and starts both OzoneDB caches empty. The 16 GiB LRU and
+the 50 GiB tier are far from full at the end of a cell. That is deliberate.
+Read the "Read this first" section of the plan before you read the numbers.
+
 Launch detached from the laptop (macOS has no setsid):
 
     nohup bash bench/scripts/campaign-strict100/chain_trial.sh 1 \
@@ -531,19 +633,20 @@ mkdir -p bench/results/local/strict100-chains
 
 - [ ] **Step 3: Check the plan the chain will run, without running it**
 
-Add `--dry-run` by hand to one point and read the printed iteration plan.
-
 ```bash
 export OZONEDB_HOME=$PWD
 HOSTS=$(python3 bench/scripts/ycsb_config.py --list clients --field ssh | paste -s -d, -)
 bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --linearizable --log-trim \
-  --record-cnt 100000000 --lru-cache-bytes 104857600 --workloads "a b c f d" \
-  --writers-list 4 --client-hosts "$HOSTS" --trial 1 --duration 300 \
-  --run-tag strict100-dry --dry-run
+  --record-cnt 100000000 --lru-cache-bytes 17179869184 \
+  --disk-cache-bytes 53687091200 --disk-cache-dir /tank/cache \
+  --workloads "a b c f d" --writers-list 4 --client-hosts "$HOSTS" --trial 1 \
+  --duration 180 --run-tag strict100-dry --dry-run
 ```
 
 Expected: 5 dry-run lines, one per workload, each with `writers_per_host=4`,
-and a header line with `read_mode=linearizable log_trim=1 record_cnt=100000000`.
+and a header line with `read_mode=linearizable log_trim=1
+lru_cache_bytes=17179869184 disk_cache_bytes=53687091200 disk_cache_mode=chunk
+disk_cache_admission=frequency record_cnt=100000000 duration=180`.
 
 - [ ] **Step 4: Commit**
 
@@ -578,25 +681,34 @@ If the first cell fails, stop the chain and read the failure before a rerun.
 
 ```bash
 TAG=strict100-20260830
-ls bench/results/local/$TAG-cass/*_agg_multinode_*_trial1.result | wc -l   # expect 25
-ls bench/results/local/$TAG-oz/*_agg_multinode_*_trial1.result   | wc -l   # expect 25
-grep -L "SumWriterThroughput" bench/results/local/$TAG-*/*_agg_multinode_*_trial1.result
-grep -l "Missing writer indices" bench/results/local/strict100-chains/trial1.log
+ls bench/results/local/$TAG/*_agg_multinode_*_trial1.result | wc -l    # expect 50
+grep -L "SumWriterThroughput" bench/results/local/$TAG/*_agg_multinode_*_trial1.result
+grep -c "Missing writer indices" bench/results/local/strict100-chains/trial1.log
 ```
 
-Expected: 25 and 25, no file without `SumWriterThroughput`, and no
-`Missing writer indices` line.
+Expected: 50, which is 25 cells per system. No file without
+`SumWriterThroughput`. A `Missing writer indices` count of 0.
 
-- [ ] **Step 4: Read the trial-1 numbers before 10 more hours run**
+- [ ] **Step 4: Read the trial-1 numbers before 9 more hours run**
 
 ```bash
-python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG-cass --window 60
-python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG-oz  --window 120
+python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG --window 60
 ```
 
 Compare the 8-writer rows against the expected values at the top of this plan.
-If workload a on OzoneDB is far from 2,756 ops/s, or Cassandra serial is far
-from 8,277 ops/s, stop. Find the cause before trial 2.
+Cassandra serial must land near 8,277 ops/s on workload a. OzoneDB must land
+near the no-tier row, not the warm-tier row, because the caches are 2 % and10 % full. If either system is far from those, stop. Find the cause before
+trial 2.
+
+- [ ] **Step 5: Record the tier hit rate of trial 1**
+
+```bash
+grep -h "\[disk_cache\]" bench/results/local/$TAG/*_w*of*_t1_trial1.result | head -5
+```
+
+Expected: a low `hits` count against `misses`, and a `fills` count near
+5.4 GB divided by the 64 KiB entry size. Record the ratio in the write-up. It
+is the direct evidence for the cache-fill statement.
 
 ---
 
@@ -624,46 +736,56 @@ Wait for `CHAIN-DONE`. Repeat Task 7 Step 3 with `trial3`.
 
 ```bash
 TAG=strict100-20260830
-ls bench/results/local/$TAG-cass/*_agg_multinode_*.result | wc -l    # expect 75
-ls bench/results/local/$TAG-oz/*_agg_multinode_*.result   | wc -l    # expect 75
+ls bench/results/local/$TAG/*_agg_multinode_*.result | wc -l    # expect 150
 ```
 
-Expected: 75 and 75, which is 150 cells.
+Expected: 150 cells.
 
 ---
 
-## Task 9 (optional): client-storage parity control
+## Task 9: the warm-cache point (required, not optional)
 
-**Why:** the main curves give OzoneDB 100 MiB of client RAM per writer, and
-give Cassandra a 31 GB heap plus the page cache of a 125 GB server. A reader
-can call that unfair. This control gives each OzoneDB writer local storage
-instead, which is the deployment the cost model recommends.
+**Why:** the 150 cells above never fill the 16 GiB cache or the 50 GiB tier.
+Without this task the write-up names two budgets that no cell ever used. Two
+long cells give the steady point. They cost about 1 h 45 min.
 
-Run it only after Task 8. It adds 5 cells and about 1 hour.
+Run this after Task 8, on the same corpus, at 8 writers (one per host).
 
-- [ ] **Step 1: Run the parity cells at 8 writers**
+- [ ] **Step 1: Run two long cells**
 
 ```bash
 export OZONEDB_HOME=$PWD
 TAG=strict100-20260830
 HOSTS=$(python3 bench/scripts/ycsb_config.py --list clients --field ssh | paste -s -d, -)
 bash bench/scripts/local/run_multinode_ycsb_with_corfu.sh --linearizable --log-trim \
-  --record-cnt 100000000 --lru-cache-bytes 838860800 \
+  --record-cnt 100000000 --lru-cache-bytes 17179869184 \
   --disk-cache-bytes 53687091200 --disk-cache-dir /tank/cache \
-  --workloads "a b c f d" --writers-list 1 --client-hosts "$HOSTS" \
-  --trial 1 --duration 2700 --run-tag $TAG-oz-tier
+  --workloads "a c" --writers-list 1 --client-hosts "$HOSTS" \
+  --trial 1 --duration 2700 --run-tag $TAG-warm
 ```
 
-The 2700 s duration is the value campaign `cost2-20260828` needed for a 50 GiB
-tier to fill at about 30 MB/s per writer.
+2700 s is the value campaign `cost2-20260828` needed for a 50 GiB tier to fill
+at about 30 MB/s per writer. In 2700 s the tier reaches its full 50 GiB and the
+16 GiB LRU cache reaches about 5 GiB. State both numbers in the write-up.
 
-- [ ] **Step 2: Extract**
+- [ ] **Step 2: Extract with a long window**
 
 ```bash
-python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG-oz-tier --window 300
+python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG-warm --window 300
 ```
 
-Expected: workload c near 10,088 ops/s, the 50 GiB value measured at 100 GB.
+Expected: workload c near 10,088 ops/s and workload a near 2,800 ops/s, the
+50 GiB tier values measured at 100 GB.
+
+- [ ] **Step 3: Check that the tier really filled**
+
+```bash
+grep -h "\[disk_cache\]" bench/results/local/$TAG-warm/*_w*of*_t1_trial1.result | head -3
+```
+
+Expected: a `hits` count that is a large fraction of `hits + misses`, and a
+`capacity` figure near 53687091200. Compare the hit rate against Task 7 Step 5.
+That pair of numbers is the result of this task.
 
 ---
 
@@ -673,17 +795,14 @@ Expected: workload c near 10,088 ops/s, the 50 GiB value measured at 100 GB.
 - Create: `bench/results-strict100-20260830.tsv`
 - Create: `bench/RESULTS-strict-100g.md`
 
-- [ ] **Step 1: Build one TSV**
+- [ ] **Step 1: Build the TSV**
 
 ```bash
 TAG=strict100-20260830
-python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG-cass \
-  --window 60  --tsv bench/results-strict100-20260830-cass.tsv
-python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG-oz \
-  --window 120 --tsv bench/results-strict100-20260830-oz.tsv
-head -1 bench/results-strict100-20260830-cass.tsv > bench/results-strict100-20260830.tsv
-tail -q -n +2 bench/results-strict100-20260830-cass.tsv bench/results-strict100-20260830-oz.tsv \
-  >> bench/results-strict100-20260830.tsv
+python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG \
+  --window 60 --tsv bench/results-strict100-20260830.tsv
+python3 bench/scripts/extract_steady_throughput.py bench/results/local/$TAG-warm \
+  --window 300 --tsv bench/results-strict100-20260830-warm.tsv
 wc -l bench/results-strict100-20260830.tsv
 ```
 
@@ -700,7 +819,7 @@ under-reports the cell.
 - [ ] **Step 2: Count failed operations**
 
 ```bash
-grep -h "FAILED" bench/results/local/$TAG-*/*_w*of*_t1_trial*.result | sort | uniq -c | sort -rn | head -20
+grep -h "FAILED" bench/results/local/$TAG/*_w*of*_t1_trial*.result | sort | uniq -c | sort -rn | head -20
 ```
 
 A Paxos timeout at 16 or 32 writers is a real result. Record the count per
@@ -738,7 +857,7 @@ AGG_RE = re.compile(r"_agg(?:_multinode)?_w(\d+)_t\d+(?:_trial\d+)?\.result$")
 
 One figure, five panels, one per workload. Each panel: x is the total writer
 count on a log-2 axis, y is steady ops/s, two lines, and an error bar over the
-three trials.
+three trials. Mark the two Task 9 points on the a panel and the c panel.
 
 - [ ] **Step 5: Write `bench/RESULTS-strict-100g.md`**
 
@@ -746,11 +865,16 @@ Follow the shape of `bench/RESULTS-strict-frontier.md`. It must hold:
 
 1. The date, the cluster, the dataset, the replication factor, the read modes.
 2. The exact engine labels from Task 5 Step 5.
-3. The steady-state table: workload, writers, both systems, and the ratio.
-4. The failed-operation count per cell, or a line that says zero everywhere.
-5. The trial spread from Step 3.
-6. A comparison against the 1 GB run in `bench/RESULTS-strict-frontier.md`.
-7. The reproduce block: the chain command and the two extractor commands.
+3. **The cache-fill statement, near the top.** State that every 180 s cell
+   starts both OzoneDB caches empty, and give the two fractions from Task 7
+   Step 5. A reader who takes these numbers as steady-state OzoneDB throughput
+   will be wrong.
+4. The steady-state table: workload, writers, both systems, and the ratio.
+5. The two Task 9 warm points, next to their 180 s twins.
+6. The failed-operation count per cell, or a line that says zero everywhere.
+7. The trial spread from Step 3.
+8. A comparison against the 1 GB run in `bench/RESULTS-strict-frontier.md`.
+9. The reproduce block: the chain command and the two extractor commands.
 
 - [ ] **Step 6: Commit**
 
@@ -768,36 +892,44 @@ git commit -m "bench: strict frontier at 100 GB -- 150 cells, 3 trials, write-up
 | Task 0 to Task 4: guard, disk, snapshot, sync | 45 min |
 | Task 5: smoke | 15 min |
 | Task 6: chain scripts and dry run | 20 min |
-| Task 7: trial 1 | 5 h 15 min |
-| Task 8: trials 2 and 3 | 10 h 30 min |
-| Task 9: optional parity control | 1 h |
+| Task 7: trial 1 | 4 h 25 min |
+| Task 8: trials 2 and 3 | 8 h 50 min |
+| Task 9: warm-cache point | 1 h 45 min |
 | Task 10: extract, plot, write up | 1 h |
 
-**Total: about 18 hours,** or 17 hours without Task 9.
+**Total: about 17 hours.**
 
 Per-cell arithmetic behind the trial estimate:
 
-- Cassandra: 25 cells x (180 s run + 60 s restore and start + 40 s launch) = 1 h 55 min.
-- OzoneDB: 25 cells x (300 s run + 90 s bucket mirror + 40 s start + 40 s launch) = 3 h 20 min.
+- Cassandra: 25 cells x (180 s run + 60 s restore and start + 40 s launch) = 1 h 57 min.
+- OzoneDB: 25 cells x (180 s run + 90 s bucket mirror + 40 s start + 40 s launch) = 2 h 26 min.
 
-## Levers if 18 hours is too long
+The per-cell overhead is now larger than the cell itself on the OzoneDB side.
+The 90 s bucket mirror is the largest single part. It is not optional: the log
+and the bucket must be restored together, or `bootstrap` throws.
+
+## Levers if 17 hours is too long
 
 Apply these in order. Each one keeps the matrix shape.
 
-1. **Drop to 2 trials.** Saves 5 h 15 min. The spread from two trials is weaker
+1. **Drop to 2 trials.** Saves 4 h 25 min. The spread from two trials is weaker
    but still reportable.
-2. **Cut the OzoneDB cell to 240 s and the window to 90 s.** Saves 1 h 15 min.
-   The 100 MiB cache fills in about 55 s, so 240 s still holds a steady window.
-3. **Drop workload b.** Workload b sits between a and c and adds little. Saves
-   3 h.
+2. **Drop workload b.** Workload b sits between a and c and adds little. Saves
+   2 h 40 min.
+3. **Drop the 2-writer point.** The 1 GB run showed it adds no shape. Saves
+   1 h 20 min.
 
-Do not cut the writer points. The shape of the curve is the result.
+Do not cut the cell below 180 s. At 120 s the last-60 s window starts
+before the tier serves a useful hit. Do not cut Task 9. It is the only cell
+that measures the configuration the budgets describe.
 
 ## Follow-ups (not in this sweep)
 
 - The relaxed points of the frontier: Cassandra `--consistency quorum` and
   OzoneDB without `--linearizable`, same matrix. That completes a
   two-point-per-system frontier figure.
+- A warm-cache sweep across all five writer points, at 2700 s per cell. That
+  costs about 19 hours per trial and needs its own lease.
 - A thread sweep at a fixed writer count, to find the server ceiling rather
   than the per-request latency.
 - A 3+3 replicated configuration, with replication on both sides.
