@@ -10,11 +10,11 @@ Writes <out>.{pdf,png} (double-column: panel (a) the projection, panel (b) the
 bill at 10 TB) and <out>_col.{pdf,png} (single column: panel (a) alone).
 
 Panel (a) is plot_cost_model.py's figure cut to what the text argues from:
-four series (OzoneDB with the high RAM cache, OzoneDB with a disk tier per
+four series (OzoneKV with the high RAM cache, OzoneKV with a disk tier per
 client, Cassandra on EBS, Cassandra on local NVMe as the gray context line),
 the x-axis from the smallest measured dataset, filled markers on the measured
 sizes and none beyond, the tier regime shaded, one "cheaper from" marker per
-OzoneDB line, and four value labels. --read-fraction overrides
+OzoneKV line, and four value labels. --read-fraction overrides
 prices.json's projection.read_fraction (the offered mix; writes are blind
 puts, so this is the insert workload `ai` of PLAN-cost-2, not workload a).
 Panel (b) is one decade of the same model split into its cost lines.
@@ -37,7 +37,7 @@ import plot_cost_model as pcm  # noqa: E402
 GB = pcm.GB
 TB = 1000.0 * GB
 
-# Series hues (validated categorical slots, light surface): OzoneDB blue,
+# Series hues (validated categorical slots, light surface): OzoneKV blue,
 # the tier aqua, Cassandra EBS orange; Cassandra NVMe is context, so gray.
 BLUE, AQUA, ORANGE, GRAY = "#2a78d6", "#1baf7a", "#eb6834", "#8a8a82"
 INK, INK2 = "#1f1f1e", "#5f5f5a"
@@ -78,7 +78,7 @@ def build(args):
 
 
 def cheaper_from(ds, ozone, cass):
-    """The smallest D from which OzoneDB stays cheaper than the cheaper
+    """The smallest D from which OzoneKV stays cheaper than the cheaper
     Cassandra layout over the rest of the grid. plot_cost_model.find_crossover
     returns the first dip instead; between 9 and 13 TB the lines sit within
     1 % of each other and dip in and out with the node steps, so the first dip
@@ -136,10 +136,10 @@ def panel_a(ax, coef, model, prices, s, single):
 
     ax.plot(x, s["cass_nvme"], color=GRAY, lw=1.4, ls=(0, (4, 2)), label="Cassandra (SERIAL), NVMe i4i")
     ax.plot(x, s["cass_ebs"], color=ORANGE, lw=1.8, ls=(0, (4, 2)), label="Cassandra (SERIAL), EBS gp3")
-    ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8, label=f"OzoneDB, {s['hi']} GB RAM cache")
+    ax.plot(x, s["oz_hi"], color=BLUE, lw=1.8, label=f"OzoneKV, {s['hi']} GB RAM cache")
     if s["disk_gb"]:
         ax.plot(x, s["oz_disk"], color=AQUA, lw=1.8,
-                label=f"OzoneDB + {s['disk_gb'] / 1000:g} TB SSD tier per client")
+                label=f"OzoneKV + {s['disk_gb'] / 1000:g} TB SSD tier per client")
 
     # Measured sizes: filled markers on every line, none beyond.
     for d in coef.measured_d:
@@ -172,13 +172,13 @@ def panel_a(ax, coef, model, prices, s, single):
     ytop = ymax / 1.25
     if s["tier_full_to"]:
         ax.text(x[0] * 1.2, ytop, "tier holds\nthe dataset", fontsize=fs - 0.5, color=INK2, va="top", ha="left")
-    # One "cheaper from" marker per OzoneDB line: the size from which the line
+    # One "cheaper from" marker per OzoneKV line: the size from which the line
     # stays below the cheaper Cassandra layout. The earlier one is labelled to
     # its left, the later one to its right, so the labels never meet.
     marks = [(s["x_disk"], AQUA, "tier"), (s["x_oz"], BLUE, f"{s['hi']} GB cache")]
     marks = sorted((d, c, n) for d, c, n in marks if d)
     if len(marks) == 2 and abs(marks[0][0] - marks[1][0]) < 1e-6 * marks[0][0]:
-        marks = [(marks[0][0], INK2, "OzoneDB")]
+        marks = [(marks[0][0], INK2, "OzoneKV")]
     for i, (d, col, name) in enumerate(marks):
         ax.axvline(d / GB, color=col, lw=0.8, ls=(0, (1.5, 1.5)), alpha=0.9)
         left = i == 0 and len(marks) > 1
@@ -230,8 +230,8 @@ def panel_b(ax, model, prices, s, d_bytes):
         ("S3 storage, PUTs", o["bulk"] + o["put_cost"] + o["ckpt_cost"], BLUES[3]),
     ] + ([("SSD tier", o["disk_cost"], AQUA)] if tier else [])
     bars = [
-        (f"OzoneDB, {hi} GB cache", oz_lines(oz, False)),
-        (f"OzoneDB + {s['disk_gb'] / 1000:g} TB tier", oz_lines(ozd, True)),
+        (f"OzoneKV, {hi} GB cache", oz_lines(oz, False)),
+        (f"OzoneKV + {s['disk_gb'] / 1000:g} TB tier", oz_lines(ozd, True)),
         ("Cassandra SERIAL, EBS", [("Cassandra nodes", ce["node_cost"], ORANGES[0]),
                                   ("Cassandra clients", ce["client_cost"], ORANGES[1])]),
     ]
