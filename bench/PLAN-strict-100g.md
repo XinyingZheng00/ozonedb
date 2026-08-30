@@ -25,6 +25,27 @@ run of that plan is written up in `bench/RESULTS-strict-frontier.md`.
 5. The smoke test measured the tier fill rate directly: 2.44 GB in 120 s, of
    which the first 38 s were tailer catch-up with no reads. That is 29.8 MB/s
    of read time, which matches the 30 MB/s below.
+6. **Cassandra's page cache is warm, not cold.** The section "Read this first"
+   claimed that Cassandra restarts cold each cell. That claim is wrong, and the
+   hard-link snapshot of Task 2 makes it more wrong. `restore-load` unlinks the
+   directory entries under `data` and relinks the same inodes from `data.load`,
+   so pages cached in one cell stay valid in the next. The server holds 125 GB
+   of RAM, and `free -g` reported 85 GB in `buff/cache` during trial 1 against
+   a 103 GB dataset. Cassandra therefore serves most of the corpus from memory
+   by the middle of a trial.
+
+   Trial 1 measured 10,761 ops/s on workload a at 8 writers, against the 8,277
+   of `cost2-20260828` in `bench/RESULTS-cost.md`. About 3 points of that gap
+   come from the extractor fix in note 4. The rest is the warm page cache.
+
+   **The campaign keeps this configuration.** Changing it now would make trial 1
+   incomparable with trials 2 and 3, and the resulting comparison is the honest
+   one to publish: a warm server against a cold-joining client. That is the
+   elastic regime this sweep set out to measure. It gives Cassandra its best
+   case and OzoneDB its join case, so it is conservative against OzoneDB, and
+   any OzoneDB win under it is real. The write-up must state this next to the
+   cache-fill statement, and must not repeat the "page cache is also cold"
+   sentence.
 
 ## Goal
 
@@ -78,8 +99,10 @@ state that the 16 GiB and 50 GiB budgets describe. Three consequences:
    32 GiB tier and a 50 GiB tier give the same 300 s number.
 2. The numbers will land between the no-tier and the warm-tier values of
    `bench/RESULTS-cost.md`, closer to the no-tier end.
-3. Cassandra is measured the same way. It restarts from the restored data
-   directory each cell, so its page cache is also cold.
+3. Cassandra is **not** measured the same way. See execution note 6: the
+   hard-link restore keeps the same inodes, so its page cache stays warm from
+   cell to cell, and the server holds 85 GB of a 103 GB dataset in memory.
+   The comparison is a warm server against a cold-joining client.
 
 **This is a real and reportable regime.** It is the elastic case that OzoneDB
 claims: a writer joins by opening the log and starts serving at once. Report it
