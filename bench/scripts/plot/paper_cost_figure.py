@@ -205,7 +205,9 @@ def panel_a(ax, coef, model, prices, s, single):
         ax.spines[side].set_linewidth(0.6)
     ax.tick_params(length=2, color=INK2, labelsize=fs)
     pr = prices["projection"]
-    leg = ax.legend(fontsize=fs - 0.5, loc="upper left", bbox_to_anchor=(0.0, 0.80), frameon=False,
+    # A white backing: the "cheaper from" marker can fall under the legend.
+    leg = ax.legend(fontsize=fs - 0.5, loc="upper left", bbox_to_anchor=(0.0, 0.80), frameon=True,
+                    facecolor="white", edgecolor="none", framealpha=0.92, borderpad=0.3,
                     handlelength=2.0, borderaxespad=0.0, labelspacing=0.35,
                     title=f"{pr['ops_per_s']:,} ops/s, {pr['read_fraction']:.0%} reads, "
                           f"{1 - pr['read_fraction']:.0%} blind writes, RF={pr['rf']}",

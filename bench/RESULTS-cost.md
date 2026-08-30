@@ -244,14 +244,14 @@ the `cass_mode` column. `--cassandra-mode quorum` reproduces the earlier run.
 **Paper figure.** `bench/fig_cost.{pdf,png}` (double column: (a) the projection, (b) the
 10 TB bill) and `bench/fig_cost_col.{pdf,png}` ((a) alone, single column) come from
 `bench/scripts/plot/paper_cost_figure.py`, which evaluates the same `Coefficients` and
-`Model` on a 48-per-decade grid from 10 GB, **at 25 % reads and 75 % blind writes**
-(`--read-fraction 0.25`; the figure's legend title says so):
+`Model` on a 48-per-decade grid from 10 GB, **at 10 % reads and 90 % blind writes**
+(`--read-fraction 0.10`; the figure's legend title says so):
 
 ```bash
 uv run --with matplotlib python3 bench/scripts/plot/paper_cost_figure.py \
   bench/results-cost2-20260828.tsv bench/scripts/plot/prices.json \
   --space bench/scripts/plot/space.json --tier-variant ch64k-adm \
-  --cassandra-mode serial --read-fraction 0.25 --out bench/fig_cost
+  --cassandra-mode serial --read-fraction 0.10 --out bench/fig_cost
 ```
 
 Four series — OzoneDB with the 16 GB cache as one line (the 4 GB line is at most $350
@@ -259,24 +259,28 @@ above it and is left to the text), OzoneDB with the 2 TB tier, Cassandra EBS, Ca
 NVMe as the gray context line — filled markers at the two measured sizes and none
 beyond, the tier regime shaded to 1 TB (the last grid point where the tier's own hit
 rate is at least 0.95), and one "cheaper from" marker per OzoneDB line at the smallest
-size from which the line *stays* below the cheaper Cassandra layout. At 25 % reads both
-markers fall on the same grid point, **5.4 TB**, which is the EBS layout's fourth-node
-step, so the figure draws one. Numbers at this mix: OzoneDB $2,551 at 100 GB and $2,724 at 1 TB
-against Cassandra EBS $2,402 and NVMe $1,565; the tier $1,565 at 100 GB and $1,623 at
-1 TB; at 10 TB OzoneDB $3,207
-(GETs $1,894, the log tier $614, clients $420) against EBS $4,742; at 100 TB $5,946
-against $45,302. Panel (b) drops the NVMe bar ($12,587 at 10 TB) so the OzoneDB
-segments stay legible; the projection carries the NVMe blow-up.
+size from which the line *stays* below the cheaper Cassandra layout. At 10 % reads both
+markers fall on the same grid point, **1.3 TB**, which is the NVMe layout's fourth-node
+step, so the figure draws one. Numbers at this mix: OzoneDB $1,645 at 100 GB and $1,732
+at 1 TB against Cassandra EBS $2,402 and NVMe $1,565; the tier $1,539 at 100 GB and
+$1,579 at 1 TB; at 10 TB OzoneDB $2,073 (GETs $759, the log tier $614, clients $420,
+S3 storage $274) against EBS $4,742; at 100 TB $4,646 against $45,302. The tier line
+crosses *above* the RAM line near 2 TB and reads $2,388 at 10 TB: with 1,000 reads/s
+there is little left for a tier to serve, and its $480 of gp3 is not recovered. Panel
+(b) drops the NVMe bar ($12,587 at 10 TB) so the OzoneDB segments stay legible; the
+projection carries the NVMe blow-up.
 
 Caveats the caption must carry: the campaign measured no cell below 50 % reads, so the
 client CPU per op is workload a's (0.83 ms; the loads measured 0.71 to 0.77 ms per put,
-so the client count holds) and reads were not measured beside a 7,500 puts/s fleet
-write rate (finding 10); at 10,000 ops/s the 75 % insert stream adds 20 TB a month, so
-the x-axis is a point in time unless the writes are overwrites. The GET line is linear
-in the read fraction ($757 a month per 10 points at 10 TB): at 50 % reads the marker
-moves to 10 TB to 13 TB (the tier line is $4,753 against $4,742 at exactly 10 TB, and
-`plot_cost_model.py`'s first-dip crossovers of 12.1 TB and 14.7 TB are grid artefacts),
-and at 100 % reads (a read-modify-write update) to 26 TB.
+so the client count holds) and reads were not measured beside a 9,000 puts/s fleet
+write rate (finding 10; the loads ran 12,000 to 14,000 puts/s from one host); at
+10,000 ops/s the 90 % insert stream adds 24 TB a month, so the x-axis is a point in
+time unless the writes are overwrites. The GET line is linear in the read fraction
+($757 a month per 10 points at 10 TB): at 25 % reads the marker moves to 5.4 TB (the
+EBS fourth-node step), at 50 % reads to a 10 TB to 13 TB band (the tier line is $4,753
+against $4,742 at exactly 10 TB, and `plot_cost_model.py`'s first-dip crossovers of
+12.1 TB and 14.7 TB are grid artefacts), and at 100 % reads (a read-modify-write
+update) to 26 TB.
 
 | D | Cassandra NVMe | Cassandra EBS | OzoneDB, 16 GB cache | OzoneDB, 4 GB | OzoneDB + 2 TB tier per client | OzoneDB, no trimming | `h` at 16 GB | zipfian, 16 GB |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
