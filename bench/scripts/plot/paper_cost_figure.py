@@ -393,7 +393,7 @@ def main():
     plt.rcParams.update(
         {
             "font.family": "sans-serif",
-            "font.sans-serif": ["Helvetica", "Arial", "DejaVu Sans"],
+            "font.sans-serif": ["DejaVu Sans"],
             "font.size": 7,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
