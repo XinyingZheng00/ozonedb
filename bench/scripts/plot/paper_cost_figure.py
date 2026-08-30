@@ -448,9 +448,9 @@ def main():
     plt.close(fig)
 
     # Single column: (a) alone.
-    fig, ax = plt.subplots(figsize=(3.5, 1.85))
+    fig, ax = plt.subplots(figsize=(3.5, 1.6))
     panel_a(ax, coef, model, prices, s, single=True)
-    fig.subplots_adjust(left=0.143, right=0.985, top=0.968, bottom=0.216)
+    fig.subplots_adjust(left=0.143, right=0.985, top=0.962, bottom=0.25)
     for ext in ("pdf", "png"):
         fig.savefig(f"{args.out}_col.{ext}")
         print(f"wrote {args.out}_col.{ext}")
