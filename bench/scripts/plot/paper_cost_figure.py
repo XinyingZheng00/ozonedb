@@ -20,11 +20,23 @@ prices.json's projection.read_fraction (the offered mix; writes are blind
 puts, so this is the insert workload `ai` of PLAN-cost-2, not workload a).
 Panel (b) is one decade of the same model split into its cost lines.
 Everything is computed here from Coefficients and Model; nothing is typed in.
+
+The committed bench/fig_cost* came from (paths relative to the repo root):
+
+  python3 bench/scripts/plot/paper_cost_figure.py \
+      bench/results-cost2-20260828.tsv bench/scripts/plot/prices.json \
+      --space bench/scripts/plot/space.json --tier-variant ch64k-adm \
+      --cassandra-mode serial --read-fraction 0.10 --out bench/fig_cost
+
+Needs python3 with matplotlib. plot_cost_model.py must sit in the same
+directory as this file; the two JSON files and the TSV can live anywhere.
 """
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
 
 import matplotlib
@@ -104,12 +116,12 @@ def series(coef, model, prices, tier=False):
     # (10.24 GB -> 10 GB); everything to its right is the model.
     d_min_gb = pr["d_min_gb"]
     if coef.measured_d:
-        d_min_gb = 10 ** int(round(pcm.math.log10(min(coef.measured_d) / GB)))
+        d_min_gb = 10 ** int(round(math.log10(min(coef.measured_d) / GB)))
     ds = pcm.grid(d_min_gb, pr["d_max_gb"], per_decade=48)
     # The SSD tier is opt-in (--tier): off, disk_gb is 0 and every tier
     # series, marker, label and bar is skipped.
     disk_gb = float(pr.get("disk_gb_per_client", 0)) if tier else 0.0
-    hi, lo = pr["cache_gb_high"], pr["cache_gb_low"]
+    hi = pr["cache_gb_high"]
     s = {
         "ds": ds,
         "cass_nvme": [model.cassandra(d, "nvme")["total"] for d in ds],
@@ -118,7 +130,6 @@ def series(coef, model, prices, tier=False):
         "oz_disk": [model.ozonedb(d, hi, disk_gb=disk_gb)["total"] for d in ds],
         "disk_gb": disk_gb,
         "hi": hi,
-        "lo": lo,
     }
     cass_min = [min(a, b) for a, b in zip(s["cass_nvme"], s["cass_ebs"])]
     s["x_oz"] = cheaper_from(ds, s["oz_hi"], cass_min)
@@ -134,7 +145,7 @@ def series(coef, model, prices, tier=False):
     return s
 
 
-def panel_a(ax, coef, model, prices, s, single):
+def panel_a(ax, coef, model, s, single):
     ds = s["ds"]
     x = [d / GB for d in ds]
     fs = 6.5 if single else 7
@@ -191,10 +202,8 @@ def panel_a(ax, coef, model, prices, s, single):
 
     # One exact-cost label per line, at its right end (100 TB). The x-axis
     # runs a little past the last decade so the labels sit in clear space.
-    ends = [("cass_nvme", "Cassandra NVMe"), ("cass_ebs", "Cassandra EBS"), ("oz_hi", "OzoneKV")]
-    if s["disk_gb"]:
-        ends.append(("oz_disk", "OzoneKV + tier"))
-    for key, _ in ends:
+    ends = ["cass_nvme", "cass_ebs", "oz_hi"] + (["oz_disk"] if s["disk_gb"] else [])
+    for key in ends:
         ax.annotate(
             fmt_usd(s[key][-1]),
             (x[-1], s[key][-1]),
@@ -249,9 +258,8 @@ def panel_a(ax, coef, model, prices, s, single):
         ax.spines[side].set_color(INK2)
         ax.spines[side].set_linewidth(0.6)
     ax.tick_params(length=2, color=INK2, labelsize=fs)
-    pr = prices["projection"]
     # A white backing: the "cheaper from" marker can fall under the legend.
-    leg = ax.legend(
+    ax.legend(
         fontsize=fs - 0.5,
         loc="upper left",
         bbox_to_anchor=(0.0, 0.80),
@@ -267,8 +275,7 @@ def panel_a(ax, coef, model, prices, s, single):
     # The offered load, mix and RF belong to the caption, not the legend.
 
 
-def panel_b(ax, model, prices, s, d_bytes):
-    pr = prices["projection"]
+def panel_b(ax, model, s, d_bytes):
     fs = 7
     hi = s["hi"]
     oz = model.ozonedb(d_bytes, hi)
@@ -404,7 +411,7 @@ def main():
     )
     coef, model, prices = build(args)
     s = series(coef, model, prices, tier=args.tier)
-    m = pcm.re.match(r"^\s*([\d.]+)\s*(GB|TB)\s*$", args.breakdown_at)
+    m = re.match(r"^\s*([\d.]+)\s*(GB|TB)\s*$", args.breakdown_at)
     if not m:
         raise SystemExit(f"--breakdown-at: cannot parse {args.breakdown_at!r}")
     d_b = float(m.group(1)) * (TB if m.group(2) == "TB" else GB)
@@ -428,8 +435,8 @@ def main():
         figsize=(7.0, 2.05),
         gridspec_kw={"width_ratios": [1.55, 1], "wspace": 0.55},
     )
-    panel_a(ax_a, coef, model, prices, s, single=False)
-    panel_b(ax_b, model, prices, s, d_b)
+    panel_a(ax_a, coef, model, s, single=False)
+    panel_b(ax_b, model, s, d_b)
     for ax, tag in ((ax_a, "(a)"), (ax_b, "(b)")):
         ax.text(
             -0.02,
@@ -449,7 +456,7 @@ def main():
 
     # Single column: (a) alone.
     fig, ax = plt.subplots(figsize=(3.5, 1.6))
-    panel_a(ax, coef, model, prices, s, single=True)
+    panel_a(ax, coef, model, s, single=True)
     fig.subplots_adjust(left=0.158, right=0.985, top=0.962, bottom=0.25)
     for ext in ("pdf", "png"):
         fig.savefig(f"{args.out}_col.{ext}")
