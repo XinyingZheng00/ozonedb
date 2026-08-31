@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "matplotlib>=3.10",
+# ]
+# ///
 """The paper's cost figure, drawn from the same model as plot_cost_model.py.
 
   paper_cost_figure.py results.tsv prices.json --space space.json
@@ -28,8 +34,10 @@ The committed bench/fig_cost* came from (paths relative to the repo root):
       --space bench/scripts/plot/space.json --tier-variant ch64k-adm \
       --cassandra-mode serial --read-fraction 0.10 --out bench/fig_cost
 
-Needs python3 with matplotlib. plot_cost_model.py must sit in the same
-directory as this file; the two JSON files and the TSV can live anywhere.
+Run it with `uv run paper_cost_figure.py ...` and uv installs matplotlib
+from the inline metadata above; plain python3 needs matplotlib installed.
+plot_cost_model.py must sit in the same directory as this file; the two
+JSON files and the TSV can live anywhere.
 """
 
 import argparse
