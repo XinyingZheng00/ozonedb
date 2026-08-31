@@ -88,6 +88,9 @@ The warm point remains a follow-up.
 
 Figure: `bench/strict-frontier-100g.png`, five panels, one per workload.
 
+Artifact (the same report as a page):
+https://claude.ai/code/artifact/f0a1642d-8a0d-40aa-b46f-4f851e79d04e
+
 ---
 
 ## Findings
