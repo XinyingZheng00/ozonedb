@@ -174,6 +174,18 @@ class FileStorage : public Storage {
   std::shared_mutex read_mtx;
   std::shared_mutex write_mtx;
 
+  // getWriteStream()'s write_mtx above only guards the write_streams map
+  // lookup/insertion, not the actual write()/flush()/fsync() sequence --
+  // multiple threads in the same process calling append() on the same
+  // fileName share one ofstream with no synchronization around the I/O
+  // itself, so concurrent writes can interleave mid-record and corrupt the
+  // log's protobuf framing (silently losing every record after the
+  // corruption point). write_op_mtx guards that critical section instead,
+  // one mutex per fileName so writes to different files stay independent.
+  std::unordered_map<std::string, std::mutex> write_op_mtx;
+  std::shared_mutex write_op_mtx_map_mtx;
+  std::mutex& getWriteOpMutex(std::string const& fileName);
+
  public:
   std::ifstream* getReadStream(std::string const& name);
   std::ofstream* getWriteStream(std::string const& name);

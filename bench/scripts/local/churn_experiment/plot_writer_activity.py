@@ -54,8 +54,11 @@ def parse_log(path: Path) -> list[tuple[float, float]]:
     return intervals
 
 
-def plot_trial(trial_dir: Path, out: Path) -> None:
-    writer_logs = sorted(trial_dir.glob("writer_*.log"))
+def plot_trial(trial_dir: Path, out: Path, ymax: float | None = None,
+               show_ylabel: bool = True) -> None:
+    # Numeric sort: writer_2 before writer_10 (plain sorted() is lexical).
+    writer_logs = sorted(trial_dir.glob("writer_*.log"),
+                         key=lambda p: int(re.search(r"writer_(\d+)\.log", p.name).group(1)))
     if not writer_logs:
         print(f"No writer_*.log under {trial_dir}", file=sys.stderr)
         return
@@ -77,25 +80,40 @@ def plot_trial(trial_dir: Path, out: Path) -> None:
     duration = t_end - t0
 
     n_writers = len(series)
-    # Bigger figure → bigger usable area for larger fonts without overlap.
-    fig_h = max(3.5, 1.2 + 0.30 * n_writers)
-    fig, ax = plt.subplots(figsize=(8, fig_h))
+    # Transposed layout: writers on the x-axis, wall-clock time running DOWN
+    # the y-axis. Makes each panel tall-and-narrow so N=8 and N=16 sit side
+    # by side in the paper. Width grows with the writer count; height fixed
+    # so the two panels share a time scale visually.
+    FIG_H = 3
+    fig_w = max(2.6, 1.0 + 0.32 * n_writers)
+    fig, ax = plt.subplots(figsize=(fig_w, FIG_H))
     bar_color = "#1f77b4"
     for i, (label, ivs) in enumerate(series):
-        bars = [(s - t0, e - s) for s, e in ivs]
-        ax.broken_barh(bars, (i - 0.4, 0.8), facecolors=bar_color,
-                       edgecolor="white", linewidth=0.3)
-    ax.set_yticks(range(n_writers))
-    ax.set_yticklabels([label for label, _ in series], fontsize=16)
-    ax.tick_params(axis="x", labelsize=16)
-    ax.invert_yaxis()
-    ax.set_xlim(0, max(duration, 1.0))
-    ax.set_xlabel("Time since first compaction (s)", fontsize=16)
-    ax.set_ylabel("Writer", fontsize=16)
-    # ax.set_title(f"Per-writer compaction timeline (N={n_writers})",
-                #  fontsize=20, pad=10)
-    ax.grid(True, axis="x", linestyle=":", alpha=0.5)
-    fig.tight_layout()
+        for s, e in ivs:
+            ax.bar(i, e - s, bottom=s - t0, width=0.8, align="center",
+                   facecolor=bar_color, edgecolor="white", linewidth=0.3)
+    ax.set_xticks(range(n_writers))
+    ax.set_xticklabels([str(i) for i in range(n_writers)],
+                       fontsize=19 if n_writers <= 8 else 15)
+    ax.tick_params(axis="y", labelsize=19)
+    ax.set_xlim(-0.6, n_writers - 0.4)
+    # t=0 at the bottom, time flows upward. A caller-supplied ymax lets the
+    # N=8 and N=16 panels share an identical time scale.
+    ax.set_ylim(0, ymax if ymax is not None else max(duration, 1.0))
+    ax.set_xlabel("Writer", fontsize=19)
+    # Two lines: the label is tall on the narrow N=8 panel at this font size.
+    ax.set_ylabel("Time since first\ncompaction (s)" if show_ylabel else "",
+                  fontsize=19)
+    ax.grid(True, axis="y", linestyle=":", alpha=0.5)
+    # Pin the axes rectangle to identical ABSOLUTE margins (inches) on every
+    # panel and do NOT crop with bbox_inches="tight": that crop hugs each
+    # panel's own content, so the N=8 (2-line y-label, big x-ticks) and N=16
+    # (no y-label, smaller x-ticks) plot boxes end up at different distances
+    # from the PDF's bottom edge -> bottoms don't line up when placed side by
+    # side. Fixed margins + equal-ratio \includegraphics widths keep them aligned.
+    left_in = 1.05 if show_ylabel else 0.52  # 2-line rotated label + y-tick nums
+    fig.subplots_adjust(left=left_in / fig_w, right=1 - 0.12 / fig_w,
+                        bottom=0.72 / FIG_H, top=1 - 0.12 / FIG_H)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out)
     plt.close(fig)
@@ -112,6 +130,12 @@ def main() -> int:
     p.add_argument("trial_dir", type=Path,
                    help="Path to per_trial/<trial_id> directory, OR a "
                         "results/v4_<ts> dir (will plot all trials inside).")
+    p.add_argument("--ymax", type=float, default=None,
+                   help="Fixed upper y-limit in seconds, so panels plotted "
+                        "in separate runs (e.g. N=8 and N=16) share a time scale.")
+    p.add_argument("--no-ylabel", action="store_true",
+                   help="Omit the y-axis label (for the right panel of a "
+                        "side-by-side pair that already has it on the left).")
     args = p.parse_args()
 
     if not args.trial_dir.exists():
@@ -135,7 +159,7 @@ def main() -> int:
     plots_dir = results_dir / "plots"
     for d in trial_dirs:
         out = plots_dir / f"writer_activity_{d.name}.pdf"
-        plot_trial(d, out)
+        plot_trial(d, out, ymax=args.ymax, show_ylabel=not args.no_ylabel)
     print(f"plots -> {plots_dir}")
     return 0
 

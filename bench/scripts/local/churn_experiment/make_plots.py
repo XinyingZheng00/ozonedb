@@ -79,35 +79,41 @@ def plot_completion_vs_writers(rows: list[dict], out: Path) -> None:
         for r, t in zip(rows, ys_actual)
     ]
 
-    fig, axes = plt.subplots(1, 2, figsize=(7, 3))
+    # Larger fonts for the paper figure (Fig. 12); kept short vertically, so
+    # the y-labels are two lines to fit the reduced plot height.
+    LABEL_SIZE, TICK_SIZE, PANEL_SIZE = 17, 16, 17
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 2.45))
     ax_t, ax_s = axes
 
     ax_t.plot(xs, ys_actual, "s-", color="#ff7f0e", label="actual completion time")
     ax_t.set_xscale("log", base=2)
     ax_t.set_xticks(xs)
     ax_t.set_xticklabels([str(x) for x in xs])
-    ax_t.set_xlabel("Number of Writers")
-    ax_t.set_ylabel("Completion time (s)")
-    # ax_t.set_title("Completion time vs. # writers")
+    ax_t.set_xlabel("Number of Writers", fontsize=LABEL_SIZE)
+    ax_t.set_ylabel("Completion\ntime (s)", fontsize=LABEL_SIZE)
+    ax_t.tick_params(axis="both", labelsize=TICK_SIZE)
     ax_t.grid(True, linestyle=":", alpha=0.5)
 
     ax_s.plot(xs, ys_speed, "o-", color="#1f77b4", label="compaction speed")
     ax_s.set_xscale("log", base=2)
     ax_s.set_xticks(xs)
     ax_s.set_xticklabels([str(x) for x in xs])
-    ax_s.set_xlabel("Number of Writers")
-    ax_s.set_ylabel("Compaction speed (MB/s)")
-    # ax_s.set_title("Compaction speed vs. # writers")
+    ax_s.set_xlabel("Number of Writers", fontsize=LABEL_SIZE)
+    ax_s.set_ylabel("Compaction\nspeed (MB/s)", fontsize=LABEL_SIZE)
+    ax_s.tick_params(axis="both", labelsize=TICK_SIZE)
     ax_s.grid(True, linestyle=":", alpha=0.5)
 
-    fig.suptitle("Distributed Compaction Efficiency (Without Churn)", fontsize=12)
-    fig.tight_layout(rect=[0, 0.05, 1, 1.03])
-    # Panel labels below each subplot, in figure coordinates.
+    # Panel labels in a thin band below the plots; suptitle dropped (the paper
+    # caption covers it -- per-axis titles are commented out too). Height is
+    # trimmed from the plot area instead of from this band.
+    fig.tight_layout(rect=[0, 0.10, 1, 1.0])
     for ax, label in ((ax_t, "(a)"), (ax_s, "(b)")):
         bbox = ax.get_position()
-        fig.text((bbox.x0 + bbox.x1) / 2, 0.04, label,
-                 ha="center", va="bottom", fontsize=11)
-    fig.savefig(out)
+        fig.text((bbox.x0 + bbox.x1) / 2, 0.01, label,
+                 ha="center", va="bottom", fontsize=PANEL_SIZE)
+    # bbox_inches/pad_inches: crop the leftover margins tight_layout's fixed
+    # rect leaves around the edges, instead of just reserving a fixed band.
+    fig.savefig(out, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
@@ -240,7 +246,10 @@ def plot_generation_distribution(rows: list[dict], out: Path) -> None:
         all_gens.update(summed.keys())
     gens = sorted(all_gens)
 
-    fig, ax = plt.subplots(figsize=(4, 0.4 + 0.55 * len(rates)))
+    # Larger fonts for the paper figure (Fig. 14); wider so they fit, and
+    # kept short vertically.
+    LABEL_SIZE, TICK_SIZE, LEGEND_SIZE = 20, 18, 17
+    fig, ax = plt.subplots(figsize=(9.2, 0.9 + 0.42 * len(rates)))
     ys = list(range(len(rates)))
     # Normalize each row so all bars span 0..1 (proportional view).
     totals = [sum(per_rate_mean[rate].values()) or 1.0 for rate in rates]
@@ -255,16 +264,39 @@ def plot_generation_distribution(rows: list[dict], out: Path) -> None:
                 edgecolor="white", linewidth=0.5)
         lefts = [l + w for l, w in zip(lefts, widths)]
     ax.set_yticks(ys)
-    ax.set_yticklabels([f"R={int(100 * r)}%" for r in rates])
-    ax.invert_yaxis()
+    ax.set_yticklabels([f"R={int(100 * r)}%" for r in rates], fontsize=TICK_SIZE)
+    ax.tick_params(axis="x", labelsize=TICK_SIZE)
+    # Tight y-limits (vs. plain invert_yaxis()) trim the auto-added top/bottom
+    # margin so the 5 rows -- still with their gaps, unlike the touching-bars
+    # version -- span closer to the legend's height instead of looking short.
+    ax.set_ylim(len(rates) - 0.5, -0.5)
     ax.set_xlim(0, 1)
-    ax.set_xlabel("Fraction of tasks")
-    ax.set_title("Version Number Distribution by Abort Rate")
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
-              fontsize=8, title="Version \nNumber", frameon=False)
+    ax.set_xlabel("Fraction of tasks", fontsize=LABEL_SIZE)
+    # Title dropped -- the paper caption ("Version-number distribution vs.
+    # abort ratios.") covers it, matching the other paper plots in this file.
+    # Multi-column so the ~12 version entries don't make a tall single strip
+    # that fights the short figure height.
+    # upper-left anchor at y=1.0 (axes top) instead of center-left at y=0.5:
+    # the legend entries now start level with the top bar (R=1%) instead of
+    # being vertically centered on the whole block.
+    # No `title=` here -- matplotlib always renders a legend title above the
+    # entries, with no built-in way to put it below. Instead the label
+    # "Version number" is placed as its own text under the legend once we
+    # know where the legend actually ended up (below).
+    leg = ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.08),
+                    fontsize=LEGEND_SIZE, frameon=False,
+                    ncol=2, columnspacing=1.0, handletextpad=0.4)
     ax.grid(True, axis="x", linestyle=":", alpha=0.5)
     fig.tight_layout()
-    fig.savefig(out)
+    fig.canvas.draw()  # legend needs a real layout pass to know its extent
+    bbox_fig = leg.get_window_extent(fig.canvas.get_renderer()).transformed(
+        fig.transFigure.inverted())
+    fig.text((bbox_fig.x0 + bbox_fig.x1) / 2, bbox_fig.y0 - 0.02,
+             "Version number", ha="center", va="top", fontsize=LEGEND_SIZE)
+    # bbox_inches: the legend sits outside the axes on the right; on the
+    # shortened figure tight_layout alone can clip it (or the label below it).
+    # pad_inches trimmed to the minimum so the crop is as tight as possible.
+    fig.savefig(out, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 

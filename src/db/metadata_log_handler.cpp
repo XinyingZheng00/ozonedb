@@ -39,7 +39,15 @@ Status MetadataLogHandler::startViewUpdate(std::atomic<bool> const* active) {
 }
 
 Status MetadataLogHandler::stopViewUpdate() {
-  this->update_view_thread->join();
+  // EXPERIMENT (not upstream): detach instead of join, so closeDB() doesn't
+  // block on the view-update thread's up-to-100ms poll interval
+  // (rollForwardMetadataLogPeriodically's sleep_for). Safe today because
+  // DB::closeDB() never actually frees `db` (`delete db;` is commented
+  // out there), so the detached thread keeps touching valid, merely-leaked
+  // memory until it notices `*active == false` on its own. See conversation
+  // notes -- this is coupled to that leak and would need revisiting if the
+  // leak is ever fixed.
+  this->update_view_thread->detach();
   delete this->update_view_thread;
   this->update_view_thread = nullptr;
   return Status::kSuccess;

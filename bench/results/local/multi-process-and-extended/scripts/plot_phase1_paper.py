@@ -29,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 
 def _sci_fmt(x: float, pos: int) -> str:
@@ -116,15 +116,43 @@ def plot_bars(rows: dict, x_counts: list[int], title: str, x_label: str,
               out_path: Path, system_order: list[str],
               log_y: bool = True) -> None:
     """Multi-writer bar chart in fig2 format. 1x5 grid, grouped bars per system per N."""
-    workloads = ["a", "b", "c", "d", "f"]
+    # a and f run ~10x lower than b/c/d; on one shared linear y-axis their two
+    # SQLite bars collapse into indistinguishable slivers. So: group a+f on the
+    # LEFT with their own (smaller) shared y-limit, b/c/d keep the larger shared
+    # y-limit on the right. Each group factors its own power of 10 into the unit.
+    # (Swap the two halves of `workloads` to put a/f on the right instead.)
+    workloads = ["a", "f", "b", "c", "d"]
+    small_wl = {"a", "f"}
+    groups = [["a", "f"], ["b", "c", "d"]]
     n_sys = len(system_order)
     bar_width = 0.8 / n_sys
     x_idx = np.arange(len(x_counts))
 
-    fig, axes = plt.subplots(1, 5, figsize=(28, 6.5), sharey=True)
+    def _group_exp(wls):
+        vals = [m for s in system_order for w in wls
+                for (m, _sd) in rows.get(s, {}).get(w, {}).values()
+                if m is not None and np.isfinite(m) and m > 0]
+        return int(np.floor(np.log10(max(vals)))) if vals else 0
+
+    exp_small, exp_big = _group_exp(small_wl), _group_exp(groups[1])
+
+    # Spacer columns: tight gaps between panels of the same group, a wide gap
+    # between the two groups so each group's leading y-axis + label has room.
+    GAP_IN, GAP_MID = 0.06, 0.40
+    fig = plt.figure(figsize=(28, 4.8))
+    gs = fig.add_gridspec(
+        1, 9, wspace=0.0,
+        width_ratios=[1, GAP_IN, 1, GAP_MID, 1, GAP_IN, 1, GAP_IN, 1],
+        left=0.055, right=0.995, top=0.90, bottom=0.34)
+    panel_cols = [0, 2, 4, 6, 8]
+    axes = []
+    for ci, col in enumerate(panel_cols):
+        shared = axes[0] if (log_y and axes) else None
+        axes.append(fig.add_subplot(gs[0, col], sharey=shared))
 
     for i, wl in enumerate(workloads):
         ax = axes[i]
+        e = exp_small if wl in small_wl else exp_big
         for j, sys_ in enumerate(system_order):
             per_n = rows.get(sys_, {}).get(wl, {})
             means = [per_n.get(n, (np.nan, 0))[0] for n in x_counts]
@@ -143,12 +171,30 @@ def plot_bars(rows: dict, x_counts: list[int], title: str, x_label: str,
         if log_y:
             ax.set_yscale("log")
         else:
-            ax.yaxis.set_major_formatter(FuncFormatter(_sci_fmt))
+            ax.yaxis.set_major_formatter(FuncFormatter(
+                lambda v, _p, e=e: f"{v / 10 ** e:g}"))
+            # Whole-number ticks for the a/f group, half-decade for b/c/d.
+            step = (1.0 if wl in small_wl else 0.5) * 10 ** e
+            ax.yaxis.set_major_locator(MultipleLocator(step))
         ax.set_title(WORKLOAD_LABELS.get(wl, f"Workload {wl}"), fontsize=28)
         ax.set_xlabel("Writers", fontsize=26)
-        if i == 0:
-            ax.set_ylabel("Throughput (ops/sec)", fontsize=26)
         ax.grid(True, axis="y", alpha=0.3)
+
+    if log_y:
+        axes[0].set_ylabel("Throughput\n(ops/sec)", fontsize=26)
+    else:
+        # Share one y-limit per group; y-ticks + label only on each group's
+        # first panel (the reappearing y-axis marks the scale change).
+        for grp in groups:
+            idxs = [workloads.index(w) for w in grp]
+            top = max(axes[k].get_ylim()[1] for k in idxs)
+            for k in idxs:
+                axes[k].set_ylim(0, top)
+            for k in idxs[1:]:
+                axes[k].tick_params(axis="y", labelleft=False)
+            e = exp_small if grp[0] in small_wl else exp_big
+            axes[idxs[0]].set_ylabel(
+                "Throughput\n" rf"($\times 10^{{{e}}}$ ops/sec)", fontsize=26)
 
     handles, _ = axes[0].get_legend_handles_labels()
     labels = [SYSTEM_LABELS[s] for s in system_order]
@@ -157,8 +203,8 @@ def plot_bars(rows: dict, x_counts: list[int], title: str, x_label: str,
                fontsize=24, frameon=False,
                handletextpad=1.0, columnspacing=2.5)
 
-    fig.tight_layout()
-    fig.subplots_adjust(bottom=0.28, wspace=0.12)
+    # Margins/gaps are set on add_gridspec above (tight_layout would fight the
+    # spacer columns, the mid-row y-label, and the figure legend).
     fig.savefig(out_path)
     plt.close(fig)
 

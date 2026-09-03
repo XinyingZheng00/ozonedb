@@ -55,14 +55,18 @@ from typing import Optional
 # Static config
 # -----------------------------------------------------------------------------
 
-YCSB_CPP_DIR = Path("/users/Xinying/YCSB-cpp")
+# Paths are env-overridable so the sweep can run from a relocated checkout.
+# Defaults target the ozonedb-revision-backup layout.
+YCSB_CPP_DIR = Path(os.environ.get(
+    "YCSB_CPP_DIR", "/users/Xinying/ozonedb-revision-backup/YCSB-cpp"))
 YCSB_CPP_BIN = YCSB_CPP_DIR / "ycsb"
 
-OZONEDB_HOME = Path("/users/Xinying/ozonedb")
+OZONEDB_HOME = Path(os.environ.get(
+    "OZONEDB_HOME", "/users/Xinying/ozonedb-revision-backup/ozonedb"))
 OZONEDB_YCSB = OZONEDB_HOME / "ycsb"
 OZONEDB_BIN = OZONEDB_YCSB / "bin" / "ycsb"
 
-DATA_ROOT = Path("/tank/ycsb_data")
+DATA_ROOT = Path(os.environ.get("YCSB_DATA_ROOT", "/tank/ycsb_data"))
 WORK_ROOT = DATA_ROOT / "multi-proc-run"  # parent for all per-process working DBs
 
 DEFAULT_RECORD_COUNT = 1_000_000

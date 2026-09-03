@@ -8,7 +8,24 @@ Status CompactionWatcher::startCompactionWatcher(std::atomic<bool> const* active
   return Status::kSuccess;
 }
 Status CompactionWatcher::stopCompactionWatcher() {
-  this->compaction_thread->join();
+  // EXPERIMENT (not upstream): detach instead of join, same rationale as
+  // MetadataLogHandler::stopViewUpdate(). watchForCompaction's only
+  // synchronous side effects live inside doCompactionWork(): output
+  // SSTables are written and finish()ed BEFORE the compaction is committed
+  // via appendToMetadataLog(operation_record), and input files are only
+  // deleted AFTER that commit (see the "Step4: append to metadata log
+  // first, then delete" comment further down this file) -- so a thread
+  // interrupted anywhere in that sequence leaves at worst an orphaned,
+  // unreferenced .sst file, never a torn/inconsistent view. This is the
+  // same failure mode (a writer disappearing mid-compaction with zero
+  // cleanup) the heartbeat-timeout/reclaim protocol already exists for and
+  // that bench/scripts/local/churn_experiment validated at up to 50% abort
+  // rate with 100% post-completion integrity. Detaching is a gentler
+  // version of that already-tolerated failure (the thread keeps running
+  // until it notices `*active == false`, rather than vanishing instantly).
+  this->compaction_thread->detach();
+  delete this->compaction_thread;
+  this->compaction_thread = nullptr;
   return Status::kSuccess;
 }
 

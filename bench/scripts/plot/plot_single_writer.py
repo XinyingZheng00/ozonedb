@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import re
 import sys
@@ -179,7 +180,7 @@ def plot_figure(data, output_path: Path):
     x = np.arange(len(WORKLOAD_ORDER))
     width = 0.18
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5), constrained_layout=True)
     fig.suptitle("Figure 1. Single-writer throughput and latency", fontsize=20, fontweight="bold")
 
     for idx, system in enumerate(SYSTEM_ORDER):
@@ -224,11 +225,10 @@ def plot_figure(data, output_path: Path):
     fig.legend(
         handles,
         labels,
-        loc="lower center",
-        ncol=len(SYSTEM_ORDER),
+        loc="center left",
+        ncol=1,
         frameon=False,
-        bbox_to_anchor=(0.5, -0.08),
-
+        bbox_to_anchor=(1.0, 0.5),
     )
 
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -254,6 +254,120 @@ def plot_figure(data, output_path: Path):
             file=sys.stderr,
         )
         print(banner, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Independent path: reproduce the ORIGINAL 5-system fig1_single_writer.pdf
+# (OzoneKV/RocksDB/SQLite-trunk/BCW2/HCTree, 7 groups: Load, Load tmpfs,
+# A-D, F, single log-y throughput panel) directly from the aggregated CSVs
+# that already live in fig1-single-writer-local/ -- no raw-log re-parsing,
+# and no dependency on the *.result files collect_metrics() expects (which
+# don't exist in that directory).
+# ---------------------------------------------------------------------------
+
+FIG1_CSV_GROUPS = ["load", "load_tmpfs", "a", "b", "c", "d", "f"]
+FIG1_CSV_GROUP_LABELS = {
+    "load": "Load",
+    "load_tmpfs": "Load\ntmpfs",
+    "a": "A", "b": "B", "c": "C", "d": "D", "f": "F",
+}
+FIG1_CSV_SYSTEM_ORDER = ["ozonedb", "rocksdb", "trunkcpp", "bcw2", "hctree"]
+FIG1_CSV_SYSTEM_DISPLAY = {
+    "ozonedb": "OzoneKV",
+    "rocksdb": "RocksDB",
+    "trunkcpp": "SQLite\n(trunk,\nplain WAL)",
+    "bcw2": "SQLite (BEGIN\nCONCURRENT\n+ WAL2)",
+    "hctree": "SQLite (HCTree)",
+}
+FIG1_CSV_SYSTEM_COLORS = {
+    "ozonedb": "#1f77b4",
+    "rocksdb": "#d62728",
+    "trunkcpp": "#2ca02c",
+    "bcw2": "#ff7f0e",
+    "hctree": "#9467bd",
+}
+
+
+def collect_metrics_fig1_csv(results_dir: Path):
+    """Merge results.csv (workloads a/b/c/d/f) with load_results.csv and
+    load_tmpfs_results.csv (the "Load"/"Load tmpfs" groups) into the same
+    data[system][group] = {"throughput_mean", "throughput_std"} shape the
+    other collectors use. n_repeats is 1 for every row in these CSVs, so
+    throughput_stddev is empty -- std is reported as 0.0, not NaN, so a
+    missing stddev doesn't silently drop the bar."""
+    data = {
+        system: {g: {"throughput_mean": math.nan, "throughput_std": 0.0}
+                 for g in FIG1_CSV_GROUPS}
+        for system in FIG1_CSV_SYSTEM_ORDER
+    }
+
+    with open(results_dir / "results.csv", newline="") as f:
+        for row in csv.DictReader(f):
+            system, workload = row["system"], row["workload"]
+            if system not in FIG1_CSV_SYSTEM_ORDER or workload not in FIG1_CSV_GROUPS:
+                continue
+            data[system][workload]["throughput_mean"] = float(row["throughput_mean"])
+            std = (row.get("throughput_stddev") or "").strip()
+            data[system][workload]["throughput_std"] = float(std) if std else 0.0
+
+    for fname, group in (("load_results.csv", "load"), ("load_tmpfs_results.csv", "load_tmpfs")):
+        path = results_dir / fname
+        if not path.exists():
+            continue
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                system = row["system"]
+                if system not in FIG1_CSV_SYSTEM_ORDER:
+                    continue
+                data[system][group]["throughput_mean"] = float(row["throughput"])
+
+    return data
+
+
+def plot_figure_fig1_csv(data, output_path: Path):
+    """Single log-y throughput bar chart, 5 systems x 7 groups. Shorter and
+    with the legend on the right (same treatment applied to plot_figure())."""
+    n_sys = len(FIG1_CSV_SYSTEM_ORDER)
+    x = np.arange(len(FIG1_CSV_GROUPS))
+    width = 0.8 / n_sys
+
+    fig, ax = plt.subplots(figsize=(11, 3.8), constrained_layout=True)
+    for i, system in enumerate(FIG1_CSV_SYSTEM_ORDER):
+        offset = (i - (n_sys - 1) / 2) * width
+        means = [data[system][g]["throughput_mean"] for g in FIG1_CSV_GROUPS]
+        stds = [data[system][g]["throughput_std"] for g in FIG1_CSV_GROUPS]
+        ax.bar(x + offset, means, width, yerr=stds, capsize=3,
+               label=FIG1_CSV_SYSTEM_DISPLAY[system],
+               color=FIG1_CSV_SYSTEM_COLORS[system])
+
+    ax.set_yscale("log")
+    ax.set_ylabel("Throughput (ops/sec)", fontsize=22)
+    ax.tick_params(axis="y", labelsize=19)
+    ax.set_xticks(x)
+    # Global rcParams at the top of this file set an 18pt tick font sized for
+    # the old 18x9in figure; on this shorter/narrower one, "Load"/"Load tmpfs"
+    # crowd into each other at that size, so override it down for this panel.
+    ax.set_xticklabels([FIG1_CSV_GROUP_LABELS[g] for g in FIG1_CSV_GROUPS], fontsize=17)
+    # Title dropped -- the paper's subfigure caption ("Single writer
+    # performance in local deployment") already says it.
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    # fontsize override: the file-level rcParams sets legend.fontsize=20,
+    # sized for the old 18x9in figure -- far too large for this one.
+    # Smaller handles/padding (not just fontsize) so the legend column itself
+    # is narrower -- constrained_layout gives the axes whatever room that frees.
+    ax.legend(loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False, fontsize=17,
+              handlelength=1.2, handletextpad=0.4, borderpad=0.3, labelspacing=0.5)
+
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"Saved figure to: {output_path}")
+
+    missing = [f"{FIG1_CSV_SYSTEM_DISPLAY[s]} / {FIG1_CSV_GROUP_LABELS[g]}"
+               for s in FIG1_CSV_SYSTEM_ORDER for g in FIG1_CSV_GROUPS
+               if math.isnan(data[s][g]["throughput_mean"])]
+    if missing:
+        print(f"WARNING: {len(missing)} cell(s) missing from the CSVs:", file=sys.stderr)
+        for entry in missing:
+            print(f"  - {entry}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -441,13 +555,19 @@ def plot_figure_hbr(data, output_path: Path, title: str = "Single-writer: HCTree
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot single-writer YCSB results. Two modes: 'fig1' (ozonedb/rocksdb/sqlite) and 'hbr' (hctree/bcw2/rocksdb)."
+        description="Plot single-writer YCSB results. Modes: 'fig1' (ozonedb/rocksdb/sqlite "
+                    "from *.result files), 'fig1csv' (5-system reproduction of the original "
+                    "fig1_single_writer.pdf from the aggregated CSVs), 'hbr' (hctree/bcw2/rocksdb)."
     )
     parser.add_argument(
         "--mode",
-        choices=["fig1", "hbr"],
+        choices=["fig1", "fig1csv", "hbr"],
         default="fig1",
-        help="fig1: original OzoneDB/RocksDB/SQLite plot. hbr: HCTree/BCW2/RocksDB plot from run_benchmark_*.sh.",
+        help="fig1: OzoneDB/RocksDB/SQLite throughput+latency plot from *.result files. "
+             "fig1csv: 5-system throughput-only plot from results.csv/load_results.csv/"
+             "load_tmpfs_results.csv (use this one -- fig1-single-writer-local/ has no "
+             "*.result files, only these CSVs and raw *.log). "
+             "hbr: HCTree/BCW2/RocksDB plot from run_benchmark_*.sh.",
     )
     parser.add_argument(
         "--results-dir",
@@ -485,6 +605,14 @@ def main():
         data = collect_metrics(results_dir, args.insert_results_dir)
         output.parent.mkdir(parents=True, exist_ok=True)
         plot_figure(data, output)
+    elif args.mode == "fig1csv":
+        results_dir = args.results_dir or Path("../../results/local/fig1-single-writer-local")
+        output = args.output or Path("../../results/local/fig1-single-writer-local/fig1_single_writer.pdf")
+        if not results_dir.exists():
+            raise FileNotFoundError(f"Results directory does not exist: {results_dir}")
+        data = collect_metrics_fig1_csv(results_dir)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        plot_figure_fig1_csv(data, output)
     else:
         results_dir = args.results_dir or Path("../../results/local/fig2-multi-writer-local")
         output = args.output or Path("../../results/local/fig2-multi-writer-local/single_writer_hctree_bcw2_rocksdb.pdf")

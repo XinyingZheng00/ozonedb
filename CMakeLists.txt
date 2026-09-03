@@ -93,10 +93,47 @@ target_link_libraries(runUnitTests
     pthread OzoneDB
 )
 
-# add_executable(runBench 
+# add_executable(runBench
 # bench/bench.cpp
 # )
 # target_link_libraries(runBench OzoneDB unofficial::sqlite3::sqlite3 rocksdb log4cxx)
+
+# Use-case benchmark driver (Serval Mesh/Rhizome, MLflow, Podman-shaped
+# workloads): a single small binary that can act as either an OzoneDB
+# writer or a plain-SQLite writer, run either as a one-shot "cli" process
+# or a long-running "daemon" process.
+add_executable(kv_writer
+    bench/usecases/kv_writer.cpp
+)
+target_link_libraries(kv_writer
+    OzoneDB
+    unofficial::sqlite3::sqlite3
+    pthread
+)
+
+# ctypes-loadable shim for the MLflow swap-in bridge (Python has no
+# existing OzoneDB binding, unlike Java's JNI one under ozonedb-jni-maven/).
+# Only exposes open/put/get/remove/close -- the operations the metric-write
+# bridge needs.
+add_library(ozonedb_pyshim SHARED
+    bench/usecases/mlflow/ozonedb_pyshim.cpp
+)
+target_link_libraries(ozonedb_pyshim
+    OzoneDB
+)
+
+# koffi-loadable shim for the ruflo/claude-flow HybridBackend swap-in bridge
+# (Node.js has no existing OzoneDB binding). Only exposes open/put/get/
+# remove/close -- the operations OzoneDBBackend needs. get() uses a
+# fixed-capacity-output-buffer ABI rather than ozonedb_pyshim's malloc'd
+# pointer, since that's the robust, documented koffi pattern -- see
+# ozonedb_nodeshim.cpp's header comment.
+add_library(ozonedb_nodeshim SHARED
+    bench/usecases/ruflo/ozonedb_nodeshim.cpp
+)
+target_link_libraries(ozonedb_nodeshim
+    OzoneDB
+)
 
 # Custom Clean Targets
 add_custom_target(clean-all
